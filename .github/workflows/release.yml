@@ -2,25 +2,6 @@ name: Release
 
 on:
   workflow_dispatch:
-    inputs:
-      tag_name:
-        description: "Release tag to publish. Leave empty to create a manual-build tag."
-        required: false
-        type: string
-      release_name:
-        description: "Release title. Leave empty to use the tag."
-        required: false
-        type: string
-      prerelease:
-        description: "Mark manually triggered releases as pre-releases."
-        required: true
-        default: true
-        type: boolean
-      publish_release:
-        description: "Publish packaged executables to GitHub Releases."
-        required: true
-        default: true
-        type: boolean
 
 permissions:
   contents: write
@@ -36,32 +17,37 @@ jobs:
       release_tag: ${{ steps.meta.outputs.release_tag }}
       release_name: ${{ steps.meta.outputs.release_name }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
-      publish_release: ${{ steps.meta.outputs.publish_release }}
     steps:
+      - uses: actions/checkout@v4
+
       - name: Prepare release metadata
         id: meta
         shell: bash
         run: |
           set -euo pipefail
 
-          release_tag="${{ inputs.tag_name }}"
-          if [[ -z "$release_tag" ]]; then
-            release_tag="manual-build-${{ github.run_number }}"
-          fi
+          version="$(python3 - <<'PY'
+          import tomllib
 
-          release_name="${{ inputs.release_name }}"
-          if [[ -z "$release_name" ]]; then
-            release_name="$release_tag"
-          fi
+          with open("Cargo.toml", "rb") as cargo_toml:
+              manifest = tomllib.load(cargo_toml)
 
-          prerelease="${{ inputs.prerelease }}"
-          publish_release="${{ inputs.publish_release }}"
+          print(manifest["workspace"]["package"]["version"])
+          PY
+          )"
+
+          release_tag="v${version}"
+          release_name="ZeroDPI ${release_tag}"
+
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
 
           {
             echo "release_tag=$release_tag"
             echo "release_name=$release_name"
             echo "prerelease=$prerelease"
-            echo "publish_release=$publish_release"
           } >> "$GITHUB_OUTPUT"
 
   linux:
@@ -126,7 +112,6 @@ jobs:
   publish:
     needs: [prepare, linux, windows]
     runs-on: ubuntu-latest
-    if: needs.prepare.outputs.publish_release == 'true'
     steps:
       - uses: actions/download-artifact@v4
         with:

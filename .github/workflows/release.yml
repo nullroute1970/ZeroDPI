@@ -1,9 +1,6 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag_name:
@@ -47,25 +44,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            release_tag="${{ github.ref_name }}"
-            release_name="${{ github.ref_name }}"
-            prerelease="false"
-            publish_release="true"
-          else
-            release_tag="${{ inputs.tag_name }}"
-            if [[ -z "$release_tag" ]]; then
-              release_tag="manual-build-${{ github.run_number }}"
-            fi
-
-            release_name="${{ inputs.release_name }}"
-            if [[ -z "$release_name" ]]; then
-              release_name="$release_tag"
-            fi
-
-            prerelease="${{ inputs.prerelease }}"
-            publish_release="${{ inputs.publish_release }}"
+          release_tag="${{ inputs.tag_name }}"
+          if [[ -z "$release_tag" ]]; then
+            release_tag="manual-build-${{ github.run_number }}"
           fi
+
+          release_name="${{ inputs.release_name }}"
+          if [[ -z "$release_name" ]]; then
+            release_name="$release_tag"
+          fi
+
+          prerelease="${{ inputs.prerelease }}"
+          publish_release="${{ inputs.publish_release }}"
 
           {
             echo "release_tag=$release_tag"

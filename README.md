@@ -451,19 +451,6 @@ Output staged under `dist/termux/<arch>/`.
 
 ---
 
-## 🚢 GitHub Releases
-
-Maintainers can publish a release from GitHub without pushing a tag locally:
-
-1. Open **Actions** in the GitHub repository.
-2. Select the **release** workflow.
-3. Click **Run workflow**.
-4. Optionally enter a tag name and release title, then run the workflow.
-
-If no tag is provided, the workflow creates a `manual-build-<run_number>` release tag. Manual releases are marked as pre-releases by default unless the checkbox is cleared.
-
----
-
 ## ✅ Testing
 
 ```sh

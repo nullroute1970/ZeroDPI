@@ -10,6 +10,24 @@ ZeroDPI sits between your **upstream VPN app** (xray-core, sing-box, v2ray, Hyst
 
 ---
 
+## Table of Contents
+
+- [Features](#-features)
+- [Screenshots](#-screenshots)
+- [Quick Start](#-quick-start)
+- [Project Layout](#-project-layout)
+- [Choosing a Mode](#-choosing-a-mode)
+- [Operating Modes](#-operating-modes)
+- [Bypass Methods](#-bypass-methods)
+- [Configuration Recipes](#-configuration-recipes)
+- [Configuration Reference](#-configuration-reference)
+- [Running](#-running)
+- [Building from Source](#-building-from-source)
+- [Troubleshooting](#-troubleshooting)
+- [Security & Privacy Checklist](#-security--privacy-checklist)
+
+---
+
 ## ✨ Features
 
 | Feature | Description |
@@ -26,6 +44,54 @@ ZeroDPI sits between your **upstream VPN app** (xray-core, sing-box, v2ray, Hyst
 
 ---
 
+## 📸 Screenshots
+
+### Ranked SNI Selection
+
+![ZeroDPI SNI selection table showing ranked SNI candidates with scores, selected IPs, TCP and TLS latency, certificate status, TTFB, download speed, and HTTP result.](images/sni-selection.png)
+
+After an SNI scan, ZeroDPI shows a ranked table of candidates. Use it to compare score, latency, certificate validity, response speed, and HTTP behavior before selecting the target that new proxy connections should use.
+
+### Live Connection Dashboard
+
+![ZeroDPI running dashboard showing selected SNI, selected IP, bypass method, listener address, uptime, connection counts, traffic totals, and per-connection relay status.](images/tui-dashboard.png)
+
+The running dashboard confirms the active SNI/IP pair, current bypass method, local listener, uptime, connection state, byte counters, and recent relay activity. This is the main view for interactive desktop runs.
+
+### Headless Service Logs
+
+![ZeroDPI service log output showing accepted proxy connections, bypass failures before relay, interceptor-closed flows, and successful bypass completion.](images/linux-service-logs.png)
+
+For systemd or other headless deployments, run with `--no-tui` and inspect logs instead of the terminal UI. The log stream shows accepted local proxy connections, bypass attempts, interceptor decisions, and successful handoff to the relay.
+
+---
+
+## 🚀 Quick Start
+
+1. **Build or download ZeroDPI** for your platform.
+2. **Edit `config.toml`** and choose a mode. Start with `MODE = "sni_spoof"` unless you know you need `ip_bypass` or a scan-only mode.
+3. **Fill the input list**:
+   - `sni_list.txt` for SNI-based modes.
+   - `ip_list.txt` for IP-based modes.
+4. **Run ZeroDPI with the required privileges**:
+
+```sh
+# Linux / rooted Android
+sudo ./zerodpi --config ./config.toml
+```
+
+```powershell
+# Windows Administrator terminal
+.\zerodpi.exe --config .\config.toml
+```
+
+5. **Point your VPN client at ZeroDPI**, not directly at the remote VPN server. The default local endpoint is `127.0.0.1:44444`.
+6. **Select a candidate** in the TUI, or set `AUTO_SELECT = true` / pass `--auto-select` for unattended startup.
+
+For service deployments, combine `AUTO_SELECT = true` with `--no-tui` so the process can run without an interactive terminal.
+
+---
+
 ## 🏗️ Project Layout
 
 ```
@@ -38,9 +104,25 @@ ZeroDPI sits between your **upstream VPN app** (xray-core, sing-box, v2ray, Hyst
 ├── 📄 config.toml              # Configuration file
 ├── 📄 sni_list.txt             # Decoy CDN hostnames (sni_spoof mode)
 ├── 📄 ip_list.txt              # Relay IPs / CIDR ranges (ip_bypass mode)
+├── 📄 install-systemd.sh       # Linux systemd service installer
+├── 📁 images/                  # README screenshots
 ├── 📁 windivert/               # Windows: WinDivert.dll, .lib, .sys
 └── 🐍 build.py                 # Cross-platform packaging script
 ```
+
+---
+
+## 🧭 Choosing a Mode
+
+| Goal | Recommended Mode | Notes |
+|------|------------------|-------|
+| Bypass DPI for a TLS VPN behind a CDN | `sni_spoof` | Best default. Scans SNI candidates, selects an SNI/IP pair, then relays VPN traffic. |
+| Use a scanned relay IP without SNI spoofing | `ip_bypass` | No packet interception. Useful when you have IPs or CIDR ranges to test directly. |
+| Audit SNI candidates only | `sni_scan` | Runs the SNI scanner, displays or saves results, then exits. |
+| Audit IP/CIDR candidates only | `ip_scan` | Runs the IP scanner, displays or saves results, then exits. |
+| Measure real VPN performance through an existing SOCKS5 client | `proxy_scan` | Tests candidates through V2RayN/sing-box and blends scanner score with end-to-end proxy results. |
+
+Choose a bypass method separately with `BYPASS_METHOD`. If you cannot or do not want to use WinDivert/NFQUEUE packet interception, try `BYPASS_METHOD = "tcp_segmentation"` with `MODE = "sni_spoof"`.
 
 ---
 
@@ -109,6 +191,82 @@ Results are blended using a configurable weight and displayed in the TUI.
 | `wrong_checksum` | Injects fake ClientHello with corrupted TCP checksum | ✅ Yes | DPI that doesn't verify checksums |
 | `tls_record_frag` | Splits real ClientHello into multiple tiny TLS records | ✅ Yes | DPI that can't reassemble TLS fragments |
 | `tcp_segmentation` | Writes real ClientHello in tiny TCP segments (no packet interception) | ❌ No | DPI that inspects individual TCP segments |
+
+---
+
+## 🧪 Configuration Recipes
+
+### Default SNI Spoofing
+
+Use this when your VPN server is reachable through a CDN edge and you have candidate hostnames in `sni_list.txt`.
+
+```toml
+MODE = "sni_spoof"
+LISTEN_HOST = "127.0.0.1"
+LISTEN_PORT = 44444
+SNI_LIST = "sni_list.txt"
+BYPASS_METHOD = "wrong_seq"
+AUTO_SELECT = false
+```
+
+Run ZeroDPI, select a high-scoring SNI, then configure your VPN client to connect to `127.0.0.1:44444`.
+
+### Headless / Service Run
+
+Use this for systemd, scheduled startup, or remote machines where no terminal UI is available.
+
+```toml
+MODE = "sni_spoof"
+AUTO_SELECT = true
+RESCAN_INTERVAL_SECS = 300
+SNI_SWITCH_MIN_SCORE = 40
+```
+
+Start the process with:
+
+```sh
+./zerodpi --config ./config.toml --auto-select --no-tui
+```
+
+### Packet-Interception-Free Bypass
+
+Use this when WinDivert/NFQUEUE is unavailable or you want a method that operates entirely inside the proxy.
+
+```toml
+MODE = "sni_spoof"
+BYPASS_METHOD = "tcp_segmentation"
+TCP_SEG_SIZE = 1
+TCP_SEG_NODELAY = true
+```
+
+This still requires your VPN client to connect to ZeroDPI's local listener, but it does not start the platform packet interceptor.
+
+### Scan Only and Save Results
+
+Use scan-only modes to prepare candidate lists before a production run.
+
+```toml
+MODE = "sni_scan"
+SNI_LIST = "sni_list.txt"
+SCAN_OUTPUT = "sni-results.json"
+```
+
+```toml
+MODE = "ip_scan"
+IP_LIST = "ip_list.txt"
+SCAN_OUTPUT = "ip-results.json"
+```
+
+### IP Bypass
+
+Use this when you want ZeroDPI to pick a working IP from `ip_list.txt` and relay raw TCP without SNI spoofing.
+
+```toml
+MODE = "ip_bypass"
+IP_LIST = "ip_list.txt"
+IP_SCAN_SNI = "cloudflare.com"
+AUTO_SELECT = true
+```
 
 ---
 
@@ -354,6 +512,9 @@ Configure your VPN app to point to `LISTEN_HOST:LISTEN_PORT` (default: `127.0.0.
 
 1. **Same CDN** — Decoy hostnames must resolve to CDN edge IPs that also terminate your VPN server domain.
 2. **Low latency** — ZeroDPI ranks candidates automatically; pick from the top.
+3. **Public, harmless hostnames** — Use hostnames that are normal to access from your network and do not expose your private services.
+4. **Keep it current** — CDN routing changes. Re-run `sni_scan` periodically and remove candidates that stop completing TCP/TLS/HTTP probes.
+5. **Avoid secrets** — Do not put private VPN domains, credentials, customer domains, or internal hostnames in a list you plan to publish.
 
 ```
 # Example sni_list.txt
@@ -361,6 +522,8 @@ cloudflare.com
 auth.vercel.com
 www.fastly.com
 ```
+
+For a first pass, keep the list small enough to understand the results. After you know which CDN family works on your network, expand the list and use `SNI_MAX_CONCURRENT` to control scan speed.
 
 ---
 
@@ -379,9 +542,18 @@ www.fastly.com
 
 Hostnames are silently skipped — IPs and CIDRs only.
 
+Large CIDR ranges can take time and create many outbound probes. Start with narrow ranges, keep `IP_MAX_P1_CONCURRENT` conservative on slow networks, and use `IPV6_MAX_HOSTS` to cap IPv6 expansion.
+
 ---
 
 ## 🏃 Running
+
+Before starting ZeroDPI:
+
+- Make sure your VPN client is configured to connect to `LISTEN_HOST:LISTEN_PORT`.
+- Make sure the real VPN server name is still configured inside your VPN profile's TLS settings.
+- Use an Administrator/root shell for interceptor-based methods.
+- Use `--no-tui` for services, SSH sessions without a proper terminal, and log-only operation.
 
 ### 🐧 Linux
 
@@ -389,7 +561,45 @@ Hostnames are silently skipped — IPs and CIDRs only.
 sudo ./zerodpi --config ./config.toml
 ```
 
-Requires `CAP_NET_ADMIN` (or root). iptables rules are installed on startup and **automatically removed on shutdown**.
+Requires `CAP_NET_ADMIN` (or root). iptables rules are installed on startup and **automatically removed on shutdown** for interceptor-based methods.
+
+#### systemd service installer
+
+`install-systemd.sh` exists for Linux servers and headless machines where ZeroDPI should start at boot and keep running without an interactive terminal. It installs ZeroDPI as a native `systemd` service instead of requiring you to keep a root shell open. It is not needed for interactive desktop runs, Windows, or Android/Termux.
+
+Run it from the same directory as the ZeroDPI release files:
+
+```sh
+sudo ./install-systemd.sh
+systemctl status zerodpi.service
+journalctl -u zerodpi.service -f
+```
+
+Before running the installer, edit `config.toml`, `sni_list.txt`, and `ip_list.txt` in that directory. The installer requires root, `systemctl`, a running systemd instance, a ZeroDPI executable, and `config.toml` next to the script.
+
+The installer:
+
+- Finds the ZeroDPI executable in the script directory (`zerodpi` or `zerodpi-*`).
+- Uses that directory as the service `WorkingDirectory`, so relative config/list paths resolve there.
+- Verifies the generated unit with `systemd-analyze verify` when that command is available.
+- Warns if `sni_list.txt` or `ip_list.txt` is missing, and makes the binary executable.
+- Writes `/etc/systemd/system/zerodpi.service`.
+- Runs the service as `root`, which is required for NFQUEUE/iptables-based bypass methods.
+- Starts ZeroDPI with the resolved binary and config paths plus `--auto-select --no-tui`.
+- Sets `RUST_LOG=info`, sends output to journald, restarts on failure, reloads systemd, enables the service at boot, and starts it immediately.
+
+The generated unit deliberately runs with `--auto-select --no-tui` because services cannot wait for keyboard selection or render the TUI. Use `journalctl -u zerodpi.service -f` to watch scan results, selected candidates, bypass attempts, and relay activity.
+
+Useful service commands:
+
+```sh
+sudo systemctl restart zerodpi.service
+sudo systemctl stop zerodpi.service
+sudo systemctl disable --now zerodpi.service
+sudo systemctl daemon-reload
+```
+
+If you move the release directory, binary, or config file after installation, rerun `sudo ./install-systemd.sh` from the new directory so the unit points at the correct paths. The installer rejects paths containing whitespace, quotes, backslashes, or `%` characters because those are unsafe in the generated systemd unit.
 
 ### 🪟 Windows
 
@@ -399,6 +609,8 @@ Requires `CAP_NET_ADMIN` (or root). iptables rules are installed on startup and 
 
 Run from an **Administrator** prompt. Requires `WinDivert.dll` and `WinDivert64.sys` next to the EXE.
 
+If Windows blocks the driver or DLL, unblock the downloaded archive before extracting it, then run the terminal as Administrator. Keep the `windivert/` runtime files next to the executable when packaging manually.
+
 ### 📱 Android / Termux
 
 ```sh
@@ -406,6 +618,8 @@ Run from an **Administrator** prompt. Requires `WinDivert.dll` and `WinDivert64.
 ```
 
 Requires root, `iptables`, and a kernel with NFQUEUE support.
+
+On Android, `tcp_segmentation` is the simplest method to try first because it does not require NFQUEUE interception. Interceptor-based methods still need root and a compatible kernel.
 
 ---
 
@@ -465,6 +679,38 @@ Unit tests cover:
 - ⚙️ Config parsing (all fields, defaults, validation modes)
 - 📊 SNI & IP scanner unified scoring
 - 🌐 CIDR expansion, IPv6 cap, hostname skipping
+
+---
+
+## 🧯 Troubleshooting
+
+| Symptom | What to Check |
+|---------|---------------|
+| No traffic reaches ZeroDPI | Your VPN app must connect to `127.0.0.1:44444` or your configured `LISTEN_HOST:LISTEN_PORT`. Keep the real server/SNI inside the VPN TLS settings. |
+| Permission or interceptor errors | Use Administrator on Windows or root/`CAP_NET_ADMIN` on Linux. For Linux, install NFQUEUE support and make sure iptables is available. |
+| Windows starts but interception fails | Confirm `WinDivert.dll` and `WinDivert64.sys` are next to `zerodpi.exe` and that the terminal is elevated. |
+| Linux service starts then exits | Run `journalctl -u zerodpi.service -f`, check `config.toml`, and confirm `sni_list.txt` / `ip_list.txt` paths are valid relative to the service working directory. |
+| Scan returns no useful candidates | Increase `SCAN_TIMEOUT_SECS`, lower concurrency on weak networks, refresh the candidate list, and verify the CDN or IP range is reachable without ZeroDPI. |
+| TUI is garbled over SSH or systemd | Run with `--no-tui` and rely on logs. |
+| `wrong_seq` or `wrong_checksum` does not work | Try `tls_record_frag`, then `tcp_segmentation`. Different DPI devices fail on different TCP/TLS behaviors. |
+| Connections start but stall | Raise `BYPASS_TIMEOUT_SECS`, reduce `SNI_MAX_CONCURRENT`, and check whether the selected candidate has high TTFB or low speed. |
+
+Use `RUST_LOG=debug` when collecting detailed diagnostics:
+
+```sh
+RUST_LOG=debug ./zerodpi --config ./config.toml --no-tui
+```
+
+---
+
+## 🔐 Security & Privacy Checklist
+
+- Do not publish real VPN endpoints, private SNI lists, proxy credentials, or machine-specific paths.
+- Treat screenshots as publishable artifacts only after removing visible private details and embedded metadata.
+- Keep `config.toml`, `sni_list.txt`, and `ip_list.txt` out of public commits if they contain operational infrastructure.
+- Prefer `LISTEN_HOST = "127.0.0.1"` unless another device must connect to ZeroDPI.
+- Review logs before sharing them. Logs can include local ports, selected candidates, timing, and failure reasons.
+- Use scan-only modes before production changes so you can validate candidates without running the relay.
 
 ---
 

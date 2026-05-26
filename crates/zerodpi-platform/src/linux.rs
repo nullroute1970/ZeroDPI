@@ -7,6 +7,7 @@
 //! IP/TCP checksums recomputed) — this is the "modify outbound packet by
 //! replacing payload" path used by the `wrong_seq` bypass.
 
+use std::io::ErrorKind;
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -23,7 +24,7 @@ const HOOK_LOCAL_OUT: u8 = 3;
 
 pub struct NfqInterceptor {
     queue: Queue,
-    rules: IptablesGuard,
+    _rules: IptablesGuard,
 }
 
 impl PacketInterceptor for NfqInterceptor {
@@ -42,16 +43,22 @@ impl PacketInterceptor for NfqInterceptor {
             .context("set NFQUEUE fail_open")?;
 
         info!(queue_num, "NFQUEUE bound");
-        Ok(Self { queue, rules })
+        Ok(Self {
+            queue,
+            _rules: rules,
+        })
     }
 
     fn run<H: PacketHandler>(mut self, mut handler: H) -> Result<()> {
         loop {
             let mut msg = match self.queue.recv() {
                 Ok(m) => m,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {
+                    debug!(error = %e, "NFQUEUE recv interrupted; retrying");
+                    continue;
+                }
                 Err(e) => {
-                    warn!(error = %e, "NFQUEUE recv error; exiting loop");
-                    break;
+                    return Err(e).context("NFQUEUE recv");
                 }
             };
             let direction = match msg.get_hook() {
@@ -102,8 +109,6 @@ impl PacketInterceptor for NfqInterceptor {
                 warn!(error = %e, "NFQUEUE verdict failed");
             }
         }
-        drop(self.rules);
-        Ok(())
     }
 }
 

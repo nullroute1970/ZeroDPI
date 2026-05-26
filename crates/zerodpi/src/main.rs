@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
@@ -333,9 +333,9 @@ fn main() -> Result<()> {
 
     let flows = new_flow_table();
 
-    let _intercept_thread = if cfg.BYPASS_METHOD == "tcp_segmentation" {
+    let (_intercept_thread, intercept_done_rx) = if cfg.BYPASS_METHOD == "tcp_segmentation" {
         info!("tcp_segmentation selected; skipping packet interceptor");
-        None
+        (None, None)
     } else {
         let method_box = build_method(&cfg)
             .with_context(|| format!("unknown BYPASS_METHOD '{}'", cfg.BYPASS_METHOD))?;
@@ -350,16 +350,18 @@ fn main() -> Result<()> {
         let interceptor = DefaultInterceptor::open(filter).context("open packet interceptor")?;
 
         let handler = Handler::new(flows.clone(), method);
-        Some(
-            std::thread::Builder::new()
-                .name("zerodpi-intercept".into())
-                .spawn(move || {
-                    if let Err(e) = interceptor.run(handler) {
-                        error!(error = %e, "intercept loop ended with error");
-                    }
-                })
-                .context("spawn intercept thread")?,
-        )
+        let (intercept_done_tx, intercept_done_rx) = oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("zerodpi-intercept".into())
+            .spawn(move || {
+                let result = interceptor.run(handler);
+                if let Err(ref e) = result {
+                    error!(error = %e, "intercept loop ended with error");
+                }
+                let _ = intercept_done_tx.send(result);
+            })
+            .context("spawn intercept thread")?;
+        (Some(thread), Some(intercept_done_rx))
     };
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
@@ -395,7 +397,11 @@ fn main() -> Result<()> {
     });
 
     if no_tui {
-        let result = rt.block_on(run_headless_proxy(proxy_handle, event_rx));
+        let result = rt.block_on(run_headless_proxy(
+            proxy_handle,
+            event_rx,
+            intercept_done_rx,
+        ));
         info!("shutting down");
         return result;
     }
@@ -673,20 +679,46 @@ fn mode_requires_packet_interception(mode: &str, bypass_method: &str) -> bool {
 async fn run_headless_proxy(
     proxy_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     event_rx: mpsc::UnboundedReceiver<ProxyEvent>,
+    intercept_done_rx: Option<oneshot::Receiver<anyhow::Result<()>>>,
 ) -> anyhow::Result<()> {
     log_headless_proxy_start();
     let mut proxy_handle = proxy_handle;
     let event_log_handle = tokio::spawn(log_headless_proxy_events(event_rx));
-    tokio::select! {
-        signal = shutdown_signal() => {
-            signal?;
-            proxy_handle.abort();
-            event_log_handle.abort();
-            Ok(())
+
+    if let Some(intercept_done_rx) = intercept_done_rx {
+        tokio::select! {
+            signal = shutdown_signal() => {
+                signal?;
+                proxy_handle.abort();
+                event_log_handle.abort();
+                Ok(())
+            }
+            result = &mut proxy_handle => {
+                event_log_handle.abort();
+                result.context("proxy task panicked")?
+            }
+            intercept_result = intercept_done_rx => {
+                proxy_handle.abort();
+                event_log_handle.abort();
+                match intercept_result {
+                    Ok(Ok(())) => Err(anyhow::anyhow!("packet interceptor stopped unexpectedly")),
+                    Ok(Err(e)) => Err(e.context("packet interceptor stopped")),
+                    Err(_) => Err(anyhow::anyhow!("packet interceptor thread stopped before reporting a result")),
+                }
+            }
         }
-        result = &mut proxy_handle => {
-            event_log_handle.abort();
-            result.context("proxy task panicked")?
+    } else {
+        tokio::select! {
+            signal = shutdown_signal() => {
+                signal?;
+                proxy_handle.abort();
+                event_log_handle.abort();
+                Ok(())
+            }
+            result = &mut proxy_handle => {
+                event_log_handle.abort();
+                result.context("proxy task panicked")?
+            }
         }
     }
 }
@@ -878,7 +910,7 @@ fn ip_bypass_main(
         rt.spawn(async move { run_ip_bypass_proxy(cfg, proxy_active, dashboard_event_tx).await });
 
     if no_tui {
-        let result = rt.block_on(run_headless_proxy(proxy_handle, event_rx));
+        let result = rt.block_on(run_headless_proxy(proxy_handle, event_rx, None));
         info!("shutting down");
         return result;
     }

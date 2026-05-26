@@ -216,7 +216,7 @@ pub async fn run_proxy(
                     handle_tcp_seg_connection_with_ip(cfg, connect_ip, incoming, peer, event_tx)
                         .await
                 {
-                    debug!(error = %e, "tcp_seg connection ended");
+                    warn!(%peer, error = %e, "tcp_seg connection failed");
                 }
             });
             continue;
@@ -238,7 +238,7 @@ pub async fn run_proxy(
             )
             .await
             {
-                debug!(error = %e, "connection ended");
+                warn!(%peer, error = %e, "connection failed");
             }
         });
     }
@@ -581,7 +581,7 @@ pub async fn run_ip_bypass_proxy(
             if let Err(e) =
                 handle_ip_bypass_connection(ip, incoming, peer, src_port, event_tx).await
             {
-                debug!(error = %e, "ip_bypass: connection ended");
+                warn!(%peer, error = %e, "ip_bypass: connection failed");
             }
         });
     }

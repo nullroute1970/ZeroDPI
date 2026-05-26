@@ -389,13 +389,13 @@ fn main() -> Result<()> {
 
     // Spawn the proxy on the tokio runtime's worker threads so the main
     // thread is free to drive the ratatui dashboard.
-    let dashboard_event_tx = if no_tui { None } else { Some(event_tx) };
+    let dashboard_event_tx = Some(event_tx.clone());
     let proxy_handle = rt.spawn(async move {
         run_proxy(cfg, active_target, interface_ip, flows, dashboard_event_tx).await
     });
 
     if no_tui {
-        let result = rt.block_on(run_headless_proxy(proxy_handle));
+        let result = rt.block_on(run_headless_proxy(proxy_handle, event_rx));
         info!("shutting down");
         return result;
     }
@@ -672,17 +672,56 @@ fn mode_requires_packet_interception(mode: &str, bypass_method: &str) -> bool {
 
 async fn run_headless_proxy(
     proxy_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    event_rx: mpsc::UnboundedReceiver<ProxyEvent>,
 ) -> anyhow::Result<()> {
     log_headless_proxy_start();
     let mut proxy_handle = proxy_handle;
+    let event_log_handle = tokio::spawn(log_headless_proxy_events(event_rx));
     tokio::select! {
         signal = shutdown_signal() => {
             signal?;
             proxy_handle.abort();
+            event_log_handle.abort();
             Ok(())
         }
         result = &mut proxy_handle => {
+            event_log_handle.abort();
             result.context("proxy task panicked")?
+        }
+    }
+}
+
+async fn log_headless_proxy_events(mut event_rx: mpsc::UnboundedReceiver<ProxyEvent>) {
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            ProxyEvent::ConnectionAccepted { peer, src_port } => {
+                info!(%peer, src_port, "accepted proxy connection");
+            }
+            ProxyEvent::BypassComplete { src_port, outcome } => match outcome {
+                zerodpi_core::flow::BypassOutcome::FakeDataAcked => {
+                    info!(src_port, "bypass complete; relaying");
+                }
+                zerodpi_core::flow::BypassOutcome::UnexpectedClose => {
+                    warn!(src_port, "bypass failed before relay");
+                }
+            },
+            ProxyEvent::RelayFinished {
+                src_port,
+                c2s_bytes,
+                s2c_bytes,
+            } => {
+                info!(src_port, c2s_bytes, s2c_bytes, "relay finished");
+            }
+            ProxyEvent::ConnectionError { src_port, error } => {
+                warn!(src_port, %error, "proxy connection failed");
+            }
+            ProxyEvent::RelayProgress { .. } => {}
+            ProxyEvent::SniTargetChanged { sni, ip, score } => {
+                info!(%sni, %ip, score, "active SNI target changed");
+            }
+            ProxyEvent::IpTargetChanged { ip } => {
+                info!(%ip, "active IP target changed");
+            }
         }
     }
 }
@@ -834,12 +873,12 @@ fn ip_bypass_main(
     let cfg_dash = cfg.clone();
     let proxy_active = active_ip_arc.clone();
 
-    let dashboard_event_tx = if no_tui { None } else { Some(event_tx) };
+    let dashboard_event_tx = Some(event_tx.clone());
     let proxy_handle =
         rt.spawn(async move { run_ip_bypass_proxy(cfg, proxy_active, dashboard_event_tx).await });
 
     if no_tui {
-        let result = rt.block_on(run_headless_proxy(proxy_handle));
+        let result = rt.block_on(run_headless_proxy(proxy_handle, event_rx));
         info!("shutting down");
         return result;
     }

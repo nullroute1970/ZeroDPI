@@ -93,6 +93,9 @@ struct Args {
     /// Override `AUTO_SELECT` (automatically choose the top-ranked candidate).
     #[arg(long)]
     auto_select: bool,
+    /// Disable ratatui screens; suitable for systemd and other headless runs.
+    #[arg(long)]
+    no_tui: bool,
     /// Override `SELECTED_SNI` — skip scanning and use this hostname.
     #[arg(long)]
     sni: Option<String>,
@@ -145,6 +148,8 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    let no_tui = args.no_tui;
 
     // ---- config ----
     let cfg_path = args.config.clone().unwrap_or_else(|| {
@@ -208,7 +213,7 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return ip_bypass_main(cfg_clone, cfg_path_clone, rt);
+        return ip_bypass_main(cfg_clone, cfg_path_clone, rt, no_tui);
     }
 
     // ---- branch: scan-only modes ----
@@ -218,7 +223,7 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return sni_scan_main(cfg_clone, cfg_path_clone, rt);
+        return sni_scan_main(cfg_clone, cfg_path_clone, rt, no_tui);
     }
     if cfg.MODE == "ip_scan" {
         let cfg_clone = cfg.clone();
@@ -226,7 +231,7 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return ip_scan_main(cfg_clone, cfg_path_clone, rt);
+        return ip_scan_main(cfg_clone, cfg_path_clone, rt, no_tui);
     }
 
     if cfg.MODE == "proxy_scan" {
@@ -235,7 +240,7 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return proxy_scan_main(cfg_clone, cfg_path_clone, rt);
+        return proxy_scan_main(cfg_clone, cfg_path_clone, rt, no_tui);
     }
 
     // ---- resolve SNI list path relative to the config file ----
@@ -269,9 +274,15 @@ fn main() -> Result<()> {
         info!(path = %sni_list_path.display(), "scanning SNI list");
         let path = sni_list_path.clone();
         let cfg_clone = cfg.clone();
-        let entries = rt.block_on(async move {
-            scan_sni_list_with_progress(cfg_clone, &path, scan_timeout).await
-        })?;
+        let entries = if no_tui {
+            let entries = rt.block_on(scan_sni_list(&path, scan_timeout, cfg_clone, None))?;
+            log_sni_scan_results("headless scan", &entries);
+            entries
+        } else {
+            rt.block_on(async move {
+                scan_sni_list_with_progress(cfg_clone, &path, scan_timeout).await
+            })?
+        };
         if entries.is_empty() {
             anyhow::bail!(
                 "no reachable SNI candidates found in {}",
@@ -282,7 +293,10 @@ fn main() -> Result<()> {
     };
 
     // ---- step 2: select a candidate ----
-    let selected: SniProbeEntry = if cfg.AUTO_SELECT || cfg.SELECTED_SNI.is_some() {
+    if no_tui && !cfg.AUTO_SELECT && cfg.SELECTED_SNI.is_none() {
+        warn!("--no-tui cannot show the selection table; auto-selecting rank-1");
+    }
+    let selected: SniProbeEntry = if cfg.AUTO_SELECT || cfg.SELECTED_SNI.is_some() || no_tui {
         let best = sorted_entries
             .into_iter()
             .next()
@@ -356,14 +370,15 @@ fn main() -> Result<()> {
     if cfg.RESCAN_INTERVAL_SECS > 0 {
         let interval = cfg.RESCAN_INTERVAL_SECS;
         let active_target = active_target.clone();
-        let event_tx = event_tx.clone();
+        let rescan_event_tx = if no_tui { None } else { Some(event_tx.clone()) };
         rt.spawn(async move {
             background_rescan(
                 rescan_cfg,
                 rescan_path,
                 interval,
                 active_target,
-                Some(event_tx),
+                rescan_event_tx,
+                no_tui,
             )
             .await;
         });
@@ -374,11 +389,16 @@ fn main() -> Result<()> {
 
     // Spawn the proxy on the tokio runtime's worker threads so the main
     // thread is free to drive the ratatui dashboard.
+    let dashboard_event_tx = if no_tui { None } else { Some(event_tx) };
     let proxy_handle = rt.spawn(async move {
-        if let Err(e) = run_proxy(cfg, active_target, interface_ip, flows, Some(event_tx)).await {
-            error!(error = %e, "proxy ended with error");
-        }
+        run_proxy(cfg, active_target, interface_ip, flows, dashboard_event_tx).await
     });
+
+    if no_tui {
+        let result = rt.block_on(run_headless_proxy(proxy_handle));
+        info!("shutting down");
+        return result;
+    }
 
     let mut terminal = tui::enter_tui()?;
     let dash_info = tui::DashboardInfo::SniSpoof {
@@ -500,6 +520,47 @@ fn count_hostnames(path: &std::path::Path) -> usize {
         .count()
 }
 
+fn log_sni_scan_results(context: &str, entries: &[SniProbeEntry]) {
+    info!(
+        "{context} complete — {} (SNI, IP) pairs probed",
+        entries.len()
+    );
+    for e in entries {
+        info!("{}", e.summary_line());
+    }
+}
+
+fn log_sni_scan_top(context: &str, entries: &[SniProbeEntry]) {
+    for (rank, e) in entries.iter().take(5).enumerate() {
+        info!(rank = rank + 1, "{}", e.summary_line());
+    }
+    if entries.len() > 5 {
+        info!(
+            remaining = entries.len() - 5,
+            "{context}: additional candidates omitted"
+        );
+    }
+}
+
+fn log_ip_scan_results(context: &str, entries: &[IpProbeEntry]) {
+    info!("{context} complete — {} IPs probed", entries.len());
+    for e in entries {
+        info!("{}", e.summary_line());
+    }
+}
+
+fn log_ip_scan_top(context: &str, entries: &[IpProbeEntry]) {
+    for (rank, e) in entries.iter().take(5).enumerate() {
+        info!(rank = rank + 1, "{}", e.summary_line());
+    }
+    if entries.len() > 5 {
+        info!(
+            remaining = entries.len() - 5,
+            "{context}: additional candidates omitted"
+        );
+    }
+}
+
 /// Background rescan task: runs every `interval_secs` seconds and switches
 /// new connections to better SNI targets.
 ///
@@ -511,30 +572,55 @@ async fn background_rescan(
     interval_secs: u64,
     active_target: Arc<std::sync::RwLock<ActiveSniTarget>>,
     event_tx: Option<ProxyEventSender>,
+    headless: bool,
 ) {
     let interval = Duration::from_secs(interval_secs);
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     loop {
         tokio::time::sleep(interval).await;
-        debug!("background rescan starting");
+        if headless {
+            info!(path = %path.display(), "background SNI rescan starting");
+        } else {
+            debug!("background rescan starting");
+        }
         let cfg_clone = cfg.clone();
         match scan_sni_list(&path, scan_timeout, cfg_clone, None).await {
             Ok(entries) => {
-                debug!(
-                    "background rescan complete — {} (SNI, IP) pairs",
-                    entries.len()
-                );
+                if headless {
+                    info!(
+                        "background SNI rescan complete — {} (SNI, IP) pairs",
+                        entries.len()
+                    );
+                    log_sni_scan_top("background SNI rescan top candidates", &entries);
+                } else {
+                    debug!(
+                        "background rescan complete — {} (SNI, IP) pairs",
+                        entries.len()
+                    );
+                }
                 if let Some(best) = entries.first() {
                     let current = active_target.read().unwrap().clone();
-                    debug!(
-                        sni = %best.sni,
-                        ip = %best.ip,
-                        score = best.score,
-                        current_sni = %current.sni,
-                        current_ip = %current.ip,
-                        current_score = current.score,
-                        "rescan top result"
-                    );
+                    if headless {
+                        info!(
+                            sni = %best.sni,
+                            ip = %best.ip,
+                            score = best.score,
+                            current_sni = %current.sni,
+                            current_ip = %current.ip,
+                            current_score = current.score,
+                            "background SNI rescan evaluated top result"
+                        );
+                    } else {
+                        debug!(
+                            sni = %best.sni,
+                            ip = %best.ip,
+                            score = best.score,
+                            current_sni = %current.sni,
+                            current_ip = %current.ip,
+                            current_score = current.score,
+                            "rescan top result"
+                        );
+                    }
 
                     if should_switch_sni_target(&current, best, cfg.SNI_SWITCH_MIN_SCORE) {
                         let next = ActiveSniTarget::new(best.sni.clone(), best.ip, best.score);
@@ -584,11 +670,67 @@ fn mode_requires_packet_interception(mode: &str, bypass_method: &str) -> bool {
     matches!(mode, "sni_spoof" | "proxy_scan") && bypass_method != "tcp_segmentation"
 }
 
+async fn run_headless_proxy(
+    proxy_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    info!("running without TUI; send SIGTERM or press Ctrl-C to stop");
+    let mut proxy_handle = proxy_handle;
+    tokio::select! {
+        signal = shutdown_signal() => {
+            signal?;
+            proxy_handle.abort();
+            Ok(())
+        }
+        result = &mut proxy_handle => {
+            result.context("proxy task panicked")?
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> anyhow::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut interrupt = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+    let mut terminate = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut hangup = signal(SignalKind::hangup()).context("install SIGHUP handler")?;
+
+    loop {
+        tokio::select! {
+            _ = interrupt.recv() => {
+                info!("received SIGINT");
+                return Ok(());
+            }
+            _ = terminate.recv() => {
+                info!("received SIGTERM");
+                return Ok(());
+            }
+            _ = hangup.recv() => {
+                warn!("received SIGHUP; continuing because --no-tui is running headless");
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> anyhow::Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for Ctrl-C")?;
+    info!("received Ctrl-C");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // IP bypass mode
 // ---------------------------------------------------------------------------
 
-fn ip_bypass_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runtime) -> Result<()> {
+fn ip_bypass_main(
+    cfg: Arc<Config>,
+    cfg_path: PathBuf,
+    rt: tokio::runtime::Runtime,
+    no_tui: bool,
+) -> Result<()> {
     let ip_list_path = {
         let raw = PathBuf::from(&cfg.IP_LIST);
         if raw.is_absolute() {
@@ -624,14 +766,22 @@ fn ip_bypass_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runti
 
         let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
         let cfg_clone = cfg.clone();
-        let entries =
-            scan_ip_list_with_ip_progress(cfg_clone, &rt, ips, scan_sni, scan_timeout, total_ips)?;
+        let entries = if no_tui {
+            let entries = rt.block_on(scan_ip_list(ips, scan_sni, scan_timeout, cfg_clone, None));
+            log_ip_scan_results("headless IP scan", &entries);
+            Ok(entries)
+        } else {
+            scan_ip_list_with_ip_progress(cfg_clone, &rt, ips, scan_sni, scan_timeout, total_ips)
+        }?;
 
         if entries.is_empty() {
             anyhow::bail!("no IPs passed the scan — check connectivity or ip_list");
         }
 
-        let selected_entry: IpProbeEntry = if cfg.AUTO_SELECT {
+        if no_tui && !cfg.AUTO_SELECT {
+            warn!("--no-tui cannot show the IP selection table; auto-selecting rank-1");
+        }
+        let selected_entry: IpProbeEntry = if cfg.AUTO_SELECT || no_tui {
             let best = entries.into_iter().next().context("no probe results")?;
             info!(ip = %best.ip, score = best.score, "auto-selected IP");
             best
@@ -655,14 +805,15 @@ fn ip_bypass_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runti
         let rescan_path = ip_list_path.clone();
         let interval = cfg.RESCAN_INTERVAL_SECS;
         let active_clone = active_ip_arc.clone();
-        let event_tx = event_tx.clone();
+        let rescan_event_tx = if no_tui { None } else { Some(event_tx.clone()) };
         rt.spawn(async move {
             background_ip_rescan(
                 rescan_cfg,
                 rescan_path,
                 interval,
                 active_clone,
-                Some(event_tx),
+                rescan_event_tx,
+                no_tui,
             )
             .await;
         });
@@ -674,11 +825,15 @@ fn ip_bypass_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runti
     let cfg_dash = cfg.clone();
     let proxy_active = active_ip_arc.clone();
 
-    let proxy_handle = rt.spawn(async move {
-        if let Err(e) = run_ip_bypass_proxy(cfg, proxy_active, Some(event_tx)).await {
-            error!(error = %e, "ip_bypass proxy ended with error");
-        }
-    });
+    let dashboard_event_tx = if no_tui { None } else { Some(event_tx) };
+    let proxy_handle =
+        rt.spawn(async move { run_ip_bypass_proxy(cfg, proxy_active, dashboard_event_tx).await });
+
+    if no_tui {
+        let result = rt.block_on(run_headless_proxy(proxy_handle));
+        info!("shutting down");
+        return result;
+    }
 
     let dash_info = tui::DashboardInfo::IpBypass { ip: active_ip };
     let mut terminal = tui::enter_tui()?;
@@ -749,13 +904,18 @@ async fn background_ip_rescan(
     interval_secs: u64,
     active_ip: Arc<std::sync::RwLock<std::net::IpAddr>>,
     event_tx: Option<ProxyEventSender>,
+    headless: bool,
 ) {
     let interval = Duration::from_secs(interval_secs);
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
     loop {
         tokio::time::sleep(interval).await;
-        debug!("ip_bypass: background rescan starting");
+        if headless {
+            info!(path = %ip_list_path.display(), "ip_bypass: background IP rescan starting");
+        } else {
+            debug!("ip_bypass: background rescan starting");
+        }
 
         let ips = match load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS) {
             Ok(v) => v,
@@ -771,7 +931,16 @@ async fn background_ip_rescan(
             continue;
         }
         let best = &entries[0];
-        debug!(ip = %best.ip, score = best.score, "ip_bypass: rescan top result");
+        if headless {
+            info!(
+                "ip_bypass: background IP rescan complete — {} IPs probed",
+                entries.len()
+            );
+            log_ip_scan_top("ip_bypass: background IP rescan top candidates", &entries);
+            info!(ip = %best.ip, score = best.score, "ip_bypass: background IP rescan evaluated top result");
+        } else {
+            debug!(ip = %best.ip, score = best.score, "ip_bypass: rescan top result");
+        }
 
         let current = *active_ip.read().unwrap();
         if best.ip != current {
@@ -779,7 +948,7 @@ async fn background_ip_rescan(
             if let Some(ref tx) = event_tx {
                 let _ = tx.send(ProxyEvent::IpTargetChanged { ip: best.ip });
             }
-            debug!(old = %current, new = %best.ip, "ip_bypass: hot-swapped active IP");
+            info!(old = %current, new = %best.ip, "ip_bypass: hot-swapped active IP");
         }
     }
 }
@@ -788,7 +957,12 @@ async fn background_ip_rescan(
 // sni_scan mode
 // ---------------------------------------------------------------------------
 
-fn sni_scan_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runtime) -> Result<()> {
+fn sni_scan_main(
+    cfg: Arc<Config>,
+    cfg_path: PathBuf,
+    rt: tokio::runtime::Runtime,
+    no_tui: bool,
+) -> Result<()> {
     let sni_list_path = {
         let raw = PathBuf::from(&cfg.SNI_LIST);
         if raw.is_absolute() {
@@ -808,34 +982,38 @@ fn sni_scan_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runtim
     let total_hostnames = count_hostnames(&sni_list_path);
     let path = sni_list_path.clone();
     let cfg_clone = cfg.clone();
-    let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
-    let scan_handle =
-        rt.spawn(async move { scan_sni_list(&path, scan_timeout, cfg_clone, Some(tx)).await });
-
-    let mut terminal = tui::enter_tui()?;
-    let (arrived, aborted) = tui::run_scan_progress(&mut terminal, &mut rx, total_hostnames)?;
-    tui::leave_tui(terminal)?;
-
-    let sorted = if scan_handle.is_finished() {
-        rt.block_on(scan_handle)
-            .context("scanner task panicked")??
+    let sorted = if no_tui {
+        rt.block_on(scan_sni_list(&path, scan_timeout, cfg_clone, None))?
     } else {
-        scan_handle.abort();
-        if aborted {
-            info!(
-                "sni_scan aborted — using {} results collected so far",
-                arrived.len()
-            );
+        let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
+        let scan_handle =
+            rt.spawn(async move { scan_sni_list(&path, scan_timeout, cfg_clone, Some(tx)).await });
+
+        let mut terminal = tui::enter_tui()?;
+        let (arrived, aborted) = tui::run_scan_progress(&mut terminal, &mut rx, total_hostnames)?;
+        tui::leave_tui(terminal)?;
+
+        if scan_handle.is_finished() {
+            rt.block_on(scan_handle)
+                .context("scanner task panicked")??
+        } else {
+            scan_handle.abort();
+            if aborted {
+                info!(
+                    "sni_scan aborted — using {} results collected so far",
+                    arrived.len()
+                );
+            }
+            let mut e = arrived;
+            e.sort_by(|a, b| {
+                b.score.cmp(&a.score).then(
+                    a.tcp_latency_ms
+                        .unwrap_or(u64::MAX)
+                        .cmp(&b.tcp_latency_ms.unwrap_or(u64::MAX)),
+                )
+            });
+            e
         }
-        let mut e = arrived;
-        e.sort_by(|a, b| {
-            b.score.cmp(&a.score).then(
-                a.tcp_latency_ms
-                    .unwrap_or(u64::MAX)
-                    .cmp(&b.tcp_latency_ms.unwrap_or(u64::MAX)),
-            )
-        });
-        e
     };
 
     info!("sni_scan complete — {} (SNI, IP) pairs", sorted.len());
@@ -852,9 +1030,11 @@ fn sni_scan_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runtim
         None
     };
 
-    let mut terminal = tui::enter_tui()?;
-    tui::run_sni_results_view(&mut terminal, &sorted, saved_path_str.as_deref())?;
-    tui::leave_tui(terminal)?;
+    if !no_tui {
+        let mut terminal = tui::enter_tui()?;
+        tui::run_sni_results_view(&mut terminal, &sorted, saved_path_str.as_deref())?;
+        tui::leave_tui(terminal)?;
+    }
 
     Ok(())
 }
@@ -863,7 +1043,12 @@ fn sni_scan_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runtim
 // ip_scan mode
 // ---------------------------------------------------------------------------
 
-fn ip_scan_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runtime) -> Result<()> {
+fn ip_scan_main(
+    cfg: Arc<Config>,
+    cfg_path: PathBuf,
+    rt: tokio::runtime::Runtime,
+    no_tui: bool,
+) -> Result<()> {
     let ip_list_path = {
         let raw = PathBuf::from(&cfg.IP_LIST);
         if raw.is_absolute() {
@@ -890,34 +1075,39 @@ fn ip_scan_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runtime
 
     let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<IpScanEvent>();
     let cfg_clone = cfg.clone();
-    let scan_handle = rt
-        .spawn(async move { scan_ip_list(ips, scan_sni, scan_timeout, cfg_clone, Some(tx)).await });
-
-    let mut terminal = tui::enter_tui()?;
-    let (arrived, aborted) = tui::run_ip_scan_progress(&mut terminal, &mut rx, total_ips)?;
-    tui::leave_tui(terminal)?;
-
-    let sorted = if scan_handle.is_finished() {
-        rt.block_on(scan_handle).context("scanner task panicked")?
+    let sorted = if no_tui {
+        rt.block_on(scan_ip_list(ips, scan_sni, scan_timeout, cfg_clone, None))
     } else {
-        scan_handle.abort();
-        if aborted {
-            info!(
-                "ip_scan aborted — using {} results collected so far",
-                arrived.len()
-            );
-        }
-        let mut e = arrived;
-        e.sort_by(|a, b| {
-            b.score.cmp(&a.score).then(
-                a.tcp_latency_ms
-                    .unwrap_or(u64::MAX)
-                    .cmp(&b.tcp_latency_ms.unwrap_or(u64::MAX)),
-            )
+        let (tx, mut rx) = mpsc::unbounded_channel::<IpScanEvent>();
+        let scan_handle = rt.spawn(async move {
+            scan_ip_list(ips, scan_sni, scan_timeout, cfg_clone, Some(tx)).await
         });
-        e
+
+        let mut terminal = tui::enter_tui()?;
+        let (arrived, aborted) = tui::run_ip_scan_progress(&mut terminal, &mut rx, total_ips)?;
+        tui::leave_tui(terminal)?;
+
+        if scan_handle.is_finished() {
+            rt.block_on(scan_handle).context("scanner task panicked")?
+        } else {
+            scan_handle.abort();
+            if aborted {
+                info!(
+                    "ip_scan aborted — using {} results collected so far",
+                    arrived.len()
+                );
+            }
+            let mut e = arrived;
+            e.sort_by(|a, b| {
+                b.score.cmp(&a.score).then(
+                    a.tcp_latency_ms
+                        .unwrap_or(u64::MAX)
+                        .cmp(&b.tcp_latency_ms.unwrap_or(u64::MAX)),
+                )
+            });
+            e
+        }
     };
 
     info!("ip_scan complete — {} IPs probed", sorted.len());
@@ -933,9 +1123,11 @@ fn ip_scan_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runtime
         None
     };
 
-    let mut terminal = tui::enter_tui()?;
-    tui::run_ip_results_view(&mut terminal, &sorted, saved_path_str.as_deref())?;
-    tui::leave_tui(terminal)?;
+    if !no_tui {
+        let mut terminal = tui::enter_tui()?;
+        tui::run_ip_results_view(&mut terminal, &sorted, saved_path_str.as_deref())?;
+        tui::leave_tui(terminal)?;
+    }
 
     Ok(())
 }
@@ -980,7 +1172,12 @@ fn save_ip_results(path: &PathBuf, entries: &[IpProbeEntry]) -> Result<()> {
 // proxy_scan mode
 // ---------------------------------------------------------------------------
 
-fn proxy_scan_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runtime) -> Result<()> {
+fn proxy_scan_main(
+    cfg: Arc<Config>,
+    cfg_path: PathBuf,
+    rt: tokio::runtime::Runtime,
+    no_tui: bool,
+) -> Result<()> {
     // ---- resolve SNI list path ----
     let sni_list_path = {
         let raw = PathBuf::from(&cfg.SNI_LIST);
@@ -998,43 +1195,50 @@ fn proxy_scan_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runt
 
     // ---- Phase 1: SNI scan ----
     info!(path = %sni_list_path.display(), "proxy_scan: Phase 1 — scanning SNI list");
-    let total_hostnames = count_hostnames(&sni_list_path);
     let path = sni_list_path.clone();
     let cfg_clone = cfg.clone();
-    let (tx1, mut rx1) = mpsc::unbounded_channel::<SniProbeEntry>();
-    let scan_handle =
-        rt.spawn(async move { scan_sni_list(&path, scan_timeout, cfg_clone, Some(tx1)).await });
-
-    let mut terminal = tui::enter_tui()?;
-    let (arrived, aborted) = tui::run_scan_progress(&mut terminal, &mut rx1, total_hostnames)?;
-    tui::leave_tui(terminal)?;
-
-    let phase1_sorted = if scan_handle.is_finished() {
-        rt.block_on(scan_handle)
-            .context("scanner task panicked")??
+    let phase1_sorted = if no_tui {
+        rt.block_on(scan_sni_list(&path, scan_timeout, cfg_clone, None))?
     } else {
-        scan_handle.abort();
-        if aborted {
-            info!(
-                "proxy_scan: Phase 1 aborted — using {} results collected so far",
-                arrived.len()
-            );
+        let total_hostnames = count_hostnames(&sni_list_path);
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SniProbeEntry>();
+        let scan_handle =
+            rt.spawn(async move { scan_sni_list(&path, scan_timeout, cfg_clone, Some(tx1)).await });
+
+        let mut terminal = tui::enter_tui()?;
+        let (arrived, aborted) = tui::run_scan_progress(&mut terminal, &mut rx1, total_hostnames)?;
+        tui::leave_tui(terminal)?;
+
+        if scan_handle.is_finished() {
+            rt.block_on(scan_handle)
+                .context("scanner task panicked")??
+        } else {
+            scan_handle.abort();
+            if aborted {
+                info!(
+                    "proxy_scan: Phase 1 aborted — using {} results collected so far",
+                    arrived.len()
+                );
+            }
+            let mut entries = arrived;
+            entries.sort_by(|a, b| {
+                b.score.cmp(&a.score).then(
+                    a.tcp_latency_ms
+                        .unwrap_or(u64::MAX)
+                        .cmp(&b.tcp_latency_ms.unwrap_or(u64::MAX)),
+                )
+            });
+            entries
         }
-        let mut entries = arrived;
-        entries.sort_by(|a, b| {
-            b.score.cmp(&a.score).then(
-                a.tcp_latency_ms
-                    .unwrap_or(u64::MAX)
-                    .cmp(&b.tcp_latency_ms.unwrap_or(u64::MAX)),
-            )
-        });
-        entries
     };
 
     info!(
         "proxy_scan: Phase 1 complete — {} (SNI, IP) pairs",
         phase1_sorted.len()
     );
+    if no_tui {
+        log_sni_scan_results("proxy_scan: headless Phase 1 SNI scan", &phase1_sorted);
+    }
 
     // ---- Filter Phase 1 results ----
     let min_score = cfg.PROXY_TEST_MIN_SNI_SCORE;
@@ -1127,17 +1331,22 @@ fn proxy_scan_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runt
         })
     });
 
-    let mut terminal = tui::enter_tui()?;
-    let (proxy_arrived, _) =
-        tui::run_proxy_scan_progress(&mut terminal, &mut rx2, candidates.len())?;
-    tui::leave_tui(terminal)?;
-
-    let mut phase2_results: Vec<ProxyTestEntry> = if phase2_handle.is_finished() {
+    let mut phase2_results: Vec<ProxyTestEntry> = if no_tui {
         rt.block_on(phase2_handle)
             .context("proxy_scan phase2 task panicked")?
     } else {
-        phase2_handle.abort();
-        proxy_arrived
+        let mut terminal = tui::enter_tui()?;
+        let (proxy_arrived, _) =
+            tui::run_proxy_scan_progress(&mut terminal, &mut rx2, candidates.len())?;
+        tui::leave_tui(terminal)?;
+
+        if phase2_handle.is_finished() {
+            rt.block_on(phase2_handle)
+                .context("proxy_scan phase2 task panicked")?
+        } else {
+            phase2_handle.abort();
+            proxy_arrived
+        }
     };
 
     // Sort by final_score descending.
@@ -1168,9 +1377,15 @@ fn proxy_scan_main(cfg: Arc<Config>, cfg_path: PathBuf, rt: tokio::runtime::Runt
     };
 
     // ---- TUI results view ----
-    let mut terminal = tui::enter_tui()?;
-    tui::run_proxy_scan_results_view(&mut terminal, &phase2_results, saved_path_str.as_deref())?;
-    tui::leave_tui(terminal)?;
+    if !no_tui {
+        let mut terminal = tui::enter_tui()?;
+        tui::run_proxy_scan_results_view(
+            &mut terminal,
+            &phase2_results,
+            saved_path_str.as_deref(),
+        )?;
+        tui::leave_tui(terminal)?;
+    }
 
     Ok(())
 }

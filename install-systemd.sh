@@ -3,7 +3,6 @@ set -euo pipefail
 
 SERVICE_NAME="zerodpi"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
-TTY_PATH="${ZERODPI_TTY:-/dev/tty1}"
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -91,12 +90,10 @@ CONFIG_PATH="$APP_DIR/config.toml"
 validate_systemd_path "$APP_DIR" "Application directory"
 validate_systemd_path "$BINARY_PATH" "Executable path"
 validate_systemd_path "$CONFIG_PATH" "Configuration path"
-validate_systemd_path "$TTY_PATH" "TTY path"
 
 [ -f "$CONFIG_PATH" ] || die "Could not find config.toml in $APP_DIR."
 [ -f "$APP_DIR/sni_list.txt" ] || info "Warning: sni_list.txt was not found in $APP_DIR."
 [ -f "$APP_DIR/ip_list.txt" ] || info "Warning: ip_list.txt was not found in $APP_DIR."
-[ -e "$TTY_PATH" ] || die "$TTY_PATH does not exist. Set ZERODPI_TTY=/dev/ttyN if you need another Linux virtual terminal."
 
 chmod 0755 "$BINARY_PATH"
 
@@ -115,15 +112,12 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=$APP_DIR
-ExecStart=$BINARY_PATH --config $CONFIG_PATH --auto-select
+ExecStart=$BINARY_PATH --config $CONFIG_PATH --auto-select --no-tui
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info
-TTYPath=$TTY_PATH
-TTYReset=yes
-TTYVHangup=yes
-StandardInput=tty
-StandardOutput=tty
+StandardInput=null
+StandardOutput=journal
 StandardError=journal
 
 [Install]
@@ -143,6 +137,5 @@ info "Installed and started $SERVICE_NAME.service"
 info "Application directory: $APP_DIR"
 info "Executable: $BINARY_PATH"
 info "Configuration: $CONFIG_PATH"
-info "TTY: $TTY_PATH"
 info "Check status with: systemctl status $SERVICE_NAME.service"
 info "View logs with: journalctl -u $SERVICE_NAME.service -f"

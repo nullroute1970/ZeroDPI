@@ -272,6 +272,7 @@ Options:
       --listen-host <HOST>             Override LISTEN_HOST
       --listen-port <PORT>             Override LISTEN_PORT
       --auto-select                    Auto-select top-ranked candidate
+      --no-tui                         Disable ratatui screens for headless/service runs
       --sni <SNI>                      Override SELECTED_SNI (skip scan)
       --method <METHOD>                Override BYPASS_METHOD
       --queue-num <N>                  Override NFQUEUE_NUM (Linux)

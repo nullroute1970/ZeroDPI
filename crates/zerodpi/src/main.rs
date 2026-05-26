@@ -673,7 +673,7 @@ fn mode_requires_packet_interception(mode: &str, bypass_method: &str) -> bool {
 async fn run_headless_proxy(
     proxy_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    info!("running without TUI; send SIGTERM or press Ctrl-C to stop");
+    log_headless_proxy_start();
     let mut proxy_handle = proxy_handle;
     tokio::select! {
         signal = shutdown_signal() => {
@@ -688,6 +688,16 @@ async fn run_headless_proxy(
 }
 
 #[cfg(unix)]
+fn log_headless_proxy_start() {
+    info!("running without TUI; send SIGTERM to stop");
+}
+
+#[cfg(not(unix))]
+fn log_headless_proxy_start() {
+    info!("running without TUI; press Ctrl-C to stop");
+}
+
+#[cfg(unix)]
 async fn shutdown_signal() -> anyhow::Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
 
@@ -698,8 +708,7 @@ async fn shutdown_signal() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = interrupt.recv() => {
-                info!("received SIGINT");
-                return Ok(());
+                warn!("received SIGINT; continuing because --no-tui is running headless; send SIGTERM to stop");
             }
             _ = terminate.recv() => {
                 info!("received SIGTERM");

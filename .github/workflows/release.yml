@@ -39,7 +39,7 @@ jobs:
           timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
           unique="$(git rev-parse --short=12 HEAD)"
 
-          release_tag="v${version}-${timestamp}-${unique}"
+          release_tag="v${timestamp}-${unique}"
           release_name="ZeroDPI ${release_tag}"
 
           prerelease=false

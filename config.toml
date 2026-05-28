@@ -171,6 +171,14 @@ BYPASS_METHOD = "wrong_seq"
 # bypass cannot complete.  Must be at least 1.
 BYPASS_TIMEOUT_SECS = 2
 
+# Maximum lifetime (in seconds) for an established relay before ZeroDPI closes
+# it and lets the upstream VPN client reconnect. This is useful for protocols
+# such as gRPC that keep one TCP/TLS connection open for hours; reconnecting
+# lets new connections use the latest scanned SNI/IP target.
+#
+# Set to 0 to disable relay rotation. This is the default.
+RELAY_MAX_LIFETIME_SECS = 0
+
 # (Linux only) NFQUEUE queue number used to intercept packets via iptables.
 #
 # ZeroDPI installs iptables rules that send selected TCP packets to this queue.

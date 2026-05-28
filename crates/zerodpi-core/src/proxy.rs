@@ -77,13 +77,12 @@ pub enum ProxyEvent {
     /// The bidirectional relay ended.
     ///
     /// `c2s_bytes` and `s2c_bytes` are the bytes transferred in each direction.
-    /// Both are reported as `0` when the relay encountered an I/O error, since
-    /// [`tokio::io::copy_bidirectional`] does not expose partial byte counts on
-    /// failure.
+    /// They include bytes copied before a configured max-lifetime rotation.
     RelayFinished {
         src_port: u16,
         c2s_bytes: u64,
         s2c_bytes: u64,
+        reason: RelayEndReason,
     },
     /// A fatal error occurred before the relay could start (e.g. upstream
     /// TCP connect failed).
@@ -108,6 +107,29 @@ pub enum ProxyEvent {
 /// the live dashboard.  When `None` is passed the proxy operates silently.
 pub type ProxyEventSender = mpsc::UnboundedSender<ProxyEvent>;
 
+/// Why a relay ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayEndReason {
+    /// Both relay directions ended naturally.
+    Completed,
+    /// The configured maximum relay lifetime expired and the relay was closed
+    /// so the upstream client can reconnect through the current target.
+    MaxLifetime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayResult {
+    c2s_bytes: u64,
+    s2c_bytes: u64,
+    reason: RelayEndReason,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RelayTiming {
+    bypass_timeout: Duration,
+    max_lifetime: Option<Duration>,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -118,6 +140,10 @@ fn emit(tx: &Option<ProxyEventSender>, event: ProxyEvent) {
     if let Some(ref tx) = tx {
         let _ = tx.send(event);
     }
+}
+
+fn configured_relay_max_lifetime(cfg: &Config) -> Option<Duration> {
+    (cfg.RELAY_MAX_LIFETIME_SECS > 0).then(|| Duration::from_secs(cfg.RELAY_MAX_LIFETIME_SECS))
 }
 
 /// How long to wait for the bypass to complete before giving up.
@@ -225,7 +251,10 @@ pub async fn run_proxy(
         let target = active_target.read().unwrap().clone();
         let flows = flows.clone();
         let event_tx = event_tx.clone();
-        let bypass_timeout = Duration::from_secs(cfg.BYPASS_TIMEOUT_SECS);
+        let relay_timing = RelayTiming {
+            bypass_timeout: Duration::from_secs(cfg.BYPASS_TIMEOUT_SECS),
+            max_lifetime: configured_relay_max_lifetime(&cfg),
+        };
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 interface_ip,
@@ -234,7 +263,7 @@ pub async fn run_proxy(
                 incoming,
                 peer,
                 event_tx,
-                bypass_timeout,
+                relay_timing,
             )
             .await
             {
@@ -251,7 +280,7 @@ async fn handle_connection(
     incoming: TcpStream,
     peer: SocketAddr,
     event_tx: Option<ProxyEventSender>,
-    bypass_timeout: Duration,
+    relay_timing: RelayTiming,
 ) -> anyhow::Result<()> {
     let connect_port = CONNECT_PORT;
     let connect_ip = target.ip;
@@ -302,7 +331,7 @@ async fn handle_connection(
     };
 
     // Wait (with timeout) for the interceptor to finish the bypass.
-    let waited = tokio::time::timeout(bypass_timeout, entry.notify.notified()).await;
+    let waited = tokio::time::timeout(relay_timing.bypass_timeout, entry.notify.notified()).await;
     let outcome = entry.state.lock().outcome;
     match (waited, outcome) {
         (Ok(()), Some(BypassOutcome::FakeDataAcked)) => {
@@ -342,14 +371,27 @@ async fn handle_connection(
     drop(cleanup);
 
     // Bidirectional relay with periodic progress events.
-    let (c2s_bytes, s2c_bytes) = counting_relay(incoming, outgoing, &event_tx, src_port).await;
-    debug!(c2s_bytes, s2c_bytes, "relay finished");
+    let relay = counting_relay(
+        incoming,
+        outgoing,
+        &event_tx,
+        src_port,
+        relay_timing.max_lifetime,
+    )
+    .await;
+    debug!(
+        c2s_bytes = relay.c2s_bytes,
+        s2c_bytes = relay.s2c_bytes,
+        reason = ?relay.reason,
+        "relay finished"
+    );
     emit(
         &event_tx,
         ProxyEvent::RelayFinished {
             src_port,
-            c2s_bytes,
-            s2c_bytes,
+            c2s_bytes: relay.c2s_bytes,
+            s2c_bytes: relay.s2c_bytes,
+            reason: relay.reason,
         },
     );
 
@@ -445,14 +487,27 @@ async fn handle_tcp_seg_connection_with_ip(
 
     // Bidirectional relay for the rest of the session.
     // The ClientHello has already been forwarded; the relay starts mid-stream.
-    let (c2s_bytes, s2c_bytes) = counting_relay(incoming, outgoing, &event_tx, src_port).await;
-    debug!(c2s_bytes, s2c_bytes, "tcp_seg: relay finished");
+    let relay = counting_relay(
+        incoming,
+        outgoing,
+        &event_tx,
+        src_port,
+        configured_relay_max_lifetime(&cfg),
+    )
+    .await;
+    debug!(
+        c2s_bytes = relay.c2s_bytes,
+        s2c_bytes = relay.s2c_bytes,
+        reason = ?relay.reason,
+        "tcp_seg: relay finished"
+    );
     emit(
         &event_tx,
         ProxyEvent::RelayFinished {
             src_port,
-            c2s_bytes,
-            s2c_bytes,
+            c2s_bytes: relay.c2s_bytes,
+            s2c_bytes: relay.s2c_bytes,
+            reason: relay.reason,
         },
     );
     Ok(())
@@ -465,23 +520,24 @@ async fn handle_tcp_seg_connection_with_ip(
 /// Run a bidirectional relay between `incoming` and `outgoing`, emitting
 /// [`ProxyEvent::RelayProgress`] every 500 ms when a sender is present.
 ///
-/// Returns `(c2s_bytes, s2c_bytes)` — the total bytes transferred in each
-/// direction.  Shutdown of each write half is handled internally when the
+/// Returns the total bytes transferred in each direction plus the reason the
+/// relay ended.  Shutdown of each write half is handled internally when the
 /// corresponding read half reaches EOF.
 async fn counting_relay(
     incoming: TcpStream,
     outgoing: TcpStream,
     event_tx: &Option<ProxyEventSender>,
     src_port: u16,
-) -> (u64, u64) {
+    max_lifetime: Option<Duration>,
+) -> RelayResult {
     let (inc_rd, inc_wr) = incoming.into_split();
     let (out_rd, out_wr) = outgoing.into_split();
 
     let c2s_atomic = Arc::new(AtomicU64::new(0));
     let s2c_atomic = Arc::new(AtomicU64::new(0));
 
-    let c2s_task = tokio::spawn(copy_counting(inc_rd, out_wr, c2s_atomic.clone()));
-    let s2c_task = tokio::spawn(copy_counting(out_rd, inc_wr, s2c_atomic.clone()));
+    let mut c2s_task = tokio::spawn(copy_counting(inc_rd, out_wr, c2s_atomic.clone()));
+    let mut s2c_task = tokio::spawn(copy_counting(out_rd, inc_wr, s2c_atomic.clone()));
 
     // Progress ticker — only spawned in interactive mode.
     let ticker = event_tx.as_ref().map(|tx| {
@@ -503,12 +559,63 @@ async fn counting_relay(
         })
     });
 
-    let (c2s_result, s2c_result) = tokio::join!(c2s_task, s2c_task);
+    let result = if let Some(max_lifetime) = max_lifetime {
+        let mut c2s_done: Option<u64> = None;
+        let mut s2c_done: Option<u64> = None;
+        let deadline = tokio::time::sleep(max_lifetime);
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    if c2s_done.is_none() {
+                        c2s_task.abort();
+                    }
+                    if s2c_done.is_none() {
+                        s2c_task.abort();
+                    }
+                    break RelayResult {
+                        c2s_bytes: c2s_done.unwrap_or_else(|| c2s_atomic.load(Ordering::Relaxed)),
+                        s2c_bytes: s2c_done.unwrap_or_else(|| s2c_atomic.load(Ordering::Relaxed)),
+                        reason: RelayEndReason::MaxLifetime,
+                    };
+                }
+                c2s_result = &mut c2s_task, if c2s_done.is_none() => {
+                    c2s_done = Some(c2s_result.unwrap_or(0));
+                    if let (Some(c2s_bytes), Some(s2c_bytes)) = (c2s_done, s2c_done) {
+                        break RelayResult {
+                            c2s_bytes,
+                            s2c_bytes,
+                            reason: RelayEndReason::Completed,
+                        };
+                    }
+                }
+                s2c_result = &mut s2c_task, if s2c_done.is_none() => {
+                    s2c_done = Some(s2c_result.unwrap_or(0));
+                    if let (Some(c2s_bytes), Some(s2c_bytes)) = (c2s_done, s2c_done) {
+                        break RelayResult {
+                            c2s_bytes,
+                            s2c_bytes,
+                            reason: RelayEndReason::Completed,
+                        };
+                    }
+                }
+            }
+        }
+    } else {
+        let (c2s_result, s2c_result) = tokio::join!(c2s_task, s2c_task);
+        RelayResult {
+            c2s_bytes: c2s_result.unwrap_or(0),
+            s2c_bytes: s2c_result.unwrap_or(0),
+            reason: RelayEndReason::Completed,
+        }
+    };
+
     if let Some(t) = ticker {
         t.abort();
     }
 
-    (c2s_result.unwrap_or(0), s2c_result.unwrap_or(0))
+    result
 }
 
 /// Copy all bytes from `reader` to `writer`, updating `counter` after each
@@ -576,10 +683,18 @@ pub async fn run_ip_bypass_proxy(
         let ip = *active_ip.read().unwrap();
         let event_tx = event_tx.clone();
         let src_port = peer.port();
+        let relay_max_lifetime = configured_relay_max_lifetime(&cfg);
 
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_ip_bypass_connection(ip, incoming, peer, src_port, event_tx).await
+            if let Err(e) = handle_ip_bypass_connection(
+                ip,
+                incoming,
+                peer,
+                src_port,
+                event_tx,
+                relay_max_lifetime,
+            )
+            .await
             {
                 warn!(%peer, error = %e, "ip_bypass: connection failed");
             }
@@ -593,6 +708,7 @@ async fn handle_ip_bypass_connection(
     peer: SocketAddr,
     src_port: u16,
     event_tx: Option<ProxyEventSender>,
+    relay_max_lifetime: Option<Duration>,
 ) -> anyhow::Result<()> {
     let connect_addr = SocketAddr::new(connect_ip, CONNECT_PORT);
     emit(&event_tx, ProxyEvent::ConnectionAccepted { peer, src_port });
@@ -621,15 +737,114 @@ async fn handle_ip_bypass_connection(
         }
     };
 
-    let (c2s_bytes, s2c_bytes) = counting_relay(incoming, outgoing, &event_tx, src_port).await;
-    debug!(c2s_bytes, s2c_bytes, "ip_bypass: relay finished");
+    let relay = counting_relay(incoming, outgoing, &event_tx, src_port, relay_max_lifetime).await;
+    debug!(
+        c2s_bytes = relay.c2s_bytes,
+        s2c_bytes = relay.s2c_bytes,
+        reason = ?relay.reason,
+        "ip_bypass: relay finished"
+    );
     emit(
         &event_tx,
         ProxyEvent::RelayFinished {
             src_port,
-            c2s_bytes,
-            s2c_bytes,
+            c2s_bytes: relay.c2s_bytes,
+            s2c_bytes: relay.s2c_bytes,
+            reason: relay.reason,
         },
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (client, accepted) = tokio::join!(connect, accept);
+        (client.unwrap(), accepted.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn relay_without_max_lifetime_completes_on_eof() {
+        let (mut client, incoming) = tcp_pair().await;
+        let (mut upstream, outgoing) = tcp_pair().await;
+
+        let relay = tokio::spawn(counting_relay(incoming, outgoing, &None, 1234, None));
+
+        client.write_all(b"ping").await.unwrap();
+        let mut upstream_buf = [0u8; 4];
+        upstream.read_exact(&mut upstream_buf).await.unwrap();
+        assert_eq!(&upstream_buf, b"ping");
+
+        upstream.write_all(b"pong").await.unwrap();
+        let mut client_buf = [0u8; 4];
+        client.read_exact(&mut client_buf).await.unwrap();
+        assert_eq!(&client_buf, b"pong");
+
+        client.shutdown().await.unwrap();
+        upstream.shutdown().await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.reason, RelayEndReason::Completed);
+        assert_eq!(result.c2s_bytes, 4);
+        assert_eq!(result.s2c_bytes, 4);
+    }
+
+    #[tokio::test]
+    async fn relay_with_max_lifetime_rotates_open_connection() {
+        let (_client, incoming) = tcp_pair().await;
+        let (_upstream, outgoing) = tcp_pair().await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            counting_relay(
+                incoming,
+                outgoing,
+                &None,
+                1234,
+                Some(Duration::from_millis(25)),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.reason, RelayEndReason::MaxLifetime);
+        assert_eq!(result.c2s_bytes, 0);
+        assert_eq!(result.s2c_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn relay_rotation_preserves_bytes_copied_before_expiry() {
+        let (mut client, incoming) = tcp_pair().await;
+        let (mut upstream, outgoing) = tcp_pair().await;
+
+        let relay = tokio::spawn(counting_relay(
+            incoming,
+            outgoing,
+            &None,
+            1234,
+            Some(Duration::from_millis(50)),
+        ));
+
+        client.write_all(b"hello").await.unwrap();
+        let mut upstream_buf = [0u8; 5];
+        upstream.read_exact(&mut upstream_buf).await.unwrap();
+        assert_eq!(&upstream_buf, b"hello");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.reason, RelayEndReason::MaxLifetime);
+        assert_eq!(result.c2s_bytes, 5);
+        assert_eq!(result.s2c_bytes, 0);
+    }
 }

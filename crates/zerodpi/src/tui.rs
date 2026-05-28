@@ -37,7 +37,7 @@ use tokio::sync::mpsc;
 use zerodpi_core::config::Config;
 use zerodpi_core::flow::BypassOutcome;
 use zerodpi_core::ip_scanner::{IpProbeEntry, IpScanEvent};
-use zerodpi_core::proxy::ProxyEvent;
+use zerodpi_core::proxy::{ProxyEvent, RelayEndReason};
 use zerodpi_core::sni_scanner::SniProbeEntry;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -529,6 +529,7 @@ enum ConnStatus {
     Connecting,
     Relaying,
     Done,
+    Rotated,
     Failed,
 }
 
@@ -538,6 +539,7 @@ impl ConnStatus {
             ConnStatus::Connecting => "Connecting",
             ConnStatus::Relaying => "Relaying",
             ConnStatus::Done => "Done",
+            ConnStatus::Rotated => "Rotated",
             ConnStatus::Failed => "Failed",
         }
     }
@@ -547,6 +549,7 @@ impl ConnStatus {
             ConnStatus::Connecting => Style::default().fg(Color::Yellow),
             ConnStatus::Relaying => Style::default().fg(Color::Cyan),
             ConnStatus::Done => Style::default().fg(Color::Green),
+            ConnStatus::Rotated => Style::default().fg(Color::Magenta),
             ConnStatus::Failed => Style::default().fg(Color::Red),
         }
     }
@@ -584,7 +587,7 @@ fn connection_row_style(record: &ConnectionRecord) -> Style {
             }
         }
         ConnStatus::Failed => Style::default().bg(Color::Indexed(52)),
-        ConnStatus::Done => Style::default(),
+        ConnStatus::Done | ConnStatus::Rotated => Style::default(),
     }
 }
 
@@ -625,7 +628,7 @@ impl FilterStatus {
         match self {
             FilterStatus::All => true,
             FilterStatus::Active => matches!(status, ConnStatus::Connecting | ConnStatus::Relaying),
-            FilterStatus::Done => matches!(status, ConnStatus::Done),
+            FilterStatus::Done => matches!(status, ConnStatus::Done | ConnStatus::Rotated),
             FilterStatus::Failed => matches!(status, ConnStatus::Failed),
         }
     }
@@ -981,13 +984,18 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
             src_port,
             c2s_bytes,
             s2c_bytes,
+            reason,
         } => {
             state.active = state.active.saturating_sub(1);
             state.total_c2s += c2s_bytes;
             state.total_s2c += s2c_bytes;
             if let Some(r) = find_record(&mut state.records, src_port) {
                 let now = Instant::now();
-                r.set_status(ConnStatus::Done, now);
+                let status = match reason {
+                    RelayEndReason::Completed => ConnStatus::Done,
+                    RelayEndReason::MaxLifetime => ConnStatus::Rotated,
+                };
+                r.set_status(status, now);
                 r.c2s_bytes = c2s_bytes;
                 r.s2c_bytes = s2c_bytes;
                 r.rate_c2s_bps = 0.0;

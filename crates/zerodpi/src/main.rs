@@ -35,7 +35,8 @@ use zerodpi_core::ip_scanner::{load_ip_list, scan_ip_list, IpProbeEntry, IpScanE
 use zerodpi_core::methods::build_method;
 use zerodpi_core::net::default_interface_ipv4;
 use zerodpi_core::proxy::{
-    run_ip_bypass_proxy, run_proxy, ActiveSniTarget, ProxyEvent, ProxyEventSender, CONNECT_PORT,
+    run_ip_bypass_proxy, run_proxy, ActiveSniTarget, ProxyEvent, ProxyEventSender, RelayEndReason,
+    CONNECT_PORT,
 };
 use zerodpi_core::proxy_tester::{test_candidate_full, ProxyTestEntry};
 use zerodpi_core::sni_scanner::{scan_sni_list, SniProbeEntry};
@@ -127,6 +128,9 @@ struct Args {
     /// Override `BYPASS_TIMEOUT_SECS`.
     #[arg(long)]
     bypass_timeout: Option<u64>,
+    /// Override `RELAY_MAX_LIFETIME_SECS` (`0` disables relay rotation).
+    #[arg(long)]
+    relay_max_lifetime: Option<u64>,
 }
 
 fn main() -> Result<()> {
@@ -199,6 +203,9 @@ fn main() -> Result<()> {
     }
     if let Some(v) = args.bypass_timeout {
         cfg.BYPASS_TIMEOUT_SECS = v;
+    }
+    if let Some(v) = args.relay_max_lifetime {
+        cfg.RELAY_MAX_LIFETIME_SECS = v;
     }
     cfg.validate()?;
     if requires_packet_interception(&cfg) {
@@ -741,9 +748,18 @@ async fn log_headless_proxy_events(mut event_rx: mpsc::UnboundedReceiver<ProxyEv
                 src_port,
                 c2s_bytes,
                 s2c_bytes,
-            } => {
-                info!(src_port, c2s_bytes, s2c_bytes, "relay finished");
-            }
+                reason,
+            } => match reason {
+                RelayEndReason::Completed => {
+                    info!(src_port, c2s_bytes, s2c_bytes, "relay finished");
+                }
+                RelayEndReason::MaxLifetime => {
+                    info!(
+                        src_port,
+                        c2s_bytes, s2c_bytes, "relay rotated after max lifetime"
+                    );
+                }
+            },
             ProxyEvent::ConnectionError { src_port, error } => {
                 warn!(src_port, %error, "proxy connection failed");
             }

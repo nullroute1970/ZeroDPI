@@ -220,6 +220,7 @@ MODE = "sni_spoof"
 AUTO_SELECT = true
 RESCAN_INTERVAL_SECS = 300
 SNI_SWITCH_MIN_SCORE = 40
+RELAY_MAX_LIFETIME_SECS = 0
 ```
 
 Start the process with:
@@ -332,6 +333,7 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 |-------|------|---------|-------------|
 | `BYPASS_METHOD` | `string` | `"wrong_seq"` | `wrong_seq`, `wrong_checksum`, `tls_record_frag`, or `tcp_segmentation` |
 | `BYPASS_TIMEOUT_SECS` | `u64` | `2` | Time to wait for bypass ACK before giving up |
+| `RELAY_MAX_LIFETIME_SECS` | `u64` | `0` | Rotate established relays after this many seconds (`0` = disabled/default) |
 | `NFQUEUE_NUM` | `u16` | `1` | (Linux) NFQUEUE queue number |
 
 #### `wrong_seq` Parameters
@@ -441,6 +443,7 @@ Options:
       --wrong-seq-no-psh               Clear PSH flag (wrong_seq)
       --wrong-seq-no-bump-ident        Skip IPv4 ID bump (wrong_seq)
       --bypass-timeout <SECS>          Override BYPASS_TIMEOUT_SECS
+      --relay-max-lifetime <SECS>      Override RELAY_MAX_LIFETIME_SECS
   -h, --help                           Print help
   -V, --version                        Print version
 ```
@@ -694,6 +697,7 @@ Unit tests cover:
 | TUI is garbled over SSH or systemd | Run with `--no-tui` and rely on logs. |
 | `wrong_seq` or `wrong_checksum` does not work | Try `tls_record_frag`, then `tcp_segmentation`. Different DPI devices fail on different TCP/TLS behaviors. |
 | Connections start but stall | Raise `BYPASS_TIMEOUT_SECS`, reduce `SNI_MAX_CONCURRENT`, and check whether the selected candidate has high TTFB or low speed. |
+| gRPC works after restart but fails after hours | Enable `RESCAN_INTERVAL_SECS` and set `RELAY_MAX_LIFETIME_SECS` to a positive value so long-lived relays reconnect through the latest working target. |
 
 Use `RUST_LOG=debug` when collecting detailed diagnostics:
 

@@ -191,6 +191,12 @@ pub struct Config {
     #[serde(default = "default_bypass_timeout")]
     pub BYPASS_TIMEOUT_SECS: u64,
 
+    /// Maximum lifetime for an established relay before ZeroDPI closes it and
+    /// lets the upstream client reconnect through the current target.
+    /// `0` disables relay rotation.  Default: `0`.
+    #[serde(default)]
+    pub RELAY_MAX_LIFETIME_SECS: u64,
+
     // -----------------------------------------------------------------------
     // IP bypass mode
     // -----------------------------------------------------------------------
@@ -533,6 +539,7 @@ mod tests {
         assert!(cfg.TCP_SEG_NODELAY);
         // proxy timing defaults
         assert_eq!(cfg.BYPASS_TIMEOUT_SECS, 2);
+        assert_eq!(cfg.RELAY_MAX_LIFETIME_SECS, 0);
     }
 
     #[test]
@@ -658,6 +665,7 @@ mod tests {
             WRONG_CHECKSUM_BUMP_IP_IDENT = false
             WRONG_CHECKSUM_COMPLETE_IMMEDIATELY = false
             BYPASS_TIMEOUT_SECS = 5
+            RELAY_MAX_LIFETIME_SECS = 7200
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
@@ -675,6 +683,17 @@ mod tests {
         assert!(!cfg.WRONG_CHECKSUM_BUMP_IP_IDENT);
         assert!(!cfg.WRONG_CHECKSUM_COMPLETE_IMMEDIATELY);
         assert_eq!(cfg.BYPASS_TIMEOUT_SECS, 5);
+        assert_eq!(cfg.RELAY_MAX_LIFETIME_SECS, 7200);
+    }
+
+    #[test]
+    fn rejects_negative_relay_max_lifetime() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            RELAY_MAX_LIFETIME_SECS = -1
+        "#;
+        assert!(toml::from_str::<Config>(toml_str).is_err());
     }
 
     #[test]

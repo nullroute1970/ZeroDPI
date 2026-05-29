@@ -59,6 +59,8 @@ pub struct Config {
     /// - `"tls_record_frag"` — splits the real ClientHello into multiple small
     ///   TLS record fragments so no single record contains the full SNI.
     ///   No fake packet is injected; the server reassembles normally.
+    /// - `"wrong_seq_tls_frag"` — injects a `wrong_seq` fake ClientHello,
+    ///   then fragments the real ClientHello for downstream DPI layers.
     /// - `"tcp_segmentation"` — splits the real ClientHello into multiple tiny
     ///   TCP segments so DPI cannot reassemble the SNI from any single packet.
     ///   Does **not** inject fake packets or use WinDivert/NFQUEUE interception;
@@ -462,10 +464,14 @@ impl Config {
         }
         if !matches!(
             self.BYPASS_METHOD.as_str(),
-            "wrong_seq" | "wrong_checksum" | "tls_record_frag" | "tcp_segmentation"
+            "wrong_seq"
+                | "wrong_checksum"
+                | "tls_record_frag"
+                | "wrong_seq_tls_frag"
+                | "tcp_segmentation"
         ) {
             anyhow::bail!(
-                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"tls_record_frag\", \"tcp_segmentation\"",
+                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"tcp_segmentation\"",
                 self.BYPASS_METHOD
             );
         }
@@ -684,6 +690,20 @@ mod tests {
         assert!(!cfg.WRONG_CHECKSUM_COMPLETE_IMMEDIATELY);
         assert_eq!(cfg.BYPASS_TIMEOUT_SECS, 5);
         assert_eq!(cfg.RELAY_MAX_LIFETIME_SECS, 7200);
+    }
+
+    #[test]
+    fn wrong_seq_tls_frag_accepted_by_validate() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "wrong_seq_tls_frag"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.BYPASS_METHOD, "wrong_seq_tls_frag");
+        assert_eq!(cfg.WRONG_SEQ_EXTRA_OFFSET, 0);
+        assert_eq!(cfg.TLS_RECORD_FRAG_SIZE, 1);
     }
 
     #[test]

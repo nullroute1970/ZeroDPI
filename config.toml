@@ -149,6 +149,13 @@ SPEED_CAP_BPS = 2048000.0
 #     reassemble TLS records across fragment boundaries will fail to extract
 #     the SNI.  The upstream TLS server reassembles the fragments normally.
 #
+#   "wrong_seq_tls_frag"
+#     Combines both stages for layered filtering.  First, it injects a fake
+#     wrong-sequence ClientHello on the handshake ACK.  Then it intercepts the
+#     real first ClientHello and re-wraps it as TLS record fragments, so later
+#     DPI layers still do not see an unfragmented SNI even if the fake packet
+#     was dropped by an earlier firewall.
+#
 #   "tcp_segmentation"
 #     Does NOT inject fake packets and does NOT use WinDivert or NFQUEUE
 #     packet interception.  Instead, it reads the real TLS ClientHello from
@@ -159,8 +166,8 @@ SPEED_CAP_BPS = 2048000.0
 #     normally and sees an identical ClientHello.
 #
 # This setting is only used by modes that perform packet interception
-# ("sni_spoof" and "sni_scan").  The "ip_bypass" and "ip_scan" modes do not
-# use a bypass method.
+# ("sni_spoof", "sni_scan", and "proxy_scan").  The "ip_bypass" and
+# "ip_scan" modes do not use a bypass method.
 BYPASS_METHOD = "wrong_seq"
 
 # Seconds the proxy waits for the intercept thread to confirm that the spoofed
@@ -189,7 +196,8 @@ NFQUEUE_NUM = 1
 # ---------------------------------------------------------------------------
 # wrong_seq method parameters
 # ---------------------------------------------------------------------------
-# These settings only apply when BYPASS_METHOD = "wrong_seq".
+# These settings apply when BYPASS_METHOD = "wrong_seq" or
+# "wrong_seq_tls_frag".
 
 # Extra bytes subtracted from the injected TCP sequence number in addition to
 # the spoofed ClientHello payload length.
@@ -257,7 +265,8 @@ WRONG_CHECKSUM_COMPLETE_IMMEDIATELY = true
 # ---------------------------------------------------------------------------
 # tls_record_frag method parameters
 # ---------------------------------------------------------------------------
-# These settings only apply when BYPASS_METHOD = "tls_record_frag".
+# These settings apply when BYPASS_METHOD = "tls_record_frag" or
+# "wrong_seq_tls_frag".
 
 # Maximum number of payload bytes placed in each TLS record fragment.
 #

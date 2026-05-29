@@ -7,9 +7,9 @@
 //! - On the first outbound bare ACK after the handshake, asks the active
 //!   [`crate::methods::BypassMethod`] to stage payload mutations and returns
 //!   [`crate::interceptor::Verdict::AcceptModified`].
-//! - On the inbound ACK that acknowledges the spoofed segment, or immediately
-//!   for methods that cannot expect a server ACK, signals the waiting proxy
-//!   task via the flow's `Notify`.
+//! - On the inbound ACK that acknowledges the spoofed segment, after first-data
+//!   mutation, or immediately for methods that cannot expect a server ACK,
+//!   signals the waiting proxy task via the flow's `Notify`.
 //! - Any unexpected packet for a tracked flow is forwarded but the flow is
 //!   marked closed (mirroring upstream's `on_unexpected_packet`).
 //!
@@ -104,7 +104,7 @@ impl PacketHandler for Handler {
                     return Verdict::Accept;
                 }
                 if pkt.is_bare_ack() {
-                    if state.fake_sent {
+                    if state.fake_sent || state.waiting_for_data {
                         return self.unexpected(
                             &entry,
                             &mut state,
@@ -154,10 +154,14 @@ impl PacketHandler for Handler {
                     match self.method.on_handshake_complete_ack(&state, pkt) {
                         MethodAction::EmitFakeAndAccept {
                             complete_immediately,
+                            continue_with_data,
                         } => {
                             state.fake_sent = true;
                             trace!(method = self.method.name(), "emitting fake (modified ACK)");
-                            if complete_immediately {
+                            if continue_with_data {
+                                state.waiting_for_data = true;
+                                entry.ready_for_data.notify_waiters();
+                            } else if complete_immediately {
                                 drop(state);
                                 entry.finish(BypassOutcome::FakeDataAcked);
                             }
@@ -166,6 +170,7 @@ impl PacketHandler for Handler {
                         MethodAction::PassThrough => {
                             // Method deferred to the first data packet (e.g. tls_record_frag).
                             state.waiting_for_data = true;
+                            entry.ready_for_data.notify_waiters();
                             trace!(
                                 method = self.method.name(),
                                 "deferring bypass to first data packet"
@@ -175,12 +180,14 @@ impl PacketHandler for Handler {
                     }
                 }
                 // First outbound data packet when method deferred to this stage.
-                if pkt.payload_len > 0 && state.waiting_for_data && !state.fake_sent {
+                if pkt.payload_len > 0 && state.waiting_for_data && !state.first_data_modified {
                     match self.method.on_first_data_packet(&state, pkt) {
                         MethodAction::EmitFakeAndAccept {
                             complete_immediately,
+                            continue_with_data: _,
                         } => {
-                            state.fake_sent = true;
+                            state.first_data_modified = true;
+                            state.waiting_for_data = false;
                             trace!(
                                 method = self.method.name(),
                                 "fragmented first data packet; signalling bypass complete"
@@ -246,6 +253,13 @@ impl PacketHandler for Handler {
                             "inbound post-fake ACK ack mismatch",
                         );
                     }
+                    if state.waiting_for_data {
+                        trace!(
+                            method = self.method.name(),
+                            "accepted post-fake ACK while waiting for first data packet"
+                        );
+                        return Verdict::Accept;
+                    }
                     drop(state);
                     entry.finish(BypassOutcome::FakeDataAcked);
                     return Verdict::Accept;
@@ -265,8 +279,10 @@ mod tests {
     use crate::config::Config;
     use crate::flow::{new_flow_table, BypassOutcome, FlowEntry, FlowKey};
     use crate::interceptor::{Direction, PacketView, TcpFlags};
+    use crate::methods::tls_record_frag::TlsRecordFrag;
     use crate::methods::wrong_checksum::WrongChecksum;
     use crate::methods::wrong_seq::WrongSeq;
+    use crate::methods::wrong_seq_tls_frag::WrongSeqTlsFrag;
 
     fn default_cfg() -> Config {
         toml::from_str(
@@ -469,6 +485,171 @@ mod tests {
         assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
         assert_eq!(p.new_seq, None);
         assert_eq!(p.corrupt_tcp_checksum_delta, Some(1));
+        assert_eq!(
+            entry.state.lock().outcome,
+            Some(BypassOutcome::FakeDataAcked)
+        );
+        assert!(!entry.state.lock().monitor);
+    }
+
+    #[test]
+    fn tls_record_frag_waits_for_first_data_packet() {
+        let flows = new_flow_table();
+        let key = FlowKey {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            dst_port: 443,
+        };
+        let entry = FlowEntry::new(vec![0xAA; 517]);
+        flows.insert(key, entry.clone());
+
+        let mut cfg = default_cfg();
+        cfg.BYPASS_METHOD = "tls_record_frag".into();
+        let mut h = Handler::new(flows, Arc::new(TlsRecordFrag::new(&cfg)));
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            1000,
+            0,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                syn: true,
+                ack: true,
+                ..Default::default()
+            },
+            5000,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+        assert!(entry.state.lock().waiting_for_data);
+        assert!(entry.state.lock().outcome.is_none());
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            3,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
+        assert_eq!(p.new_payload.as_ref().unwrap().len(), 18);
+        assert_eq!(
+            entry.state.lock().outcome,
+            Some(BypassOutcome::FakeDataAcked)
+        );
+    }
+
+    #[test]
+    fn wrong_seq_tls_frag_accepts_post_fake_ack_then_fragments_data() {
+        let flows = new_flow_table();
+        let key = FlowKey {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            dst_port: 443,
+        };
+        let entry = FlowEntry::new(vec![0xAA; 517]);
+        flows.insert(key, entry.clone());
+
+        let mut cfg = default_cfg();
+        cfg.BYPASS_METHOD = "wrong_seq_tls_frag".into();
+        let mut h = Handler::new(flows, Arc::new(WrongSeqTlsFrag::new(&cfg)));
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            1000,
+            0,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                syn: true,
+                ack: true,
+                ..Default::default()
+            },
+            5000,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
+        assert_eq!(p.new_seq, Some(1001u32.wrapping_sub(517)));
+        assert!(entry.state.lock().fake_sent);
+        assert!(entry.state.lock().waiting_for_data);
+        assert!(entry.state.lock().outcome.is_none());
+
+        let mut p = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            5001,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+        assert!(entry.state.lock().waiting_for_data);
+        assert!(entry.state.lock().outcome.is_none());
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            3,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
+        assert_eq!(p.new_payload.as_ref().unwrap().len(), 18);
         assert_eq!(
             entry.state.lock().outcome,
             Some(BypassOutcome::FakeDataAcked)

@@ -72,8 +72,10 @@ impl BypassMethod for WrongChecksum {
             "staged fake ClientHello with corrupted TCP checksum"
         );
 
-        MethodAction::EmitFakeAndAccept {
-            complete_immediately: self.complete_immediately,
+        if self.complete_immediately {
+            MethodAction::emit_and_complete()
+        } else {
+            MethodAction::emit_and_wait_for_ack()
         }
     }
 }

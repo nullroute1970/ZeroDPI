@@ -32,7 +32,7 @@ ZeroDPI sits between your **upstream VPN app** (xray-core, sing-box, v2ray, Hyst
 
 | Feature | Description |
 |---------|-------------|
-| 🧩 **4 bypass methods** | `wrong_seq`, `wrong_checksum`, `tls_record_frag`, `tcp_segmentation` |
+| 🧩 **5 bypass methods** | `wrong_seq`, `wrong_checksum`, `tls_record_frag`, `wrong_seq_tls_frag`, `tcp_segmentation` |
 | 🎯 **5 operating modes** | `sni_spoof`, `ip_bypass`, `sni_scan`, `ip_scan`, `proxy_scan` |
 | 🖥️ **TUI dashboard** | Ratatui-powered live progress, selection tables, and connection monitoring |
 | 🔄 **Auto-rescan** | Background re-scanning hot-swaps the best target without restart |
@@ -190,6 +190,7 @@ Results are blended using a configurable weight and displayed in the TUI.
 | `wrong_seq` | Injects fake ClientHello with deliberately old TCP sequence number | ✅ Yes (WinDivert/NFQUEUE) | Most DPI systems |
 | `wrong_checksum` | Injects fake ClientHello with corrupted TCP checksum | ✅ Yes | DPI that doesn't verify checksums |
 | `tls_record_frag` | Splits real ClientHello into multiple tiny TLS records | ✅ Yes | DPI that can't reassemble TLS fragments |
+| `wrong_seq_tls_frag` | Sends a wrong-sequence fake ClientHello, then fragments the real ClientHello | ✅ Yes | Layered firewall paths |
 | `tcp_segmentation` | Writes real ClientHello in tiny TCP segments (no packet interception) | ❌ No | DPI that inspects individual TCP segments |
 
 ---
@@ -331,8 +332,8 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `BYPASS_METHOD` | `string` | `"wrong_seq"` | `wrong_seq`, `wrong_checksum`, `tls_record_frag`, or `tcp_segmentation` |
-| `BYPASS_TIMEOUT_SECS` | `u64` | `2` | Time to wait for bypass ACK before giving up |
+| `BYPASS_METHOD` | `string` | `"wrong_seq"` | `wrong_seq`, `wrong_checksum`, `tls_record_frag`, `wrong_seq_tls_frag`, or `tcp_segmentation` |
+| `BYPASS_TIMEOUT_SECS` | `u64` | `2` | Time to wait for bypass setup before giving up |
 | `RELAY_MAX_LIFETIME_SECS` | `u64` | `0` | Rotate established relays after this many seconds (`0` = disabled/default) |
 | `NFQUEUE_NUM` | `u16` | `1` | (Linux) NFQUEUE queue number |
 
@@ -360,6 +361,8 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | `TLS_RECORD_FRAG_SIZE` | `usize` | `1` | Max payload bytes per TLS record fragment (≥ 1) |
 | `TLS_RECORD_FRAG_SET_PSH` | `bool` | `true` | Set PSH flag on the fragmented packet |
 | `TLS_RECORD_FRAG_BUMP_IP_IDENT` | `bool` | `true` | Bump IPv4 Identification field |
+
+`wrong_seq_tls_frag` uses both the `wrong_seq` and `tls_record_frag` parameter groups.
 
 #### `tcp_segmentation` Parameters
 
@@ -695,6 +698,7 @@ Unit tests cover:
 | Linux service starts then exits | Run `journalctl -u zerodpi.service -f`, check `config.toml`, and confirm `sni_list.txt` / `ip_list.txt` paths are valid relative to the service working directory. |
 | Scan returns no useful candidates | Increase `SCAN_TIMEOUT_SECS`, lower concurrency on weak networks, refresh the candidate list, and verify the CDN or IP range is reachable without ZeroDPI. |
 | TUI is garbled over SSH or systemd | Run with `--no-tui` and rely on logs. |
+| `wrong_seq` works on simple paths but fails on layered firewalls | Try `wrong_seq_tls_frag`; it keeps the fake wrong-sequence stage and fragments the real ClientHello for later DPI layers. |
 | `wrong_seq` or `wrong_checksum` does not work | Try `tls_record_frag`, then `tcp_segmentation`. Different DPI devices fail on different TCP/TLS behaviors. |
 | Connections start but stall | Raise `BYPASS_TIMEOUT_SECS`, reduce `SNI_MAX_CONCURRENT`, and check whether the selected candidate has high TTFB or low speed. |
 | gRPC works after restart but fails after hours | Enable `RESCAN_INTERVAL_SECS` and set `RELAY_MAX_LIFETIME_SECS` to a positive value so long-lived relays reconnect through the latest working target. |

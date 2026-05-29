@@ -51,13 +51,16 @@ pub struct FlowState {
     pub syn_seq: Option<u32>,
     /// Sequence number observed in the server's SYN-ACK. `None` until seen.
     pub syn_ack_seq: Option<u32>,
-    /// True once we've replaced the first outbound bare ACK with the fake
-    /// ClientHello (i.e. the bypass packet has been emitted).
+    /// True once we've replaced the first outbound bare ACK with a fake
+    /// ClientHello.
     pub fake_sent: bool,
     /// True when the active bypass method returned `PassThrough` on the
-    /// handshake-complete ACK and is waiting to intercept the first outbound
-    /// data packet instead (e.g. `tls_record_frag`).
+    /// handshake-complete ACK, or requested a second stage after fake
+    /// injection, and is waiting to intercept the first outbound data packet.
     pub waiting_for_data: bool,
+    /// True once the first outbound data packet has been modified by a
+    /// first-data-stage method.
+    pub first_data_modified: bool,
     /// Final outcome, set when [`Self::notify`] fires.
     pub outcome: Option<BypassOutcome>,
     /// Spoofed TLS ClientHello payload to inject. Built once per flow.
@@ -72,6 +75,7 @@ impl FlowState {
             syn_ack_seq: None,
             fake_sent: false,
             waiting_for_data: false,
+            first_data_modified: false,
             outcome: None,
             fake_data,
         }
@@ -82,6 +86,7 @@ impl FlowState {
 #[derive(Debug)]
 pub struct FlowEntry {
     pub state: Mutex<FlowState>,
+    pub ready_for_data: Notify,
     pub notify: Notify,
 }
 
@@ -89,6 +94,7 @@ impl FlowEntry {
     pub fn new(fake_data: Vec<u8>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(FlowState::new(fake_data)),
+            ready_for_data: Notify::new(),
             notify: Notify::new(),
         })
     }

@@ -1,14 +1,15 @@
 //! tokio-based TCP proxy that drives the bypass:
 //!
-//! For interceptor-based methods (`wrong_seq`, `tls_record_frag`):
+//! For interceptor-based methods (`wrong_seq`, `tls_record_frag`,
+//! `wrong_seq_tls_frag`):
 //! 1. Accept incoming TCP on `LISTEN_HOST:LISTEN_PORT`.
 //! 2. Open an outbound TCP socket bound to the local interface IP.
 //! 3. Build a fake ClientHello and register the flow in the [`FlowTable`].
-//! 4. The platform interceptor observes the handshake and, on the first
-//!    outbound bare ACK, mutates it into the spoofed ClientHello and signals
-//!    the proxy task via the flow's `Notify`.
-//! 5. With a 2 s timeout for that signal, the proxy then runs a normal
-//!    bidirectional copy between the two sockets.
+//! 4. The platform interceptor observes the handshake and either completes the
+//!    fake-packet bypass or asks the proxy to write the first ClientHello while
+//!    the flow is still being intercepted.
+//! 5. Once the bypass completes, the proxy runs a normal bidirectional copy
+//!    between the two sockets.
 //!
 //! For socket-based methods (`tcp_segmentation`):
 //! 1. Accept incoming TCP on `LISTEN_HOST:LISTEN_PORT`.
@@ -130,6 +131,12 @@ struct RelayTiming {
     max_lifetime: Option<Duration>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BypassProgress {
+    ReadyForData,
+    Complete(BypassOutcome),
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -163,6 +170,91 @@ pub fn fresh_fake_client_hello(fake_sni: &[u8]) -> Vec<u8> {
     random32(&mut session_id);
     random32(&mut key_share);
     build_client_hello(&random, &session_id, fake_sni, &key_share)
+}
+
+fn current_bypass_progress(entry: &FlowEntry) -> Option<BypassProgress> {
+    let state = entry.state.lock();
+    if let Some(outcome) = state.outcome {
+        Some(BypassProgress::Complete(outcome))
+    } else if state.waiting_for_data {
+        Some(BypassProgress::ReadyForData)
+    } else {
+        None
+    }
+}
+
+async fn wait_for_initial_bypass_progress(
+    entry: &FlowEntry,
+    timeout: Duration,
+) -> Option<BypassProgress> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(progress) = current_bypass_progress(entry) {
+                return progress;
+            }
+            tokio::select! {
+                _ = entry.notify.notified() => {}
+                _ = entry.ready_for_data.notified() => {}
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+async fn wait_for_bypass_completion(entry: &FlowEntry, timeout: Duration) -> Option<BypassOutcome> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(outcome) = entry.state.lock().outcome {
+                return outcome;
+            }
+            entry.notify.notified().await;
+        }
+    })
+    .await
+    .ok()
+}
+
+fn finish_bypass_or_error(
+    entry: &FlowEntry,
+    event_tx: &Option<ProxyEventSender>,
+    src_port: u16,
+    outcome: Option<BypassOutcome>,
+    timeout_error: &'static str,
+) -> anyhow::Result<()> {
+    match outcome {
+        Some(BypassOutcome::FakeDataAcked) => {
+            emit(
+                event_tx,
+                ProxyEvent::BypassComplete {
+                    src_port,
+                    outcome: BypassOutcome::FakeDataAcked,
+                },
+            );
+            Ok(())
+        }
+        Some(BypassOutcome::UnexpectedClose) => {
+            emit(
+                event_tx,
+                ProxyEvent::BypassComplete {
+                    src_port,
+                    outcome: BypassOutcome::UnexpectedClose,
+                },
+            );
+            anyhow::bail!("interceptor closed the flow");
+        }
+        None => {
+            entry.finish(BypassOutcome::UnexpectedClose);
+            emit(
+                event_tx,
+                ProxyEvent::BypassComplete {
+                    src_port,
+                    outcome: BypassOutcome::UnexpectedClose,
+                },
+            );
+            anyhow::bail!(timeout_error);
+        }
+    }
 }
 
 /// A tiny inline RNG so we don't pull in the `rand` crate just for 96 bytes
@@ -277,7 +369,7 @@ async fn handle_connection(
     interface_ip: Ipv4Addr,
     target: ActiveSniTarget,
     flows: FlowTable,
-    incoming: TcpStream,
+    mut incoming: TcpStream,
     peer: SocketAddr,
     event_tx: Option<ProxyEventSender>,
     relay_timing: RelayTiming,
@@ -312,7 +404,7 @@ async fn handle_connection(
 
     // Connect: while this is happening, the kernel emits SYN, receives SYN-ACK,
     // and sends the bare ACK that the interceptor will rewrite.
-    let outgoing = match socket
+    let mut outgoing = match socket
         .connect(SocketAddr::from((connect_ip, connect_port)))
         .await
     {
@@ -330,42 +422,88 @@ async fn handle_connection(
         }
     };
 
-    // Wait (with timeout) for the interceptor to finish the bypass.
-    let waited = tokio::time::timeout(relay_timing.bypass_timeout, entry.notify.notified()).await;
-    let outcome = entry.state.lock().outcome;
-    match (waited, outcome) {
-        (Ok(()), Some(BypassOutcome::FakeDataAcked)) => {
-            debug!(?key, "bypass complete");
-            emit(
+    // Wait until the interceptor either completes a fake-packet bypass or asks
+    // us to send the first real ClientHello while the flow is still tracked.
+    match wait_for_initial_bypass_progress(&entry, relay_timing.bypass_timeout).await {
+        Some(BypassProgress::Complete(outcome)) => {
+            finish_bypass_or_error(
+                &entry,
                 &event_tx,
-                ProxyEvent::BypassComplete {
-                    src_port,
-                    outcome: BypassOutcome::FakeDataAcked,
-                },
-            );
+                src_port,
+                Some(outcome),
+                "bypass timed out",
+            )?;
         }
-        (Ok(()), Some(BypassOutcome::UnexpectedClose)) => {
-            emit(
+        Some(BypassProgress::ReadyForData) => {
+            let client_hello = match tokio::time::timeout(
+                relay_timing.bypass_timeout,
+                read_one_tls_record(&mut incoming),
+            )
+            .await
+            {
+                Ok(Ok(record)) => record,
+                Ok(Err(e)) => {
+                    entry.finish(BypassOutcome::UnexpectedClose);
+                    emit(
+                        &event_tx,
+                        ProxyEvent::BypassComplete {
+                            src_port,
+                            outcome: BypassOutcome::UnexpectedClose,
+                        },
+                    );
+                    return Err(e).context("reading ClientHello from client");
+                }
+                Err(_) => {
+                    entry.finish(BypassOutcome::UnexpectedClose);
+                    emit(
+                        &event_tx,
+                        ProxyEvent::BypassComplete {
+                            src_port,
+                            outcome: BypassOutcome::UnexpectedClose,
+                        },
+                    );
+                    anyhow::bail!("timed out reading ClientHello from client");
+                }
+            };
+
+            if let Err(e) = outgoing.write_all(&client_hello).await {
+                entry.finish(BypassOutcome::UnexpectedClose);
+                emit(
+                    &event_tx,
+                    ProxyEvent::BypassComplete {
+                        src_port,
+                        outcome: BypassOutcome::UnexpectedClose,
+                    },
+                );
+                return Err(e).context("writing ClientHello to upstream");
+            }
+            if let Err(e) = outgoing.flush().await {
+                entry.finish(BypassOutcome::UnexpectedClose);
+                emit(
+                    &event_tx,
+                    ProxyEvent::BypassComplete {
+                        src_port,
+                        outcome: BypassOutcome::UnexpectedClose,
+                    },
+                );
+                return Err(e).context("flushing ClientHello to upstream");
+            }
+
+            let outcome = wait_for_bypass_completion(&entry, relay_timing.bypass_timeout).await;
+            finish_bypass_or_error(
+                &entry,
                 &event_tx,
-                ProxyEvent::BypassComplete {
-                    src_port,
-                    outcome: BypassOutcome::UnexpectedClose,
-                },
-            );
-            anyhow::bail!("interceptor closed the flow");
+                src_port,
+                outcome,
+                "first data bypass timed out",
+            )?;
         }
-        _ => {
-            entry.finish(BypassOutcome::UnexpectedClose);
-            emit(
-                &event_tx,
-                ProxyEvent::BypassComplete {
-                    src_port,
-                    outcome: BypassOutcome::UnexpectedClose,
-                },
-            );
-            anyhow::bail!("bypass timed out");
+        None => {
+            finish_bypass_or_error(&entry, &event_tx, src_port, None, "bypass timed out")?;
         }
     }
+
+    debug!(?key, "bypass complete");
 
     // Release the flow before relaying so any further packets pass through.
     drop(cleanup);

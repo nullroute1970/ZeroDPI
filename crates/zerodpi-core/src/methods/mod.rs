@@ -9,10 +9,11 @@
 //! They implement the [`BypassMethod`] trait and are driven by two hooks:
 //!
 //! - [`BypassMethod::on_handshake_complete_ack`] — fires on the first outbound
-//!   bare ACK after the TCP handshake.  `wrong_seq` and `wrong_checksum` act
-//!   here (fake injection).
+//!   bare ACK after the TCP handshake.  `wrong_seq`, `wrong_checksum`, and the
+//!   first stage of `wrong_seq_tls_frag` act here (fake injection).
 //! - [`BypassMethod::on_first_data_packet`] — fires on the first outbound
-//!   data packet.  `tls_record_frag` acts here (TLS record fragmentation).
+//!   data packet.  `tls_record_frag` and the second stage of
+//!   `wrong_seq_tls_frag` act here (TLS record fragmentation).
 //!
 //! ## Socket-based methods
 //!
@@ -31,6 +32,7 @@ pub mod tcp_segmentation;
 pub mod tls_record_frag;
 pub mod wrong_checksum;
 pub mod wrong_seq;
+pub mod wrong_seq_tls_frag;
 
 use crate::config::Config;
 use crate::flow::FlowState;
@@ -43,8 +45,12 @@ pub enum MethodAction {
     ///
     /// `complete_immediately = false` keeps monitoring until an inbound ACK
     /// confirms the fake packet path. `true` signals bypass completion as soon
-    /// as the modified packet is emitted.
-    EmitFakeAndAccept { complete_immediately: bool },
+    /// as the modified packet is emitted. `continue_with_data = true` keeps
+    /// monitoring for a first outbound data packet after this modified packet.
+    EmitFakeAndAccept {
+        complete_immediately: bool,
+        continue_with_data: bool,
+    },
     /// Forward unchanged.
     PassThrough,
 }
@@ -53,12 +59,21 @@ impl MethodAction {
     pub const fn emit_and_wait_for_ack() -> Self {
         Self::EmitFakeAndAccept {
             complete_immediately: false,
+            continue_with_data: false,
         }
     }
 
     pub const fn emit_and_complete() -> Self {
         Self::EmitFakeAndAccept {
             complete_immediately: true,
+            continue_with_data: false,
+        }
+    }
+
+    pub const fn emit_and_wait_for_data() -> Self {
+        Self::EmitFakeAndAccept {
+            complete_immediately: false,
+            continue_with_data: true,
         }
     }
 }
@@ -99,14 +114,16 @@ pub trait BypassMethod: Send + Sync + 'static {
 /// Build an interceptor-based method from the application config.
 ///
 /// Returns `Some(method)` for interceptor-based methods (`wrong_seq`,
-/// `wrong_checksum`, `tls_record_frag`) and `None` for socket-based methods
-/// (`tcp_segmentation`) or unknown names.  Callers should validate the method name via
-/// [`crate::config::Config::validate`] before calling this function.
+/// `wrong_checksum`, `tls_record_frag`, `wrong_seq_tls_frag`) and `None` for
+/// socket-based methods (`tcp_segmentation`) or unknown names.  Callers should
+/// validate the method name via [`crate::config::Config::validate`] before
+/// calling this function.
 pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
     match cfg.BYPASS_METHOD.as_str() {
         "wrong_seq" => Some(Box::new(wrong_seq::WrongSeq::new(cfg))),
         "wrong_checksum" => Some(Box::new(wrong_checksum::WrongChecksum::new(cfg))),
         "tls_record_frag" => Some(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
+        "wrong_seq_tls_frag" => Some(Box::new(wrong_seq_tls_frag::WrongSeqTlsFrag::new(cfg))),
         // "tcp_segmentation" is socket-based and handled directly in proxy.rs.
         _ => None,
     }
@@ -130,6 +147,13 @@ mod tests {
         let cfg = cfg_with_method("wrong_checksum");
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "wrong_checksum");
+    }
+
+    #[test]
+    fn build_wrong_seq_tls_frag_method() {
+        let cfg = cfg_with_method("wrong_seq_tls_frag");
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "wrong_seq_tls_frag");
     }
 
     #[test]

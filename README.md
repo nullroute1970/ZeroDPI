@@ -96,11 +96,15 @@ For service deployments, combine `AUTO_SELECT = true` with `--no-tui` so the pro
 
 ```
 📦 zerodpi/
+├── 📁 .cargo/                  # Cargo environment (WINDIVERT_PATH)
+├── 📁 .github/
+│   └── 📁 workflows/           # GitHub Actions release pipeline
 ├── 📁 crates/
 │   ├── 📁 zerodpi-core/        # Platform-independent: config, TLS templates,
 │   │                           #   flow tracking, bypass methods, scanners
 │   ├── 📁 zerodpi-platform/    # Packet interception: WinDivert (win), NFQUEUE (nix)
 │   └── 📁 zerodpi/             # CLI binary + ratatui TUI
+├── 📄 AGENTS.md                # Contributor/AI agent guidelines
 ├── 📄 config.toml              # Configuration file
 ├── 📄 sni_list.txt             # Decoy CDN hostnames (sni_spoof mode)
 ├── 📄 ip_list.txt              # Relay IPs / CIDR ranges (ip_bypass mode)
@@ -447,8 +451,8 @@ Options:
       --rescan-interval <SECS>         Override RESCAN_INTERVAL_SECS
       --sni-switch-min-score <SCORE>   Override SNI_SWITCH_MIN_SCORE
       --wrong-seq-extra-offset <N>     Override WRONG_SEQ_EXTRA_OFFSET
-      --wrong-seq-no-psh               Clear PSH flag (wrong_seq)
-      --wrong-seq-no-bump-ident        Skip IPv4 ID bump (wrong_seq)
+      --wrong-seq-no-psh               Clear PSH flag (sets WRONG_SEQ_SET_PSH=false)
+      --wrong-seq-no-bump-ident        Skip IPv4 ID bump (sets WRONG_SEQ_BUMP_IP_IDENT=false)
       --bypass-timeout <SECS>          Override BYPASS_TIMEOUT_SECS
       --relay-max-lifetime <SECS>      Override RELAY_MAX_LIFETIME_SECS
   -h, --help                           Print help
@@ -638,6 +642,8 @@ On Android, `tcp_segmentation` is the simplest method to try first because it do
 ---
 
 ## 🔨 Building from Source
+
+Requires **Rust 1.75+** (MSRV). The workspace targets the 2021 edition.
 
 ```sh
 cargo build --release

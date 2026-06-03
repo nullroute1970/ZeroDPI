@@ -19,6 +19,8 @@ jobs:
       prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Prepare release metadata
         id: meta
@@ -52,6 +54,61 @@ jobs:
             echo "release_name=$release_name"
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(python3 - <<'PY'
+          import tomllib
+
+          with open("Cargo.toml", "rb") as cargo_toml:
+              manifest = tomllib.load(cargo_toml)
+
+          print(manifest["workspace"]["package"]["version"])
+          PY
+          )"
+
+          repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          current_sha="$(git rev-parse HEAD)"
+          current_short_sha="$(git rev-parse --short=12 HEAD)"
+          previous_tag="$(git tag --merged HEAD --sort=-creatordate | head -n 1 || true)"
+
+          {
+            echo "## Changes"
+            echo
+            echo "- Version: \`$version\`"
+            echo "- Commit: [\`$current_short_sha\`]($repo_url/commit/$current_sha)"
+
+            if [[ -n "$previous_tag" ]]; then
+              echo "- Previous release: [$previous_tag]($repo_url/releases/tag/$previous_tag)"
+              echo "- Compare: [$previous_tag...$current_short_sha]($repo_url/compare/$previous_tag...$current_sha)"
+              range="$previous_tag..HEAD"
+            else
+              echo "- Previous release: none"
+              range="HEAD"
+            fi
+
+            echo
+            echo "### Commits"
+            echo
+
+            if [[ "$(git rev-list --count "$range")" == "0" ]]; then
+              echo "- No commits since \`$previous_tag\`."
+            else
+              git log --pretty=format:'%H%x09%h%x09%s' "$range" |
+                while IFS=$'\t' read -r full_sha short_sha subject; do
+                  printf -- "- %s ([%s](%s/commit/%s))\n" "$subject" "$short_sha" "$repo_url" "$full_sha"
+                done
+            fi
+          } > release-notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
 
   linux:
     runs-on: ubuntu-latest
@@ -147,13 +204,17 @@ jobs:
         with:
           path: dist
 
+      - name: Show release changes
+        run: cat dist/release-notes/release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
           name: ${{ needs.prepare.outputs.release_name }}
           prerelease: ${{ needs.prepare.outputs.prerelease }}
-          generate_release_notes: true
+          body_path: dist/release-notes/release-notes.md
           files: |
             dist/zerodpi-linux-x86_64/zerodpi-linux-x86_64.tar.gz
             dist/zerodpi-windows-x86_64/zerodpi-windows-x86_64.zip

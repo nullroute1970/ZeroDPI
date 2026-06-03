@@ -1144,11 +1144,11 @@ fn draw_dashboard(
         frame.render_widget(header, chunks[0]);
 
         // ── Stats bar ────────────────────────────────────────────────────────
-        let ok_pct = if state.total > 0 {
-            format!("({}%)", state.bypasses_ok * 100 / state.total)
-        } else {
-            String::new()
-        };
+        let ok_pct = state
+            .bypasses_ok
+            .saturating_mul(100)
+            .checked_div(state.total)
+            .map_or_else(String::new, |pct| format!("({pct}%)"));
         // Aggregate instantaneous throughput from all relaying connections.
         let agg_c2s_bps: f64 = state
             .records

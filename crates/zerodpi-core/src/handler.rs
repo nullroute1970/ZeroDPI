@@ -177,6 +177,11 @@ impl PacketHandler for Handler {
                             );
                             return Verdict::Accept;
                         }
+                        MethodAction::CompleteAndAccept => {
+                            drop(state);
+                            entry.finish(BypassOutcome::FakeDataAcked);
+                            return Verdict::Accept;
+                        }
                     }
                 }
                 // First outbound data packet when method deferred to this stage.
@@ -198,6 +203,13 @@ impl PacketHandler for Handler {
                                 entry.finish(BypassOutcome::FakeDataAcked);
                             }
                             return Verdict::AcceptModified;
+                        }
+                        MethodAction::CompleteAndAccept => {
+                            state.first_data_modified = true;
+                            state.waiting_for_data = false;
+                            drop(state);
+                            entry.finish(BypassOutcome::FakeDataAcked);
+                            return Verdict::Accept;
                         }
                         MethodAction::PassThrough => return Verdict::Accept,
                     }
@@ -283,6 +295,7 @@ mod tests {
     use crate::methods::wrong_checksum::WrongChecksum;
     use crate::methods::wrong_seq::WrongSeq;
     use crate::methods::wrong_seq_tls_frag::WrongSeqTlsFrag;
+    use crate::methods::wrong_seq_tls_record_frag::WrongSeqTlsRecordFrag;
 
     fn default_cfg() -> Config {
         toml::from_str(
@@ -304,6 +317,17 @@ mod tests {
         } else {
             Box::leak(vec![0u8; payload_len].into_boxed_slice())
         };
+        pkt_with_payload(direction, flags, seq, ack, payload)
+    }
+
+    fn pkt_with_payload(
+        direction: Direction,
+        flags: TcpFlags,
+        seq: u32,
+        ack: u32,
+        payload: &'static [u8],
+    ) -> PacketView<'static> {
+        let payload_len = payload.len();
         PacketView {
             direction,
             src_ip: if direction == Direction::Outbound {
@@ -337,6 +361,12 @@ mod tests {
             bump_ipv4_ident: false,
             corrupt_tcp_checksum_delta: None,
         }
+    }
+
+    fn tls_record(body: &[u8]) -> &'static [u8] {
+        let mut record = vec![0x16, 0x03, 0x03, (body.len() >> 8) as u8, body.len() as u8];
+        record.extend_from_slice(body);
+        Box::leak(record.into_boxed_slice())
     }
 
     #[test]
@@ -547,7 +577,7 @@ mod tests {
         assert!(entry.state.lock().waiting_for_data);
         assert!(entry.state.lock().outcome.is_none());
 
-        let mut p = pkt(
+        let mut p = pkt_with_payload(
             Direction::Outbound,
             TcpFlags {
                 ack: true,
@@ -556,7 +586,7 @@ mod tests {
             },
             1001,
             5001,
-            3,
+            tls_record(&[0x01, 0x02, 0x03]),
         );
         assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
         assert_eq!(p.new_payload.as_ref().unwrap().len(), 18);
@@ -567,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_seq_tls_frag_accepts_post_fake_ack_then_fragments_data() {
+    fn wrong_seq_tls_frag_accepts_post_fake_ack_then_completes_on_tcp_segmented_data() {
         let flows = new_flow_table();
         let key = FlowKey {
             src_ip: Ipv4Addr::new(10, 0, 0, 1),
@@ -637,7 +667,7 @@ mod tests {
         assert!(entry.state.lock().waiting_for_data);
         assert!(entry.state.lock().outcome.is_none());
 
-        let mut p = pkt(
+        let mut p = pkt_with_payload(
             Direction::Outbound,
             TcpFlags {
                 ack: true,
@@ -646,7 +676,99 @@ mod tests {
             },
             1001,
             5001,
-            3,
+            tls_record(&[0x01, 0x02, 0x03]),
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+        assert!(p.new_payload.is_none());
+        assert!(p.new_flags.is_none());
+        assert_eq!(
+            entry.state.lock().outcome,
+            Some(BypassOutcome::FakeDataAcked)
+        );
+        assert!(!entry.state.lock().monitor);
+    }
+
+    #[test]
+    fn wrong_seq_tls_record_frag_accepts_post_fake_ack_then_fragments_data() {
+        let flows = new_flow_table();
+        let key = FlowKey {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            dst_port: 443,
+        };
+        let entry = FlowEntry::new(vec![0xAA; 517]);
+        flows.insert(key, entry.clone());
+
+        let mut cfg = default_cfg();
+        cfg.BYPASS_METHOD = "wrong_seq_tls_record_frag".into();
+        let mut h = Handler::new(flows, Arc::new(WrongSeqTlsRecordFrag::new(&cfg)));
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            1000,
+            0,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                syn: true,
+                ack: true,
+                ..Default::default()
+            },
+            5000,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
+        assert_eq!(p.new_seq, Some(1001u32.wrapping_sub(517)));
+        assert!(entry.state.lock().fake_sent);
+        assert!(entry.state.lock().waiting_for_data);
+        assert!(entry.state.lock().outcome.is_none());
+
+        let mut p = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            5001,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+        assert!(entry.state.lock().waiting_for_data);
+        assert!(entry.state.lock().outcome.is_none());
+
+        let mut p = pkt_with_payload(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            tls_record(&[0x01, 0x02, 0x03]),
         );
         assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
         assert_eq!(p.new_payload.as_ref().unwrap().len(), 18);

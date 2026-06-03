@@ -11,11 +11,11 @@
 //! non-TLS or pass it through.
 //!
 //! This method intercepts the first outbound *data* packet (the real
-//! ClientHello), splits its payload into chunks of at most
-//! `TLS_RECORD_FRAG_SIZE` bytes, wraps each chunk in a new TLS record header,
-//! and stages the concatenated result as the replacement payload.  The
-//! upstream server receives all fragments in order and reassembles them
-//! identically to an unfragmented ClientHello.
+//! ClientHello), parses the TLS record header, splits the record body into
+//! chunks of at most `TLS_RECORD_FRAG_SIZE` bytes, wraps each body chunk in a
+//! new TLS record header, and stages the concatenated result as the
+//! replacement payload.  The upstream server receives all fragments in order
+//! and reassembles them identically to an unfragmented ClientHello.
 //!
 //! Because no fake packet is injected, the bypass is signalled complete
 //! immediately after the fragmented packet is emitted — no inbound ACK
@@ -25,7 +25,7 @@
 //!
 //! | Key | Type | Default | Description |
 //! |-----|------|---------|-------------|
-//! | `TLS_RECORD_FRAG_SIZE` | `usize` | `1` | Max payload bytes per TLS record. |
+//! | `TLS_RECORD_FRAG_SIZE` | `usize` | `1` | Max body bytes per TLS record. |
 //! | `TLS_RECORD_FRAG_SET_PSH` | `bool` | `true` | Set PSH on the modified packet. |
 //! | `TLS_RECORD_FRAG_BUMP_IP_IDENT` | `bool` | `true` | Increment IPv4 ID. |
 
@@ -35,6 +35,8 @@ use super::{BypassMethod, MethodAction};
 use crate::config::Config;
 use crate::flow::FlowState;
 use crate::interceptor::PacketView;
+
+const TLS_RECORD_HEADER_LEN: usize = 5;
 
 pub struct TlsRecordFrag {
     /// Maximum bytes of payload placed in each TLS record fragment.
@@ -76,7 +78,15 @@ impl BypassMethod for TlsRecordFrag {
     /// Fragments the packet payload into multiple TLS records and stages the
     /// result, then returns `EmitFakeAndAccept` to signal bypass completion.
     fn on_first_data_packet(&self, _flow: &FlowState, pkt: &mut PacketView<'_>) -> MethodAction {
-        let fragmented = fragment_payload(pkt.payload, self.frag_size);
+        let Some(fragmented) = fragment_payload(pkt.payload, self.frag_size) else {
+            trace!(
+                target = "zerodpi::tls_record_frag",
+                frag_size = self.frag_size,
+                orig_len = pkt.payload_len,
+                "first data packet is not a complete TLS record; passing through"
+            );
+            return MethodAction::complete_and_accept();
+        };
 
         let mut flags = pkt.flags;
         flags.psh = self.set_psh;
@@ -98,41 +108,56 @@ impl BypassMethod for TlsRecordFrag {
     }
 }
 
-/// Split `data` into TLS records of at most `frag_size` payload bytes each.
+/// Split one or more complete TLS records into smaller TLS records.
 ///
-/// Each fragment is wrapped with a 5-byte TLS record header:
-/// `[content_type][0x03][0x01][len_hi][len_lo]`
-///
-/// The `content_type` byte is taken from `data[0]` (preserving whatever
-/// record type the caller sent: `0x16` for Handshake, `0x17` for
-/// ApplicationData, etc.).  If `data` is empty, an empty `Vec` is returned.
+/// The input must be a sequence of complete TLS records.  For each record, the
+/// TLS content type and legacy version bytes are preserved, and only the
+/// record body is split into chunks of at most `frag_size` bytes.  If the input
+/// is empty, an empty `Vec` is returned.  If any record header or body is
+/// incomplete, `None` is returned so the caller can pass the packet through
+/// unchanged.
 ///
 /// # Panics
 /// Panics if `frag_size == 0`.
-pub fn fragment_payload(data: &[u8], frag_size: usize) -> Vec<u8> {
+pub fn fragment_payload(data: &[u8], frag_size: usize) -> Option<Vec<u8>> {
     assert!(frag_size > 0, "frag_size must be >= 1");
     if data.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
-    // Content-type byte from the first byte of the original data.
-    let content_type = data[0];
+    let mut out = Vec::with_capacity(data.len());
+    let mut offset = 0usize;
 
-    let num_frags = data.len().div_ceil(frag_size);
-    // 5 header bytes per fragment + original data length.
-    let capacity = 5 * num_frags + data.len();
-    let mut out = Vec::with_capacity(capacity);
+    while offset < data.len() {
+        if data.len() - offset < TLS_RECORD_HEADER_LEN {
+            return None;
+        }
 
-    for chunk in data.chunks(frag_size) {
-        let len = chunk.len() as u16;
-        out.push(content_type);
-        out.push(0x03); // TLS major version
-        out.push(0x01); // TLS minor version (TLS 1.0 record layer)
-        out.push((len >> 8) as u8);
-        out.push(len as u8);
-        out.extend_from_slice(chunk);
+        let header = &data[offset..offset + TLS_RECORD_HEADER_LEN];
+        let body_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+        let body_start = offset + TLS_RECORD_HEADER_LEN;
+        let body_end = body_start.checked_add(body_len)?;
+        if body_end > data.len() {
+            return None;
+        }
+
+        let body = &data[body_start..body_end];
+        if body.is_empty() {
+            out.extend_from_slice(header);
+        } else {
+            for chunk in body.chunks(frag_size) {
+                let len = chunk.len() as u16;
+                out.extend_from_slice(&header[..3]);
+                out.push((len >> 8) as u8);
+                out.push(len as u8);
+                out.extend_from_slice(chunk);
+            }
+        }
+
+        offset = body_end;
     }
-    out
+
+    Some(out)
 }
 
 #[cfg(test)]
@@ -180,77 +205,154 @@ mod tests {
     // fragment_payload unit tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn empty_data_returns_empty() {
-        assert!(fragment_payload(&[], 1).is_empty());
+    fn make_tls_record(content_type: u8, version: [u8; 2], body: &[u8]) -> Vec<u8> {
+        let body_len = body.len();
+        let mut record = vec![
+            content_type,
+            version[0],
+            version[1],
+            (body_len >> 8) as u8,
+            body_len as u8,
+        ];
+        record.extend_from_slice(body);
+        record
+    }
+
+    fn reassembled_body(records: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut offset = 0usize;
+        while offset < records.len() {
+            let len = u16::from_be_bytes([records[offset + 3], records[offset + 4]]) as usize;
+            body.extend_from_slice(&records[offset + 5..offset + 5 + len]);
+            offset += TLS_RECORD_HEADER_LEN + len;
+        }
+        body
     }
 
     #[test]
-    fn single_byte_frag_size_produces_one_record_per_byte() {
-        // 3 bytes of payload → 3 records, each with a 5-byte header.
-        let data = vec![0x16u8, 0xAA, 0xBB];
-        let out = fragment_payload(&data, 1);
-        assert_eq!(out.len(), 3 * 6); // 5-byte header + 1-byte chunk × 3
-                                      // First record
+    fn empty_data_returns_empty() {
+        assert_eq!(fragment_payload(&[], 1), Some(Vec::new()));
+    }
+
+    #[test]
+    fn single_byte_frag_size_produces_one_record_per_body_byte() {
+        let body = [0x01, 0xAA, 0xBB];
+        let data = make_tls_record(0x16, [0x03, 0x03], &body);
+        let out = fragment_payload(&data, 1).unwrap();
+
+        assert_eq!(out.len(), body.len() * (TLS_RECORD_HEADER_LEN + 1));
         assert_eq!(out[0], 0x16); // content_type preserved
         assert_eq!(out[1], 0x03);
-        assert_eq!(out[2], 0x01);
+        assert_eq!(out[2], 0x03);
         assert_eq!(&out[3..5], &[0x00, 0x01]); // length = 1
-        assert_eq!(out[5], 0x16); // payload byte
-                                  // Second record
+        assert_eq!(out[5], 0x01); // first ClientHello body byte
         assert_eq!(out[6], 0x16);
         assert_eq!(&out[9..11], &[0x00, 0x01]);
         assert_eq!(out[11], 0xAA);
+        assert_eq!(reassembled_body(&out), body.to_vec());
     }
 
     #[test]
-    fn frag_size_larger_than_data_produces_one_record() {
-        let data = vec![0x16u8; 10];
-        let out = fragment_payload(&data, 100);
-        // 1 record: 5-byte header + 10 payload bytes
-        assert_eq!(out.len(), 15);
+    fn frag_size_larger_than_body_produces_one_record() {
+        let body = [0xA5; 10];
+        let data = make_tls_record(0x16, [0x03, 0x03], &body);
+        let out = fragment_payload(&data, 100).unwrap();
+
+        assert_eq!(out.len(), TLS_RECORD_HEADER_LEN + body.len());
         assert_eq!(out[0], 0x16);
+        assert_eq!(out[1], 0x03);
+        assert_eq!(out[2], 0x03);
         assert_eq!(&out[3..5], &[0x00, 0x0A]); // length = 10
+        assert_eq!(reassembled_body(&out), body.to_vec());
     }
 
     #[test]
-    fn frag_size_exactly_divides_data() {
-        // 6 bytes, frag_size=2 → 3 records of 2 bytes each.
-        let data = vec![0x17u8, 1, 2, 3, 4, 5];
-        let out = fragment_payload(&data, 2);
+    fn frag_size_exactly_divides_body() {
+        let body = [1, 2, 3, 4, 5, 6];
+        let data = make_tls_record(0x17, [0x03, 0x04], &body);
+        let out = fragment_payload(&data, 2).unwrap();
+
         assert_eq!(out.len(), 3 * 7); // 5 header + 2 payload × 3
         for i in 0..3 {
             let off = i * 7;
             assert_eq!(out[off], 0x17);
+            assert_eq!(out[off + 1], 0x03);
+            assert_eq!(out[off + 2], 0x04);
             assert_eq!(&out[off + 3..off + 5], &[0x00, 0x02]);
         }
+        assert_eq!(reassembled_body(&out), body.to_vec());
     }
 
     #[test]
     fn frag_size_does_not_divide_evenly() {
-        // 7 bytes, frag_size=3 → 2 records of 3 + 1 record of 1.
-        let data = vec![0x16u8; 7];
-        let out = fragment_payload(&data, 3);
+        let body = [0x16; 7];
+        let data = make_tls_record(0x16, [0x03, 0x03], &body);
+        let out = fragment_payload(&data, 3).unwrap();
+
         // (5+3) + (5+3) + (5+1) = 22
         assert_eq!(out.len(), 22);
         // Last record starts at byte 16: 2 × (5-hdr + 3-payload) = 16.
         // Its length field is at offset 16+3 = 19.
         let last_hdr_off = (5 + 3) * 2; // = 16
         assert_eq!(&out[last_hdr_off + 3..last_hdr_off + 5], &[0x00, 0x01]);
+        assert_eq!(reassembled_body(&out), body.to_vec());
     }
 
     #[test]
-    fn content_type_is_preserved_from_first_byte() {
-        let mut data = vec![0x17u8]; // ApplicationData type
-        data.extend_from_slice(&[0u8; 10]);
-        let out = fragment_payload(&data, 4);
-        for chunk_idx in 0..out.len() / 9 {
-            assert_eq!(
-                out[chunk_idx * 9],
-                0x17,
-                "content_type mismatch in fragment {chunk_idx}"
-            );
+    fn content_type_and_version_are_preserved() {
+        let body = [0xAB; 10];
+        let data = make_tls_record(0x17, [0x03, 0x04], &body);
+        let out = fragment_payload(&data, 4).unwrap();
+
+        let mut offset = 0usize;
+        while offset < out.len() {
+            assert_eq!(out[offset], 0x17);
+            assert_eq!(out[offset + 1], 0x03);
+            assert_eq!(out[offset + 2], 0x04);
+            let len = u16::from_be_bytes([out[offset + 3], out[offset + 4]]) as usize;
+            offset += TLS_RECORD_HEADER_LEN + len;
         }
+    }
+
+    #[test]
+    fn multiple_complete_records_are_fragmented_independently() {
+        let first_body = [0x01, 0x02, 0x03];
+        let second_body = [0xAA, 0xBB];
+        let mut data = make_tls_record(0x16, [0x03, 0x03], &first_body);
+        data.extend_from_slice(&make_tls_record(0x17, [0x03, 0x03], &second_body));
+
+        let out = fragment_payload(&data, 2).unwrap();
+
+        assert_eq!(
+            reassembled_body(&out),
+            [first_body.as_slice(), second_body.as_slice()].concat()
+        );
+        assert_eq!(out[0], 0x16);
+        let first_record_end = TLS_RECORD_HEADER_LEN + 2;
+        let second_fragment_off = first_record_end;
+        assert_eq!(out[second_fragment_off], 0x16);
+        let third_fragment_off = second_fragment_off + TLS_RECORD_HEADER_LEN + 1;
+        assert_eq!(out[third_fragment_off], 0x17);
+    }
+
+    #[test]
+    fn incomplete_header_returns_none() {
+        assert_eq!(fragment_payload(&[0x16, 0x03, 0x03], 1), None);
+    }
+
+    #[test]
+    fn incomplete_body_returns_none() {
+        let mut data = make_tls_record(0x16, [0x03, 0x03], &[0x01, 0x02, 0x03]);
+        data.truncate(data.len() - 1);
+
+        assert_eq!(fragment_payload(&data, 1), None);
+    }
+
+    #[test]
+    fn zero_length_record_is_preserved() {
+        let data = make_tls_record(0x16, [0x03, 0x03], &[]);
+
+        assert_eq!(fragment_payload(&data, 1).unwrap(), data);
     }
 
     // -----------------------------------------------------------------------
@@ -273,23 +375,25 @@ mod tests {
         let method = TlsRecordFrag::new(&cfg);
         let state = FlowState::new(vec![]);
 
-        let payload = vec![0x16u8; 12]; // 12 bytes of fake ClientHello
+        let body = vec![0x01u8; 12]; // fake ClientHello body
+        let payload = make_tls_record(0x16, [0x03, 0x03], &body);
         let mut pkt = data_pkt(&payload);
         let action = method.on_first_data_packet(&state, &mut pkt);
 
         assert_eq!(action, MethodAction::emit_and_complete());
         let new_payload = pkt.new_payload.as_ref().unwrap();
-        // 12 bytes → 12 records of 1 byte each, each with 5-byte header → 72 bytes
-        assert_eq!(new_payload.len(), 12 * 6);
+        // 12 body bytes → 12 records of 1 byte each, each with 5-byte header.
+        assert_eq!(new_payload.len(), body.len() * (TLS_RECORD_HEADER_LEN + 1));
         // Verify each record header
-        for i in 0..12 {
+        for i in 0..body.len() {
             let off = i * 6;
             assert_eq!(new_payload[off], 0x16);
             assert_eq!(new_payload[off + 1], 0x03);
-            assert_eq!(new_payload[off + 2], 0x01);
+            assert_eq!(new_payload[off + 2], 0x03);
             assert_eq!(&new_payload[off + 3..off + 5], &[0x00, 0x01]);
-            assert_eq!(new_payload[off + 5], 0x16);
+            assert_eq!(new_payload[off + 5], 0x01);
         }
+        assert_eq!(reassembled_body(new_payload), body);
         assert!(pkt.new_flags.unwrap().psh); // default SET_PSH = true
         assert!(pkt.bump_ipv4_ident); // default BUMP_IP_IDENT = true
     }
@@ -301,8 +405,8 @@ mod tests {
         let method = TlsRecordFrag::new(&cfg);
         let state = FlowState::new(vec![]);
 
-        // 10-byte payload → 2 records of 5 bytes each
-        let payload = vec![0x16u8; 10];
+        // 10-byte body → 2 records of 5 bytes each.
+        let payload = make_tls_record(0x16, [0x03, 0x03], &[0x01; 10]);
         let mut pkt = data_pkt(&payload);
         method.on_first_data_packet(&state, &mut pkt);
         let new_payload = pkt.new_payload.unwrap();
@@ -315,7 +419,7 @@ mod tests {
         cfg.TLS_RECORD_FRAG_SET_PSH = false;
         let method = TlsRecordFrag::new(&cfg);
         let state = FlowState::new(vec![]);
-        let payload = vec![0x16u8; 4];
+        let payload = make_tls_record(0x16, [0x03, 0x03], &[0x01; 4]);
         let mut pkt = data_pkt(&payload);
         method.on_first_data_packet(&state, &mut pkt);
         assert!(!pkt.new_flags.unwrap().psh);
@@ -327,9 +431,25 @@ mod tests {
         cfg.TLS_RECORD_FRAG_BUMP_IP_IDENT = false;
         let method = TlsRecordFrag::new(&cfg);
         let state = FlowState::new(vec![]);
-        let payload = vec![0x16u8; 4];
+        let payload = make_tls_record(0x16, [0x03, 0x03], &[0x01; 4]);
         let mut pkt = data_pkt(&payload);
         method.on_first_data_packet(&state, &mut pkt);
+        assert!(!pkt.bump_ipv4_ident);
+    }
+
+    #[test]
+    fn malformed_first_data_packet_completes_without_rewrite() {
+        let cfg = default_cfg();
+        let method = TlsRecordFrag::new(&cfg);
+        let state = FlowState::new(vec![]);
+        let payload = [0x16, 0x03, 0x03];
+        let mut pkt = data_pkt(&payload);
+
+        let action = method.on_first_data_packet(&state, &mut pkt);
+
+        assert_eq!(action, MethodAction::complete_and_accept());
+        assert!(pkt.new_payload.is_none());
+        assert!(pkt.new_flags.is_none());
         assert!(!pkt.bump_ipv4_ident);
     }
 }

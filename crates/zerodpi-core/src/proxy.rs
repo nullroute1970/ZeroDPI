@@ -1,7 +1,7 @@
 //! tokio-based TCP proxy that drives the bypass:
 //!
 //! For interceptor-based methods (`wrong_seq`, `tls_record_frag`,
-//! `wrong_seq_tls_frag`):
+//! `wrong_seq_tls_frag`, `wrong_seq_tls_record_frag`):
 //! 1. Accept incoming TCP on `LISTEN_HOST:LISTEN_PORT`.
 //! 2. Open an outbound TCP socket bound to the local interface IP.
 //! 3. Build a fake ClientHello and register the flow in the [`FlowTable`].
@@ -10,13 +10,15 @@
 //!    the flow is still being intercepted.
 //! 5. Once the bypass completes, the proxy runs a normal bidirectional copy
 //!    between the two sockets.
+//! 6. For `wrong_seq_tls_frag`, step 4 writes the intact ClientHello in small
+//!    TCP segments using the same `TCP_SEG_*` settings as `tcp_segmentation`.
 //!
-//! For socket-based methods (`tcp_segmentation`):
+//! For socket-based methods (`tcp_segmentation`, TCP-level TLS Fragment):
 //! 1. Accept incoming TCP on `LISTEN_HOST:LISTEN_PORT`.
 //! 2. Connect to the upstream server (no FlowTable registration, no interceptor).
 //! 3. Read one complete TLS record (the ClientHello) from the client socket.
-//! 4. Write it to the upstream socket in tiny chunks with `TCP_NODELAY` so
-//!    each chunk arrives as a separate TCP segment.
+//! 4. Write the intact TLS record to the upstream socket in tiny chunks with
+//!    `TCP_NODELAY` so each chunk arrives as a separate TCP segment.
 //! 5. Hand off to the normal bidirectional relay.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -126,9 +128,25 @@ struct RelayResult {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct RelayTiming {
+struct ConnectionSettings {
     bypass_timeout: Duration,
     max_lifetime: Option<Duration>,
+    segment_first_client_hello: bool,
+    tcp_seg_size: usize,
+    tcp_seg_nodelay: bool,
+}
+
+impl ConnectionSettings {
+    fn from_config(cfg: &Config) -> Self {
+        let tcp_segmentation = TcpSegmentation::new(cfg);
+        Self {
+            bypass_timeout: Duration::from_secs(cfg.BYPASS_TIMEOUT_SECS),
+            max_lifetime: configured_relay_max_lifetime(cfg),
+            segment_first_client_hello: method_segments_first_client_hello(&cfg.BYPASS_METHOD),
+            tcp_seg_size: tcp_segmentation.seg_size,
+            tcp_seg_nodelay: tcp_segmentation.nodelay,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +199,10 @@ fn current_bypass_progress(entry: &FlowEntry) -> Option<BypassProgress> {
     } else {
         None
     }
+}
+
+fn method_segments_first_client_hello(method: &str) -> bool {
+    method == "wrong_seq_tls_frag"
 }
 
 async fn wait_for_initial_bypass_progress(
@@ -343,10 +365,7 @@ pub async fn run_proxy(
         let target = active_target.read().unwrap().clone();
         let flows = flows.clone();
         let event_tx = event_tx.clone();
-        let relay_timing = RelayTiming {
-            bypass_timeout: Duration::from_secs(cfg.BYPASS_TIMEOUT_SECS),
-            max_lifetime: configured_relay_max_lifetime(&cfg),
-        };
+        let connection_settings = ConnectionSettings::from_config(&cfg);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 interface_ip,
@@ -355,7 +374,7 @@ pub async fn run_proxy(
                 incoming,
                 peer,
                 event_tx,
-                relay_timing,
+                connection_settings,
             )
             .await
             {
@@ -372,7 +391,7 @@ async fn handle_connection(
     mut incoming: TcpStream,
     peer: SocketAddr,
     event_tx: Option<ProxyEventSender>,
-    relay_timing: RelayTiming,
+    settings: ConnectionSettings,
 ) -> anyhow::Result<()> {
     let connect_port = CONNECT_PORT;
     let connect_ip = target.ip;
@@ -424,7 +443,7 @@ async fn handle_connection(
 
     // Wait until the interceptor either completes a fake-packet bypass or asks
     // us to send the first real ClientHello while the flow is still tracked.
-    match wait_for_initial_bypass_progress(&entry, relay_timing.bypass_timeout).await {
+    match wait_for_initial_bypass_progress(&entry, settings.bypass_timeout).await {
         Some(BypassProgress::Complete(outcome)) => {
             finish_bypass_or_error(
                 &entry,
@@ -436,7 +455,7 @@ async fn handle_connection(
         }
         Some(BypassProgress::ReadyForData) => {
             let client_hello = match tokio::time::timeout(
-                relay_timing.bypass_timeout,
+                settings.bypass_timeout,
                 read_one_tls_record(&mut incoming),
             )
             .await
@@ -466,30 +485,51 @@ async fn handle_connection(
                 }
             };
 
-            if let Err(e) = outgoing.write_all(&client_hello).await {
-                entry.finish(BypassOutcome::UnexpectedClose);
-                emit(
-                    &event_tx,
-                    ProxyEvent::BypassComplete {
-                        src_port,
-                        outcome: BypassOutcome::UnexpectedClose,
-                    },
-                );
-                return Err(e).context("writing ClientHello to upstream");
-            }
-            if let Err(e) = outgoing.flush().await {
-                entry.finish(BypassOutcome::UnexpectedClose);
-                emit(
-                    &event_tx,
-                    ProxyEvent::BypassComplete {
-                        src_port,
-                        outcome: BypassOutcome::UnexpectedClose,
-                    },
-                );
-                return Err(e).context("flushing ClientHello to upstream");
+            if settings.segment_first_client_hello {
+                if settings.tcp_seg_nodelay {
+                    outgoing
+                        .set_nodelay(true)
+                        .context("wrong_seq_tls_frag: set_nodelay on upstream socket")?;
+                }
+                if let Err(e) =
+                    write_segmented(&mut outgoing, &client_hello, settings.tcp_seg_size).await
+                {
+                    entry.finish(BypassOutcome::UnexpectedClose);
+                    emit(
+                        &event_tx,
+                        ProxyEvent::BypassComplete {
+                            src_port,
+                            outcome: BypassOutcome::UnexpectedClose,
+                        },
+                    );
+                    return Err(e).context("wrong_seq_tls_frag: writing segmented ClientHello");
+                }
+            } else {
+                if let Err(e) = outgoing.write_all(&client_hello).await {
+                    entry.finish(BypassOutcome::UnexpectedClose);
+                    emit(
+                        &event_tx,
+                        ProxyEvent::BypassComplete {
+                            src_port,
+                            outcome: BypassOutcome::UnexpectedClose,
+                        },
+                    );
+                    return Err(e).context("writing ClientHello to upstream");
+                }
+                if let Err(e) = outgoing.flush().await {
+                    entry.finish(BypassOutcome::UnexpectedClose);
+                    emit(
+                        &event_tx,
+                        ProxyEvent::BypassComplete {
+                            src_port,
+                            outcome: BypassOutcome::UnexpectedClose,
+                        },
+                    );
+                    return Err(e).context("flushing ClientHello to upstream");
+                }
             }
 
-            let outcome = wait_for_bypass_completion(&entry, relay_timing.bypass_timeout).await;
+            let outcome = wait_for_bypass_completion(&entry, settings.bypass_timeout).await;
             finish_bypass_or_error(
                 &entry,
                 &event_tx,
@@ -514,7 +554,7 @@ async fn handle_connection(
         outgoing,
         &event_tx,
         src_port,
-        relay_timing.max_lifetime,
+        settings.max_lifetime,
     )
     .await;
     debug!(
@@ -984,5 +1024,15 @@ mod tests {
         assert_eq!(result.reason, RelayEndReason::MaxLifetime);
         assert_eq!(result.c2s_bytes, 5);
         assert_eq!(result.s2c_bytes, 0);
+    }
+
+    #[test]
+    fn wrong_seq_tls_frag_segments_first_client_hello() {
+        assert!(method_segments_first_client_hello("wrong_seq_tls_frag"));
+        assert!(!method_segments_first_client_hello(
+            "wrong_seq_tls_record_frag"
+        ));
+        assert!(!method_segments_first_client_hello("tls_record_frag"));
+        assert!(!method_segments_first_client_hello("tcp_segmentation"));
     }
 }

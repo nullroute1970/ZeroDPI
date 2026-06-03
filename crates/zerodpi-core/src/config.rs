@@ -56,13 +56,19 @@ pub struct Config {
     /// - `"wrong_checksum"` — injects a fake TLS ClientHello with the normal
     ///   TCP sequence number, then corrupts the TCP checksum so DPI can inspect
     ///   the fake SNI while the real server drops the invalid segment.
-    /// - `"tls_record_frag"` — splits the real ClientHello into multiple small
-    ///   TLS record fragments so no single record contains the full SNI.
-    ///   No fake packet is injected; the server reassembles normally.
+    /// - `"tls_record_frag"` — TLS Record Fragment / TLS-layer fragmentation.
+    ///   Splits the real ClientHello into multiple small TLS records so no
+    ///   single record contains the full SNI. No fake packet is injected; the
+    ///   server reassembles normally.
     /// - `"wrong_seq_tls_frag"` — injects a `wrong_seq` fake ClientHello,
-    ///   then fragments the real ClientHello for downstream DPI layers.
-    /// - `"tcp_segmentation"` — splits the real ClientHello into multiple tiny
-    ///   TCP segments so DPI cannot reassemble the SNI from any single packet.
+    ///   then sends the intact real ClientHello in small TCP segments for
+    ///   downstream DPI layers.
+    /// - `"wrong_seq_tls_record_frag"` — injects a `wrong_seq` fake
+    ///   ClientHello, then fragments the real ClientHello into multiple small
+    ///   TLS records for downstream DPI layers.
+    /// - `"tcp_segmentation"` — TLS Fragment / TCP-level fragmentation.
+    ///   Splits a normal, intact TLS ClientHello record into multiple tiny TCP
+    ///   segments so DPI cannot reassemble the SNI from any single packet.
     ///   Does **not** inject fake packets or use WinDivert/NFQUEUE interception;
     ///   operates entirely inside the proxy via controlled socket writes.
     #[serde(default = "default_method")]
@@ -129,16 +135,17 @@ pub struct Config {
     // tls_record_frag method parameters
     // -----------------------------------------------------------------------
     /// Maximum bytes placed in each TLS record fragment when using
-    /// `tls_record_frag`.
+    /// `tls_record_frag` or `wrong_seq_tls_record_frag`.
     ///
-    /// The real ClientHello payload is split into chunks of at most this many
-    /// bytes, each wrapped in its own TLS record header.  The resulting
-    /// reassembled stream is identical from the server's perspective.
+    /// The real ClientHello TLS record body is split into chunks of at most
+    /// this many bytes, each wrapped in its own TLS record header.  The
+    /// resulting reassembled handshake is identical from the server's
+    /// perspective.
     ///
     /// Smaller values produce more fragments, making it harder for DPI to
-    /// reconstruct the SNI.  A value of `1` puts exactly one byte of payload
-    /// per record (most aggressive). A value of `5` puts exactly the TLS
-    /// record header bytes in the first fragment.  Must be `>= 1`.
+    /// reconstruct the SNI.  A value of `1` puts exactly one byte of record
+    /// body per record (most aggressive). A value of `5` puts five body bytes
+    /// in each fragment. Must be `>= 1`.
     /// Default: `1`.
     #[serde(default = "default_tls_frag_size")]
     pub TLS_RECORD_FRAG_SIZE: usize,
@@ -156,11 +163,12 @@ pub struct Config {
     // -----------------------------------------------------------------------
     // tcp_segmentation method parameters
     // -----------------------------------------------------------------------
-    /// Maximum payload bytes sent in each TCP segment when using
-    /// `tcp_segmentation`.
+    /// Maximum ClientHello bytes sent in each TCP segment when using
+    /// `tcp_segmentation` or `wrong_seq_tls_frag`.
     ///
-    /// The real TLS ClientHello is sliced into chunks of at most this many
-    /// bytes and each chunk is written to the upstream socket individually.
+    /// The normal, intact TLS ClientHello record is sliced into chunks of at
+    /// most this many bytes and each chunk is written to the upstream socket
+    /// individually.
     /// With `TCP_SEG_NODELAY = true` the OS sends each chunk as a separate
     /// TCP segment, preventing any DPI engine from seeing the full SNI in a
     /// single segment.
@@ -468,10 +476,11 @@ impl Config {
                 | "wrong_checksum"
                 | "tls_record_frag"
                 | "wrong_seq_tls_frag"
+                | "wrong_seq_tls_record_frag"
                 | "tcp_segmentation"
         ) {
             anyhow::bail!(
-                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"tcp_segmentation\"",
+                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_seq_tls_record_frag\", \"tcp_segmentation\"",
                 self.BYPASS_METHOD
             );
         }
@@ -698,12 +707,34 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_seq_tls_frag"
+            TCP_SEG_SIZE = 9
+            TCP_SEG_NODELAY = false
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.BYPASS_METHOD, "wrong_seq_tls_frag");
         assert_eq!(cfg.WRONG_SEQ_EXTRA_OFFSET, 0);
-        assert_eq!(cfg.TLS_RECORD_FRAG_SIZE, 1);
+        assert_eq!(cfg.TCP_SEG_SIZE, 9);
+        assert!(!cfg.TCP_SEG_NODELAY);
+    }
+
+    #[test]
+    fn wrong_seq_tls_record_frag_accepted_by_validate() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "wrong_seq_tls_record_frag"
+            TLS_RECORD_FRAG_SIZE = 7
+            TLS_RECORD_FRAG_SET_PSH = false
+            TLS_RECORD_FRAG_BUMP_IP_IDENT = false
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.BYPASS_METHOD, "wrong_seq_tls_record_frag");
+        assert_eq!(cfg.WRONG_SEQ_EXTRA_OFFSET, 0);
+        assert_eq!(cfg.TLS_RECORD_FRAG_SIZE, 7);
+        assert!(!cfg.TLS_RECORD_FRAG_SET_PSH);
+        assert!(!cfg.TLS_RECORD_FRAG_BUMP_IP_IDENT);
     }
 
     #[test]

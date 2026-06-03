@@ -1,6 +1,6 @@
-//! `tcp_segmentation` bypass: splits the real TLS ClientHello into multiple
-//! tiny TCP segments so that DPI cannot reassemble the SNI from any single
-//! packet.
+//! `tcp_segmentation` bypass: TCP-level TLS Fragment.  It keeps the TLS record
+//! intact, then splits the real TLS ClientHello bytes into multiple tiny TCP
+//! segments so that DPI cannot reassemble the SNI from any single packet.
 //!
 //! ## How it works
 //!

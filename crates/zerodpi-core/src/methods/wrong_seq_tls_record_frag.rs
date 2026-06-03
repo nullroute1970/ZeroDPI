@@ -1,34 +1,37 @@
-//! Combined `wrong_seq` + TCP-level TLS Fragment bypass.
+//! Combined `wrong_seq` + `tls_record_frag` bypass.
 //!
 //! This method targets layered DPI paths.  The first stage injects a fake
 //! ClientHello with an old TCP sequence number so the first DPI layer can be
-//! desynchronized.  The second stage lets the proxy write the intact real
-//! ClientHello as small TCP segments so downstream DPI layers that never saw
-//! the fake packet still have to reassemble the real TCP stream.
+//! desynchronized.  The second stage fragments the real ClientHello into small
+//! TLS records so downstream DPI layers that never saw the fake packet still
+//! have to reassemble the real stream.
 
 use tracing::trace;
 
+use super::tls_record_frag::TlsRecordFrag;
 use super::wrong_seq::WrongSeq;
 use super::{BypassMethod, MethodAction};
 use crate::config::Config;
 use crate::flow::FlowState;
 use crate::interceptor::PacketView;
 
-pub struct WrongSeqTlsFrag {
+pub struct WrongSeqTlsRecordFrag {
     wrong_seq: WrongSeq,
+    tls_record_frag: TlsRecordFrag,
 }
 
-impl WrongSeqTlsFrag {
+impl WrongSeqTlsRecordFrag {
     pub fn new(cfg: &Config) -> Self {
         Self {
             wrong_seq: WrongSeq::new(cfg),
+            tls_record_frag: TlsRecordFrag::new(cfg),
         }
     }
 }
 
-impl BypassMethod for WrongSeqTlsFrag {
+impl BypassMethod for WrongSeqTlsRecordFrag {
     fn name(&self) -> &'static str {
-        "wrong_seq_tls_frag"
+        "wrong_seq_tls_record_frag"
     }
 
     fn on_handshake_complete_ack(
@@ -38,18 +41,18 @@ impl BypassMethod for WrongSeqTlsFrag {
     ) -> MethodAction {
         let _ = self.wrong_seq.on_handshake_complete_ack(flow, pkt);
         trace!(
-            target = "zerodpi::wrong_seq_tls_frag",
-            "staged wrong_seq fake; waiting for TCP-segmented first data packet"
+            target = "zerodpi::wrong_seq_tls_record_frag",
+            "staged wrong_seq fake; waiting for TLS record fragmentation"
         );
         MethodAction::emit_and_wait_for_data()
     }
 
-    fn on_first_data_packet(&self, _flow: &FlowState, _pkt: &mut PacketView<'_>) -> MethodAction {
+    fn on_first_data_packet(&self, flow: &FlowState, pkt: &mut PacketView<'_>) -> MethodAction {
         trace!(
-            target = "zerodpi::wrong_seq_tls_frag",
-            "first TCP-segmented ClientHello data observed; completing bypass"
+            target = "zerodpi::wrong_seq_tls_record_frag",
+            "staging TLS record fragmentation for real ClientHello"
         );
-        MethodAction::complete_and_accept()
+        self.tls_record_frag.on_first_data_packet(flow, pkt)
     }
 }
 
@@ -65,7 +68,7 @@ mod tests {
         toml::from_str(
             r#"LISTEN_HOST = "127.0.0.1"
                LISTEN_PORT = 44444
-               BYPASS_METHOD = "wrong_seq_tls_frag""#,
+               BYPASS_METHOD = "wrong_seq_tls_record_frag""#,
         )
         .unwrap()
     }
@@ -101,8 +104,8 @@ mod tests {
         state.syn_ack_seq = Some(5000);
 
         let mut packet = pkt(&[], 0);
-        let action =
-            WrongSeqTlsFrag::new(&default_cfg()).on_handshake_complete_ack(&state, &mut packet);
+        let action = WrongSeqTlsRecordFrag::new(&default_cfg())
+            .on_handshake_complete_ack(&state, &mut packet);
 
         assert_eq!(action, MethodAction::emit_and_wait_for_data());
         assert_eq!(packet.new_payload.as_ref().unwrap().len(), 517);
@@ -112,16 +115,17 @@ mod tests {
     }
 
     #[test]
-    fn first_data_stage_completes_without_rewrite() {
+    fn first_data_stage_fragments_real_payload() {
         let state = FlowState::new(vec![]);
         let payload: &'static [u8] = &[0x16, 0x03, 0x03, 0x00, 0x03, 0x01, 0x02, 0x03];
         let mut packet = pkt(payload, payload.len());
 
-        let action = WrongSeqTlsFrag::new(&default_cfg()).on_first_data_packet(&state, &mut packet);
+        let action =
+            WrongSeqTlsRecordFrag::new(&default_cfg()).on_first_data_packet(&state, &mut packet);
 
-        assert_eq!(action, MethodAction::complete_and_accept());
-        assert!(packet.new_payload.is_none());
-        assert!(packet.new_flags.is_none());
-        assert!(!packet.bump_ipv4_ident);
+        assert_eq!(action, MethodAction::emit_and_complete());
+        assert_eq!(packet.new_payload.as_ref().unwrap().len(), 18);
+        assert!(packet.new_flags.unwrap().psh);
+        assert!(packet.bump_ipv4_ident);
     }
 }

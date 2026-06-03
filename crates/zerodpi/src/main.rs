@@ -1547,6 +1547,14 @@ mod tests {
             "sni_spoof",
             "tls_record_frag"
         ));
+        assert!(mode_requires_packet_interception(
+            "sni_spoof",
+            "wrong_seq_tls_frag"
+        ));
+        assert!(mode_requires_packet_interception(
+            "sni_spoof",
+            "wrong_seq_tls_record_frag"
+        ));
     }
 
     #[test]

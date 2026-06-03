@@ -4,6 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::interceptor::LinuxFirewallBackend;
 use crate::tls_template::MAX_SNI_LEN;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,11 +74,18 @@ pub struct Config {
     ///   operates entirely inside the proxy via controlled socket writes.
     #[serde(default = "default_method")]
     pub BYPASS_METHOD: String,
-    /// (Linux only) NFQUEUE queue number used to intercept packets via
-    /// iptables.  Must match the queue number in the iptables rules installed
-    /// by ZeroDPI.  Default: `1`.
+    /// (Linux only) NFQUEUE queue number used to intercept packets. Must
+    /// match the queue number in the firewall rules installed by ZeroDPI.
+    /// Default: `1`.
     #[serde(default = "default_queue_num")]
     pub NFQUEUE_NUM: u16,
+
+    /// (Linux only) Firewall rule backend used to route matching packets into
+    /// NFQUEUE. Supported values:
+    /// - `"iptables"` (default) — preserve legacy iptables behavior.
+    /// - `"nftables"` — use the `nft` command and an `inet` table.
+    #[serde(default = "default_linux_firewall_backend")]
+    pub LINUX_FIREWALL_BACKEND: String,
 
     // -----------------------------------------------------------------------
     // wrong_seq method parameters
@@ -362,6 +370,9 @@ fn default_method() -> String {
 fn default_queue_num() -> u16 {
     1
 }
+fn default_linux_firewall_backend() -> String {
+    LinuxFirewallBackend::default().as_str().into()
+}
 fn default_true() -> bool {
     true
 }
@@ -493,6 +504,12 @@ impl Config {
         if self.TCP_SEG_SIZE == 0 {
             anyhow::bail!("TCP_SEG_SIZE must be >= 1");
         }
+        if LinuxFirewallBackend::parse(&self.LINUX_FIREWALL_BACKEND).is_none() {
+            anyhow::bail!(
+                "Unknown LINUX_FIREWALL_BACKEND '{}'. Valid values: \"iptables\", \"nftables\"",
+                self.LINUX_FIREWALL_BACKEND
+            );
+        }
         if !matches!(
             self.MODE.as_str(),
             "sni_spoof" | "ip_bypass" | "sni_scan" | "ip_scan" | "proxy_scan"
@@ -514,6 +531,10 @@ impl Config {
         }
         Ok(())
     }
+
+    pub fn linux_firewall_backend(&self) -> LinuxFirewallBackend {
+        LinuxFirewallBackend::parse(&self.LINUX_FIREWALL_BACKEND).unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -531,6 +552,7 @@ mod tests {
         assert_eq!(cfg.LISTEN_PORT, 40443);
         assert_eq!(cfg.BYPASS_METHOD, "wrong_seq");
         assert_eq!(cfg.NFQUEUE_NUM, 1);
+        assert_eq!(cfg.LINUX_FIREWALL_BACKEND, "iptables");
         assert!(!cfg.AUTO_SELECT);
         assert_eq!(cfg.RESCAN_INTERVAL_SECS, 0);
         assert_eq!(cfg.SNI_SWITCH_MIN_SCORE, 1);
@@ -660,6 +682,29 @@ mod tests {
     }
 
     #[test]
+    fn linux_firewall_backend_accepts_nftables() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            LINUX_FIREWALL_BACKEND = "nftables"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.linux_firewall_backend(), LinuxFirewallBackend::Nftables);
+    }
+
+    #[test]
+    fn rejects_unknown_linux_firewall_backend() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            LINUX_FIREWALL_BACKEND = "pf"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn parses_all_fields() {
         let toml_str = r#"
             LISTEN_HOST = "127.0.0.1"
@@ -672,6 +717,7 @@ mod tests {
             SELECTED_SNI = "auth.vercel.com"
             BYPASS_METHOD = "wrong_seq"
             NFQUEUE_NUM = 2
+            LINUX_FIREWALL_BACKEND = "nftables"
             WRONG_SEQ_EXTRA_OFFSET = 100
             WRONG_SEQ_SET_PSH = false
             WRONG_SEQ_BUMP_IP_IDENT = false
@@ -690,6 +736,7 @@ mod tests {
         assert_eq!(cfg.RESCAN_INTERVAL_SECS, 300);
         assert_eq!(cfg.SNI_SWITCH_MIN_SCORE, 40);
         assert_eq!(cfg.SELECTED_SNI.as_deref(), Some("auth.vercel.com"));
+        assert_eq!(cfg.linux_firewall_backend(), LinuxFirewallBackend::Nftables);
         assert_eq!(cfg.WRONG_SEQ_EXTRA_OFFSET, 100);
         assert!(!cfg.WRONG_SEQ_SET_PSH);
         assert!(!cfg.WRONG_SEQ_BUMP_IP_IDENT);

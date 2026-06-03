@@ -109,7 +109,7 @@ pub trait PacketHandler: Send + 'static {
 }
 
 /// Backend-side filter description. Backends translate this to their native
-/// filter language (WinDivert filter string, iptables rules, etc.).
+/// filter language (WinDivert filter string, Linux firewall rules, etc.).
 #[derive(Debug, Clone)]
 pub struct FilterSpec {
     pub interface_ip: Ipv4Addr,
@@ -119,12 +119,42 @@ pub struct FilterSpec {
     pub remote_port: u16,
     /// Linux NFQUEUE queue number; ignored on backends that don't use it.
     pub queue_num: u16,
+    /// Linux firewall rule backend used to feed packets into NFQUEUE; ignored
+    /// on non-Linux backends.
+    pub linux_firewall_backend: LinuxFirewallBackend,
+}
+
+/// Linux firewall-rule manager used by the NFQUEUE backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LinuxFirewallBackend {
+    /// Use legacy `iptables` commands. This is the backwards-compatible default.
+    #[default]
+    Iptables,
+    /// Use `nft`/nftables commands.
+    Nftables,
+}
+
+impl LinuxFirewallBackend {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "iptables" => Some(Self::Iptables),
+            "nftables" => Some(Self::Nftables),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Iptables => "iptables",
+            Self::Nftables => "nftables",
+        }
+    }
 }
 
 /// A platform packet-interception backend.
 pub trait PacketInterceptor: Sized + Send + 'static {
     /// Open the interceptor with the given filter. Backend may install
-    /// system rules (e.g. iptables) here; they're removed in `Drop`.
+    /// system rules here; they're removed in `Drop`.
     fn open(filter: FilterSpec) -> anyhow::Result<Self>;
 
     /// Run the intercept loop, calling `handler` for each captured packet.

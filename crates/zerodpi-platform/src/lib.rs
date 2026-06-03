@@ -42,7 +42,7 @@ fn packet_interception_access_error() -> &'static str {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn packet_interception_access_error() -> &'static str {
-    "ZeroDPI needs root privileges or CAP_NET_ADMIN for packet interception via NFQUEUE/iptables. \
+    "ZeroDPI needs root privileges or CAP_NET_ADMIN for packet interception via NFQUEUE. \
      Run ZeroDPI with sudo/root, grant CAP_NET_ADMIN to the binary, or use \
      BYPASS_METHOD = \"tcp_segmentation\" or MODE = \"ip_bypass\"."
 }

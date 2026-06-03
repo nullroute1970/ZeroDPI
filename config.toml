@@ -197,12 +197,20 @@ BYPASS_TIMEOUT_SECS = 2
 # Set to 0 to disable relay rotation. This is the default.
 RELAY_MAX_LIFETIME_SECS = 0
 
-# (Linux only) NFQUEUE queue number used to intercept packets via iptables.
+# (Linux only) NFQUEUE queue number used to intercept packets.
 #
-# ZeroDPI installs iptables rules that send selected TCP packets to this queue.
+# ZeroDPI installs firewall rules that send selected TCP packets to this queue.
 # If you change this value, the queue number in the installed rules must match.
 # Windows builds use WinDivert instead, so this setting has no effect there.
 NFQUEUE_NUM = 1
+
+# (Linux only) Firewall rule backend used for NFQUEUE interception.
+#
+# Valid values:
+#   "iptables" — legacy/default behavior.
+#   "nftables" — use the nft command and an inet table.
+# Windows builds use WinDivert instead, so this setting has no effect there.
+LINUX_FIREWALL_BACKEND = "iptables"
 
 # ---------------------------------------------------------------------------
 # wrong_seq method parameters

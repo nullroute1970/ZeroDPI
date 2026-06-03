@@ -40,7 +40,7 @@ ZeroDPI sits between your **upstream VPN app** (xray-core, sing-box, v2ray, Hyst
 | ⚡ **Concurrent scanning** | Configurable concurrency per phase for fast results |
 | 🔌 **Protocol agnostic** | Raw TCP relay — works with any TLS-based VPN protocol |
 | 🪟 **Windows** | WinDivert packet interception |
-| 🐧 **Linux / Android** | NFQUEUE packet interception |
+| 🐧 **Linux / Android** | NFQUEUE packet interception, with selectable iptables/nftables rule setup on Linux |
 
 ---
 
@@ -337,6 +337,7 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | `BYPASS_TIMEOUT_SECS` | `u64` | `2` | Time to wait for bypass setup before giving up |
 | `RELAY_MAX_LIFETIME_SECS` | `u64` | `0` | Rotate established relays after this many seconds (`0` = disabled/default) |
 | `NFQUEUE_NUM` | `u16` | `1` | (Linux) NFQUEUE queue number |
+| `LINUX_FIREWALL_BACKEND` | `string` | `"iptables"` | (Linux) Rule backend: `iptables` or `nftables` |
 
 #### `wrong_seq` Parameters
 
@@ -570,7 +571,11 @@ Before starting ZeroDPI:
 sudo ./zerodpi --config ./config.toml
 ```
 
-Requires `CAP_NET_ADMIN` (or root). iptables rules are installed on startup and **automatically removed on shutdown** for interceptor-based methods.
+Requires `CAP_NET_ADMIN` (or root), NFQUEUE kernel support, and the selected firewall command. By default ZeroDPI uses `iptables`; set `LINUX_FIREWALL_BACKEND = "nftables"` to use the `nft` command instead. Rules are installed on startup and **automatically removed on shutdown** for interceptor-based methods.
+
+```toml
+LINUX_FIREWALL_BACKEND = "nftables"
+```
 
 #### systemd service installer
 
@@ -593,7 +598,7 @@ The installer:
 - Verifies the generated unit with `systemd-analyze verify` when that command is available.
 - Warns if `sni_list.txt` or `ip_list.txt` is missing, and makes the binary executable.
 - Writes `/etc/systemd/system/zerodpi.service`.
-- Runs the service as `root`, which is required for NFQUEUE/iptables-based bypass methods.
+- Runs the service as `root`, which is required for NFQUEUE-based bypass methods.
 - Starts ZeroDPI with the resolved binary and config paths plus `--auto-select --no-tui`.
 - Sets `RUST_LOG=info`, sends output to journald, restarts on failure, reloads systemd, enables the service at boot, and starts it immediately.
 
@@ -626,7 +631,7 @@ If Windows blocks the driver or DLL, unblock the downloaded archive before extra
 ./zerodpi --config ./config.toml
 ```
 
-Requires root, `iptables`, and a kernel with NFQUEUE support.
+Requires root, a supported firewall backend command (`iptables` by default, or `nft` with `LINUX_FIREWALL_BACKEND = "nftables"`), and a kernel with NFQUEUE support.
 
 On Android, `tcp_segmentation` is the simplest method to try first because it does not require NFQUEUE interception. Interceptor-based methods still need root and a compatible kernel.
 
@@ -696,7 +701,7 @@ Unit tests cover:
 | Symptom | What to Check |
 |---------|---------------|
 | No traffic reaches ZeroDPI | Your VPN app must connect to `127.0.0.1:44444` or your configured `LISTEN_HOST:LISTEN_PORT`. Keep the real server/SNI inside the VPN TLS settings. |
-| Permission or interceptor errors | Use Administrator on Windows or root/`CAP_NET_ADMIN` on Linux. For Linux, install NFQUEUE support and make sure iptables is available. |
+| Permission or interceptor errors | Use Administrator on Windows or root/`CAP_NET_ADMIN` on Linux. For Linux, install NFQUEUE support and make sure the selected firewall backend is available (`iptables` or `nft`). |
 | Windows starts but interception fails | Confirm `WinDivert.dll` and `WinDivert64.sys` are next to `zerodpi.exe` and that the terminal is elevated. |
 | Linux service starts then exits | Run `journalctl -u zerodpi.service -f`, check `config.toml`, and confirm `sni_list.txt` / `ip_list.txt` paths are valid relative to the service working directory. |
 | Scan returns no useful candidates | Increase `SCAN_TIMEOUT_SECS`, lower concurrency on weak networks, refresh the candidate list, and verify the CDN or IP range is reachable without ZeroDPI. |

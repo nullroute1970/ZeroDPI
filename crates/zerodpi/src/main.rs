@@ -353,6 +353,7 @@ fn main() -> Result<()> {
             remote_ip: None,
             remote_port: CONNECT_PORT,
             queue_num: cfg.NFQUEUE_NUM,
+            linux_firewall_backend: cfg.linux_firewall_backend(),
         };
         let interceptor = DefaultInterceptor::open(filter).context("open packet interceptor")?;
 

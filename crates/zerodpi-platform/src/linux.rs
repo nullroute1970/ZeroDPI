@@ -1,7 +1,8 @@
 //! Linux backend: NFQUEUE-based packet interception.
 //!
-//! We install two `iptables` rules that funnel IPv4 TCP packets between the
-//! local interface IP and the configured upstream into a netfilter queue.
+//! We install firewall rules that funnel IPv4 TCP packets between the local
+//! interface IP and the configured upstream into a netfilter queue. The rule
+//! manager is selectable between iptables and nftables.
 //! For each captured packet we run the user-provided [`PacketHandler`] and
 //! either accept the original bytes or accept a *modified* payload (with
 //! IP/TCP checksums recomputed) — this is the "modify outbound packet by
@@ -9,6 +10,7 @@
 
 use std::io::ErrorKind;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
@@ -16,7 +18,8 @@ use nfq::{Queue, Verdict as NfqVerdict};
 use tracing::{debug, info, warn};
 
 use zerodpi_core::interceptor::{
-    Direction, FilterSpec, PacketHandler, PacketInterceptor, PacketView, TcpFlags, Verdict,
+    Direction, FilterSpec, LinuxFirewallBackend, PacketHandler, PacketInterceptor, PacketView,
+    TcpFlags, Verdict,
 };
 
 const HOOK_LOCAL_IN: u8 = 1;
@@ -24,13 +27,18 @@ const HOOK_LOCAL_OUT: u8 = 3;
 
 pub struct NfqInterceptor {
     queue: Queue,
-    _rules: IptablesGuard,
+    _rules: FirewallGuard,
 }
 
 impl PacketInterceptor for NfqInterceptor {
     fn open(filter: FilterSpec) -> Result<Self> {
         let queue_num = filter.queue_num;
-        let rules = IptablesGuard::install(&filter).context("install iptables rules")?;
+        let rules = FirewallGuard::install(&filter).with_context(|| {
+            format!(
+                "install Linux firewall rules using {}",
+                filter.linux_firewall_backend.as_str()
+            )
+        })?;
 
         let mut queue = Queue::open().context("open NFQUEUE")?;
         queue.bind(queue_num).context("bind NFQUEUE")?;
@@ -42,7 +50,11 @@ impl PacketInterceptor for NfqInterceptor {
             .set_fail_open(queue_num, false)
             .context("set NFQUEUE fail_open")?;
 
-        info!(queue_num, "NFQUEUE bound");
+        info!(
+            queue_num,
+            firewall_backend = filter.linux_firewall_backend.as_str(),
+            "NFQUEUE bound"
+        );
         Ok(Self {
             queue,
             _rules: rules,
@@ -206,6 +218,26 @@ fn build_modified(orig: &[u8], layout: &PacketLayout, view: &PacketView<'_>) -> 
     Ok(out)
 }
 
+// ---------------------- firewall rule management ----------------------
+
+enum FirewallGuard {
+    Iptables { _guard: IptablesGuard },
+    Nftables { _guard: NftablesGuard },
+}
+
+impl FirewallGuard {
+    fn install(filter: &FilterSpec) -> Result<Self> {
+        match filter.linux_firewall_backend {
+            LinuxFirewallBackend::Iptables => {
+                IptablesGuard::install(filter).map(|guard| Self::Iptables { _guard: guard })
+            }
+            LinuxFirewallBackend::Nftables => {
+                NftablesGuard::install(filter).map(|guard| Self::Nftables { _guard: guard })
+            }
+        }
+    }
+}
+
 // ---------------------- iptables rule management ----------------------
 
 struct IptablesGuard {
@@ -214,80 +246,7 @@ struct IptablesGuard {
 
 impl IptablesGuard {
     fn install(filter: &FilterSpec) -> Result<Self> {
-        let iface = filter.interface_ip.to_string();
-        let port = filter.remote_port.to_string();
-        let q = filter.queue_num.to_string();
-
-        let rules: Vec<Vec<String>> = match filter.remote_ip {
-            Some(remote_ip) => {
-                let remote = remote_ip.to_string();
-                vec![
-                    vec![
-                        "OUTPUT".into(),
-                        "-p".into(),
-                        "tcp".into(),
-                        "-s".into(),
-                        iface.clone(),
-                        "-d".into(),
-                        remote.clone(),
-                        "--dport".into(),
-                        port.clone(),
-                        "-j".into(),
-                        "NFQUEUE".into(),
-                        "--queue-num".into(),
-                        q.clone(),
-                        "--queue-bypass".into(),
-                    ],
-                    vec![
-                        "INPUT".into(),
-                        "-p".into(),
-                        "tcp".into(),
-                        "-s".into(),
-                        remote,
-                        "-d".into(),
-                        iface,
-                        "--sport".into(),
-                        port,
-                        "-j".into(),
-                        "NFQUEUE".into(),
-                        "--queue-num".into(),
-                        q,
-                        "--queue-bypass".into(),
-                    ],
-                ]
-            }
-            None => vec![
-                vec![
-                    "OUTPUT".into(),
-                    "-p".into(),
-                    "tcp".into(),
-                    "-s".into(),
-                    iface.clone(),
-                    "--dport".into(),
-                    port.clone(),
-                    "-j".into(),
-                    "NFQUEUE".into(),
-                    "--queue-num".into(),
-                    q.clone(),
-                    "--queue-bypass".into(),
-                ],
-                vec![
-                    "INPUT".into(),
-                    "-p".into(),
-                    "tcp".into(),
-                    "-d".into(),
-                    iface,
-                    "--sport".into(),
-                    port,
-                    "-j".into(),
-                    "NFQUEUE".into(),
-                    "--queue-num".into(),
-                    q,
-                    "--queue-bypass".into(),
-                ],
-            ],
-        };
-
+        let rules = iptables_rules(filter);
         for rule in &rules {
             run_iptables("-A", rule).context("install iptables rule")?;
         }
@@ -320,9 +279,208 @@ fn run_iptables(action: &str, rule_args: &[String]) -> Result<()> {
     Ok(())
 }
 
-// Re-export FilterSpec extension: backends in this crate need a queue_num.
-// To keep `zerodpi-core` platform-agnostic we extend via a helper trait here.
-// Currently a no-op since the field lives on FilterSpec directly.
+fn iptables_rules(filter: &FilterSpec) -> Vec<Vec<String>> {
+    let iface = filter.interface_ip.to_string();
+    let port = filter.remote_port.to_string();
+    let q = filter.queue_num.to_string();
+
+    match filter.remote_ip {
+        Some(remote_ip) => {
+            let remote = remote_ip.to_string();
+            vec![
+                vec![
+                    "OUTPUT".into(),
+                    "-p".into(),
+                    "tcp".into(),
+                    "-s".into(),
+                    iface.clone(),
+                    "-d".into(),
+                    remote.clone(),
+                    "--dport".into(),
+                    port.clone(),
+                    "-j".into(),
+                    "NFQUEUE".into(),
+                    "--queue-num".into(),
+                    q.clone(),
+                    "--queue-bypass".into(),
+                ],
+                vec![
+                    "INPUT".into(),
+                    "-p".into(),
+                    "tcp".into(),
+                    "-s".into(),
+                    remote,
+                    "-d".into(),
+                    iface,
+                    "--sport".into(),
+                    port,
+                    "-j".into(),
+                    "NFQUEUE".into(),
+                    "--queue-num".into(),
+                    q,
+                    "--queue-bypass".into(),
+                ],
+            ]
+        }
+        None => vec![
+            vec![
+                "OUTPUT".into(),
+                "-p".into(),
+                "tcp".into(),
+                "-s".into(),
+                iface.clone(),
+                "--dport".into(),
+                port.clone(),
+                "-j".into(),
+                "NFQUEUE".into(),
+                "--queue-num".into(),
+                q.clone(),
+                "--queue-bypass".into(),
+            ],
+            vec![
+                "INPUT".into(),
+                "-p".into(),
+                "tcp".into(),
+                "-d".into(),
+                iface,
+                "--sport".into(),
+                port,
+                "-j".into(),
+                "NFQUEUE".into(),
+                "--queue-num".into(),
+                q,
+                "--queue-bypass".into(),
+            ],
+        ],
+    }
+}
+
+// ---------------------- nftables rule management ----------------------
+
+const NFT_TABLE_FAMILY: &str = "inet";
+const NFT_OUTPUT_CHAIN: &str = "output";
+const NFT_INPUT_CHAIN: &str = "input";
+
+static NFT_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct NftablesGuard {
+    table_name: String,
+}
+
+impl NftablesGuard {
+    fn install(filter: &FilterSpec) -> Result<Self> {
+        let table_name = next_nft_table_name();
+        let commands = nft_install_commands(&table_name, filter);
+        for args in &commands {
+            if let Err(e) = run_nft(args) {
+                let _ = delete_nft_table(&table_name);
+                return Err(e).context("install nftables rule");
+            }
+        }
+        info!(table = %table_name, "nftables rules installed");
+        Ok(Self { table_name })
+    }
+}
+
+impl Drop for NftablesGuard {
+    fn drop(&mut self) {
+        if let Err(e) = delete_nft_table(&self.table_name) {
+            warn!(error = %e, table = %self.table_name, "failed to remove nftables table");
+        } else {
+            debug!(table = %self.table_name, "nftables table removed");
+        }
+    }
+}
+
+fn next_nft_table_name() -> String {
+    let id = NFT_TABLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("zerodpi_{}_{}", std::process::id(), id)
+}
+
+fn nft_install_commands(table_name: &str, filter: &FilterSpec) -> Vec<Vec<String>> {
+    vec![
+        strings(&["add", "table", NFT_TABLE_FAMILY, table_name]),
+        nft_add_chain_args(table_name, NFT_OUTPUT_CHAIN, "output"),
+        nft_add_chain_args(table_name, NFT_INPUT_CHAIN, "input"),
+        nft_add_rule_args(table_name, Direction::Outbound, filter),
+        nft_add_rule_args(table_name, Direction::Inbound, filter),
+    ]
+}
+
+fn nft_add_chain_args(table_name: &str, chain: &str, hook: &str) -> Vec<String> {
+    strings(&[
+        "add",
+        "chain",
+        NFT_TABLE_FAMILY,
+        table_name,
+        chain,
+        "{",
+        "type",
+        "filter",
+        "hook",
+        hook,
+        "priority",
+        "0",
+        ";",
+        "policy",
+        "accept",
+        ";",
+        "}",
+    ])
+}
+
+fn nft_add_rule_args(table_name: &str, direction: Direction, filter: &FilterSpec) -> Vec<String> {
+    let iface = filter.interface_ip.to_string();
+    let port = filter.remote_port.to_string();
+    let q = filter.queue_num.to_string();
+    let mut args = strings(&["add", "rule", NFT_TABLE_FAMILY, table_name]);
+
+    match direction {
+        Direction::Outbound => {
+            args.push(NFT_OUTPUT_CHAIN.into());
+            args.extend(strings(&["ip", "saddr", &iface]));
+            if let Some(remote_ip) = filter.remote_ip {
+                let remote = remote_ip.to_string();
+                args.extend(strings(&["ip", "daddr", &remote]));
+            }
+            args.extend(strings(&[
+                "tcp", "dport", &port, "queue", "num", &q, "bypass",
+            ]));
+        }
+        Direction::Inbound => {
+            args.push(NFT_INPUT_CHAIN.into());
+            if let Some(remote_ip) = filter.remote_ip {
+                let remote = remote_ip.to_string();
+                args.extend(strings(&["ip", "saddr", &remote]));
+            }
+            args.extend(strings(&["ip", "daddr", &iface]));
+            args.extend(strings(&[
+                "tcp", "sport", &port, "queue", "num", &q, "bypass",
+            ]));
+        }
+    }
+
+    args
+}
+
+fn delete_nft_table(table_name: &str) -> Result<()> {
+    run_nft(&strings(&["delete", "table", NFT_TABLE_FAMILY, table_name]))
+}
+
+fn run_nft(args: &[String]) -> Result<()> {
+    let status = Command::new("nft")
+        .args(args)
+        .status()
+        .context("spawn nft")?;
+    if !status.success() {
+        anyhow::bail!("nft {:?} failed: {status}", args);
+    }
+    Ok(())
+}
+
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|item| (*item).into()).collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -354,6 +512,163 @@ mod tests {
             bump_ipv4_ident: true,
             corrupt_tcp_checksum_delta: None,
         }
+    }
+
+    fn make_filter(remote_ip: Option<Ipv4Addr>) -> FilterSpec {
+        FilterSpec {
+            interface_ip: Ipv4Addr::new(10, 0, 0, 1),
+            remote_ip,
+            remote_port: 443,
+            queue_num: 7,
+            linux_firewall_backend: LinuxFirewallBackend::Iptables,
+        }
+    }
+
+    #[test]
+    fn iptables_rules_without_remote_match_nfqueue_shape() {
+        let rules = iptables_rules(&make_filter(None));
+
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0],
+            strings(&[
+                "OUTPUT",
+                "-p",
+                "tcp",
+                "-s",
+                "10.0.0.1",
+                "--dport",
+                "443",
+                "-j",
+                "NFQUEUE",
+                "--queue-num",
+                "7",
+                "--queue-bypass",
+            ])
+        );
+        assert_eq!(
+            rules[1],
+            strings(&[
+                "INPUT",
+                "-p",
+                "tcp",
+                "-d",
+                "10.0.0.1",
+                "--sport",
+                "443",
+                "-j",
+                "NFQUEUE",
+                "--queue-num",
+                "7",
+                "--queue-bypass",
+            ])
+        );
+    }
+
+    #[test]
+    fn nftables_commands_without_remote_use_inet_nfqueue_bypass() {
+        let commands = nft_install_commands("zerodpi_test", &make_filter(None));
+
+        assert_eq!(commands.len(), 5);
+        assert_eq!(
+            commands[0],
+            strings(&["add", "table", "inet", "zerodpi_test"])
+        );
+        assert_eq!(
+            commands[3],
+            strings(&[
+                "add",
+                "rule",
+                "inet",
+                "zerodpi_test",
+                "output",
+                "ip",
+                "saddr",
+                "10.0.0.1",
+                "tcp",
+                "dport",
+                "443",
+                "queue",
+                "num",
+                "7",
+                "bypass",
+            ])
+        );
+        assert_eq!(
+            commands[4],
+            strings(&[
+                "add",
+                "rule",
+                "inet",
+                "zerodpi_test",
+                "input",
+                "ip",
+                "daddr",
+                "10.0.0.1",
+                "tcp",
+                "sport",
+                "443",
+                "queue",
+                "num",
+                "7",
+                "bypass",
+            ])
+        );
+    }
+
+    #[test]
+    fn nftables_commands_with_remote_pin_both_directions() {
+        let commands = nft_install_commands(
+            "zerodpi_test",
+            &make_filter(Some(Ipv4Addr::new(1, 2, 3, 4))),
+        );
+
+        assert_eq!(
+            commands[3],
+            strings(&[
+                "add",
+                "rule",
+                "inet",
+                "zerodpi_test",
+                "output",
+                "ip",
+                "saddr",
+                "10.0.0.1",
+                "ip",
+                "daddr",
+                "1.2.3.4",
+                "tcp",
+                "dport",
+                "443",
+                "queue",
+                "num",
+                "7",
+                "bypass",
+            ])
+        );
+        assert_eq!(
+            commands[4],
+            strings(&[
+                "add",
+                "rule",
+                "inet",
+                "zerodpi_test",
+                "input",
+                "ip",
+                "saddr",
+                "1.2.3.4",
+                "ip",
+                "daddr",
+                "10.0.0.1",
+                "tcp",
+                "sport",
+                "443",
+                "queue",
+                "num",
+                "7",
+                "bypass",
+            ])
+        );
     }
 
     fn data_packet(payload: &[u8]) -> Vec<u8> {

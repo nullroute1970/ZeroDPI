@@ -207,6 +207,7 @@ where
         remote_ip: Some(candidate.ip),
         remote_port: CONNECT_PORT,
         queue_num: config.NFQUEUE_NUM,
+        linux_firewall_backend: config.linux_firewall_backend(),
     };
 
     let interceptor = match interceptor_factory(filter) {

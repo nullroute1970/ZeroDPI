@@ -667,10 +667,10 @@ python build.py --platform windows
 <summary><b>Android / Termux</b> (click to expand)</summary>
 
 ```sh
-python build.py --platform termux --termux-arch aarch64 --android-ndk /path/to/android-ndk
+python build.py --platform termux --termux-arch all --android-ndk /path/to/android-ndk
 ```
 
-Output staged under `dist/termux/<arch>/`.
+Use `--termux-arch armv7` or `--termux-arch armv8` to build one Android ARM package. Output is staged under `dist/termux/<arch>/`.
 </details>
 
 ---

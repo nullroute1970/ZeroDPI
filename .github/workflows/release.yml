@@ -174,26 +174,32 @@ jobs:
 
   termux:
     runs-on: ubuntu-latest
-    env:
-      TERMUX_ARCH: aarch64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: armv7
+            rust_target: armv7-linux-androideabi
+          - arch: armv8
+            rust_target: aarch64-linux-android
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: ${{ matrix.rust_target }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Build Termux Android package
         shell: bash
-        run: printf '\n' | python3 build.py --platform termux --termux-arch "$TERMUX_ARCH"
+        run: printf '\n' | python3 build.py --platform termux --termux-arch "${{ matrix.arch }}"
 
       - name: Archive Termux Android package
-        run: tar -C "dist/termux/$TERMUX_ARCH" -czf "zerodpi-termux-$TERMUX_ARCH.tar.gz" .
+        run: tar -C "dist/termux/${{ matrix.arch }}" -czf "zerodpi-termux-${{ matrix.arch }}.tar.gz" .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: zerodpi-termux-aarch64
-          path: zerodpi-termux-aarch64.tar.gz
+          name: zerodpi-termux-${{ matrix.arch }}
+          path: zerodpi-termux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
   publish:
@@ -218,4 +224,5 @@ jobs:
           files: |
             dist/zerodpi-linux-x86_64/zerodpi-linux-x86_64.tar.gz
             dist/zerodpi-windows-x86_64/zerodpi-windows-x86_64.zip
-            dist/zerodpi-termux-aarch64/zerodpi-termux-aarch64.tar.gz
+            dist/zerodpi-termux-armv7/zerodpi-termux-armv7.tar.gz
+            dist/zerodpi-termux-armv8/zerodpi-termux-armv8.tar.gz

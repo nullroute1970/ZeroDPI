@@ -6,7 +6,7 @@ Usage:
     python build.py [--platform linux|windows|termux|all]
                    [--windivert-version <ver>] [--toolchain <toolchain>]
                    [--msys2-path <path>]
-                   [--termux-arch <arch>] [--android-ndk <path>]
+                   [--termux-arch all|armv7|armv8|<arch>] [--android-ndk <path>]
 
 What it does
 ------------
@@ -29,7 +29,7 @@ Termux:
   2. Configures Cargo to use the selected NDK clang linker.
   3. Runs `cargo build --workspace --release --target <android-target>`.
   4. Copies zerodpi + config.toml + sni_list.txt + ip_list.txt + README.md
-     to dist/termux/<arch>/.
+     to dist/termux/<arch>/. The default `all` builds Android ARMv7 and ARMv8.
 """
 
 import argparse
@@ -76,20 +76,28 @@ LINUX_TARGET_ALIASES = {
     "aarch64-musl": "aarch64-unknown-linux-musl",
 }
 ANDROID_DEFAULT_API_LEVEL = 23
-TERMUX_DEFAULT_ARCH = "aarch64"
+TERMUX_DEFAULT_ARCH = "all"
 ANDROID_NDK_DEFAULT_VERSION = "r27"
+TERMUX_ARM_ARCHES = ("armv7", "armv8")
 TERMUX_RUST_TARGETS = {
+    "armv7": "armv7-linux-androideabi",
+    "armv8": "aarch64-linux-android",
     "aarch64": "aarch64-linux-android",
+    "arm64": "aarch64-linux-android",
     "arm": "armv7-linux-androideabi",
     "x86_64": "x86_64-linux-android",
     "i686": "i686-linux-android",
 }
 TERMUX_CLANG_TARGETS = {
+    "armv7": "armv7a-linux-androideabi",
+    "armv8": "aarch64-linux-android",
     "aarch64": "aarch64-linux-android",
+    "arm64": "aarch64-linux-android",
     "arm": "armv7a-linux-androideabi",
     "x86_64": "x86_64-linux-android",
     "i686": "i686-linux-android",
 }
+TERMUX_ARCH_CHOICES = ("all",) + tuple(sorted(TERMUX_RUST_TARGETS))
 REPO_ROOT = Path(__file__).resolve().parent
 CARGO_RELEASE_DIR = REPO_ROOT / "target" / "release"
 COMMON_DIST_FILES = ("config.toml", "sni_list.txt", "ip_list.txt", "README.md")
@@ -692,16 +700,22 @@ def android_ar_path(ndk_path: Path) -> Path:
     return ndk_path / "toolchains" / "llvm" / "prebuilt" / android_host_tag() / "bin" / ar_name
 
 
-def build_termux(arch: str, android_ndk: str | None, android_api: int) -> None:
-    print(f"=== Building ZeroDPI for Termux ({arch}) ===")
+def resolve_termux_arches(arch_arg: str) -> list[str]:
+    if arch_arg == "all":
+        return list(TERMUX_ARM_ARCHES)
+    if arch_arg in TERMUX_RUST_TARGETS:
+        return [arch_arg]
 
+    supported = ", ".join(TERMUX_ARCH_CHOICES)
+    die(f"Unsupported Termux architecture: {arch_arg}. Supported values: {supported}")
+
+
+def build_termux_arch(arch: str, ndk_path: Path, android_api: int) -> None:
     if arch not in TERMUX_RUST_TARGETS:
         supported = ", ".join(sorted(TERMUX_RUST_TARGETS))
         die(f"Unsupported Termux architecture: {arch}. Supported values: {supported}")
-    if android_api < ANDROID_DEFAULT_API_LEVEL:
-        die(f"Android API level must be {ANDROID_DEFAULT_API_LEVEL} or newer.")
 
-    ndk_path = resolve_android_ndk(android_ndk)
+    print(f"\n--- Building Termux Android package ({arch}) ---")
     rust_target = TERMUX_RUST_TARGETS[arch]
     linker = android_clang_path(ndk_path, arch, android_api)
     cxx = android_clang_path(ndk_path, arch, android_api, cxx=True)
@@ -736,6 +750,22 @@ def build_termux(arch: str, android_ndk: str | None, android_api: int) -> None:
     copy_common_dist_files(dist_dir)
 
     print_dist_contents(dist_dir)
+
+
+def build_termux(arch_arg: str, android_ndk: str | None, android_api: int) -> None:
+    arches = resolve_termux_arches(arch_arg)
+    label = ", ".join(arches)
+    print(f"=== Building ZeroDPI for Termux ({label}) ===")
+
+    if android_api < ANDROID_DEFAULT_API_LEVEL:
+        die(f"Android API level must be {ANDROID_DEFAULT_API_LEVEL} or newer.")
+
+    rust_targets = sorted({TERMUX_RUST_TARGETS[arch] for arch in arches})
+    ensure_rustup_targets(rust_targets)
+
+    ndk_path = resolve_android_ndk(android_ndk)
+    for arch in arches:
+        build_termux_arch(arch, ndk_path, android_api)
 
 
 # ---------------------------------------------------------------------------
@@ -787,8 +817,9 @@ def build_all(
     print("\n" + "=" * 60)
     print("  Platform builds complete!")
     print("=" * 60)
-    for p in ("windows", "linux", f"termux/{termux_arch}"):
-        d = REPO_ROOT / "dist" / p.replace("/", "\\")
+    termux_paths = [f"termux/{arch}" for arch in resolve_termux_arches(termux_arch)]
+    for p in ("windows", "linux", *termux_paths):
+        d = REPO_ROOT / "dist" / Path(*p.split("/"))
         if d.is_dir():
             print(f"  {d}")
         else:
@@ -843,9 +874,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--termux-arch",
-        choices=sorted(TERMUX_RUST_TARGETS),
+        choices=TERMUX_ARCH_CHOICES,
         default=TERMUX_DEFAULT_ARCH,
-        help=f"Termux Android architecture (default: {TERMUX_DEFAULT_ARCH}).",
+        help=(
+            f"Termux Android architecture (default: {TERMUX_DEFAULT_ARCH}, "
+            f"builds {', '.join(TERMUX_ARM_ARCHES)})."
+        ),
     )
     parser.add_argument(
         "--android-ndk",

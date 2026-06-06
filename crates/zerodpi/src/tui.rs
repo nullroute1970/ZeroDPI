@@ -87,7 +87,7 @@ fn http_style(status: Option<u16>) -> Style {
         Some(s) if (200..300).contains(&s) => Color::Green,
         Some(s) if (300..400).contains(&s) => Color::Yellow,
         Some(_) => Color::Red,
-        None => Color::DarkGray,
+        None => Color::Gray,
     };
     Style::default().fg(color)
 }
@@ -98,6 +98,10 @@ fn cert_style(valid: bool) -> Style {
     } else {
         Style::default().fg(Color::Red)
     }
+}
+
+fn label_style() -> Style {
+    Style::default().fg(Color::Gray)
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,7 +1086,7 @@ fn draw_dashboard(
                     .expect("SNI dashboard state is initialised");
                 vec![
                     Line::from(vec![
-                        Span::styled("SNI: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("SNI: ", label_style()),
                         Span::styled(
                             sni.clone(),
                             Style::default()
@@ -1090,23 +1094,23 @@ fn draw_dashboard(
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::raw("   "),
-                        Span::styled("IP: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("IP: ", label_style()),
                         Span::styled(ip.to_string(), Style::default().fg(Color::White)),
                         Span::raw("   "),
-                        Span::styled("Score: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Score: ", label_style()),
                         Span::styled(score.to_string(), score_style(*score)),
                     ]),
                     Line::from(vec![
-                        Span::styled("Method: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Method: ", label_style()),
                         Span::styled(cfg.BYPASS_METHOD.clone(), Style::default().fg(Color::White)),
                         Span::raw("   "),
-                        Span::styled("Listen: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Listen: ", label_style()),
                         Span::styled(
                             format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT),
                             Style::default().fg(Color::White),
                         ),
                         Span::raw("   "),
-                        Span::styled("Uptime: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Uptime: ", label_style()),
                         Span::styled(uptime, Style::default().fg(Color::White)),
                     ]),
                 ]
@@ -1115,7 +1119,7 @@ fn draw_dashboard(
                 let ip = state.active_ip.expect("IP dashboard state is initialised");
                 vec![
                     Line::from(vec![
-                        Span::styled("Mode: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Mode: ", label_style()),
                         Span::styled(
                             "ip_bypass",
                             Style::default()
@@ -1123,17 +1127,17 @@ fn draw_dashboard(
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::raw("   "),
-                        Span::styled("Active IP: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Active IP: ", label_style()),
                         Span::styled(ip.to_string(), Style::default().fg(Color::White)),
                         Span::raw("   "),
-                        Span::styled("Listen: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Listen: ", label_style()),
                         Span::styled(
                             format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT),
                             Style::default().fg(Color::White),
                         ),
                     ]),
                     Line::from(vec![
-                        Span::styled("Uptime: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Uptime: ", label_style()),
                         Span::styled(uptime, Style::default().fg(Color::White)),
                     ]),
                 ]
@@ -1164,7 +1168,7 @@ fn draw_dashboard(
             .sum();
         let (total_upload, total_download) = live_transfer_totals(state);
         let stats_line = Line::from(vec![
-            Span::styled(" Total: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Total: ", label_style()),
             Span::styled(
                 state.total.to_string(),
                 Style::default()
@@ -1172,7 +1176,7 @@ fn draw_dashboard(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("OK: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("OK: ", label_style()),
             Span::styled(
                 state.bypasses_ok.to_string(),
                 Style::default()
@@ -1181,13 +1185,13 @@ fn draw_dashboard(
             ),
             Span::styled(format!(" {ok_pct}"), Style::default().fg(Color::Green)),
             Span::raw("  "),
-            Span::styled("Failed: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Failed: ", label_style()),
             Span::styled(
                 state.bypasses_failed.to_string(),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("Active: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Active: ", label_style()),
             Span::styled(
                 state.active.to_string(),
                 Style::default()
@@ -1195,23 +1199,23 @@ fn draw_dashboard(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("Download: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Download: ", label_style()),
             Span::styled(
                 fmt_stats_field(fmt_rate(agg_s2c_bps)),
                 Style::default().fg(Color::Cyan),
             ),
-            Span::styled(" / ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" / ", label_style()),
             Span::styled(
                 fmt_stats_field(fmt_bytes(total_download)),
                 Style::default().fg(Color::Cyan),
             ),
             Span::raw("  "),
-            Span::styled("Upload: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Upload: ", label_style()),
             Span::styled(
                 fmt_stats_field(fmt_rate(agg_c2s_bps)),
                 Style::default().fg(Color::Cyan),
             ),
-            Span::styled(" / ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" / ", label_style()),
             Span::styled(
                 fmt_stats_field(fmt_bytes(total_upload)),
                 Style::default().fg(Color::Cyan),

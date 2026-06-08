@@ -52,7 +52,7 @@ It is not a replacement VPN client. It is a local TCP relay that your existing V
 
 | Feature | Description |
 |---------|-------------|
-| 🧩 **6 bypass methods** | `wrong_seq`, `wrong_checksum`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_seq_tls_record_frag`, `tcp_segmentation` |
+| 🧩 **7 bypass methods** | `wrong_seq`, `wrong_checksum`, `wrong_ack`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_seq_tls_record_frag`, `tcp_segmentation` |
 | 🎯 **5 operating modes** | `sni_spoof`, `ip_bypass`, `sni_scan`, `ip_scan`, `proxy_scan` |
 | 🖥️ **TUI dashboard** | Ratatui-powered live progress, selection tables, and connection monitoring |
 | 🔄 **Auto-rescan** | Background re-scanning hot-swaps the best target without restart |
@@ -249,7 +249,7 @@ Mode-specific inputs:
 
 ### 1️⃣ `sni_spoof` (default) — TLS SNI Spoofing
 
-Injects a **decoy ClientHello** with a harmless CDN-hosted SNI (e.g. `auth.vercel.com`) that the DPI classifies as benign. The decoy uses a deliberately broken TCP sequence or checksum so the real upstream server discards it — but the DPI has already passed the flow. Your real ClientHello then passes through unchallenged.
+Injects a **decoy ClientHello** with a harmless CDN-hosted SNI (e.g. `auth.vercel.com`) that the DPI classifies as benign. The decoy uses a deliberately broken TCP sequence number, TCP acknowledgment number, or checksum so the real upstream server discards it — but the DPI has already passed the flow. Your real ClientHello then passes through unchallenged.
 
 ```
 🖥️ Local apps → 🌐 VPN App → 🔄 ZeroDPI (sni_spoof) → 🌍 CDN Edge → 🖥️ VPN Server
@@ -308,6 +308,7 @@ Results are blended using a configurable weight and displayed in the TUI.
 |--------|-----------|:---:|---|
 | `wrong_seq` | Injects fake ClientHello with deliberately old TCP sequence number | ✅ Yes (WinDivert/NFQUEUE) | Most DPI systems |
 | `wrong_checksum` | Injects fake ClientHello with corrupted TCP checksum | ✅ Yes | DPI that doesn't verify checksums |
+| `wrong_ack` | Injects fake ClientHello with deliberately old TCP ACK number | ✅ Yes | DPI that accepts forged data but servers reject old ACKs |
 | `tls_record_frag` | TLS Record Fragment: splits the real ClientHello record body into multiple tiny TLS records | ✅ Yes | DPI that can't reassemble TLS records |
 | `wrong_seq_tls_frag` | Sends a wrong-sequence fake ClientHello, then writes the intact real ClientHello in tiny TCP segments | ✅ Yes | Layered TCP-segment DPI paths |
 | `wrong_seq_tls_record_frag` | Sends a wrong-sequence fake ClientHello, then splits the real ClientHello body into tiny TLS records | ✅ Yes | Layered TLS-record DPI paths |
@@ -324,14 +325,14 @@ Start with the least complex method that can run on your platform, then move to 
 | Windows or Linux desktop with Administrator/root access | `wrong_seq` first |
 | Rooted Android where NFQUEUE support is uncertain | `tcp_segmentation` first |
 | You cannot run packet interception but can point the VPN client at ZeroDPI | `tcp_segmentation` |
-| DPI appears to ignore invalid sequence tricks | `wrong_checksum` or `tls_record_frag` |
+| DPI appears to ignore invalid sequence tricks | `wrong_ack`, `wrong_checksum`, or `tls_record_frag` |
 | DPI sees through fake packets but fails with fragmented real handshakes | `tls_record_frag` |
 | A first firewall layer is fooled, but another layer still blocks the real ClientHello | `wrong_seq_tls_frag` or `wrong_seq_tls_record_frag` |
 | You only need the fastest reachable IP and not SNI spoofing | `MODE = "ip_bypass"` |
 
 Method behavior in more detail:
 
-- `wrong_seq` and `wrong_checksum` send a fake decoy ClientHello during the TCP handshake path. DPI may inspect it, but the real upstream server should discard it.
+- `wrong_seq`, `wrong_ack`, and `wrong_checksum` send a fake decoy ClientHello during the TCP handshake path. DPI may inspect it, but the real upstream server should discard it.
 - `tls_record_frag` rewrites the real first TLS record into many smaller TLS records. The server should reassemble the TLS handshake normally.
 - `tcp_segmentation` keeps the TLS bytes unchanged and writes them in small TCP chunks from the proxy. It avoids WinDivert/NFQUEUE and is the easiest method to run in restricted environments.
 - The `wrong_seq_*` combo methods first send the decoy wrong-sequence ClientHello, then also fragment the real ClientHello path.
@@ -524,7 +525,7 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `BYPASS_METHOD` | `string` | `"wrong_seq"` | `wrong_seq`, `wrong_checksum`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_seq_tls_record_frag`, or `tcp_segmentation` |
+| `BYPASS_METHOD` | `string` | `"wrong_seq"` | `wrong_seq`, `wrong_checksum`, `wrong_ack`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_seq_tls_record_frag`, or `tcp_segmentation` |
 | `BYPASS_TIMEOUT_SECS` | `u64` | `2` | Time to wait for bypass setup before giving up |
 | `RELAY_MAX_LIFETIME_SECS` | `u64` | `0` | Rotate established relays after this many seconds (`0` = disabled/default) |
 | `NFQUEUE_NUM` | `u16` | `1` | (Linux) NFQUEUE queue number |
@@ -546,6 +547,15 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | `WRONG_CHECKSUM_SET_PSH` | `bool` | `true` | Set PSH flag on the spoofed packet |
 | `WRONG_CHECKSUM_BUMP_IP_IDENT` | `bool` | `true` | Bump IPv4 Identification field |
 | `WRONG_CHECKSUM_COMPLETE_IMMEDIATELY` | `bool` | `true` | Signal bypass complete immediately after emission |
+
+#### `wrong_ack` Parameters
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `WRONG_ACK_OFFSET` | `u32` | `1` | Bytes subtracted from `syn_ack_seq + 1` for the spoofed TCP ACK (>= 1) |
+| `WRONG_ACK_SET_PSH` | `bool` | `true` | Set PSH flag on the spoofed packet |
+| `WRONG_ACK_BUMP_IP_IDENT` | `bool` | `true` | Bump IPv4 Identification field |
+| `WRONG_ACK_COMPLETE_IMMEDIATELY` | `bool` | `true` | Signal bypass complete immediately after emission |
 
 #### `tls_record_frag` Parameters
 
@@ -726,7 +736,7 @@ Options:
       --auto-select                    Auto-select top-ranked candidate
       --no-tui                         Disable ratatui screens for headless/service runs
       --sni <SNI>                      Override SELECTED_SNI (skip scan)
-      --method <METHOD>                Override BYPASS_METHOD
+      --method <METHOD>                Override BYPASS_METHOD (e.g. wrong_seq, wrong_ack, tcp_segmentation)
       --queue-num <N>                  Override NFQUEUE_NUM (Linux)
       --scan-timeout <SECS>            Override SCAN_TIMEOUT_SECS
       --rescan-interval <SECS>         Override RESCAN_INTERVAL_SECS
@@ -1105,7 +1115,7 @@ Unit tests cover:
 | Scan returns no useful candidates | Increase `SCAN_TIMEOUT_SECS`, lower concurrency on weak networks, refresh the candidate list, and verify the CDN or IP range is reachable without ZeroDPI. |
 | TUI is garbled over SSH or systemd | Run with `--no-tui` and rely on logs. |
 | `wrong_seq` works on simple paths but fails on layered firewalls | Try `wrong_seq_tls_frag` for TCP-level fragmentation or `wrong_seq_tls_record_frag` for TLS-record fragmentation. Both keep the fake wrong-sequence stage for the first DPI layer. |
-| `wrong_seq` or `wrong_checksum` does not work | Try `tls_record_frag` (TLS-record layer), then `tcp_segmentation` (TCP layer). Different DPI devices fail on different TCP/TLS behaviors. |
+| `wrong_seq`, `wrong_ack`, or `wrong_checksum` does not work | Try `tls_record_frag` (TLS-record layer), then `tcp_segmentation` (TCP layer). Different DPI devices fail on different TCP/TLS behaviors. |
 | Connections start but stall | Raise `BYPASS_TIMEOUT_SECS`, reduce `SNI_MAX_CONCURRENT`, and check whether the selected candidate has high TTFB or low speed. |
 | gRPC works after restart but fails after hours | Enable `RESCAN_INTERVAL_SECS` and set `RELAY_MAX_LIFETIME_SECS` to a positive value so long-lived relays reconnect through the latest working target. |
 | Scan-only mode works but relay mode fails | Confirm the VPN profile dials ZeroDPI, not the real server directly, and confirm the selected `BYPASS_METHOD` is supported on your platform. |

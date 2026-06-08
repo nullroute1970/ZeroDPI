@@ -57,6 +57,9 @@ pub struct Config {
     /// - `"wrong_checksum"` — injects a fake TLS ClientHello with the normal
     ///   TCP sequence number, then corrupts the TCP checksum so DPI can inspect
     ///   the fake SNI while the real server drops the invalid segment.
+    /// - `"wrong_ack"` — injects a fake TLS ClientHello with the normal TCP
+    ///   sequence number and a deliberately old TCP acknowledgment number so
+    ///   DPI inspects the fake SNI while the real server rejects the segment.
     /// - `"tls_record_frag"` — TLS Record Fragment / TLS-layer fragmentation.
     ///   Splits the real ClientHello into multiple small TLS records so no
     ///   single record contains the full SNI. No fake packet is injected; the
@@ -138,6 +141,32 @@ pub struct Config {
     /// invalid-checksum packet should be silently dropped by the server.
     #[serde(default = "default_true")]
     pub WRONG_CHECKSUM_COMPLETE_IMMEDIATELY: bool,
+
+    // -----------------------------------------------------------------------
+    // wrong_ack method parameters
+    // -----------------------------------------------------------------------
+    /// Bytes subtracted from `syn_ack_seq + 1` for the spoofed TCP ACK number.
+    /// A value of `1` places the forged segment's ACK one byte before the
+    /// server's current send-window left edge.
+    /// Must be `>= 1`. Default: `1`.
+    #[serde(default = "default_wrong_ack_offset")]
+    pub WRONG_ACK_OFFSET: u32,
+
+    /// Whether to set the `PSH` flag on the spoofed ClientHello packet.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub WRONG_ACK_SET_PSH: bool,
+
+    /// Whether to increment the IPv4 `Identification` field on the spoofed
+    /// packet. Default: `true`.
+    #[serde(default = "default_true")]
+    pub WRONG_ACK_BUMP_IP_IDENT: bool,
+
+    /// Whether to signal bypass completion immediately after emitting the
+    /// old-ACK packet. The default is `true` because out-of-window ACK handling
+    /// is not consistent enough to wait for a server response.
+    #[serde(default = "default_true")]
+    pub WRONG_ACK_COMPLETE_IMMEDIATELY: bool,
 
     // -----------------------------------------------------------------------
     // tls_record_frag method parameters
@@ -379,6 +408,9 @@ fn default_true() -> bool {
 fn default_wrong_checksum_delta() -> u16 {
     1
 }
+fn default_wrong_ack_offset() -> u32 {
+    1
+}
 fn default_tls_frag_size() -> usize {
     1
 }
@@ -485,18 +517,22 @@ impl Config {
             self.BYPASS_METHOD.as_str(),
             "wrong_seq"
                 | "wrong_checksum"
+                | "wrong_ack"
                 | "tls_record_frag"
                 | "wrong_seq_tls_frag"
                 | "wrong_seq_tls_record_frag"
                 | "tcp_segmentation"
         ) {
             anyhow::bail!(
-                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_seq_tls_record_frag\", \"tcp_segmentation\"",
+                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_ack\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_seq_tls_record_frag\", \"tcp_segmentation\"",
                 self.BYPASS_METHOD
             );
         }
         if self.WRONG_CHECKSUM_DELTA == 0 {
             anyhow::bail!("WRONG_CHECKSUM_DELTA must be >= 1");
+        }
+        if self.WRONG_ACK_OFFSET == 0 {
+            anyhow::bail!("WRONG_ACK_OFFSET must be >= 1");
         }
         if self.TLS_RECORD_FRAG_SIZE == 0 {
             anyhow::bail!("TLS_RECORD_FRAG_SIZE must be >= 1");
@@ -567,6 +603,11 @@ mod tests {
         assert!(cfg.WRONG_CHECKSUM_SET_PSH);
         assert!(cfg.WRONG_CHECKSUM_BUMP_IP_IDENT);
         assert!(cfg.WRONG_CHECKSUM_COMPLETE_IMMEDIATELY);
+        // wrong_ack defaults
+        assert_eq!(cfg.WRONG_ACK_OFFSET, 1);
+        assert!(cfg.WRONG_ACK_SET_PSH);
+        assert!(cfg.WRONG_ACK_BUMP_IP_IDENT);
+        assert!(cfg.WRONG_ACK_COMPLETE_IMMEDIATELY);
         // tls_record_frag defaults
         assert_eq!(cfg.TLS_RECORD_FRAG_SIZE, 1);
         assert!(cfg.TLS_RECORD_FRAG_SET_PSH);
@@ -621,6 +662,53 @@ mod tests {
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_checksum"
             WRONG_CHECKSUM_DELTA = 0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn wrong_ack_defaults() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "wrong_ack"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.BYPASS_METHOD, "wrong_ack");
+        assert_eq!(cfg.WRONG_ACK_OFFSET, 1);
+        assert!(cfg.WRONG_ACK_SET_PSH);
+        assert!(cfg.WRONG_ACK_BUMP_IP_IDENT);
+        assert!(cfg.WRONG_ACK_COMPLETE_IMMEDIATELY);
+    }
+
+    #[test]
+    fn parses_wrong_ack_fields() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "wrong_ack"
+            WRONG_ACK_OFFSET = 17
+            WRONG_ACK_SET_PSH = false
+            WRONG_ACK_BUMP_IP_IDENT = false
+            WRONG_ACK_COMPLETE_IMMEDIATELY = false
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.WRONG_ACK_OFFSET, 17);
+        assert!(!cfg.WRONG_ACK_SET_PSH);
+        assert!(!cfg.WRONG_ACK_BUMP_IP_IDENT);
+        assert!(!cfg.WRONG_ACK_COMPLETE_IMMEDIATELY);
+    }
+
+    #[test]
+    fn rejects_wrong_ack_offset_zero() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "wrong_ack"
+            WRONG_ACK_OFFSET = 0
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert!(cfg.validate().is_err());
@@ -725,6 +813,10 @@ mod tests {
             WRONG_CHECKSUM_SET_PSH = false
             WRONG_CHECKSUM_BUMP_IP_IDENT = false
             WRONG_CHECKSUM_COMPLETE_IMMEDIATELY = false
+            WRONG_ACK_OFFSET = 11
+            WRONG_ACK_SET_PSH = false
+            WRONG_ACK_BUMP_IP_IDENT = false
+            WRONG_ACK_COMPLETE_IMMEDIATELY = false
             BYPASS_TIMEOUT_SECS = 5
             RELAY_MAX_LIFETIME_SECS = 7200
         "#;
@@ -744,6 +836,10 @@ mod tests {
         assert!(!cfg.WRONG_CHECKSUM_SET_PSH);
         assert!(!cfg.WRONG_CHECKSUM_BUMP_IP_IDENT);
         assert!(!cfg.WRONG_CHECKSUM_COMPLETE_IMMEDIATELY);
+        assert_eq!(cfg.WRONG_ACK_OFFSET, 11);
+        assert!(!cfg.WRONG_ACK_SET_PSH);
+        assert!(!cfg.WRONG_ACK_BUMP_IP_IDENT);
+        assert!(!cfg.WRONG_ACK_COMPLETE_IMMEDIATELY);
         assert_eq!(cfg.BYPASS_TIMEOUT_SECS, 5);
         assert_eq!(cfg.RELAY_MAX_LIFETIME_SECS, 7200);
     }

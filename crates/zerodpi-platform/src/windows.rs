@@ -156,6 +156,7 @@ fn parse_view<'a>(direction: Direction, buf: &'a [u8]) -> Result<(PacketView<'a>
         payload_len,
         payload: &buf[payload_off..payload_off + payload_len],
         new_seq: None,
+        new_ack: None,
         new_flags: None,
         new_payload: None,
         bump_ipv4_ident: false,
@@ -184,6 +185,9 @@ fn build_modified(orig: &[u8], layout: &PacketLayout, view: &PacketView<'_>) -> 
     };
     if let Some(seq) = view.new_seq {
         tcp_hdr.sequence_number = seq;
+    }
+    if let Some(ack) = view.new_ack {
+        tcp_hdr.acknowledgment_number = ack;
     }
     if let Some(flags) = view.new_flags {
         tcp_hdr.syn = flags.syn;
@@ -240,6 +244,7 @@ mod tests {
             payload_len: 0,
             payload: &[],
             new_seq: Some(1001),
+            new_ack: None,
             new_flags: Some(TcpFlags {
                 ack: true,
                 psh: true,
@@ -360,5 +365,31 @@ mod tests {
         let ip3 = Ipv4HeaderSlice::from_slice(&modified).unwrap();
         let tcp3 = TcpHeaderSlice::from_slice(&modified[ip3.slice().len()..]).unwrap();
         assert_eq!(tcp3.checksum(), valid_checksum.wrapping_add(11));
+    }
+
+    #[test]
+    fn tcp_ack_number_can_be_rewritten_after_rebuild() {
+        let buf = bare_ack_packet();
+        let layout = PacketLayout {
+            ip_hdr_len: 20,
+            tcp_hdr_len: 20,
+            payload_off: 40,
+            total_len: 40,
+        };
+        let mut view = make_view();
+        view.new_seq = None;
+        view.new_ack = Some(4999);
+        view.corrupt_tcp_checksum_delta = None;
+        let modified = build_modified(&buf, &layout, &view).unwrap();
+
+        let ip2 = Ipv4HeaderSlice::from_slice(&modified).unwrap();
+        let tcp2 = TcpHeaderSlice::from_slice(&modified[ip2.slice().len()..]).unwrap();
+        assert_eq!(tcp2.sequence_number(), 1001);
+        assert_eq!(tcp2.acknowledgment_number(), 4999);
+        let calculated = tcp2
+            .to_header()
+            .calc_checksum_ipv4(&ip2.to_header(), &modified[40..])
+            .unwrap();
+        assert_eq!(tcp2.checksum(), calculated);
     }
 }

@@ -112,6 +112,7 @@ mod tests {
             payload_len: 0,
             payload: &[],
             new_seq: None,
+            new_ack: None,
             new_flags: None,
             new_payload: None,
             bump_ipv4_ident: false,

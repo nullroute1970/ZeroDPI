@@ -9,8 +9,9 @@
 //! They implement the [`BypassMethod`] trait and are driven by two hooks:
 //!
 //! - [`BypassMethod::on_handshake_complete_ack`] — fires on the first outbound
-//!   bare ACK after the TCP handshake.  `wrong_seq`, `wrong_checksum`, and the
-//!   first stage of the `wrong_seq_*` combo methods act here (fake injection).
+//!   bare ACK after the TCP handshake.  `wrong_seq`, `wrong_ack`,
+//!   `wrong_checksum`, and the first stage of the `wrong_seq_*` combo methods
+//!   act here (fake injection).
 //! - [`BypassMethod::on_first_data_packet`] — fires on the first outbound
 //!   data packet.  `tls_record_frag` and the second stage of
 //!   `wrong_seq_tls_record_frag` act here (TLS record fragmentation). The
@@ -33,6 +34,7 @@
 
 pub mod tcp_segmentation;
 pub mod tls_record_frag;
+pub mod wrong_ack;
 pub mod wrong_checksum;
 pub mod wrong_seq;
 pub mod wrong_seq_tls_frag;
@@ -98,8 +100,8 @@ pub trait BypassMethod: Send + Sync + 'static {
 
     /// Called when the first outbound bare ACK of the handshake is observed.
     ///
-    /// Methods that operate at this stage (e.g. `wrong_seq`, `wrong_checksum`)
-    /// stage their payload mutations here and return
+    /// Methods that operate at this stage (e.g. `wrong_seq`, `wrong_ack`,
+    /// `wrong_checksum`) stage their payload mutations here and return
     /// [`MethodAction::EmitFakeAndAccept`].
     /// Methods that operate later (e.g. `tls_record_frag`) return
     /// [`MethodAction::PassThrough`]; the handler will then set the flow into
@@ -127,13 +129,14 @@ pub trait BypassMethod: Send + Sync + 'static {
 /// Build an interceptor-based method from the application config.
 ///
 /// Returns `Some(method)` for interceptor-based methods (`wrong_seq`,
-/// `wrong_checksum`, `tls_record_frag`, `wrong_seq_tls_frag`,
+/// `wrong_ack`, `wrong_checksum`, `tls_record_frag`, `wrong_seq_tls_frag`,
 /// `wrong_seq_tls_record_frag`) and `None` for socket-based methods
 /// (`tcp_segmentation`) or unknown names.  Callers should validate the method
 /// name via [`crate::config::Config::validate`] before calling this function.
 pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
     match cfg.BYPASS_METHOD.as_str() {
         "wrong_seq" => Some(Box::new(wrong_seq::WrongSeq::new(cfg))),
+        "wrong_ack" => Some(Box::new(wrong_ack::WrongAck::new(cfg))),
         "wrong_checksum" => Some(Box::new(wrong_checksum::WrongChecksum::new(cfg))),
         "tls_record_frag" => Some(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
         "wrong_seq_tls_frag" => Some(Box::new(wrong_seq_tls_frag::WrongSeqTlsFrag::new(cfg))),
@@ -163,6 +166,13 @@ mod tests {
         let cfg = cfg_with_method("wrong_checksum");
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "wrong_checksum");
+    }
+
+    #[test]
+    fn build_wrong_ack_method() {
+        let cfg = cfg_with_method("wrong_ack");
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "wrong_ack");
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub struct PacketView<'a> {
 
     // ---- staged mutations (applied only on `AcceptModified`) ----
     pub new_seq: Option<u32>,
+    pub new_ack: Option<u32>,
     pub new_flags: Option<TcpFlags>,
     /// Replace the entire TCP payload with these bytes.
     pub new_payload: Option<Vec<u8>>,

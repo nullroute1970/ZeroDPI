@@ -142,6 +142,14 @@ SPEED_CAP_BPS = 2048000.0
 #     devices can inspect the payload using the allowed SNI, while the real
 #     upstream server drops the invalid-checksum segment before consuming data.
 #
+#   "wrong_ack"
+#     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
+#     then injects a fake TLS ClientHello on that packet with the normal valid
+#     TCP sequence number and a deliberately old TCP ACK number.  DPI devices
+#     can inspect the payload using the allowed SNI, while the real upstream
+#     server rejects the segment because its ACK is before the server send
+#     window.
+#
 #   "tls_record_frag"
 #     TLS Record Fragment / TLS-layer fragmentation.  Does NOT inject any fake
 #     packet.  Instead, it intercepts the first outbound data packet carrying
@@ -280,6 +288,41 @@ WRONG_CHECKSUM_BUMP_IP_IDENT = true
 # The default is true because a correctly invalid-checksum packet should be
 # dropped silently by the real server and therefore will not produce an ACK.
 WRONG_CHECKSUM_COMPLETE_IMMEDIATELY = true
+
+# ---------------------------------------------------------------------------
+# wrong_ack method parameters
+# ---------------------------------------------------------------------------
+# These settings only apply when BYPASS_METHOD = "wrong_ack".
+
+# Bytes subtracted from syn_ack_seq + 1 for the spoofed TCP ACK number.
+#
+# With the default value of 1, the fake segment's ACK is placed one byte before
+# the server's current send-window left edge:
+#   injected_ack = syn_ack_seq + 1 - WRONG_ACK_OFFSET
+#
+# Increase only when testing shows the default is not effective.
+#
+# Must be >= 1.  Default: 1.
+WRONG_ACK_OFFSET = 1
+
+# Whether to set the TCP PSH flag on the spoofed ClientHello packet.
+#
+# Keep this enabled for normal use.  Disable it only when testing a network or
+# middlebox that reacts poorly to PSH.
+WRONG_ACK_SET_PSH = true
+
+# Whether to increment the IPv4 Identification field on the spoofed packet.
+#
+# Bumping the ID makes the spoofed packet look like a fresh IPv4 datagram.
+# This only affects IPv4 packets; IPv6 has no IPv4 Identification field.
+WRONG_ACK_BUMP_IP_IDENT = true
+
+# Whether to signal the bypass phase complete immediately after the old-ACK
+# packet is emitted.
+#
+# The default is true because out-of-window ACK handling can be dropped or
+# answered inconsistently by real servers.
+WRONG_ACK_COMPLETE_IMMEDIATELY = true
 
 # ---------------------------------------------------------------------------
 # tls_record_frag method parameters

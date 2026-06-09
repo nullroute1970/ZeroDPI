@@ -21,14 +21,16 @@ LISTEN_PORT = 44444
 # ---------------------------------------------------------------------------
 
 # Operating mode. Valid values: "sni_spoof" (default), "ip_bypass",
-# "sni_scan", "ip_scan", "proxy_scan".
-# - "sni_spoof"  — DPI bypass via SNI spoofing (default).
-# - "ip_bypass"  — plain TCP relay through a scanned IP; no packet interception.
-# - "sni_scan"   — scan sni_list.txt and display/save results, then exit.
-# - "ip_scan"    — scan ip_list.txt and display/save results, then exit.
-# - "proxy_scan" — scan sni_list.txt (Phase 1), then test each working SNI
-#                  through your V2RayN SOCKS5 mixed port (Phase 2); display
-#                  blended results and exit.  Requires V2RayN to be running.
+# "ip_bypass_plus", "sni_scan", "ip_scan", "proxy_scan".
+# - "sni_spoof"     — DPI bypass via SNI spoofing (default).
+# - "ip_bypass"     — plain TCP relay through a scanned IP; no packet interception.
+# - "ip_bypass_plus" — IPv4 relay through a scanned IP plus real-SNI-preserving
+#                      BYPASS_METHOD ("tls_record_frag" or "tcp_segmentation").
+# - "sni_scan"      — scan sni_list.txt and display/save results, then exit.
+# - "ip_scan"       — scan ip_list.txt and display/save results, then exit.
+# - "proxy_scan"    — scan sni_list.txt (Phase 1), then test each working SNI
+#                     through your V2RayN SOCKS5 mixed port (Phase 2); display
+#                     blended results and exit.  Requires V2RayN to be running.
 MODE = "sni_spoof"
 
 # When true, ZeroDPI automatically picks the highest-ranked candidate
@@ -54,8 +56,9 @@ SELECTED_IP = ""
 # Default: "sni_list.txt" (next to config.toml).
 SNI_LIST = "sni_list.txt"
 
-# Path to the IP list file (ip_bypass mode only).
+# Path to the IP list file (ip_bypass, ip_bypass_plus, and ip_scan modes).
 # One entry per line: plain IPs (IPv4 or IPv6) or CIDR ranges.
+# ip_bypass_plus is IPv4-only and rejects IPv6 entries.
 # Default: "ip_list.txt".
 IP_LIST = "ip_list.txt"
 
@@ -185,8 +188,9 @@ SPEED_CAP_BPS = 2048000.0
 #     identical ClientHello.
 #
 # This setting is used by SNI-based modes ("sni_spoof", "sni_scan", and
-# "proxy_scan").  The "ip_bypass" and "ip_scan" modes do not use a bypass
-# method.
+# "proxy_scan").  MODE = "ip_bypass_plus" supports only "tls_record_frag" or
+# "tcp_segmentation" so the upstream VPN client's real SNI is preserved. The
+# "ip_bypass" and "ip_scan" modes do not use a bypass method.
 BYPASS_METHOD = "wrong_seq"
 
 # Seconds the proxy waits for the intercept thread to confirm that the spoofed

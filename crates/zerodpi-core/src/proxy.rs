@@ -13,6 +13,10 @@
 //! 6. For `wrong_seq_tls_frag`, step 4 writes the intact ClientHello in small
 //!    TCP segments using the same `TCP_SEG_*` settings as `tcp_segmentation`.
 //!
+//! For `ip_bypass_plus`, IP scanning selects the upstream IPv4 address, then
+//! only real-SNI-preserving methods (`tls_record_frag` or `tcp_segmentation`)
+//! are applied to the first ClientHello. No fake SNI payload is generated.
+//!
 //! For socket-based methods (`tcp_segmentation`, TCP-level TLS Fragment):
 //! 1. Accept incoming TCP on `LISTEN_HOST:LISTEN_PORT`.
 //! 2. Connect to the upstream server (no FlowTable registration, no interceptor).
@@ -153,6 +157,13 @@ impl ConnectionSettings {
 enum BypassProgress {
     ReadyForData,
     Complete(BypassOutcome),
+}
+
+#[derive(Debug)]
+struct InterceptConnectionTarget {
+    interface_ip: Ipv4Addr,
+    connect_ip: Ipv4Addr,
+    fake_client_hello: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -366,10 +377,14 @@ pub async fn run_proxy(
         let flows = flows.clone();
         let event_tx = event_tx.clone();
         let connection_settings = ConnectionSettings::from_config(&cfg);
+        let fake_client_hello = fresh_fake_client_hello(target.sni.as_bytes());
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(
-                interface_ip,
-                target,
+            if let Err(e) = handle_intercept_connection(
+                InterceptConnectionTarget {
+                    interface_ip,
+                    connect_ip: target.ip,
+                    fake_client_hello,
+                },
                 flows,
                 incoming,
                 peer,
@@ -384,9 +399,8 @@ pub async fn run_proxy(
     }
 }
 
-async fn handle_connection(
-    interface_ip: Ipv4Addr,
-    target: ActiveSniTarget,
+async fn handle_intercept_connection(
+    target: InterceptConnectionTarget,
     flows: FlowTable,
     mut incoming: TcpStream,
     peer: SocketAddr,
@@ -394,7 +408,8 @@ async fn handle_connection(
     settings: ConnectionSettings,
 ) -> anyhow::Result<()> {
     let connect_port = CONNECT_PORT;
-    let connect_ip = target.ip;
+    let interface_ip = target.interface_ip;
+    let connect_ip = target.connect_ip;
 
     // Build outbound socket bound to the host's interface IP, kernel-chosen port.
     let socket = TcpSocket::new_v4()?;
@@ -412,8 +427,7 @@ async fn handle_connection(
         dst_port: connect_port,
     };
 
-    let fake = fresh_fake_client_hello(target.sni.as_bytes());
-    let entry = FlowEntry::new(fake);
+    let entry = FlowEntry::new(target.fake_client_hello);
     flows.insert(key, entry.clone());
 
     // Make sure we always remove the entry on this path's exit.
@@ -574,6 +588,94 @@ async fn handle_connection(
     );
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// IP-bypass-plus proxy (IP selection + real-SNI-preserving bypass methods)
+// ---------------------------------------------------------------------------
+
+/// Run the IP-bypass-plus proxy.
+///
+/// The active target is an IP selected by the IP scanner, like `ip_bypass`.
+/// Unlike plain `ip_bypass`, this mode may apply a real-SNI-preserving
+/// ClientHello bypass method:
+///
+/// - `tcp_segmentation`: socket-only segmentation, no packet interceptor.
+/// - `tls_record_frag`: packet interceptor rewrites the first real ClientHello
+///   into TLS record fragments. The flow stores an empty fake payload because
+///   no fake SNI packet is emitted.
+///
+/// This mode is intentionally IPv4-only so the interceptor path can use the
+/// existing IPv4 flow tracking and platform filters.
+pub async fn run_ip_bypass_plus_proxy(
+    cfg: Arc<Config>,
+    active_ip: Arc<RwLock<IpAddr>>,
+    interface_ip: Ipv4Addr,
+    flows: FlowTable,
+    event_tx: Option<ProxyEventSender>,
+) -> anyhow::Result<()> {
+    let listen_addr: SocketAddr = format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT)
+        .parse()
+        .context("invalid LISTEN_HOST/LISTEN_PORT")?;
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .with_context(|| format!("bind {listen_addr}"))?;
+    info!(%listen_addr, method = %cfg.BYPASS_METHOD, "ip_bypass_plus: listening");
+
+    loop {
+        let (incoming, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!(error = %e, "ip_bypass_plus: accept failed");
+                continue;
+            }
+        };
+        debug!(%peer, "ip_bypass_plus: accepted");
+
+        let connect_ip = match *active_ip.read().unwrap() {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(ip) => {
+                warn!(%ip, "ip_bypass_plus: active IPv6 target rejected");
+                continue;
+            }
+        };
+
+        if cfg.BYPASS_METHOD == "tcp_segmentation" {
+            let cfg = cfg.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    handle_tcp_seg_connection_with_ip(cfg, connect_ip, incoming, peer, event_tx)
+                        .await
+                {
+                    warn!(%peer, error = %e, "ip_bypass_plus tcp_seg connection failed");
+                }
+            });
+            continue;
+        }
+
+        let flows = flows.clone();
+        let event_tx = event_tx.clone();
+        let connection_settings = ConnectionSettings::from_config(&cfg);
+        tokio::spawn(async move {
+            if let Err(e) = handle_intercept_connection(
+                InterceptConnectionTarget {
+                    interface_ip,
+                    connect_ip,
+                    fake_client_hello: Vec::new(),
+                },
+                flows,
+                incoming,
+                peer,
+                event_tx,
+                connection_settings,
+            )
+            .await
+            {
+                warn!(%peer, error = %e, "ip_bypass_plus connection failed");
+            }
+        });
+    }
 }
 
 /// Tiny scope-guard so we don't pull in the `scopeguard` crate.

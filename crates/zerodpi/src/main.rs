@@ -35,8 +35,8 @@ use zerodpi_core::ip_scanner::{load_ip_list, scan_ip_list, IpProbeEntry, IpScanE
 use zerodpi_core::methods::build_method;
 use zerodpi_core::net::default_interface_ipv4;
 use zerodpi_core::proxy::{
-    run_ip_bypass_proxy, run_proxy, ActiveSniTarget, ProxyEvent, ProxyEventSender, RelayEndReason,
-    CONNECT_PORT,
+    run_ip_bypass_plus_proxy, run_ip_bypass_proxy, run_proxy, ActiveSniTarget, ProxyEvent,
+    ProxyEventSender, RelayEndReason, CONNECT_PORT,
 };
 use zerodpi_core::proxy_tester::{test_candidate_full, ProxyTestEntry};
 use zerodpi_core::sni_scanner::{scan_sni_list, SniProbeEntry};
@@ -213,7 +213,7 @@ fn main() -> Result<()> {
     }
     let cfg = Arc::new(cfg);
 
-    // ---- branch: ip_bypass mode ----
+    // ---- branch: ip_bypass modes ----
     if cfg.MODE == "ip_bypass" {
         let cfg_clone = cfg.clone();
         let cfg_path_clone = cfg_path.clone();
@@ -221,6 +221,14 @@ fn main() -> Result<()> {
             .enable_all()
             .build()?;
         return ip_bypass_main(cfg_clone, cfg_path_clone, rt, no_tui);
+    }
+    if cfg.MODE == "ip_bypass_plus" {
+        let cfg_clone = cfg.clone();
+        let cfg_path_clone = cfg_path.clone();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return ip_bypass_plus_main(cfg_clone, cfg_path_clone, rt, no_tui);
     }
 
     // ---- branch: scan-only modes ----
@@ -681,7 +689,8 @@ fn requires_packet_interception(cfg: &Config) -> bool {
 }
 
 fn mode_requires_packet_interception(mode: &str, bypass_method: &str) -> bool {
-    matches!(mode, "sni_spoof" | "proxy_scan") && bypass_method != "tcp_segmentation"
+    matches!(mode, "sni_spoof" | "proxy_scan" | "ip_bypass_plus")
+        && bypass_method != "tcp_segmentation"
 }
 
 async fn run_headless_proxy(
@@ -911,6 +920,10 @@ fn ip_bypass_main(
                 active_clone,
                 rescan_event_tx,
                 no_tui,
+                IpRescanPolicy {
+                    mode_label: "ip_bypass",
+                    ipv4_only: false,
+                },
             )
             .await;
         });
@@ -941,6 +954,204 @@ fn ip_bypass_main(
     info!("shutting down");
     dash_result?;
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// IP bypass plus mode
+// ---------------------------------------------------------------------------
+
+fn ip_bypass_plus_main(
+    cfg: Arc<Config>,
+    cfg_path: PathBuf,
+    rt: tokio::runtime::Runtime,
+    no_tui: bool,
+) -> Result<()> {
+    let ip_list_path = {
+        let raw = PathBuf::from(&cfg.IP_LIST);
+        if raw.is_absolute() {
+            raw
+        } else {
+            cfg_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(raw)
+        }
+    };
+
+    let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+
+    // ---- step 1: obtain active IPv4 ----
+    let active_ip: IpAddr = if let Some(ref forced_ip) = cfg.SELECTED_IP {
+        let ip: IpAddr = forced_ip
+            .parse()
+            .with_context(|| format!("parsing SELECTED_IP '{forced_ip}'"))?;
+        let _ = require_ipv4_target(ip, "ip_bypass_plus")?;
+        info!(%ip, "ip_bypass_plus: SELECTED_IP set — skipping scan");
+        ip
+    } else {
+        let ips = load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS)
+            .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
+        reject_ipv6_ip_candidates(&ips, "ip_bypass_plus", &ip_list_path)?;
+        if ips.is_empty() {
+            anyhow::bail!(
+                "ip_list '{}' is empty — add at least one IPv4 address or IPv4 CIDR",
+                ip_list_path.display()
+            );
+        }
+        let total_ips = ips.len();
+        info!(total_ips, "ip_bypass_plus: scanning IPv4 list");
+
+        let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
+        let cfg_clone = cfg.clone();
+        let entries = if no_tui {
+            let entries = rt.block_on(scan_ip_list(ips, scan_sni, scan_timeout, cfg_clone, None));
+            log_ip_scan_results("ip_bypass_plus: headless IP scan", &entries);
+            Ok(entries)
+        } else {
+            scan_ip_list_with_ip_progress(cfg_clone, &rt, ips, scan_sni, scan_timeout, total_ips)
+        }?;
+
+        if entries.is_empty() {
+            anyhow::bail!("ip_bypass_plus: no IPs passed the scan — check connectivity or ip_list");
+        }
+
+        if no_tui && !cfg.AUTO_SELECT {
+            warn!("--no-tui cannot show the IP selection table; auto-selecting rank-1");
+        }
+        let selected_entry: IpProbeEntry = if cfg.AUTO_SELECT || no_tui {
+            let best = entries.into_iter().next().context("no probe results")?;
+            info!(ip = %best.ip, score = best.score, "ip_bypass_plus: auto-selected IP");
+            best
+        } else {
+            let mut terminal = tui::enter_tui()?;
+            let result = tui::run_ip_selection(&mut terminal, &entries);
+            tui::leave_tui(terminal)?;
+            let entry = result.context("IP selection")?;
+            info!(ip = %entry.ip, score = entry.score, "ip_bypass_plus: selected IP");
+            entry
+        };
+        selected_entry.ip
+    };
+
+    let active_v4 = require_ipv4_target(active_ip, "ip_bypass_plus")?;
+    let interface_ip = default_interface_ipv4(active_v4)
+        .context("could not determine local interface IP for upstream")?;
+
+    let active_ip_arc = Arc::new(std::sync::RwLock::new(active_ip));
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
+
+    // ---- step 2: optional background IPv4 rescan ----
+    if cfg.RESCAN_INTERVAL_SECS > 0 {
+        let rescan_cfg = cfg.clone();
+        let rescan_path = ip_list_path.clone();
+        let interval = cfg.RESCAN_INTERVAL_SECS;
+        let active_clone = active_ip_arc.clone();
+        let rescan_event_tx = if no_tui { None } else { Some(event_tx.clone()) };
+        rt.spawn(async move {
+            background_ip_rescan(
+                rescan_cfg,
+                rescan_path,
+                interval,
+                active_clone,
+                rescan_event_tx,
+                no_tui,
+                IpRescanPolicy {
+                    mode_label: "ip_bypass_plus",
+                    ipv4_only: true,
+                },
+            )
+            .await;
+        });
+    }
+
+    info!(
+        %active_v4,
+        %interface_ip,
+        method = %cfg.BYPASS_METHOD,
+        "ip_bypass_plus: starting proxy"
+    );
+
+    // ---- step 3: optional packet interceptor ----
+    let flows = new_flow_table();
+    let (_intercept_thread, intercept_done_rx) = if cfg.BYPASS_METHOD == "tcp_segmentation" {
+        info!("ip_bypass_plus: tcp_segmentation selected; skipping packet interceptor");
+        (None, None)
+    } else {
+        let method_box = build_method(&cfg)
+            .with_context(|| format!("unknown BYPASS_METHOD '{}'", cfg.BYPASS_METHOD))?;
+        let method: Arc<dyn zerodpi_core::methods::BypassMethod> = Arc::from(method_box);
+
+        let filter = FilterSpec {
+            interface_ip,
+            remote_ip: None,
+            remote_port: CONNECT_PORT,
+            queue_num: cfg.NFQUEUE_NUM,
+            linux_firewall_backend: cfg.linux_firewall_backend(),
+        };
+        let interceptor = DefaultInterceptor::open(filter).context("open packet interceptor")?;
+
+        let handler = Handler::new(flows.clone(), method);
+        let (intercept_done_tx, intercept_done_rx) = oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("zerodpi-ip-plus-intercept".into())
+            .spawn(move || {
+                let result = interceptor.run(handler);
+                if let Err(ref e) = result {
+                    error!(error = %e, "ip_bypass_plus intercept loop ended with error");
+                }
+                let _ = intercept_done_tx.send(result);
+            })
+            .context("spawn intercept thread")?;
+        (Some(thread), Some(intercept_done_rx))
+    };
+
+    // ---- step 4: run the proxy ----
+    let cfg_dash = cfg.clone();
+    let proxy_active = active_ip_arc.clone();
+    let dashboard_event_tx = Some(event_tx.clone());
+    let proxy_handle = rt.spawn(async move {
+        run_ip_bypass_plus_proxy(cfg, proxy_active, interface_ip, flows, dashboard_event_tx).await
+    });
+
+    if no_tui {
+        let result = rt.block_on(run_headless_proxy(
+            proxy_handle,
+            event_rx,
+            intercept_done_rx,
+        ));
+        info!("shutting down");
+        return result;
+    }
+
+    let dash_info = tui::DashboardInfo::IpBypassPlus { ip: active_ip };
+    let mut terminal = tui::enter_tui()?;
+    let dash_result = tui::run_dashboard(&mut terminal, &mut event_rx, &dash_info, &cfg_dash);
+    tui::leave_tui(terminal)?;
+
+    proxy_handle.abort();
+    info!("shutting down");
+    dash_result?;
+
+    Ok(())
+}
+
+fn require_ipv4_target(ip: IpAddr, mode: &str) -> Result<Ipv4Addr> {
+    match ip {
+        IpAddr::V4(ip) => Ok(ip),
+        IpAddr::V6(ip) => {
+            anyhow::bail!("MODE = \"{mode}\" is IPv4-only; target '{ip}' is IPv6")
+        }
+    }
+}
+
+fn reject_ipv6_ip_candidates(ips: &[IpAddr], mode: &str, path: &Path) -> Result<()> {
+    if let Some(IpAddr::V6(ip)) = ips.iter().find(|ip| ip.is_ipv6()) {
+        anyhow::bail!(
+            "MODE = \"{mode}\" is IPv4-only; remove IPv6 candidate '{ip}' from '{}'",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -995,6 +1206,12 @@ fn scan_ip_list_with_ip_progress(
 ///
 /// This runs while the ratatui dashboard owns the terminal. Keep routine scan
 /// output below `info` so it does not write over the live UI.
+#[derive(Clone, Copy)]
+struct IpRescanPolicy {
+    mode_label: &'static str,
+    ipv4_only: bool,
+}
+
 async fn background_ip_rescan(
     cfg: Arc<Config>,
     ip_list_path: PathBuf,
@@ -1002,6 +1219,7 @@ async fn background_ip_rescan(
     active_ip: Arc<std::sync::RwLock<std::net::IpAddr>>,
     event_tx: Option<ProxyEventSender>,
     headless: bool,
+    policy: IpRescanPolicy,
 ) {
     let interval = Duration::from_secs(interval_secs);
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
@@ -1009,34 +1227,44 @@ async fn background_ip_rescan(
     loop {
         tokio::time::sleep(interval).await;
         if headless {
-            info!(path = %ip_list_path.display(), "ip_bypass: background IP rescan starting");
+            info!(mode = policy.mode_label, path = %ip_list_path.display(), "background IP rescan starting");
         } else {
-            debug!("ip_bypass: background rescan starting");
+            debug!(mode = policy.mode_label, "background IP rescan starting");
         }
 
         let ips = match load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS) {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "ip_bypass: background rescan failed to load ip_list");
+                warn!(mode = policy.mode_label, error = %e, "background IP rescan failed to load ip_list");
                 continue;
             }
         };
+        if policy.ipv4_only {
+            if let Err(e) = reject_ipv6_ip_candidates(&ips, policy.mode_label, &ip_list_path) {
+                warn!(mode = policy.mode_label, error = %e, "background IP rescan rejected ip_list");
+                continue;
+            }
+        }
         let cfg_clone = cfg.clone();
         let entries = scan_ip_list(ips, scan_sni.clone(), scan_timeout, cfg_clone, None).await;
         if entries.is_empty() {
-            warn!("ip_bypass: background rescan found no working IPs");
+            warn!(
+                mode = policy.mode_label,
+                "background IP rescan found no working IPs"
+            );
             continue;
         }
         let best = &entries[0];
         if headless {
             info!(
-                "ip_bypass: background IP rescan complete — {} IPs probed",
+                mode = policy.mode_label,
+                "background IP rescan complete — {} IPs probed",
                 entries.len()
             );
-            log_ip_scan_top("ip_bypass: background IP rescan top candidates", &entries);
-            info!(ip = %best.ip, score = best.score, "ip_bypass: background IP rescan evaluated top result");
+            log_ip_scan_top("background IP rescan top candidates", &entries);
+            info!(mode = policy.mode_label, ip = %best.ip, score = best.score, "background IP rescan evaluated top result");
         } else {
-            debug!(ip = %best.ip, score = best.score, "ip_bypass: rescan top result");
+            debug!(mode = policy.mode_label, ip = %best.ip, score = best.score, "background IP rescan top result");
         }
 
         let current = *active_ip.read().unwrap();
@@ -1045,7 +1273,7 @@ async fn background_ip_rescan(
             if let Some(ref tx) = event_tx {
                 let _ = tx.send(ProxyEvent::IpTargetChanged { ip: best.ip });
             }
-            info!(old = %current, new = %best.ip, "ip_bypass: hot-swapped active IP");
+            info!(mode = policy.mode_label, old = %current, new = %best.ip, "hot-swapped active IP");
         }
     }
 }
@@ -1572,6 +1800,42 @@ mod tests {
         assert!(!mode_requires_packet_interception("ip_bypass", "wrong_seq"));
         assert!(!mode_requires_packet_interception("sni_scan", "wrong_seq"));
         assert!(!mode_requires_packet_interception("ip_scan", "wrong_seq"));
+    }
+
+    #[test]
+    fn ip_bypass_plus_requires_interception_only_for_tls_record_frag() {
+        assert!(mode_requires_packet_interception(
+            "ip_bypass_plus",
+            "tls_record_frag"
+        ));
+        assert!(!mode_requires_packet_interception(
+            "ip_bypass_plus",
+            "tcp_segmentation"
+        ));
+    }
+
+    #[test]
+    fn ip_bypass_plus_accepts_only_ipv4_targets() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        let v6 = "2606:4700:4700::1111".parse().unwrap();
+
+        assert_eq!(
+            require_ipv4_target(v4, "ip_bypass_plus").unwrap(),
+            Ipv4Addr::new(1, 2, 3, 4)
+        );
+        assert!(require_ipv4_target(v6, "ip_bypass_plus").is_err());
+    }
+
+    #[test]
+    fn ip_bypass_plus_rejects_ipv6_ip_candidates() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            "2606:4700:4700::1111".parse().unwrap(),
+        ];
+
+        assert!(
+            reject_ipv6_ip_candidates(&ips, "ip_bypass_plus", Path::new("ip_list.txt")).is_err()
+        );
     }
 
     #[test]

@@ -249,7 +249,8 @@ pub struct Config {
     // -----------------------------------------------------------------------
     /// Operating mode.  `"sni_spoof"` (default) uses SNI-based DPI bypass.
     /// `"ip_bypass"` skips packet interception entirely and routes connections
-    /// through a pre-scanned IP from `ip_list.txt`.
+    /// through a pre-scanned IP from `ip_list.txt`. `"ip_bypass_plus"` also
+    /// uses IP selection, but applies only real-SNI-preserving bypass methods.
     #[serde(default = "default_mode")]
     pub MODE: String,
 
@@ -548,11 +549,21 @@ impl Config {
         }
         if !matches!(
             self.MODE.as_str(),
-            "sni_spoof" | "ip_bypass" | "sni_scan" | "ip_scan" | "proxy_scan"
+            "sni_spoof" | "ip_bypass" | "ip_bypass_plus" | "sni_scan" | "ip_scan" | "proxy_scan"
         ) {
             anyhow::bail!(
-                "Unknown MODE '{}'. Valid values: \"sni_spoof\", \"ip_bypass\", \"sni_scan\", \"ip_scan\", \"proxy_scan\"",
+                "Unknown MODE '{}'. Valid values: \"sni_spoof\", \"ip_bypass\", \"ip_bypass_plus\", \"sni_scan\", \"ip_scan\", \"proxy_scan\"",
                 self.MODE
+            );
+        }
+        if self.MODE == "ip_bypass_plus"
+            && !matches!(
+                self.BYPASS_METHOD.as_str(),
+                "tls_record_frag" | "tcp_segmentation"
+            )
+        {
+            anyhow::bail!(
+                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\" or \"tcp_segmentation\""
             );
         }
         if !(0.0..=1.0).contains(&self.PROXY_TEST_SNI_WEIGHT) {
@@ -562,8 +573,12 @@ impl Config {
             anyhow::bail!("PROXY_TEST_TIMEOUT_SECS must be > 0");
         }
         if let Some(ref ip) = self.SELECTED_IP {
-            ip.parse::<std::net::IpAddr>()
+            let parsed = ip
+                .parse::<std::net::IpAddr>()
                 .map_err(|_| anyhow::anyhow!("SELECTED_IP '{}' is not a valid IP address", ip))?;
+            if self.MODE == "ip_bypass_plus" && parsed.is_ipv6() {
+                anyhow::bail!("MODE = \"ip_bypass_plus\" is IPv4-only; SELECTED_IP '{ip}' is IPv6");
+            }
         }
         Ok(())
     }
@@ -979,6 +994,75 @@ mod tests {
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.SELECTED_IP.as_deref(), Some("1.2.3.4"));
+    }
+
+    #[test]
+    fn ip_bypass_plus_accepts_tls_record_frag() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            MODE = "ip_bypass_plus"
+            BYPASS_METHOD = "tls_record_frag"
+            SELECTED_IP = "1.2.3.4"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.MODE, "ip_bypass_plus");
+        assert_eq!(cfg.BYPASS_METHOD, "tls_record_frag");
+    }
+
+    #[test]
+    fn ip_bypass_plus_accepts_tcp_segmentation() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            MODE = "ip_bypass_plus"
+            BYPASS_METHOD = "tcp_segmentation"
+            SELECTED_IP = "1.2.3.4"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.MODE, "ip_bypass_plus");
+        assert_eq!(cfg.BYPASS_METHOD, "tcp_segmentation");
+    }
+
+    #[test]
+    fn ip_bypass_plus_rejects_fake_sni_methods() {
+        for method in [
+            "wrong_seq",
+            "wrong_checksum",
+            "wrong_ack",
+            "wrong_seq_tls_frag",
+            "wrong_seq_tls_record_frag",
+        ] {
+            let toml_str = format!(
+                r#"
+                LISTEN_HOST = "0.0.0.0"
+                LISTEN_PORT = 40443
+                MODE = "ip_bypass_plus"
+                BYPASS_METHOD = "{method}"
+                SELECTED_IP = "1.2.3.4"
+            "#
+            );
+            let cfg: Config = toml::from_str(&toml_str).unwrap();
+            assert!(
+                cfg.validate().is_err(),
+                "ip_bypass_plus accepted method {method}"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_bypass_plus_rejects_ipv6_selected_ip() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            MODE = "ip_bypass_plus"
+            BYPASS_METHOD = "tcp_segmentation"
+            SELECTED_IP = "2606:4700:4700::1111"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

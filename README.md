@@ -53,7 +53,7 @@ It is not a replacement VPN client. It is a local TCP relay that your existing V
 | Feature | Description |
 |---------|-------------|
 | 🧩 **7 bypass methods** | `wrong_seq`, `wrong_checksum`, `wrong_ack`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_seq_tls_record_frag`, `tcp_segmentation` |
-| 🎯 **5 operating modes** | `sni_spoof`, `ip_bypass`, `sni_scan`, `ip_scan`, `proxy_scan` |
+| 🎯 **6 operating modes** | `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan` |
 | 🖥️ **TUI dashboard** | Ratatui-powered live progress, selection tables, and connection monitoring |
 | 🔄 **Auto-rescan** | Background re-scanning hot-swaps the best target without restart |
 | 🧪 **Smart scoring** | Unified 0–100 composite score across TCP, TLS, TTFB, speed, and cert validity |
@@ -117,7 +117,7 @@ For systemd or other headless deployments, run with `--no-tui` and inspect logs 
 ## 🚀 Quick Start
 
 1. **Build or download ZeroDPI** for your platform.
-2. **Edit `config.toml`** and choose a mode. Start with `MODE = "sni_spoof"` unless you know you need `ip_bypass` or a scan-only mode.
+2. **Edit `config.toml`** and choose a mode. Start with `MODE = "sni_spoof"` unless you know you need `ip_bypass`, `ip_bypass_plus`, or a scan-only mode.
 3. **Fill the input list**:
    - `sni_list.txt` for SNI-based modes.
    - `ip_list.txt` for IP-based modes.
@@ -148,9 +148,9 @@ Use this checklist when ZeroDPI starts but the VPN app still does not connect:
 2. Keep the VPN profile's real TLS `serverName` / SNI unchanged.
 3. Change the VPN profile's dial address to `127.0.0.1` and dial port to `44444` unless you changed `LISTEN_HOST` or `LISTEN_PORT`.
 4. Put candidate public hostnames in `sni_list.txt` when using `sni_spoof`, `sni_scan`, or `proxy_scan`.
-5. Put plain IPs or CIDR ranges in `ip_list.txt` when using `ip_bypass` or `ip_scan`.
+5. Put plain IPs or CIDR ranges in `ip_list.txt` when using `ip_bypass`, `ip_bypass_plus`, or `ip_scan`.
 6. Start ZeroDPI before starting or reconnecting the VPN client.
-7. Run as Administrator/root for all interceptor methods except standalone `tcp_segmentation` and `ip_bypass`.
+7. Run as Administrator/root for all interceptor methods except standalone `tcp_segmentation`, plain `ip_bypass`, and `ip_bypass_plus` when it uses `tcp_segmentation`.
 8. If the TUI is unavailable, pass `--auto-select --no-tui` and read logs instead.
 
 For the first test, keep the candidate list small. A short list makes failures easier to understand and avoids creating unnecessary outbound probes while you are still checking the VPN profile wiring.
@@ -185,7 +185,7 @@ Build-time requirements are separate from runtime requirements. See [Building fr
 ├── 📄 AGENTS.md                # Contributor/AI agent guidelines
 ├── 📄 config.toml              # Configuration file
 ├── 📄 sni_list.txt             # Decoy CDN hostnames (sni_spoof mode)
-├── 📄 ip_list.txt              # Relay IPs / CIDR ranges (ip_bypass mode)
+├── 📄 ip_list.txt              # Relay IPs / CIDR ranges (IP modes)
 ├── 📄 install-systemd.sh       # Linux systemd service installer
 ├── 📁 images/                  # README screenshots
 ├── 📁 windivert/               # Windows: WinDivert.dll, .lib, .sys
@@ -225,11 +225,12 @@ Copy or deploy the whole generated directory, not only the binary.
 |------|------------------|-------|
 | Bypass DPI for a TLS VPN behind a CDN | `sni_spoof` | Best default. Scans SNI candidates, selects an SNI/IP pair, then relays VPN traffic. |
 | Use a scanned relay IP without SNI spoofing | `ip_bypass` | No packet interception. Useful when you have IPs or CIDR ranges to test directly. |
+| Use a scanned IPv4 plus real-SNI fragmentation | `ip_bypass_plus` | Preserves the VPN client's real SNI; supports only `tls_record_frag` or `tcp_segmentation`. |
 | Audit SNI candidates only | `sni_scan` | Runs the SNI scanner, displays or saves results, then exits. |
 | Audit IP/CIDR candidates only | `ip_scan` | Runs the IP scanner, displays or saves results, then exits. |
 | Measure real VPN performance through an existing SOCKS5 client | `proxy_scan` | Tests candidates through V2RayN/sing-box and blends scanner score with end-to-end proxy results. |
 
-Choose a bypass method separately with `BYPASS_METHOD`. If you cannot or do not want to use WinDivert/NFQUEUE packet interception, try `BYPASS_METHOD = "tcp_segmentation"` with `MODE = "sni_spoof"`.
+Choose a bypass method separately with `BYPASS_METHOD`. If you cannot or do not want to use WinDivert/NFQUEUE packet interception, try `BYPASS_METHOD = "tcp_segmentation"` with `MODE = "sni_spoof"` or `MODE = "ip_bypass_plus"`.
 
 Mode-specific inputs:
 
@@ -237,6 +238,7 @@ Mode-specific inputs:
 |------|:---:|:---:|:---:|:---:|
 | `sni_spoof` | Yes, unless `SELECTED_SNI` is set | No | Yes | Yes |
 | `ip_bypass` | No | Yes, unless `SELECTED_IP` is set | Yes | No |
+| `ip_bypass_plus` | No | Yes, unless `SELECTED_IP` is set | Yes | Yes, only `tls_record_frag` or `tcp_segmentation` |
 | `sni_scan` | Yes | No | No | No relay; scan only |
 | `ip_scan` | No | Yes | No | No |
 | `proxy_scan` | Yes | No | Temporary per-candidate tests | Yes, except standalone proxy scoring still depends on your SOCKS5 proxy |
@@ -273,7 +275,20 @@ No packet interception, no SNI manipulation. Scans a list of IPs (or CIDR ranges
 
 ---
 
-### 3️⃣ `sni_scan` — SNI Scan-Only
+### 3️⃣ `ip_bypass_plus` — IP Relay Plus Real-SNI Fragmentation
+
+Scans an IPv4 list, selects a target, then relays the VPN client's real TLS stream while applying a bypass method that does not inject or replace SNI. Use `BYPASS_METHOD = "tls_record_frag"` for TLS-record fragmentation with WinDivert/NFQUEUE, or `BYPASS_METHOD = "tcp_segmentation"` for socket-only TCP segmentation.
+
+```text
+🖥️ Local apps → 🌐 VPN App → 🔄 ZeroDPI (ip_bypass_plus) → 🌍 Selected IPv4 :443
+                 TCP :44444                                Real SNI + fragmentation
+```
+
+**Use when:** You need IP scanning like `ip_bypass`, but plain relay still exposes a blockable ClientHello.
+
+---
+
+### 4️⃣ `sni_scan` — SNI Scan-Only
 
 Runs the full SNI scan pipeline (same as `sni_spoof`), displays ranked results, optionally saves to JSON, then exits. **No proxy is started.**
 
@@ -281,15 +296,15 @@ Runs the full SNI scan pipeline (same as `sni_spoof`), displays ranked results, 
 
 ---
 
-### 4️⃣ `ip_scan` — IP Scan-Only
+### 5️⃣ `ip_scan` — IP Scan-Only
 
-Runs the full IP scan pipeline (same as `ip_bypass`), displays ranked results, optionally saves to JSON, then exits. **No proxy is started.**
+Runs the full IP scan pipeline (same as the IP relay modes), displays ranked results, optionally saves to JSON, then exits. **No proxy is started.**
 
 **Use for:** Auditing `ip_list.txt` before deployment.
 
 ---
 
-### 5️⃣ `proxy_scan` — End-to-End Proxy Scan 🔬
+### 6️⃣ `proxy_scan` — End-to-End Proxy Scan 🔬
 
 A two-phase hybrid scan:
 
@@ -327,6 +342,7 @@ Start with the least complex method that can run on your platform, then move to 
 | You cannot run packet interception but can point the VPN client at ZeroDPI | `tcp_segmentation` |
 | DPI appears to ignore invalid sequence tricks | `wrong_ack`, `wrong_checksum`, or `tls_record_frag` |
 | DPI sees through fake packets but fails with fragmented real handshakes | `tls_record_frag` |
+| You need a scanned IPv4 target but must preserve the VPN client's real SNI | `MODE = "ip_bypass_plus"` with `tls_record_frag` or `tcp_segmentation` |
 | A first firewall layer is fooled, but another layer still blocks the real ClientHello | `wrong_seq_tls_frag` or `wrong_seq_tls_record_frag` |
 | You only need the fastest reachable IP and not SNI spoofing | `MODE = "ip_bypass"` |
 
@@ -416,6 +432,20 @@ IP_SCAN_SNI = "cloudflare.com"
 AUTO_SELECT = true
 ```
 
+### IP Bypass Plus
+
+Use this when you want IP scanning, but also need a bypass method that preserves the VPN client's real SNI. `ip_bypass_plus` is IPv4-only.
+
+```toml
+MODE = "ip_bypass_plus"
+IP_LIST = "ip_list.txt"
+BYPASS_METHOD = "tcp_segmentation"
+IP_SCAN_SNI = "cloudflare.com"
+AUTO_SELECT = true
+```
+
+For TLS-record fragmentation instead, set `BYPASS_METHOD = "tls_record_frag"` and run with packet interception privileges.
+
 ### Fixed Candidate After a Successful Scan
 
 Use this after you have already run `sni_scan` and want deterministic startup without scanning every time.
@@ -480,7 +510,7 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `MODE` | `string` | `"sni_spoof"` | One of: `sni_spoof`, `ip_bypass`, `sni_scan`, `ip_scan`, `proxy_scan` |
+| `MODE` | `string` | `"sni_spoof"` | One of: `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan` |
 | `AUTO_SELECT` | `bool` | `false` | Auto-pick rank-1 after scan (skip manual selection table) |
 | `SELECTED_SNI` | `string` | — | Skip SNI scan; use this hostname directly |
 | `SELECTED_IP` | `string` | — | Skip IP scan; use this IP directly |
@@ -525,7 +555,7 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `BYPASS_METHOD` | `string` | `"wrong_seq"` | `wrong_seq`, `wrong_checksum`, `wrong_ack`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_seq_tls_record_frag`, or `tcp_segmentation` |
+| `BYPASS_METHOD` | `string` | `"wrong_seq"` | `wrong_seq`, `wrong_checksum`, `wrong_ack`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_seq_tls_record_frag`, or `tcp_segmentation`; `ip_bypass_plus` allows only `tls_record_frag` or `tcp_segmentation` |
 | `BYPASS_TIMEOUT_SECS` | `u64` | `2` | Time to wait for bypass setup before giving up |
 | `RELAY_MAX_LIFETIME_SECS` | `u64` | `0` | Rotate established relays after this many seconds (`0` = disabled/default) |
 | `NFQUEUE_NUM` | `u16` | `1` | (Linux) NFQUEUE queue number |
@@ -634,7 +664,7 @@ The result list is sorted by score descending, then TCP latency ascending. A hig
 
 ### IP scanner
 
-`ip_scan` and `ip_bypass` read `ip_list.txt`, ignore blank lines and `#` comments, accept plain IPv4/IPv6 addresses, and expand CIDR ranges. IPv4 CIDRs are expanded in full; IPv6 CIDRs are capped by `IPV6_MAX_HOSTS`.
+`ip_scan` and `ip_bypass` read `ip_list.txt`, ignore blank lines and `#` comments, accept plain IPv4/IPv6 addresses, and expand CIDR ranges. IPv4 CIDRs are expanded in full; IPv6 CIDRs are capped by `IPV6_MAX_HOSTS`. `ip_bypass_plus` uses the same IP scanner but is IPv4-only and rejects IPv6 entries.
 
 The IP scanner runs a pipelined flow:
 
@@ -643,7 +673,7 @@ The IP scanner runs a pipelined flow:
 3. Phase 3: HTTP `GET /cdn-cgi/trace`.
 4. Phase 4: small download sample up to `SCAN_DOWNLOAD_CAP`.
 
-`IP_SCAN_SNI` is only used for the scan's TLS/HTTP probe. It is not inserted into real proxied VPN traffic in `ip_bypass`; the upstream VPN client's own TLS handshake passes through unchanged.
+`IP_SCAN_SNI` is only used for the scan's TLS/HTTP probe. It is not inserted into real proxied VPN traffic in `ip_bypass` or `ip_bypass_plus`; the upstream VPN client's own TLS handshake passes through unchanged.
 
 ### Proxy scanner
 
@@ -716,6 +746,7 @@ ZeroDPI uses [ratatui](https://github.com/ratatui-org/ratatui) for a live termin
 |------|--------|--------|--------|
 | `sni_spoof` | 📊 Scan progress (Score · SNI · IP · TCP · TLS · TTFB · Speed · HTTP) | 🎯 Selection table | 📈 Dashboard |
 | `ip_bypass` | 📊 IP scan progress | 🎯 Selection table | 📈 Dashboard |
+| `ip_bypass_plus` | 📊 IP scan progress | 🎯 Selection table | 📈 Dashboard |
 | `sni_scan` | 📊 Scan progress | 📋 Results table (view-only) | — |
 | `ip_scan` | 📊 IP scan progress | 📋 Results table (view-only) | — |
 | `proxy_scan` | 📊 Phase 1 + Phase 2 progress | 📋 Blended results table | — |
@@ -875,6 +906,8 @@ auth.vercel.com
 ```
 
 Hostnames are silently skipped — IPs and CIDRs only.
+
+`ip_bypass_plus` accepts only IPv4 entries. IPv6 examples are valid for `ip_scan` and plain `ip_bypass`, but are rejected by `ip_bypass_plus`.
 
 Large CIDR ranges can take time and create many outbound probes. Start with narrow ranges, keep `IP_MAX_P1_CONCURRENT` conservative on slow networks, and use `IPV6_MAX_HOSTS` to cap IPv6 expansion.
 
@@ -1099,6 +1132,7 @@ Unit tests cover:
 - ZeroDPI does not create candidate lists for you. Good results depend heavily on SNI/IP candidates that make sense for your network and upstream service.
 - `SELECTED_SNI` skips probing. It can start faster, but it will not tell you whether the resolved edge is currently healthy.
 - `ip_bypass` does not spoof SNI. It relays the upstream VPN client's original TLS bytes to the selected IP.
+- `ip_bypass_plus` also preserves the upstream VPN client's original SNI, but can fragment the first real ClientHello with `tls_record_frag` or `tcp_segmentation`.
 - Very aggressive fragmentation (`TCP_SEG_SIZE = 1` or `TLS_RECORD_FRAG_SIZE = 1`) can add overhead during connection setup.
 - Firewall, antivirus, endpoint security, or kernel driver policy can block WinDivert/NFQUEUE even when ZeroDPI is configured correctly.
 

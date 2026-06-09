@@ -119,6 +119,8 @@ pub enum DashboardInfo {
     },
     /// IP-bypass mode: show the current active IP.
     IpBypass { ip: IpAddr },
+    /// IP-bypass-plus mode: show the current active IP and bypass method.
+    IpBypassPlus { ip: IpAddr },
 }
 
 // ---------------------------------------------------------------------------
@@ -821,11 +823,11 @@ pub fn run_dashboard(
 ) -> anyhow::Result<()> {
     let active_sni = match info {
         DashboardInfo::SniSpoof { sni, ip, score } => Some((sni.clone(), *ip, *score)),
-        DashboardInfo::IpBypass { .. } => None,
+        DashboardInfo::IpBypass { .. } | DashboardInfo::IpBypassPlus { .. } => None,
     };
     let active_ip = match info {
         DashboardInfo::SniSpoof { .. } => None,
-        DashboardInfo::IpBypass { ip } => Some(*ip),
+        DashboardInfo::IpBypass { ip } | DashboardInfo::IpBypassPlus { ip } => Some(*ip),
     };
     let mut state = DashboardState {
         records: VecDeque::with_capacity(MAX_RECORDS),
@@ -1115,13 +1117,32 @@ fn draw_dashboard(
                     ]),
                 ]
             }
-            DashboardInfo::IpBypass { .. } => {
+            DashboardInfo::IpBypass { .. } | DashboardInfo::IpBypassPlus { .. } => {
                 let ip = state.active_ip.expect("IP dashboard state is initialised");
+                let mode_label = match info {
+                    DashboardInfo::IpBypass { .. } => "ip_bypass",
+                    DashboardInfo::IpBypassPlus { .. } => "ip_bypass_plus",
+                    DashboardInfo::SniSpoof { .. } => unreachable!(),
+                };
+                let status_line = match info {
+                    DashboardInfo::IpBypass { .. } => Line::from(vec![
+                        Span::styled("Uptime: ", label_style()),
+                        Span::styled(uptime, Style::default().fg(Color::White)),
+                    ]),
+                    DashboardInfo::IpBypassPlus { .. } => Line::from(vec![
+                        Span::styled("Method: ", label_style()),
+                        Span::styled(cfg.BYPASS_METHOD.clone(), Style::default().fg(Color::White)),
+                        Span::raw("   "),
+                        Span::styled("Uptime: ", label_style()),
+                        Span::styled(uptime, Style::default().fg(Color::White)),
+                    ]),
+                    DashboardInfo::SniSpoof { .. } => unreachable!(),
+                };
                 vec![
                     Line::from(vec![
                         Span::styled("Mode: ", label_style()),
                         Span::styled(
-                            "ip_bypass",
+                            mode_label,
                             Style::default()
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
@@ -1136,10 +1157,7 @@ fn draw_dashboard(
                             Style::default().fg(Color::White),
                         ),
                     ]),
-                    Line::from(vec![
-                        Span::styled("Uptime: ", label_style()),
-                        Span::styled(uptime, Style::default().fg(Color::White)),
-                    ]),
+                    status_line,
                 ]
             }
         };

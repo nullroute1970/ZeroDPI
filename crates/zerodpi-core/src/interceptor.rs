@@ -31,8 +31,9 @@ pub struct TcpFlags {
 /// A read/write view of a captured TCP/IPv4 packet.
 ///
 /// Backends construct this from their native packet representation and apply
-/// the staged mutations (`new_*`, `append_tcp_options`, `bump_ipv4_ident`,
-/// `corrupt_tcp_checksum_delta`) when the handler returns
+/// the staged mutations (`new_*`, `replace_tcp_options`,
+/// `append_tcp_options`, `bump_ipv4_ident`, `corrupt_tcp_checksum_delta`)
+/// when the handler returns
 /// [`Verdict::AcceptModified`].
 #[derive(Debug, Clone)]
 pub struct PacketView<'a> {
@@ -50,6 +51,8 @@ pub struct PacketView<'a> {
     /// Populated by the platform backend so that methods can read and repack
     /// the original data (e.g. `tls_record_frag`).
     pub payload: &'a [u8],
+    /// Raw TCP option bytes from the captured packet.
+    pub tcp_options: &'a [u8],
 
     // ---- staged mutations (applied only on `AcceptModified`) ----
     pub new_seq: Option<u32>,
@@ -57,6 +60,9 @@ pub struct PacketView<'a> {
     pub new_flags: Option<TcpFlags>,
     /// Replace the entire TCP payload with these bytes.
     pub new_payload: Option<Vec<u8>>,
+    /// Replace the entire TCP options area with these raw bytes before any
+    /// appended options are applied.
+    pub replace_tcp_options: Option<Vec<u8>>,
     /// Raw TCP option bytes appended to the existing TCP options.
     ///
     /// Backends pad the final options to 32-bit alignment and reject packets

@@ -100,7 +100,7 @@ struct Args {
     /// Override `SELECTED_SNI` — skip scanning and use this hostname.
     #[arg(long)]
     sni: Option<String>,
-    /// Override `BYPASS_METHOD` (e.g. `wrong_seq`, `wrong_md5`, `tls_frag`).
+    /// Override `BYPASS_METHOD` (e.g. `wrong_seq`, `wrong_timestamp`, `tls_frag`).
     #[arg(long)]
     method: Option<String>,
     /// Linux-only: NFQUEUE queue number to use.
@@ -1777,6 +1777,10 @@ mod tests {
             "wrong_checksum"
         ));
         assert!(mode_requires_packet_interception("sni_spoof", "wrong_md5"));
+        assert!(mode_requires_packet_interception(
+            "sni_spoof",
+            "wrong_timestamp"
+        ));
         assert!(mode_requires_packet_interception(
             "sni_spoof",
             "tls_record_frag"

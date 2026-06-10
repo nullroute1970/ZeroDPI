@@ -136,6 +136,7 @@ fn parse_view<'a>(direction: Direction, buf: &'a [u8]) -> Result<(PacketView<'a>
     let tcp_hdr_len = tcp.slice().len();
     let total_len = ip.total_len() as usize;
     let payload_off = ip_hdr_len + tcp_hdr_len;
+    let tcp_options_off = ip_hdr_len + etherparse::TcpHeader::MIN_LEN;
     let payload_len = total_len.saturating_sub(payload_off);
 
     let view = PacketView {
@@ -155,10 +156,12 @@ fn parse_view<'a>(direction: Direction, buf: &'a [u8]) -> Result<(PacketView<'a>
         },
         payload_len,
         payload: &buf[payload_off..payload_off + payload_len],
+        tcp_options: &buf[tcp_options_off..payload_off],
         new_seq: None,
         new_ack: None,
         new_flags: None,
         new_payload: None,
+        replace_tcp_options: None,
         append_tcp_options: Vec::new(),
         bump_ipv4_ident: false,
         corrupt_tcp_checksum_delta: None,
@@ -199,6 +202,11 @@ fn build_modified(orig: &[u8], layout: &PacketLayout, view: &PacketView<'_>) -> 
     }
     if view.bump_ipv4_ident {
         ip_hdr.identification = ip_hdr.identification.wrapping_add(1);
+    }
+    if let Some(options) = view.replace_tcp_options.as_deref() {
+        tcp_hdr
+            .set_options_raw(options)
+            .context("replace TCP options")?;
     }
     append_tcp_options(&mut tcp_hdr, &view.append_tcp_options)?;
 
@@ -274,6 +282,7 @@ mod tests {
             },
             payload_len: 0,
             payload: &[],
+            tcp_options: &[],
             new_seq: Some(1001),
             new_ack: None,
             new_flags: Some(TcpFlags {
@@ -282,6 +291,7 @@ mod tests {
                 ..Default::default()
             }),
             new_payload: Some(vec![0xAB; 517]),
+            replace_tcp_options: None,
             append_tcp_options: Vec::new(),
             bump_ipv4_ident: true,
             corrupt_tcp_checksum_delta: Some(11),
@@ -306,10 +316,19 @@ mod tests {
     }
 
     fn data_packet(payload: &[u8]) -> Vec<u8> {
+        data_packet_with_options(payload, &[])
+    }
+
+    fn data_packet_with_options(payload: &[u8], options: &[u8]) -> Vec<u8> {
         use etherparse::{IpNumber, Ipv4Header, TcpHeader};
 
+        let mut tcp = TcpHeader::new(12345, 443, 1001, 65535);
+        tcp.acknowledgment_number = 5001;
+        tcp.ack = true;
+        tcp.psh = true;
+        tcp.set_options_raw(options).unwrap();
         let mut ip = Ipv4Header::new(
-            (20 + payload.len()).try_into().unwrap(),
+            (tcp.header_len() + payload.len()).try_into().unwrap(),
             64,
             IpNumber::TCP,
             [10, 0, 0, 1],
@@ -317,10 +336,6 @@ mod tests {
         )
         .unwrap();
         ip.header_checksum = ip.calc_header_checksum();
-        let mut tcp = TcpHeader::new(12345, 443, 1001, 65535);
-        tcp.acknowledgment_number = 5001;
-        tcp.ack = true;
-        tcp.psh = true;
         tcp.checksum = tcp.calc_checksum_ipv4(&ip, payload).unwrap();
 
         let mut buf = Vec::new();
@@ -339,6 +354,25 @@ mod tests {
         assert_eq!(view.payload_len, payload.len());
         assert_eq!(view.payload, payload.as_slice());
         assert_eq!(layout.payload_off, 40);
+    }
+
+    fn timestamp_option(tsval: u32, tsecr: u32) -> Vec<u8> {
+        let mut option = vec![8, 10];
+        option.extend_from_slice(&tsval.to_be_bytes());
+        option.extend_from_slice(&tsecr.to_be_bytes());
+        option
+    }
+
+    #[test]
+    fn parse_view_borrows_tcp_option_bytes() {
+        let options = timestamp_option(100, 77);
+        let buf = data_packet_with_options(&[], &options);
+        let (view, layout) = parse_view(Direction::Outbound, &buf).unwrap();
+
+        assert_eq!(layout.tcp_hdr_len, 32);
+        assert_eq!(layout.payload_off, 52);
+        assert_eq!(&view.tcp_options[..options.len()], options.as_slice());
+        assert_eq!(&view.tcp_options[options.len()..], &[0, 0]);
     }
 
     #[test]
@@ -450,6 +484,38 @@ mod tests {
         let options = tcp2.options();
         assert_eq!(&options[..md5_option.len()], md5_option.as_slice());
         assert_eq!(&options[md5_option.len()..], &[0, 0]);
+
+        let payload_off = ip2.slice().len() + tcp2.slice().len();
+        let calculated = tcp2
+            .to_header()
+            .calc_checksum_ipv4(&ip2.to_header(), &modified[payload_off..])
+            .unwrap();
+        assert_eq!(tcp2.checksum(), calculated);
+    }
+
+    #[test]
+    fn tcp_options_can_be_replaced_after_rebuild() {
+        let original_options = timestamp_option(100, 77);
+        let replacement_options = timestamp_option(99, 77);
+        let buf = data_packet_with_options(&[], &original_options);
+        let (mut view, layout) = parse_view(Direction::Outbound, &buf).unwrap();
+        view.new_payload = Some(vec![0xAB; 10]);
+        view.replace_tcp_options = Some(replacement_options.clone());
+        view.corrupt_tcp_checksum_delta = None;
+
+        let modified = build_modified(&buf, &layout, &view).unwrap();
+
+        let ip2 = Ipv4HeaderSlice::from_slice(&modified).unwrap();
+        let tcp2 = TcpHeaderSlice::from_slice(&modified[ip2.slice().len()..]).unwrap();
+        assert_eq!(tcp2.slice().len(), 32);
+        assert_eq!(ip2.total_len() as usize, 20 + 32 + 10);
+
+        let options = tcp2.options();
+        assert_eq!(
+            &options[..replacement_options.len()],
+            replacement_options.as_slice()
+        );
+        assert_eq!(&options[replacement_options.len()..], &[0, 0]);
 
         let payload_off = ip2.slice().len() + tcp2.slice().len();
         let calculated = tcp2

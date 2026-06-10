@@ -182,6 +182,11 @@ impl PacketHandler for Handler {
                             entry.finish(BypassOutcome::FakeDataAcked);
                             return Verdict::Accept;
                         }
+                        MethodAction::AbortAndAccept => {
+                            drop(state);
+                            entry.finish(BypassOutcome::UnexpectedClose);
+                            return Verdict::Accept;
+                        }
                     }
                 }
                 // First outbound data packet when method deferred to this stage.
@@ -212,6 +217,13 @@ impl PacketHandler for Handler {
                             return Verdict::Accept;
                         }
                         MethodAction::PassThrough => return Verdict::Accept,
+                        MethodAction::AbortAndAccept => {
+                            state.first_data_modified = true;
+                            state.waiting_for_data = false;
+                            drop(state);
+                            entry.finish(BypassOutcome::UnexpectedClose);
+                            return Verdict::Accept;
+                        }
                     }
                 }
                 self.unexpected(&entry, &mut state, pkt, "unexpected outbound packet")
@@ -298,6 +310,7 @@ mod tests {
     use crate::methods::wrong_seq::WrongSeq;
     use crate::methods::wrong_seq_tls_frag::WrongSeqTlsFrag;
     use crate::methods::wrong_seq_tls_record_frag::WrongSeqTlsRecordFrag;
+    use crate::methods::wrong_timestamp::WrongTimestamp;
 
     fn default_cfg() -> Config {
         toml::from_str(
@@ -357,10 +370,12 @@ mod tests {
             flags,
             payload_len,
             payload,
+            tcp_options: &[],
             new_seq: None,
             new_ack: None,
             new_flags: None,
             new_payload: None,
+            replace_tcp_options: None,
             append_tcp_options: Vec::new(),
             bump_ipv4_ident: false,
             corrupt_tcp_checksum_delta: None,
@@ -647,6 +662,66 @@ mod tests {
         assert_eq!(
             entry.state.lock().outcome,
             Some(BypassOutcome::FakeDataAcked)
+        );
+        assert!(!entry.state.lock().monitor);
+    }
+
+    #[test]
+    fn wrong_timestamp_without_tcp_option_aborts_bypass() {
+        let flows = new_flow_table();
+        let key = FlowKey {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            dst_port: 443,
+        };
+        let entry = FlowEntry::new(vec![0xAA; 517]);
+        flows.insert(key, entry.clone());
+
+        let mut cfg = default_cfg();
+        cfg.BYPASS_METHOD = "wrong_timestamp".into();
+        let mut h = Handler::new(flows, Arc::new(WrongTimestamp::new(&cfg)));
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            1000,
+            0,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                syn: true,
+                ack: true,
+                ..Default::default()
+            },
+            5000,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+        assert!(p.new_payload.is_none());
+        assert_eq!(
+            entry.state.lock().outcome,
+            Some(BypassOutcome::UnexpectedClose)
         );
         assert!(!entry.state.lock().monitor);
     }

@@ -64,6 +64,9 @@ pub struct Config {
     /// - `"wrong_ack"` — injects a fake TLS ClientHello with the normal TCP
     ///   sequence number and a deliberately old TCP acknowledgment number so
     ///   DPI inspects the fake SNI while the real server rejects the segment.
+    /// - `"wrong_timestamp"` — injects a fake TLS ClientHello with a
+    ///   backdated TCP Timestamp TSval so DPI inspects the fake SNI while the
+    ///   real server rejects the segment as a PAWS replay.
     /// - `"tls_record_frag"` — TLS Record Fragment / TLS-layer fragmentation.
     ///   Splits the real ClientHello into multiple small TLS records so no
     ///   single record contains the full SNI. No fake packet is injected; the
@@ -190,6 +193,32 @@ pub struct Config {
     /// is not consistent enough to wait for a server response.
     #[serde(default = "default_true")]
     pub WRONG_ACK_COMPLETE_IMMEDIATELY: bool,
+
+    // -----------------------------------------------------------------------
+    // wrong_timestamp method parameters
+    // -----------------------------------------------------------------------
+    /// Value subtracted from the captured TCP Timestamp TSval on the spoofed
+    /// ClientHello packet. A value of `1` makes the forged segment older than
+    /// the timestamp already seen by the server, which should trigger PAWS.
+    /// Must be `>= 1`. Default: `1`.
+    #[serde(default = "default_wrong_timestamp_offset")]
+    pub WRONG_TIMESTAMP_OFFSET: u32,
+
+    /// Whether to set the `PSH` flag on the spoofed ClientHello packet.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub WRONG_TIMESTAMP_SET_PSH: bool,
+
+    /// Whether to increment the IPv4 `Identification` field on the spoofed
+    /// packet. Default: `true`.
+    #[serde(default = "default_true")]
+    pub WRONG_TIMESTAMP_BUMP_IP_IDENT: bool,
+
+    /// Whether to signal bypass completion immediately after emitting the
+    /// backdated-timestamp packet. The default is `true` because a PAWS-rejected
+    /// packet should not be acknowledged as new data by the server.
+    #[serde(default = "default_true")]
+    pub WRONG_TIMESTAMP_COMPLETE_IMMEDIATELY: bool,
 
     // -----------------------------------------------------------------------
     // tls_record_frag method parameters
@@ -435,6 +464,9 @@ fn default_wrong_checksum_delta() -> u16 {
 fn default_wrong_ack_offset() -> u32 {
     1
 }
+fn default_wrong_timestamp_offset() -> u32 {
+    1
+}
 fn default_tls_frag_size() -> usize {
     1
 }
@@ -543,13 +575,14 @@ impl Config {
                 | "wrong_checksum"
                 | "wrong_md5"
                 | "wrong_ack"
+                | "wrong_timestamp"
                 | "tls_record_frag"
                 | "wrong_seq_tls_frag"
                 | "wrong_seq_tls_record_frag"
                 | "tls_frag"
         ) {
             anyhow::bail!(
-                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_md5\", \"wrong_ack\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_seq_tls_record_frag\", \"tls_frag\"",
+                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_md5\", \"wrong_ack\", \"wrong_timestamp\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_seq_tls_record_frag\", \"tls_frag\"",
                 self.BYPASS_METHOD
             );
         }
@@ -558,6 +591,9 @@ impl Config {
         }
         if self.WRONG_ACK_OFFSET == 0 {
             anyhow::bail!("WRONG_ACK_OFFSET must be >= 1");
+        }
+        if self.WRONG_TIMESTAMP_OFFSET == 0 {
+            anyhow::bail!("WRONG_TIMESTAMP_OFFSET must be >= 1");
         }
         if self.TLS_RECORD_FRAG_SIZE == 0 {
             anyhow::bail!("TLS_RECORD_FRAG_SIZE must be >= 1");
@@ -648,6 +684,11 @@ mod tests {
         assert!(cfg.WRONG_ACK_SET_PSH);
         assert!(cfg.WRONG_ACK_BUMP_IP_IDENT);
         assert!(cfg.WRONG_ACK_COMPLETE_IMMEDIATELY);
+        // wrong_timestamp defaults
+        assert_eq!(cfg.WRONG_TIMESTAMP_OFFSET, 1);
+        assert!(cfg.WRONG_TIMESTAMP_SET_PSH);
+        assert!(cfg.WRONG_TIMESTAMP_BUMP_IP_IDENT);
+        assert!(cfg.WRONG_TIMESTAMP_COMPLETE_IMMEDIATELY);
         // tls_record_frag defaults
         assert_eq!(cfg.TLS_RECORD_FRAG_SIZE, 1);
         assert!(cfg.TLS_RECORD_FRAG_SET_PSH);
@@ -787,6 +828,53 @@ mod tests {
     }
 
     #[test]
+    fn wrong_timestamp_defaults() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "wrong_timestamp"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.BYPASS_METHOD, "wrong_timestamp");
+        assert_eq!(cfg.WRONG_TIMESTAMP_OFFSET, 1);
+        assert!(cfg.WRONG_TIMESTAMP_SET_PSH);
+        assert!(cfg.WRONG_TIMESTAMP_BUMP_IP_IDENT);
+        assert!(cfg.WRONG_TIMESTAMP_COMPLETE_IMMEDIATELY);
+    }
+
+    #[test]
+    fn parses_wrong_timestamp_fields() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "wrong_timestamp"
+            WRONG_TIMESTAMP_OFFSET = 17
+            WRONG_TIMESTAMP_SET_PSH = false
+            WRONG_TIMESTAMP_BUMP_IP_IDENT = false
+            WRONG_TIMESTAMP_COMPLETE_IMMEDIATELY = false
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.WRONG_TIMESTAMP_OFFSET, 17);
+        assert!(!cfg.WRONG_TIMESTAMP_SET_PSH);
+        assert!(!cfg.WRONG_TIMESTAMP_BUMP_IP_IDENT);
+        assert!(!cfg.WRONG_TIMESTAMP_COMPLETE_IMMEDIATELY);
+    }
+
+    #[test]
+    fn rejects_wrong_timestamp_offset_zero() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "wrong_timestamp"
+            WRONG_TIMESTAMP_OFFSET = 0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn tls_record_frag_defaults() {
         let toml_str = r#"
             LISTEN_HOST = "0.0.0.0"
@@ -892,6 +980,10 @@ mod tests {
             WRONG_ACK_SET_PSH = false
             WRONG_ACK_BUMP_IP_IDENT = false
             WRONG_ACK_COMPLETE_IMMEDIATELY = false
+            WRONG_TIMESTAMP_OFFSET = 13
+            WRONG_TIMESTAMP_SET_PSH = false
+            WRONG_TIMESTAMP_BUMP_IP_IDENT = false
+            WRONG_TIMESTAMP_COMPLETE_IMMEDIATELY = false
             BYPASS_TIMEOUT_SECS = 5
             RELAY_MAX_LIFETIME_SECS = 7200
         "#;
@@ -918,6 +1010,10 @@ mod tests {
         assert!(!cfg.WRONG_ACK_SET_PSH);
         assert!(!cfg.WRONG_ACK_BUMP_IP_IDENT);
         assert!(!cfg.WRONG_ACK_COMPLETE_IMMEDIATELY);
+        assert_eq!(cfg.WRONG_TIMESTAMP_OFFSET, 13);
+        assert!(!cfg.WRONG_TIMESTAMP_SET_PSH);
+        assert!(!cfg.WRONG_TIMESTAMP_BUMP_IP_IDENT);
+        assert!(!cfg.WRONG_TIMESTAMP_COMPLETE_IMMEDIATELY);
         assert_eq!(cfg.BYPASS_TIMEOUT_SECS, 5);
         assert_eq!(cfg.RELAY_MAX_LIFETIME_SECS, 7200);
     }
@@ -1096,6 +1192,7 @@ mod tests {
             "wrong_checksum",
             "wrong_md5",
             "wrong_ack",
+            "wrong_timestamp",
             "wrong_seq_tls_frag",
             "wrong_seq_tls_record_frag",
         ] {

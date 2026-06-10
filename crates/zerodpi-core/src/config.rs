@@ -74,7 +74,7 @@ pub struct Config {
     /// - `"wrong_seq_tls_record_frag"` — injects a `wrong_seq` fake
     ///   ClientHello, then fragments the real ClientHello into multiple small
     ///   TLS records for downstream DPI layers.
-    /// - `"tcp_segmentation"` — TLS Fragment / TCP-level fragmentation.
+    /// - `"tls_frag"` — TLS Fragment / TCP-level fragmentation.
     ///   Splits a normal, intact TLS ClientHello record into multiple tiny TCP
     ///   segments so DPI cannot reassemble the SNI from any single packet.
     ///   Does **not** inject fake packets or use WinDivert/NFQUEUE interception;
@@ -221,10 +221,10 @@ pub struct Config {
     pub TLS_RECORD_FRAG_BUMP_IP_IDENT: bool,
 
     // -----------------------------------------------------------------------
-    // tcp_segmentation method parameters
+    // tls_frag method parameters
     // -----------------------------------------------------------------------
     /// Maximum ClientHello bytes sent in each TCP segment when using
-    /// `tcp_segmentation` or `wrong_seq_tls_frag`.
+    /// `tls_frag` or `wrong_seq_tls_frag`.
     ///
     /// The normal, intact TLS ClientHello record is sliced into chunks of at
     /// most this many bytes and each chunk is written to the upstream socket
@@ -546,10 +546,10 @@ impl Config {
                 | "tls_record_frag"
                 | "wrong_seq_tls_frag"
                 | "wrong_seq_tls_record_frag"
-                | "tcp_segmentation"
+                | "tls_frag"
         ) {
             anyhow::bail!(
-                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_md5\", \"wrong_ack\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_seq_tls_record_frag\", \"tcp_segmentation\"",
+                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_md5\", \"wrong_ack\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_seq_tls_record_frag\", \"tls_frag\"",
                 self.BYPASS_METHOD
             );
         }
@@ -581,13 +581,10 @@ impl Config {
             );
         }
         if self.MODE == "ip_bypass_plus"
-            && !matches!(
-                self.BYPASS_METHOD.as_str(),
-                "tls_record_frag" | "tcp_segmentation"
-            )
+            && !matches!(self.BYPASS_METHOD.as_str(), "tls_record_frag" | "tls_frag")
         {
             anyhow::bail!(
-                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\" or \"tcp_segmentation\""
+                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\" or \"tls_frag\""
             );
         }
         if !(0.0..=1.0).contains(&self.PROXY_TEST_SNI_WEIGHT) {
@@ -655,7 +652,7 @@ mod tests {
         assert_eq!(cfg.TLS_RECORD_FRAG_SIZE, 1);
         assert!(cfg.TLS_RECORD_FRAG_SET_PSH);
         assert!(cfg.TLS_RECORD_FRAG_BUMP_IP_IDENT);
-        // tcp_segmentation defaults
+        // tls_frag defaults
         assert_eq!(cfg.TCP_SEG_SIZE, 1);
         assert!(cfg.TCP_SEG_NODELAY);
         // proxy timing defaults
@@ -1078,18 +1075,18 @@ mod tests {
     }
 
     #[test]
-    fn ip_bypass_plus_accepts_tcp_segmentation() {
+    fn ip_bypass_plus_accepts_tls_frag() {
         let toml_str = r#"
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             MODE = "ip_bypass_plus"
-            BYPASS_METHOD = "tcp_segmentation"
+            BYPASS_METHOD = "tls_frag"
             SELECTED_IP = "1.2.3.4"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.MODE, "ip_bypass_plus");
-        assert_eq!(cfg.BYPASS_METHOD, "tcp_segmentation");
+        assert_eq!(cfg.BYPASS_METHOD, "tls_frag");
     }
 
     #[test]
@@ -1125,7 +1122,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             MODE = "ip_bypass_plus"
-            BYPASS_METHOD = "tcp_segmentation"
+            BYPASS_METHOD = "tls_frag"
             SELECTED_IP = "2606:4700:4700::1111"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
@@ -1244,29 +1241,29 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // tcp_segmentation tests
+    // tls_frag tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn tcp_segmentation_defaults() {
+    fn tls_frag_defaults() {
         let toml_str = r#"
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
-            BYPASS_METHOD = "tcp_segmentation"
+            BYPASS_METHOD = "tls_frag"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.BYPASS_METHOD, "tcp_segmentation");
+        assert_eq!(cfg.BYPASS_METHOD, "tls_frag");
         assert_eq!(cfg.TCP_SEG_SIZE, 1);
         assert!(cfg.TCP_SEG_NODELAY);
     }
 
     #[test]
-    fn parses_tcp_segmentation_fields() {
+    fn parses_tls_frag_fields() {
         let toml_str = r#"
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
-            BYPASS_METHOD = "tcp_segmentation"
+            BYPASS_METHOD = "tls_frag"
             TCP_SEG_SIZE = 16
             TCP_SEG_NODELAY = false
         "#;
@@ -1281,7 +1278,7 @@ mod tests {
         let toml_str = r#"
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
-            BYPASS_METHOD = "tcp_segmentation"
+            BYPASS_METHOD = "tls_frag"
             TCP_SEG_SIZE = 0
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
@@ -1289,15 +1286,26 @@ mod tests {
     }
 
     #[test]
-    fn tcp_segmentation_accepted_by_validate() {
+    fn tls_frag_accepted_by_validate() {
         let toml_str = r#"
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
-            BYPASS_METHOD = "tcp_segmentation"
+            BYPASS_METHOD = "tls_frag"
             TCP_SEG_SIZE = 100
             TCP_SEG_NODELAY = true
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_old_tcp_segmentation_method_name() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "tcp_segmentation"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
     }
 }

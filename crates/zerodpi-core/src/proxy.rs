@@ -12,13 +12,13 @@
 //! 5. Once the bypass completes, the proxy runs a normal bidirectional copy
 //!    between the two sockets.
 //! 6. For `wrong_seq_tls_frag`, step 4 writes the intact ClientHello in small
-//!    TCP segments using the same `TCP_SEG_*` settings as `tcp_segmentation`.
+//!    TCP segments using the same `TCP_SEG_*` settings as `tls_frag`.
 //!
 //! For `ip_bypass_plus`, IP scanning selects the upstream IPv4 address, then
-//! only real-SNI-preserving methods (`tls_record_frag` or `tcp_segmentation`)
+//! only real-SNI-preserving methods (`tls_record_frag` or `tls_frag`)
 //! are applied to the first ClientHello. No fake SNI payload is generated.
 //!
-//! For socket-based methods (`tcp_segmentation`, TCP-level TLS Fragment):
+//! For socket-based methods (`tls_frag`, TCP-level TLS Fragment):
 //! 1. Accept incoming TCP on `LISTEN_HOST:LISTEN_PORT`.
 //! 2. Connect to the upstream server (no FlowTable registration, no interceptor).
 //! 3. Read one complete TLS record (the ClientHello) from the client socket.
@@ -357,9 +357,9 @@ pub async fn run_proxy(
         };
         debug!(%peer, "accepted");
 
-        // Route to the socket-based path for tcp_segmentation.
+        // Route to the socket-based path for tls_frag.
         // No FlowTable registration; no interceptor involvement.
-        if cfg.BYPASS_METHOD == "tcp_segmentation" {
+        if cfg.BYPASS_METHOD == "tls_frag" {
             let cfg = cfg.clone();
             let connect_ip = active_target.read().unwrap().ip;
             let event_tx = event_tx.clone();
@@ -368,7 +368,7 @@ pub async fn run_proxy(
                     handle_tcp_seg_connection_with_ip(cfg, connect_ip, incoming, peer, event_tx)
                         .await
                 {
-                    warn!(%peer, error = %e, "tcp_seg connection failed");
+                    warn!(%peer, error = %e, "tls_frag connection failed");
                 }
             });
             continue;
@@ -601,7 +601,7 @@ async fn handle_intercept_connection(
 /// Unlike plain `ip_bypass`, this mode may apply a real-SNI-preserving
 /// ClientHello bypass method:
 ///
-/// - `tcp_segmentation`: socket-only segmentation, no packet interceptor.
+/// - `tls_frag`: socket-only segmentation, no packet interceptor.
 /// - `tls_record_frag`: packet interceptor rewrites the first real ClientHello
 ///   into TLS record fragments. The flow stores an empty fake payload because
 ///   no fake SNI packet is emitted.
@@ -641,7 +641,7 @@ pub async fn run_ip_bypass_plus_proxy(
             }
         };
 
-        if cfg.BYPASS_METHOD == "tcp_segmentation" {
+        if cfg.BYPASS_METHOD == "tls_frag" {
             let cfg = cfg.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
@@ -649,7 +649,7 @@ pub async fn run_ip_bypass_plus_proxy(
                     handle_tcp_seg_connection_with_ip(cfg, connect_ip, incoming, peer, event_tx)
                         .await
                 {
-                    warn!(%peer, error = %e, "ip_bypass_plus tcp_seg connection failed");
+                    warn!(%peer, error = %e, "ip_bypass_plus tls_frag connection failed");
                 }
             });
             continue;
@@ -693,10 +693,10 @@ impl<F: FnOnce()> Drop for ScopeGuard<F> {
 }
 
 // ---------------------------------------------------------------------------
-// tcp_segmentation proxy path (no packet interceptor)
+// tls_frag proxy path (no packet interceptor)
 // ---------------------------------------------------------------------------
 
-/// Handle a single connection using the `tcp_segmentation` bypass method.
+/// Handle a single connection using the `tls_frag` bypass method.
 ///
 /// Does **not** register a flow in the [`FlowTable`] and does **not** involve
 /// the platform packet interceptor.  Instead:
@@ -730,7 +730,7 @@ async fn handle_tcp_seg_connection_with_ip(
                     error: e.to_string(),
                 },
             );
-            return Err(e).context("tcp_seg: connect upstream");
+            return Err(e).context("tls_frag: connect upstream");
         }
     };
 
@@ -738,24 +738,24 @@ async fn handle_tcp_seg_connection_with_ip(
     if method.nodelay {
         outgoing
             .set_nodelay(true)
-            .context("tcp_seg: set_nodelay on upstream socket")?;
+            .context("tls_frag: set_nodelay on upstream socket")?;
     }
 
     // Read exactly one TLS record (the ClientHello) from the client.
     let client_hello = read_one_tls_record(&mut incoming)
         .await
-        .context("tcp_seg: reading ClientHello from client")?;
+        .context("tls_frag: reading ClientHello from client")?;
 
     // Write it to the upstream socket in small segments.
     write_segmented(&mut outgoing, &client_hello, method.seg_size)
         .await
-        .context("tcp_seg: writing segmented ClientHello")?;
+        .context("tls_frag: writing segmented ClientHello")?;
 
     debug!(
         seg_size = method.seg_size,
         nodelay = method.nodelay,
         total_bytes = client_hello.len(),
-        "tcp_seg: ClientHello written in segments; handing off to relay"
+        "tls_frag: ClientHello written in segments; handing off to relay"
     );
 
     emit(
@@ -780,7 +780,7 @@ async fn handle_tcp_seg_connection_with_ip(
         c2s_bytes = relay.c2s_bytes,
         s2c_bytes = relay.s2c_bytes,
         reason = ?relay.reason,
-        "tcp_seg: relay finished"
+        "tls_frag: relay finished"
     );
     emit(
         &event_tx,
@@ -1136,6 +1136,6 @@ mod tests {
             "wrong_seq_tls_record_frag"
         ));
         assert!(!method_segments_first_client_hello("tls_record_frag"));
-        assert!(!method_segments_first_client_hello("tcp_segmentation"));
+        assert!(!method_segments_first_client_hello("tls_frag"));
     }
 }

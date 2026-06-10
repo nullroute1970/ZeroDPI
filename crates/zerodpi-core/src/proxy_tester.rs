@@ -184,7 +184,7 @@ where
         candidate.sni_score(),
     )));
 
-    if config.BYPASS_METHOD == "tcp_segmentation" {
+    if config.BYPASS_METHOD == "tls_frag" {
         let flows = new_flow_table();
         let probe_result =
             run_socks5_probe(config.clone(), active_target, flows, interface_ip, timeout).await;

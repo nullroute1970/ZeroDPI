@@ -24,7 +24,7 @@
 //! `TcpStream` directly.  They do **not** implement [`BypassMethod`] and the
 //! flow is never registered in the [`crate::flow::FlowTable`].
 //!
-//! - `tcp_segmentation` — TCP-level TLS Fragment. Writes the intact real
+//! - `tls_frag` — TCP-level TLS Fragment. Writes the intact real
 //!   ClientHello record in tiny TCP segments with `TCP_NODELAY` so DPI cannot
 //!   reassemble the SNI from any single packet.
 //!
@@ -133,7 +133,7 @@ pub trait BypassMethod: Send + Sync + 'static {
 /// `wrong_ack`, `wrong_checksum`, `wrong_md5`, `tls_record_frag`,
 /// `wrong_seq_tls_frag`, `wrong_seq_tls_record_frag`) and `None` for
 /// socket-based methods
-/// (`tcp_segmentation`) or unknown names.  Callers should validate the method
+/// (`tls_frag`) or unknown names.  Callers should validate the method
 /// name via [`crate::config::Config::validate`] before calling this function.
 pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
     match cfg.BYPASS_METHOD.as_str() {
@@ -146,7 +146,7 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
         "wrong_seq_tls_record_frag" => Some(Box::new(
             wrong_seq_tls_record_frag::WrongSeqTlsRecordFrag::new(cfg),
         )),
-        // "tcp_segmentation" is socket-based and handled directly in proxy.rs.
+        // "tls_frag" is socket-based and handled directly in proxy.rs.
         _ => None,
     }
 }
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn socket_method_returns_none() {
-        let cfg = cfg_with_method("tcp_segmentation");
+        let cfg = cfg_with_method("tls_frag");
         assert!(build_method(&cfg).is_none());
     }
 }

@@ -1,4 +1,4 @@
-//! `tcp_segmentation` bypass: TCP-level TLS Fragment.  It keeps the TLS record
+//! `tls_frag` bypass: TCP-level TLS Fragment.  It keeps the TLS record
 //! intact, then splits the real TLS ClientHello bytes into multiple tiny TCP
 //! segments so that DPI cannot reassemble the SNI from any single packet.
 //!
@@ -48,7 +48,7 @@ use crate::config::Config;
 /// TLS record-layer maximum.
 const MAX_TLS_RECORD_BODY: usize = 16_384;
 
-/// Parameters for the `tcp_segmentation` bypass method.
+/// Parameters for the `tls_frag` bypass method.
 pub struct TcpSegmentation {
     /// Maximum payload bytes sent in each TCP segment.
     pub seg_size: usize,
@@ -115,7 +115,7 @@ pub async fn write_segmented(
         dst.flush().await.context("flushing segmented chunk")?;
         sent += chunk.len();
         trace!(
-            target = "zerodpi::tcp_segmentation",
+            target = "zerodpi::tls_frag",
             chunk_len = chunk.len(),
             total_sent = sent,
             "wrote segment"
@@ -198,7 +198,7 @@ mod tests {
         let cfg: Config = toml::from_str(
             r#"LISTEN_HOST = "127.0.0.1"
                LISTEN_PORT = 44444
-               BYPASS_METHOD = "tcp_segmentation"
+               BYPASS_METHOD = "tls_frag"
                TCP_SEG_SIZE = 7
                TCP_SEG_NODELAY = false"#,
         )

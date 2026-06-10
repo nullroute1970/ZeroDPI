@@ -36,7 +36,7 @@ pub fn ensure_packet_interception_access() -> Result<()> {
 fn packet_interception_access_error() -> &'static str {
     "ZeroDPI needs Administrator privileges for packet interception via WinDivert. \
      Start PowerShell or Command Prompt with \"Run as administrator\" and run ZeroDPI again. \
-     To run without Administrator privileges, use BYPASS_METHOD = \"tcp_segmentation\" \
+     To run without Administrator privileges, use BYPASS_METHOD = \"tls_frag\" \
      or MODE = \"ip_bypass\"."
 }
 
@@ -44,7 +44,7 @@ fn packet_interception_access_error() -> &'static str {
 fn packet_interception_access_error() -> &'static str {
     "ZeroDPI needs root privileges or CAP_NET_ADMIN for packet interception via NFQUEUE. \
      Run ZeroDPI with sudo/root, grant CAP_NET_ADMIN to the binary, or use \
-     BYPASS_METHOD = \"tcp_segmentation\" or MODE = \"ip_bypass\"."
+     BYPASS_METHOD = \"tls_frag\" or MODE = \"ip_bypass\"."
 }
 
 #[cfg(windows)]

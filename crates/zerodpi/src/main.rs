@@ -100,7 +100,7 @@ struct Args {
     /// Override `SELECTED_SNI` — skip scanning and use this hostname.
     #[arg(long)]
     sni: Option<String>,
-    /// Override `BYPASS_METHOD` (e.g. `wrong_seq`, `wrong_md5`, `tcp_segmentation`).
+    /// Override `BYPASS_METHOD` (e.g. `wrong_seq`, `wrong_md5`, `tls_frag`).
     #[arg(long)]
     method: Option<String>,
     /// Linux-only: NFQUEUE queue number to use.
@@ -348,8 +348,8 @@ fn main() -> Result<()> {
 
     let flows = new_flow_table();
 
-    let (_intercept_thread, intercept_done_rx) = if cfg.BYPASS_METHOD == "tcp_segmentation" {
-        info!("tcp_segmentation selected; skipping packet interceptor");
+    let (_intercept_thread, intercept_done_rx) = if cfg.BYPASS_METHOD == "tls_frag" {
+        info!("tls_frag selected; skipping packet interceptor");
         (None, None)
     } else {
         let method_box = build_method(&cfg)
@@ -689,8 +689,7 @@ fn requires_packet_interception(cfg: &Config) -> bool {
 }
 
 fn mode_requires_packet_interception(mode: &str, bypass_method: &str) -> bool {
-    matches!(mode, "sni_spoof" | "proxy_scan" | "ip_bypass_plus")
-        && bypass_method != "tcp_segmentation"
+    matches!(mode, "sni_spoof" | "proxy_scan" | "ip_bypass_plus") && bypass_method != "tls_frag"
 }
 
 async fn run_headless_proxy(
@@ -1074,8 +1073,8 @@ fn ip_bypass_plus_main(
 
     // ---- step 3: optional packet interceptor ----
     let flows = new_flow_table();
-    let (_intercept_thread, intercept_done_rx) = if cfg.BYPASS_METHOD == "tcp_segmentation" {
-        info!("ip_bypass_plus: tcp_segmentation selected; skipping packet interceptor");
+    let (_intercept_thread, intercept_done_rx) = if cfg.BYPASS_METHOD == "tls_frag" {
+        info!("ip_bypass_plus: tls_frag selected; skipping packet interceptor");
         (None, None)
     } else {
         let method_box = build_method(&cfg)
@@ -1794,10 +1793,7 @@ mod tests {
 
     #[test]
     fn non_interception_modes_do_not_require_packet_interception() {
-        assert!(!mode_requires_packet_interception(
-            "sni_spoof",
-            "tcp_segmentation"
-        ));
+        assert!(!mode_requires_packet_interception("sni_spoof", "tls_frag"));
         assert!(!mode_requires_packet_interception("ip_bypass", "wrong_seq"));
         assert!(!mode_requires_packet_interception("sni_scan", "wrong_seq"));
         assert!(!mode_requires_packet_interception("ip_scan", "wrong_seq"));
@@ -1811,7 +1807,7 @@ mod tests {
         ));
         assert!(!mode_requires_packet_interception(
             "ip_bypass_plus",
-            "tcp_segmentation"
+            "tls_frag"
         ));
     }
 
@@ -1842,9 +1838,6 @@ mod tests {
     #[test]
     fn proxy_scan_only_requires_interception_for_interceptor_methods() {
         assert!(mode_requires_packet_interception("proxy_scan", "wrong_seq"));
-        assert!(!mode_requires_packet_interception(
-            "proxy_scan",
-            "tcp_segmentation"
-        ));
+        assert!(!mode_requires_packet_interception("proxy_scan", "tls_frag"));
     }
 }

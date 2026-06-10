@@ -25,7 +25,7 @@ LISTEN_PORT = 44444
 # - "sni_spoof"     — DPI bypass via SNI spoofing (default).
 # - "ip_bypass"     — plain TCP relay through a scanned IP; no packet interception.
 # - "ip_bypass_plus" — IPv4 relay through a scanned IP plus real-SNI-preserving
-#                      BYPASS_METHOD ("tls_record_frag" or "tcp_segmentation").
+#                      BYPASS_METHOD ("tls_record_frag" or "tls_frag").
 # - "sni_scan"      — scan sni_list.txt and display/save results, then exit.
 # - "ip_scan"       — scan ip_list.txt and display/save results, then exit.
 # - "proxy_scan"    — scan sni_list.txt (Phase 1), then test each working SNI
@@ -151,7 +151,6 @@ SPEED_CAP_BPS = 2048000.0
 #     TCP sequence number and ACK number plus a TCP-MD5 Signature option.  DPI
 #     devices can inspect the payload using the allowed SNI, while the real
 #     upstream server rejects the segment because no TCP-MD5 key was negotiated.
-#     This is the ZeroDPI name for sing-box's "wrong-md5" spoof behavior.
 #
 #   "wrong_ack"
 #     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
@@ -185,7 +184,7 @@ SPEED_CAP_BPS = 2048000.0
 #     an unfragmented TLS record containing the SNI even if the fake packet was
 #     dropped by an earlier firewall.
 #
-#   "tcp_segmentation"
+#   "tls_frag"
 #     TLS Fragment / TCP-level fragmentation.  Does NOT inject fake packets
 #     and does NOT use WinDivert or NFQUEUE packet interception.  Instead, it
 #     reads the normal, intact TLS ClientHello record from the client socket
@@ -197,7 +196,7 @@ SPEED_CAP_BPS = 2048000.0
 #
 # This setting is used by SNI-based modes ("sni_spoof", "sni_scan", and
 # "proxy_scan").  MODE = "ip_bypass_plus" supports only "tls_record_frag" or
-# "tcp_segmentation" so the upstream VPN client's real SNI is preserved. The
+# "tls_frag" so the upstream VPN client's real SNI is preserved. The
 # "ip_bypass" and "ip_scan" modes do not use a bypass method.
 BYPASS_METHOD = "wrong_seq"
 
@@ -399,13 +398,13 @@ TLS_RECORD_FRAG_SET_PSH = true
 TLS_RECORD_FRAG_BUMP_IP_IDENT = true
 
 # ---------------------------------------------------------------------------
-# tcp_segmentation method parameters
+# tls_frag method parameters
 # ---------------------------------------------------------------------------
-# These settings apply when BYPASS_METHOD = "tcp_segmentation" or
+# These settings apply when BYPASS_METHOD = "tls_frag" or
 # "wrong_seq_tls_frag".
 #
 # Unlike "wrong_seq" and "tls_record_frag", this method does NOT use the
-# WinDivert / NFQUEUE packet interceptor when used alone as "tcp_segmentation".
+# WinDivert / NFQUEUE packet interceptor when used alone as "tls_frag".
 # In the "wrong_seq_tls_frag" combo, the wrong_seq stage still requires packet
 # interception, while these TCP segment settings control how the real
 # ClientHello is written after the fake packet stage.

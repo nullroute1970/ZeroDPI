@@ -61,6 +61,10 @@ pub struct Config {
     ///   sequence/acknowledgment numbers and a TCP-MD5 Signature option. DPI
     ///   can inspect the fake SNI while the real server rejects the segment
     ///   because no TCP-MD5 key was negotiated.
+    /// - `"wrong_seq_wrong_md5"` — injects a fake TLS ClientHello with both a
+    ///   deliberately wrong TCP sequence number and a TCP-MD5 Signature option.
+    ///   DPI can inspect the fake SNI while the real server rejects the segment
+    ///   because it is out of window and no TCP-MD5 key was negotiated.
     /// - `"wrong_ack"` — injects a fake TLS ClientHello with the normal TCP
     ///   sequence number and a deliberately old TCP acknowledgment number so
     ///   DPI inspects the fake SNI while the real server rejects the segment.
@@ -104,23 +108,26 @@ pub struct Config {
     // wrong_seq method parameters
     // -----------------------------------------------------------------------
     /// Extra bytes subtracted from the injected TCP sequence number on top of
-    /// the payload length.  The default formula positions the spoofed segment
-    /// exactly at `syn_seq + 1 - payload_len`; adding an extra offset pushes
-    /// it further behind `rcv_nxt` and can help on networks that perform
-    /// tighter window checks.
+    /// the payload length. Used by `wrong_seq`, `wrong_seq_wrong_md5`, and
+    /// wrong-sequence combo methods. The default formula positions the spoofed
+    /// segment exactly at `syn_seq + 1 - payload_len`; adding an extra offset
+    /// pushes it further behind `rcv_nxt` and can help on networks that
+    /// perform tighter window checks.
     /// Must be `<= u32::MAX`.  Default: `0`.
     #[serde(default)]
     pub WRONG_SEQ_EXTRA_OFFSET: u32,
 
-    /// Whether to set the `PSH` flag on the spoofed ClientHello packet.
+    /// Whether to set the `PSH` flag on the wrong-sequence spoofed ClientHello
+    /// packet.
     /// Most DPI implementations expect application data to carry `PSH`; keep
     /// this `true` unless you are debugging a specific DPI device.
     /// Default: `true`.
     #[serde(default = "default_true")]
     pub WRONG_SEQ_SET_PSH: bool,
 
-    /// Whether to increment the IPv4 `Identification` field on the spoofed
-    /// packet.  Bumping the ID makes the spoofed packet look like a fresh
+    /// Whether to increment the IPv4 `Identification` field on the
+    /// wrong-sequence spoofed packet. Bumping the ID makes the spoofed packet
+    /// look like a fresh
     /// datagram rather than a retransmit, which helps some stateful
     /// middleboxes accept it.  Default: `true`.
     #[serde(default = "default_true")]
@@ -166,8 +173,9 @@ pub struct Config {
     pub WRONG_MD5_BUMP_IP_IDENT: bool,
 
     /// Whether to signal bypass completion immediately after emitting the
-    /// TCP-MD5-tagged fake packet. The default is `true` because a server
-    /// without a negotiated MD5 key should reject or drop the segment.
+    /// TCP-MD5-tagged fake packet. Used by `wrong_md5` and
+    /// `wrong_seq_wrong_md5`. The default is `true` because a server without a
+    /// negotiated MD5 key should reject or drop the segment.
     #[serde(default = "default_true")]
     pub WRONG_MD5_COMPLETE_IMMEDIATELY: bool,
 
@@ -577,6 +585,7 @@ impl Config {
             "wrong_seq"
                 | "wrong_checksum"
                 | "wrong_md5"
+                | "wrong_seq_wrong_md5"
                 | "wrong_ack"
                 | "wrong_timestamp"
                 | "tls_record_frag"
@@ -586,7 +595,7 @@ impl Config {
                 | "tls_frag"
         ) {
             anyhow::bail!(
-                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_md5\", \"wrong_ack\", \"wrong_timestamp\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_md5_tls_frag\", \"wrong_seq_tls_record_frag\", \"tls_frag\"",
+                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_md5\", \"wrong_seq_wrong_md5\", \"wrong_ack\", \"wrong_timestamp\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_md5_tls_frag\", \"wrong_seq_tls_record_frag\", \"tls_frag\"",
                 self.BYPASS_METHOD
             );
         }
@@ -781,6 +790,26 @@ mod tests {
         cfg.validate().unwrap();
         assert!(!cfg.WRONG_MD5_SET_PSH);
         assert!(!cfg.WRONG_MD5_BUMP_IP_IDENT);
+        assert!(!cfg.WRONG_MD5_COMPLETE_IMMEDIATELY);
+    }
+
+    #[test]
+    fn wrong_seq_wrong_md5_accepted_by_validate() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "wrong_seq_wrong_md5"
+            WRONG_SEQ_EXTRA_OFFSET = 33
+            WRONG_SEQ_SET_PSH = false
+            WRONG_SEQ_BUMP_IP_IDENT = false
+            WRONG_MD5_COMPLETE_IMMEDIATELY = false
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.BYPASS_METHOD, "wrong_seq_wrong_md5");
+        assert_eq!(cfg.WRONG_SEQ_EXTRA_OFFSET, 33);
+        assert!(!cfg.WRONG_SEQ_SET_PSH);
+        assert!(!cfg.WRONG_SEQ_BUMP_IP_IDENT);
         assert!(!cfg.WRONG_MD5_COMPLETE_IMMEDIATELY);
     }
 
@@ -1217,6 +1246,7 @@ mod tests {
             "wrong_seq",
             "wrong_checksum",
             "wrong_md5",
+            "wrong_seq_wrong_md5",
             "wrong_ack",
             "wrong_timestamp",
             "wrong_seq_tls_frag",

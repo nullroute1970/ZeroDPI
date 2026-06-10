@@ -10,8 +10,9 @@
 //!
 //! - [`BypassMethod::on_handshake_complete_ack`] — fires on the first outbound
 //!   bare ACK after the TCP handshake.  `wrong_seq`, `wrong_ack`,
-//!   `wrong_checksum`, `wrong_md5`, `wrong_timestamp`, and the first stage of
-//!   combo methods act here (fake injection).
+//!   `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`,
+//!   `wrong_timestamp`, and the first stage of combo methods act here (fake
+//!   injection).
 //! - [`BypassMethod::on_first_data_packet`] — fires on the first outbound
 //!   data packet.  `tls_record_frag` and the second stage of
 //!   `wrong_seq_tls_record_frag` act here (TLS record fragmentation). The
@@ -41,6 +42,7 @@ pub mod wrong_md5_tls_frag;
 pub mod wrong_seq;
 pub mod wrong_seq_tls_frag;
 pub mod wrong_seq_tls_record_frag;
+pub mod wrong_seq_wrong_md5;
 pub mod wrong_timestamp;
 
 use crate::config::Config;
@@ -110,8 +112,9 @@ pub trait BypassMethod: Send + Sync + 'static {
     /// Called when the first outbound bare ACK of the handshake is observed.
     ///
     /// Methods that operate at this stage (e.g. `wrong_seq`, `wrong_ack`,
-    /// `wrong_checksum`, `wrong_md5`, `wrong_timestamp`) stage their payload
-    /// mutations here and return [`MethodAction::EmitFakeAndAccept`].
+    /// `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`,
+    /// `wrong_timestamp`) stage their payload mutations here and return
+    /// [`MethodAction::EmitFakeAndAccept`].
     /// Methods that operate later (e.g. `tls_record_frag`) return
     /// [`MethodAction::PassThrough`]; the handler will then set the flow into
     /// `waiting_for_data` mode and call [`on_first_data_packet`] instead.
@@ -138,9 +141,9 @@ pub trait BypassMethod: Send + Sync + 'static {
 /// Build an interceptor-based method from the application config.
 ///
 /// Returns `Some(method)` for interceptor-based methods (`wrong_seq`,
-/// `wrong_ack`, `wrong_checksum`, `wrong_md5`, `wrong_timestamp`,
-/// `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_seq_tls_record_frag`,
-/// `wrong_md5_tls_frag`) and `None` for socket-based methods
+/// `wrong_ack`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`,
+/// `wrong_timestamp`, `tls_record_frag`, `wrong_seq_tls_frag`,
+/// `wrong_seq_tls_record_frag`, `wrong_md5_tls_frag`) and `None` for socket-based methods
 /// (`tls_frag`) or unknown names.  Callers should validate the method
 /// name via [`crate::config::Config::validate`] before calling this function.
 pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
@@ -149,6 +152,7 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
         "wrong_ack" => Some(Box::new(wrong_ack::WrongAck::new(cfg))),
         "wrong_checksum" => Some(Box::new(wrong_checksum::WrongChecksum::new(cfg))),
         "wrong_md5" => Some(Box::new(wrong_md5::WrongMd5::new(cfg))),
+        "wrong_seq_wrong_md5" => Some(Box::new(wrong_seq_wrong_md5::WrongSeqWrongMd5::new(cfg))),
         "wrong_md5_tls_frag" => Some(Box::new(wrong_md5_tls_frag::WrongMd5TlsFrag::new(cfg))),
         "wrong_timestamp" => Some(Box::new(wrong_timestamp::WrongTimestamp::new(cfg))),
         "tls_record_frag" => Some(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
@@ -193,6 +197,13 @@ mod tests {
         let cfg = cfg_with_method("wrong_md5");
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "wrong_md5");
+    }
+
+    #[test]
+    fn build_wrong_seq_wrong_md5_method() {
+        let cfg = cfg_with_method("wrong_seq_wrong_md5");
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "wrong_seq_wrong_md5");
     }
 
     #[test]

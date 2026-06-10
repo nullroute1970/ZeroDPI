@@ -152,6 +152,14 @@ SPEED_CAP_BPS = 2048000.0
 #     devices can inspect the payload using the allowed SNI, while the real
 #     upstream server rejects the segment because no TCP-MD5 key was negotiated.
 #
+#   "wrong_seq_wrong_md5"
+#     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
+#     then injects a fake TLS ClientHello on that packet with a deliberately
+#     old TCP sequence number plus a TCP-MD5 Signature option.  DPI devices can
+#     inspect the payload using the allowed SNI, while the real upstream server
+#     rejects the segment because it is out of window and no TCP-MD5 key was
+#     negotiated.
+#
 #   "wrong_md5_tls_frag"
 #     Combines wrong_md5 with TLS Fragment / TCP-level fragmentation for
 #     layered filtering.  First, it injects a fake TCP-MD5 ClientHello on the
@@ -249,7 +257,8 @@ LINUX_FIREWALL_BACKEND = "iptables"
 # wrong_seq method parameters
 # ---------------------------------------------------------------------------
 # These settings apply when BYPASS_METHOD = "wrong_seq" or
-# "wrong_seq_tls_frag" or "wrong_seq_tls_record_frag".
+# "wrong_seq_wrong_md5" or "wrong_seq_tls_frag" or
+# "wrong_seq_tls_record_frag".
 
 # Extra bytes subtracted from the injected TCP sequence number in addition to
 # the spoofed ClientHello payload length.
@@ -318,8 +327,10 @@ WRONG_CHECKSUM_COMPLETE_IMMEDIATELY = true
 # wrong_md5 method parameters
 # ---------------------------------------------------------------------------
 # These settings apply when BYPASS_METHOD = "wrong_md5" or
-# "wrong_md5_tls_frag".  WRONG_MD5_COMPLETE_IMMEDIATELY only affects standalone
-# "wrong_md5"; the combo always waits for the real ClientHello segmentation
+# "wrong_md5_tls_frag". "wrong_seq_wrong_md5" uses the TCP-MD5 option and
+# WRONG_MD5_COMPLETE_IMMEDIATELY, but uses the wrong_seq PSH/IP-ident settings
+# for packet shape. WRONG_MD5_COMPLETE_IMMEDIATELY does not affect
+# "wrong_md5_tls_frag"; that combo waits for the real ClientHello segmentation
 # stage.
 
 # Whether to set the TCP PSH flag on the spoofed TCP-MD5 ClientHello packet.

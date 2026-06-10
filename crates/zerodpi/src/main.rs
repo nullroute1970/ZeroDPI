@@ -1779,6 +1779,10 @@ mod tests {
         assert!(mode_requires_packet_interception("sni_spoof", "wrong_md5"));
         assert!(mode_requires_packet_interception(
             "sni_spoof",
+            "wrong_seq_wrong_md5"
+        ));
+        assert!(mode_requires_packet_interception(
+            "sni_spoof",
             "wrong_md5_tls_frag"
         ));
         assert!(mode_requires_packet_interception(

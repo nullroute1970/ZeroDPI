@@ -115,6 +115,7 @@ mod tests {
             new_ack: None,
             new_flags: None,
             new_payload: None,
+            append_tcp_options: Vec::new(),
             bump_ipv4_ident: false,
             corrupt_tcp_checksum_delta: None,
         }

@@ -1,7 +1,8 @@
 //! tokio-based TCP proxy that drives the bypass:
 //!
 //! For interceptor-based methods (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
-//! `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_seq_tls_record_frag`):
+//! `wrong_md5`, `tls_record_frag`, `wrong_seq_tls_frag`,
+//! `wrong_seq_tls_record_frag`):
 //! 1. Accept incoming TCP on `LISTEN_HOST:LISTEN_PORT`.
 //! 2. Open an outbound TCP socket bound to the local interface IP.
 //! 3. Build a fake ClientHello and register the flow in the [`FlowTable`].

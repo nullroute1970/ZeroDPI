@@ -165,6 +165,7 @@ fn parse_view<'a>(direction: Direction, buf: &'a [u8]) -> Result<(PacketView<'a>
         new_ack: None,
         new_flags: None,
         new_payload: None,
+        append_tcp_options: Vec::new(),
         bump_ipv4_ident: false,
         corrupt_tcp_checksum_delta: None,
     };
@@ -205,9 +206,11 @@ fn build_modified(orig: &[u8], layout: &PacketLayout, view: &PacketView<'_>) -> 
     if view.bump_ipv4_ident {
         ip_hdr.identification = ip_hdr.identification.wrapping_add(1);
     }
+    append_tcp_options(&mut tcp_hdr, &view.append_tcp_options)?;
 
     // Recompute IPv4 total length and checksums.
-    let new_ip_payload_len = layout.tcp_hdr_len + new_payload.len();
+    let new_tcp_hdr_len = tcp_hdr.header_len();
+    let new_ip_payload_len = new_tcp_hdr_len + new_payload.len();
     ip_hdr.set_payload_len(new_ip_payload_len)?;
     ip_hdr.header_checksum = ip_hdr.calc_header_checksum();
     tcp_hdr.checksum = tcp_hdr.calc_checksum_ipv4(&ip_hdr, new_payload)?;
@@ -215,11 +218,38 @@ fn build_modified(orig: &[u8], layout: &PacketLayout, view: &PacketView<'_>) -> 
         tcp_hdr.checksum = tcp_hdr.checksum.wrapping_add(delta);
     }
 
-    let mut out = Vec::with_capacity(layout.ip_hdr_len + layout.tcp_hdr_len + new_payload.len());
+    let mut out = Vec::with_capacity(layout.ip_hdr_len + new_tcp_hdr_len + new_payload.len());
     ip_hdr.write(&mut out)?;
     tcp_hdr.write(&mut out)?;
     out.extend_from_slice(new_payload);
     Ok(out)
+}
+
+fn append_tcp_options(tcp_hdr: &mut etherparse::TcpHeader, append: &[u8]) -> Result<()> {
+    if append.is_empty() {
+        return Ok(());
+    }
+
+    let original = tcp_hdr.options.as_slice();
+    let raw_len = original.len() + append.len();
+    let padded_len = (raw_len + 3) & !3;
+    let max_options_len = etherparse::TcpHeader::MAX_LEN - etherparse::TcpHeader::MIN_LEN;
+    if padded_len > max_options_len {
+        anyhow::bail!(
+            "TCP options would exceed maximum header size: existing={} append={} padded={}",
+            original.len(),
+            append.len(),
+            padded_len
+        );
+    }
+
+    let mut options = Vec::with_capacity(raw_len);
+    options.extend_from_slice(original);
+    options.extend_from_slice(append);
+    tcp_hdr
+        .set_options_raw(&options)
+        .context("append TCP options")?;
+    Ok(())
 }
 
 // ---------------------- firewall rule management ----------------------
@@ -514,6 +544,7 @@ mod tests {
                 ..Default::default()
             }),
             new_payload: Some(vec![0xAB; 517]),
+            append_tcp_options: Vec::new(),
             bump_ipv4_ident: true,
             corrupt_tcp_checksum_delta: None,
         }
@@ -816,5 +847,49 @@ mod tests {
             .calc_checksum_ipv4(&ip2.to_header(), &modified[40..])
             .unwrap();
         assert_eq!(tcp2.checksum(), calculated);
+    }
+
+    #[test]
+    fn tcp_options_can_be_appended_after_rebuild() {
+        use zerodpi_core::methods::wrong_md5::tcp_md5_signature_option;
+
+        let buf = data_packet(&[]);
+        let layout = PacketLayout {
+            ip_hdr_len: 20,
+            tcp_hdr_len: 20,
+            payload_off: 40,
+            total_len: 40,
+        };
+        let mut view = make_view();
+        let md5_option = tcp_md5_signature_option();
+        view.append_tcp_options = md5_option.clone();
+        let modified = build_modified(&buf, &layout, &view).unwrap();
+
+        let ip2 = Ipv4HeaderSlice::from_slice(&modified).unwrap();
+        let tcp2 = TcpHeaderSlice::from_slice(&modified[ip2.slice().len()..]).unwrap();
+        assert_eq!(tcp2.slice().len(), 40);
+        assert_eq!(ip2.total_len() as usize, 20 + 40 + 517);
+
+        let options = tcp2.options();
+        assert_eq!(&options[..md5_option.len()], md5_option.as_slice());
+        assert_eq!(&options[md5_option.len()..], &[0, 0]);
+
+        let payload_off = ip2.slice().len() + tcp2.slice().len();
+        let calculated = tcp2
+            .to_header()
+            .calc_checksum_ipv4(&ip2.to_header(), &modified[payload_off..])
+            .unwrap();
+        assert_eq!(tcp2.checksum(), calculated);
+    }
+
+    #[test]
+    fn tcp_option_append_rejects_oversized_header() {
+        use etherparse::TcpHeader;
+        use zerodpi_core::methods::wrong_md5::tcp_md5_signature_option;
+
+        let mut tcp = TcpHeader::new(12345, 443, 1001, 65535);
+        tcp.set_options_raw(&[1; 24]).unwrap();
+        let err = append_tcp_options(&mut tcp, &tcp_md5_signature_option()).unwrap_err();
+        assert!(err.to_string().contains("TCP options would exceed"));
     }
 }

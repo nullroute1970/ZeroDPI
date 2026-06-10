@@ -145,6 +145,14 @@ SPEED_CAP_BPS = 2048000.0
 #     devices can inspect the payload using the allowed SNI, while the real
 #     upstream server drops the invalid-checksum segment before consuming data.
 #
+#   "wrong_md5"
+#     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
+#     then injects a fake TLS ClientHello on that packet with the normal valid
+#     TCP sequence number and ACK number plus a TCP-MD5 Signature option.  DPI
+#     devices can inspect the payload using the allowed SNI, while the real
+#     upstream server rejects the segment because no TCP-MD5 key was negotiated.
+#     This is the ZeroDPI name for sing-box's "wrong-md5" spoof behavior.
+#
 #   "wrong_ack"
 #     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
 #     then injects a fake TLS ClientHello on that packet with the normal valid
@@ -292,6 +300,31 @@ WRONG_CHECKSUM_BUMP_IP_IDENT = true
 # The default is true because a correctly invalid-checksum packet should be
 # dropped silently by the real server and therefore will not produce an ACK.
 WRONG_CHECKSUM_COMPLETE_IMMEDIATELY = true
+
+# ---------------------------------------------------------------------------
+# wrong_md5 method parameters
+# ---------------------------------------------------------------------------
+# These settings only apply when BYPASS_METHOD = "wrong_md5".
+
+# Whether to set the TCP PSH flag on the spoofed TCP-MD5 ClientHello packet.
+#
+# Keep this enabled for normal use.  Disable it only when testing a network or
+# middlebox that reacts poorly to PSH.
+WRONG_MD5_SET_PSH = true
+
+# Whether to increment the IPv4 Identification field on the spoofed TCP-MD5
+# packet.
+#
+# Bumping the ID makes the spoofed packet look like a fresh IPv4 datagram.
+# This only affects IPv4 packets; IPv6 has no IPv4 Identification field.
+WRONG_MD5_BUMP_IP_IDENT = true
+
+# Whether to signal the bypass phase complete immediately after the TCP-MD5
+# packet is emitted.
+#
+# The default is true because a server without a negotiated TCP-MD5 key should
+# reject or drop the forged segment.
+WRONG_MD5_COMPLETE_IMMEDIATELY = true
 
 # ---------------------------------------------------------------------------
 # wrong_ack method parameters

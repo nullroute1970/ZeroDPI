@@ -31,7 +31,7 @@ pub struct TcpFlags {
 /// A read/write view of a captured TCP/IPv4 packet.
 ///
 /// Backends construct this from their native packet representation and apply
-/// the staged mutations (`new_*`, `bump_ipv4_ident`,
+/// the staged mutations (`new_*`, `append_tcp_options`, `bump_ipv4_ident`,
 /// `corrupt_tcp_checksum_delta`) when the handler returns
 /// [`Verdict::AcceptModified`].
 #[derive(Debug, Clone)]
@@ -57,6 +57,11 @@ pub struct PacketView<'a> {
     pub new_flags: Option<TcpFlags>,
     /// Replace the entire TCP payload with these bytes.
     pub new_payload: Option<Vec<u8>>,
+    /// Raw TCP option bytes appended to the existing TCP options.
+    ///
+    /// Backends pad the final options to 32-bit alignment and reject packets
+    /// whose TCP header would exceed 60 bytes.
+    pub append_tcp_options: Vec<u8>,
     /// Increment IPv4 `identification` by 1 (mod 2^16).
     pub bump_ipv4_ident: bool,
     /// Add this value to the valid computed TCP checksum after normal packet

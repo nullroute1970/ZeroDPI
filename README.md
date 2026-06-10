@@ -52,7 +52,7 @@ It is not a replacement VPN client. It is a local TCP relay that your existing V
 
 | Feature | Description |
 |---------|-------------|
-| 🧩 **9 bypass methods** | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_ack`, `wrong_timestamp`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_seq_tls_record_frag`, `tls_frag` |
+| 🧩 **10 bypass methods** | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_ack`, `wrong_timestamp`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, `tls_frag` |
 | 🎯 **6 operating modes** | `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan` |
 | 🖥️ **TUI dashboard** | Ratatui-powered live progress, selection tables, and connection monitoring |
 | 🔄 **Auto-rescan** | Background re-scanning hot-swaps the best target without restart |
@@ -328,6 +328,7 @@ Results are blended using a configurable weight and displayed in the TUI.
 | `wrong_timestamp` | Injects fake ClientHello with backdated TCP Timestamp TSval | ✅ Yes | DPI that accepts forged data but servers enforce PAWS |
 | `tls_record_frag` | TLS Record Fragment: splits the real ClientHello record body into multiple tiny TLS records | ✅ Yes | DPI that can't reassemble TLS records |
 | `wrong_seq_tls_frag` | Sends a wrong-sequence fake ClientHello, then writes the intact real ClientHello in tiny TCP segments | ✅ Yes | Layered TCP-segment DPI paths |
+| `wrong_md5_tls_frag` | Sends a TCP-MD5 fake ClientHello, then writes the intact real ClientHello in tiny TCP segments | ✅ Yes | Layered TCP-MD5 plus TCP-segment DPI paths |
 | `wrong_seq_tls_record_frag` | Sends a wrong-sequence fake ClientHello, then splits the real ClientHello body into tiny TLS records | ✅ Yes | Layered TLS-record DPI paths |
 | `tls_frag` | TLS Fragment: writes an intact ClientHello record in tiny TCP segments | ❌ No | DPI that inspects individual TCP segments |
 
@@ -345,7 +346,7 @@ Start with the least complex method that can run on your platform, then move to 
 | DPI appears to ignore invalid sequence tricks | `wrong_ack`, `wrong_timestamp`, `wrong_checksum`, `wrong_md5`, or `tls_record_frag` |
 | DPI sees through fake packets but fails with fragmented real handshakes | `tls_record_frag` |
 | You need a scanned IPv4 target but must preserve the VPN client's real SNI | `MODE = "ip_bypass_plus"` with `tls_record_frag` or `tls_frag` |
-| A first firewall layer is fooled, but another layer still blocks the real ClientHello | `wrong_seq_tls_frag` or `wrong_seq_tls_record_frag` |
+| A first firewall layer is fooled, but another layer still blocks the real ClientHello | `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, or `wrong_seq_tls_record_frag` |
 | You only need the fastest reachable IP and not SNI spoofing | `MODE = "ip_bypass"` |
 
 Method behavior in more detail:
@@ -355,7 +356,7 @@ Method behavior in more detail:
 - `wrong_timestamp` is ZeroDPI's snake_case name for sing-box's `wrong-timestamp` spoof behavior. It requires TCP timestamps on the intercepted flow and backdates `TSval` so PAWS rejects the forged segment.
 - `tls_record_frag` rewrites the real first TLS record into many smaller TLS records. The server should reassemble the TLS handshake normally.
 - `tls_frag` keeps the TLS bytes unchanged and writes them in small TCP chunks from the proxy. It avoids WinDivert/NFQUEUE and is the easiest method to run in restricted environments.
-- The `wrong_seq_*` combo methods first send the decoy wrong-sequence ClientHello, then also fragment the real ClientHello path.
+- The combo methods such as `wrong_seq_tls_frag` and `wrong_md5_tls_frag` first send a decoy ClientHello, then also fragment the real ClientHello path.
 
 If a method works but connection setup is slow, increase fragment sizes gradually (`TCP_SEG_SIZE`, `TLS_RECORD_FRAG_SIZE`) or try a higher-scoring SNI/IP. Very small fragments are aggressive and can add connection-start overhead.
 
@@ -559,7 +560,7 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `BYPASS_METHOD` | `string` | `"wrong_seq"` | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_ack`, `wrong_timestamp`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_seq_tls_record_frag`, or `tls_frag`; `ip_bypass_plus` allows only `tls_record_frag` or `tls_frag` |
+| `BYPASS_METHOD` | `string` | `"wrong_seq"` | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_ack`, `wrong_timestamp`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, or `tls_frag`; `ip_bypass_plus` allows only `tls_record_frag` or `tls_frag` |
 | `BYPASS_TIMEOUT_SECS` | `u64` | `2` | Time to wait for bypass setup before giving up |
 | `RELAY_MAX_LIFETIME_SECS` | `u64` | `0` | Rotate established relays after this many seconds (`0` = disabled/default) |
 | `NFQUEUE_NUM` | `u16` | `1` | (Linux) NFQUEUE queue number |
@@ -589,6 +590,8 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | `WRONG_MD5_SET_PSH` | `bool` | `true` | Set PSH flag on the TCP-MD5 spoofed packet |
 | `WRONG_MD5_BUMP_IP_IDENT` | `bool` | `true` | Bump IPv4 Identification field |
 | `WRONG_MD5_COMPLETE_IMMEDIATELY` | `bool` | `true` | Signal bypass complete immediately after emission |
+
+`wrong_md5_tls_frag` uses `WRONG_MD5_SET_PSH` and `WRONG_MD5_BUMP_IP_IDENT` from this group, then uses the `tls_frag` parameter group for the real ClientHello. `WRONG_MD5_COMPLETE_IMMEDIATELY` only affects standalone `wrong_md5`; the combo waits for the segmented real ClientHello stage.
 
 #### `wrong_ack` Parameters
 
@@ -625,7 +628,7 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | `TCP_SEG_SIZE` | `usize` | `1` | Max intact ClientHello bytes per TCP segment (≥ 1) |
 | `TCP_SEG_NODELAY` | `bool` | `true` | Enable TCP_NODELAY to prevent Nagle coalescing |
 
-`wrong_seq_tls_frag` uses both the `wrong_seq` and `tls_frag` parameter groups.
+`wrong_seq_tls_frag` uses both the `wrong_seq` and `tls_frag` parameter groups. `wrong_md5_tls_frag` uses the `wrong_md5` and `tls_frag` parameter groups.
 
 ### 🔬 Proxy Scan Mode (`proxy_scan`)
 
@@ -1171,6 +1174,7 @@ Unit tests cover:
 | Scan returns no useful candidates | Increase `SCAN_TIMEOUT_SECS`, lower concurrency on weak networks, refresh the candidate list, and verify the CDN or IP range is reachable without ZeroDPI. |
 | TUI is garbled over SSH or systemd | Run with `--no-tui` and rely on logs. |
 | `wrong_seq` works on simple paths but fails on layered firewalls | Try `wrong_seq_tls_frag` for TCP-level fragmentation or `wrong_seq_tls_record_frag` for TLS-record fragmentation. Both keep the fake wrong-sequence stage for the first DPI layer. |
+| `wrong_md5` works partly but the real ClientHello is still blocked | Try `wrong_md5_tls_frag` so the fake TCP-MD5 stage is followed by TCP-level fragmentation of the real ClientHello. |
 | `wrong_seq`, `wrong_ack`, `wrong_timestamp`, `wrong_checksum`, or `wrong_md5` does not work | Try `tls_record_frag` (TLS-record layer), then `tls_frag` (TCP layer). Different DPI devices fail on different TCP/TLS behaviors. |
 | Connections start but stall | Raise `BYPASS_TIMEOUT_SECS`, reduce `SNI_MAX_CONCURRENT`, and check whether the selected candidate has high TTFB or low speed. |
 | gRPC works after restart but fails after hours | Enable `RESCAN_INTERVAL_SECS` and set `RELAY_MAX_LIFETIME_SECS` to a positive value so long-lived relays reconnect through the latest working target. |

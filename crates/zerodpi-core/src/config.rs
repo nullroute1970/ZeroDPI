@@ -74,6 +74,9 @@ pub struct Config {
     /// - `"wrong_seq_tls_frag"` — injects a `wrong_seq` fake ClientHello,
     ///   then sends the intact real ClientHello in small TCP segments for
     ///   downstream DPI layers.
+    /// - `"wrong_md5_tls_frag"` — injects a `wrong_md5` fake ClientHello,
+    ///   then sends the intact real ClientHello in small TCP segments for
+    ///   downstream DPI layers.
     /// - `"wrong_seq_tls_record_frag"` — injects a `wrong_seq` fake
     ///   ClientHello, then fragments the real ClientHello into multiple small
     ///   TLS records for downstream DPI layers.
@@ -253,7 +256,7 @@ pub struct Config {
     // tls_frag method parameters
     // -----------------------------------------------------------------------
     /// Maximum ClientHello bytes sent in each TCP segment when using
-    /// `tls_frag` or `wrong_seq_tls_frag`.
+    /// `tls_frag`, `wrong_seq_tls_frag`, or `wrong_md5_tls_frag`.
     ///
     /// The normal, intact TLS ClientHello record is sliced into chunks of at
     /// most this many bytes and each chunk is written to the upstream socket
@@ -578,11 +581,12 @@ impl Config {
                 | "wrong_timestamp"
                 | "tls_record_frag"
                 | "wrong_seq_tls_frag"
+                | "wrong_md5_tls_frag"
                 | "wrong_seq_tls_record_frag"
                 | "tls_frag"
         ) {
             anyhow::bail!(
-                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_md5\", \"wrong_ack\", \"wrong_timestamp\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_seq_tls_record_frag\", \"tls_frag\"",
+                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_md5\", \"wrong_ack\", \"wrong_timestamp\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_md5_tls_frag\", \"wrong_seq_tls_record_frag\", \"tls_frag\"",
                 self.BYPASS_METHOD
             );
         }
@@ -1036,6 +1040,28 @@ mod tests {
     }
 
     #[test]
+    fn wrong_md5_tls_frag_accepted_by_validate() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "wrong_md5_tls_frag"
+            WRONG_MD5_SET_PSH = false
+            WRONG_MD5_BUMP_IP_IDENT = false
+            WRONG_MD5_COMPLETE_IMMEDIATELY = false
+            TCP_SEG_SIZE = 9
+            TCP_SEG_NODELAY = false
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.BYPASS_METHOD, "wrong_md5_tls_frag");
+        assert!(!cfg.WRONG_MD5_SET_PSH);
+        assert!(!cfg.WRONG_MD5_BUMP_IP_IDENT);
+        assert!(!cfg.WRONG_MD5_COMPLETE_IMMEDIATELY);
+        assert_eq!(cfg.TCP_SEG_SIZE, 9);
+        assert!(!cfg.TCP_SEG_NODELAY);
+    }
+
+    #[test]
     fn wrong_seq_tls_record_frag_accepted_by_validate() {
         let toml_str = r#"
             LISTEN_HOST = "0.0.0.0"
@@ -1194,6 +1220,7 @@ mod tests {
             "wrong_ack",
             "wrong_timestamp",
             "wrong_seq_tls_frag",
+            "wrong_md5_tls_frag",
             "wrong_seq_tls_record_frag",
         ] {
             let toml_str = format!(

@@ -307,6 +307,7 @@ mod tests {
     use crate::methods::wrong_ack::WrongAck;
     use crate::methods::wrong_checksum::WrongChecksum;
     use crate::methods::wrong_md5::{tcp_md5_signature_option, WrongMd5};
+    use crate::methods::wrong_md5_tls_frag::WrongMd5TlsFrag;
     use crate::methods::wrong_seq::WrongSeq;
     use crate::methods::wrong_seq_tls_frag::WrongSeqTlsFrag;
     use crate::methods::wrong_seq_tls_record_frag::WrongSeqTlsRecordFrag;
@@ -853,6 +854,100 @@ mod tests {
         );
         assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
         assert_eq!(p.new_seq, Some(1001u32.wrapping_sub(517)));
+        assert!(entry.state.lock().fake_sent);
+        assert!(entry.state.lock().waiting_for_data);
+        assert!(entry.state.lock().outcome.is_none());
+
+        let mut p = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            5001,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+        assert!(entry.state.lock().waiting_for_data);
+        assert!(entry.state.lock().outcome.is_none());
+
+        let mut p = pkt_with_payload(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            tls_record(&[0x01, 0x02, 0x03]),
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+        assert!(p.new_payload.is_none());
+        assert!(p.new_flags.is_none());
+        assert_eq!(
+            entry.state.lock().outcome,
+            Some(BypassOutcome::FakeDataAcked)
+        );
+        assert!(!entry.state.lock().monitor);
+    }
+
+    #[test]
+    fn wrong_md5_tls_frag_accepts_post_fake_ack_then_completes_on_tcp_segmented_data() {
+        let flows = new_flow_table();
+        let key = FlowKey {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            dst_port: 443,
+        };
+        let entry = FlowEntry::new(vec![0xAA; 517]);
+        flows.insert(key, entry.clone());
+
+        let mut cfg = default_cfg();
+        cfg.BYPASS_METHOD = "wrong_md5_tls_frag".into();
+        let mut h = Handler::new(flows, Arc::new(WrongMd5TlsFrag::new(&cfg)));
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            1000,
+            0,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                syn: true,
+                ack: true,
+                ..Default::default()
+            },
+            5000,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
+        assert_eq!(p.new_seq, None);
+        assert_eq!(p.new_ack, None);
+        assert_eq!(p.append_tcp_options, tcp_md5_signature_option());
         assert!(entry.state.lock().fake_sent);
         assert!(entry.state.lock().waiting_for_data);
         assert!(entry.state.lock().outcome.is_none());

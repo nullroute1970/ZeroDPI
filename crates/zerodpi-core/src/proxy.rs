@@ -2,7 +2,7 @@
 //!
 //! For interceptor-based methods (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
 //! `wrong_md5`, `wrong_timestamp`, `tls_record_frag`, `wrong_seq_tls_frag`,
-//! `wrong_seq_tls_record_frag`):
+//! `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`):
 //! 1. Accept incoming TCP on `LISTEN_HOST:LISTEN_PORT`.
 //! 2. Open an outbound TCP socket bound to the local interface IP.
 //! 3. Build a fake ClientHello and register the flow in the [`FlowTable`].
@@ -11,8 +11,9 @@
 //!    the flow is still being intercepted.
 //! 5. Once the bypass completes, the proxy runs a normal bidirectional copy
 //!    between the two sockets.
-//! 6. For `wrong_seq_tls_frag`, step 4 writes the intact ClientHello in small
-//!    TCP segments using the same `TCP_SEG_*` settings as `tls_frag`.
+//! 6. For `wrong_seq_tls_frag` and `wrong_md5_tls_frag`, step 4 writes the
+//!    intact ClientHello in small TCP segments using the same `TCP_SEG_*`
+//!    settings as `tls_frag`.
 //!
 //! For `ip_bypass_plus`, IP scanning selects the upstream IPv4 address, then
 //! only real-SNI-preserving methods (`tls_record_frag` or `tls_frag`)
@@ -214,7 +215,7 @@ fn current_bypass_progress(entry: &FlowEntry) -> Option<BypassProgress> {
 }
 
 fn method_segments_first_client_hello(method: &str) -> bool {
-    method == "wrong_seq_tls_frag"
+    matches!(method, "wrong_seq_tls_frag" | "wrong_md5_tls_frag")
 }
 
 async fn wait_for_initial_bypass_progress(
@@ -504,7 +505,7 @@ async fn handle_intercept_connection(
                 if settings.tcp_seg_nodelay {
                     outgoing
                         .set_nodelay(true)
-                        .context("wrong_seq_tls_frag: set_nodelay on upstream socket")?;
+                        .context("combo tls_frag: set_nodelay on upstream socket")?;
                 }
                 if let Err(e) =
                     write_segmented(&mut outgoing, &client_hello, settings.tcp_seg_size).await
@@ -517,7 +518,7 @@ async fn handle_intercept_connection(
                             outcome: BypassOutcome::UnexpectedClose,
                         },
                     );
-                    return Err(e).context("wrong_seq_tls_frag: writing segmented ClientHello");
+                    return Err(e).context("combo tls_frag: writing segmented ClientHello");
                 }
             } else {
                 if let Err(e) = outgoing.write_all(&client_hello).await {
@@ -1130,8 +1131,9 @@ mod tests {
     }
 
     #[test]
-    fn wrong_seq_tls_frag_segments_first_client_hello() {
+    fn combo_tls_frag_methods_segment_first_client_hello() {
         assert!(method_segments_first_client_hello("wrong_seq_tls_frag"));
+        assert!(method_segments_first_client_hello("wrong_md5_tls_frag"));
         assert!(!method_segments_first_client_hello(
             "wrong_seq_tls_record_frag"
         ));

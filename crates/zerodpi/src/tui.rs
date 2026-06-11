@@ -664,6 +664,10 @@ struct ConnectionRecord {
 }
 
 impl ConnectionRecord {
+    fn is_active(&self) -> bool {
+        matches!(self.status, ConnStatus::Connecting | ConnStatus::Relaying)
+    }
+
     fn set_status(&mut self, status: ConnStatus, now: Instant) {
         if self.status != status {
             self.status = status;
@@ -705,6 +709,15 @@ fn ordered_connection_records(state: &DashboardState, now: Instant) -> Vec<&Conn
 
     filtered.sort_by_key(|(idx, record)| (connection_display_rank(record, now), *idx));
     filtered.into_iter().map(|(_, record)| record).collect()
+}
+
+fn prune_connection_records(records: &mut VecDeque<ConnectionRecord>) {
+    while records.len() > MAX_RECORDS {
+        let Some(idx) = records.iter().rposition(|record| !record.is_active()) else {
+            break;
+        };
+        records.remove(idx);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -965,9 +978,6 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
                 last_snapshot: None,
             };
             state.records.push_front(rec);
-            if state.records.len() > MAX_RECORDS {
-                state.records.pop_back();
-            }
         }
         ProxyEvent::BypassComplete { src_port, outcome } => match outcome {
             BypassOutcome::FakeDataAcked => {
@@ -1042,6 +1052,8 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
             state.active_ip = Some(ip);
         }
     }
+
+    prune_connection_records(&mut state.records);
 }
 
 fn find_record(
@@ -2011,6 +2023,45 @@ mod tests {
             start: Instant::now(),
             channel_closed: false,
         }
+    }
+
+    #[test]
+    fn apply_event_keeps_active_connections_when_log_is_full() {
+        let old_active_port = 1111;
+        let new_active_port = 2222;
+        let mut records = Vec::with_capacity(MAX_RECORDS);
+
+        for i in 0..(MAX_RECORDS - 1) {
+            let mut done = record(ConnStatus::Done, 0.0, 0.0);
+            done.src_port = 3000 + i as u16;
+            done.end_instant = Some(Instant::now());
+            records.push(done);
+        }
+
+        let mut old_active = record(ConnStatus::Relaying, 0.0, 0.0);
+        old_active.src_port = old_active_port;
+        records.push(old_active);
+
+        let mut state = dashboard_state(records);
+        state.active = 1;
+
+        apply_event(
+            ProxyEvent::ConnectionAccepted {
+                peer: "127.0.0.1:22222".parse().unwrap(),
+                src_port: new_active_port,
+            },
+            &mut state,
+        );
+
+        assert_eq!(state.records.len(), MAX_RECORDS);
+        assert!(state
+            .records
+            .iter()
+            .any(|r| r.src_port == old_active_port && r.is_active()));
+        assert!(state
+            .records
+            .iter()
+            .any(|r| r.src_port == new_active_port && r.is_active()));
     }
 
     #[test]

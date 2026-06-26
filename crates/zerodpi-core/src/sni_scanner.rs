@@ -1,6 +1,6 @@
 //! SNI scanner: resolves each hostname from `sni_list.txt`, probes every
 //! resolved IPv4 address for TCP connectivity, TLS handshake quality, TTFB,
-//! download speed, and HTTP reachability, then ranks the results.
+//! download/upload speed, and HTTP reachability, then ranks the results.
 //!
 //! ## Checks performed (per SNI × IP pair)
 //!
@@ -11,7 +11,8 @@
 //! | TLS   | Whether a full TLS handshake succeeds; wall-clock latency |
 //! | Cert  | Certificate validation (implicit in TLS success via rustls) |
 //! | TTFB  | Time to first byte of the HTTP response |
-//! | Speed | ~10 KB download throughput from `GET /` |
+//! | Down  | ~10 KB download throughput from `GET /` |
+//! | Up    | ~10 KB upload throughput from a small `POST` |
 //! | HTTP  | HTTP status code returned by `GET /` |
 //!
 //! ## Scoring (0–100 pts) — unified with IP scanner
@@ -23,7 +24,8 @@
 //! | TLS latency      | 15      | linear: 0 ms→15, ≥1 000 ms→0 |
 //! | Cert valid       |  5      | flat |
 //! | TTFB             | 20      | linear: 0 ms→20, ≥2 000 ms→0 |
-//! | Download speed   | 15      | linear: 0→0, ≥2 000 KB/s→15 |
+//! | Download speed   | 7.5     | linear: 0→0, ≥2 000 KB/s→7.5 |
+//! | Upload speed     | 7.5     | linear: 0→0, ≥2 000 KB/s→7.5 |
 //! | All phases bonus | 10      | all signals present |
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -31,7 +33,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use serde::ser::SerializeStruct;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Semaphore};
 use tokio_rustls::rustls::pki_types::ServerName;
@@ -39,7 +42,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
 /// All probe results for one (SNI, IP) combination.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct SniProbeEntry {
     /// The SNI hostname.
     pub sni: String,
@@ -57,11 +60,35 @@ pub struct SniProbeEntry {
     /// Time-to-first-byte in milliseconds; `None` if the HTTP phase failed.
     pub ttfb_ms: Option<u64>,
     /// Download throughput in bytes/sec (~10 KB sample); `None` if unavailable.
-    pub speed_bps: Option<f64>,
+    pub download_bps: Option<f64>,
+    /// Upload throughput in bytes/sec (~10 KB sample); `None` if unavailable.
+    pub upload_bps: Option<f64>,
     /// HTTP status code returned by `GET /`, or `None` if the request failed.
     pub http_status: Option<u16>,
     /// Composite score 0–100.
     pub score: u8,
+}
+
+impl serde::Serialize for SniProbeEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("SniProbeEntry", 12)?;
+        state.serialize_field("sni", &self.sni)?;
+        state.serialize_field("ip", &self.ip)?;
+        state.serialize_field("tcp_latency_ms", &self.tcp_latency_ms)?;
+        state.serialize_field("tls_ok", &self.tls_ok)?;
+        state.serialize_field("tls_latency_ms", &self.tls_latency_ms)?;
+        state.serialize_field("cert_valid", &self.cert_valid)?;
+        state.serialize_field("ttfb_ms", &self.ttfb_ms)?;
+        state.serialize_field("download_bps", &self.download_bps)?;
+        state.serialize_field("upload_bps", &self.upload_bps)?;
+        state.serialize_field("speed_bps", &self.download_bps)?;
+        state.serialize_field("http_status", &self.http_status)?;
+        state.serialize_field("score", &self.score)?;
+        state.end()
+    }
 }
 
 impl SniProbeEntry {
@@ -86,24 +113,112 @@ impl SniProbeEntry {
             .ttfb_ms
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "-".into());
-        let speed = self
-            .speed_bps
-            .map(|bps| {
-                if bps >= 1_048_576.0 {
-                    format!("{:.1}MB/s", bps / 1_048_576.0)
-                } else {
-                    format!("{:.0}KB/s", bps / 1024.0)
-                }
-            })
+        let download = self
+            .download_bps
+            .map(format_bps)
+            .unwrap_or_else(|| "-".into());
+        let upload = self
+            .upload_bps
+            .map(format_bps)
             .unwrap_or_else(|| "-".into());
         format!(
-            "  [{score:>3}] {sni:<40} {ip:<16} tcp={tcp:<12} tls={tls:<14} cert={cert} ttfb={ttfb:<8} speed={speed:<12} http={http}",
+            "  [{score:>3}] {sni:<40} {ip:<16} tcp={tcp:<12} tls={tls:<14} cert={cert} ttfb={ttfb:<8} down={download:<12} up={upload:<12} http={http}",
             score = self.score,
             sni = self.sni,
             ip = self.ip,
             cert = if self.cert_valid { "✓" } else { "✗" },
         )
     }
+}
+
+fn format_bps(bps: f64) -> String {
+    if bps >= 1_048_576.0 {
+        format!("{:.1}MB/s", bps / 1_048_576.0)
+    } else {
+        format!("{:.0}KB/s", bps / 1024.0)
+    }
+}
+
+async fn measure_upload<S>(
+    stream: &mut S,
+    host: &str,
+    upload_path: &str,
+    upload_bytes: usize,
+    timeout: Duration,
+) -> Option<f64>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let req = format!(
+        "POST {upload_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: zerodpi-scanner/0.1\r\nContent-Type: application/octet-stream\r\nContent-Length: {upload_bytes}\r\n\r\n"
+    );
+
+    if !matches!(
+        tokio::time::timeout(timeout, stream.write_all(req.as_bytes())).await,
+        Ok(Ok(()))
+    ) {
+        return None;
+    }
+
+    let result = tokio::time::timeout(timeout, async {
+        let chunk = vec![0u8; upload_bytes.min(16 * 1024)];
+        let start = Instant::now();
+        let mut remaining = upload_bytes;
+        while remaining > 0 {
+            let n = remaining.min(chunk.len());
+            stream.write_all(&chunk[..n]).await?;
+            remaining -= n;
+        }
+        stream.flush().await?;
+        Ok::<Duration, std::io::Error>(start.elapsed())
+    })
+    .await;
+
+    let elapsed = match result {
+        Ok(Ok(elapsed)) => elapsed.as_secs_f64(),
+        _ => return None,
+    };
+
+    let mut response = [0u8; 1024];
+    if let Ok(Ok(n)) = tokio::time::timeout(timeout, stream.read(&mut response)).await {
+        if let Ok(text) = std::str::from_utf8(&response[..n]) {
+            let _ = parse_http_status(text);
+        }
+    }
+
+    if elapsed > 0.0 {
+        Some(upload_bytes as f64 / elapsed)
+    } else {
+        None
+    }
+}
+
+async fn probe_sni_upload(
+    sni: &str,
+    ip: Ipv4Addr,
+    timeout: Duration,
+    config: &crate::config::Config,
+    connector: Arc<TlsConnector>,
+) -> Option<f64> {
+    let addr = SocketAddr::from((ip, 443u16));
+    let tcp_stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+    let server_name = ServerName::try_from(sni).map(|sn| sn.to_owned()).ok()?;
+    let mut stream = tokio::time::timeout(timeout, connector.connect(server_name, tcp_stream))
+        .await
+        .ok()?
+        .ok()?;
+
+    measure_upload(
+        &mut stream,
+        sni,
+        &config.SCAN_UPLOAD_PATH,
+        config.SCAN_UPLOAD_CAP,
+        timeout,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +425,7 @@ async fn probe_sni_ip(
     };
 
     // --- HTTP GET / + TTFB + speed ---
-    let (ttfb_ms, speed_bps, http_status) = if let Some(mut stream) = tls_stream_opt {
+    let (ttfb_ms, download_bps, http_status) = if let Some(mut stream) = tls_stream_opt {
         let req = format!(
             "GET / HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\nUser-Agent: zerodpi-scanner/0.1\r\n\r\n"
         );
@@ -367,6 +482,12 @@ async fn probe_sni_ip(
         (None, None, None)
     };
 
+    let upload_bps = if ttfb_ms.is_some() {
+        probe_sni_upload(&sni, ip, timeout, &config, connector).await
+    } else {
+        None
+    };
+
     let mut entry = SniProbeEntry {
         sni,
         ip,
@@ -375,7 +496,8 @@ async fn probe_sni_ip(
         tls_latency_ms,
         cert_valid,
         ttfb_ms,
-        speed_bps,
+        download_bps,
+        upload_bps,
         http_status,
         score: 0,
     };
@@ -392,7 +514,8 @@ fn blank(sni: &str, ip: Ipv4Addr) -> SniProbeEntry {
         tls_latency_ms: None,
         cert_valid: false,
         ttfb_ms: None,
-        speed_bps: None,
+        download_bps: None,
+        upload_bps: None,
         http_status: None,
         score: 0,
     }
@@ -422,18 +545,24 @@ fn compute_score(entry: &mut SniProbeEntry, config: &crate::config::Config) {
         None => 0.0,
         Some(ms) => 20.0 * (1.0 - (ms as f64 / config.TTFB_CAP_MS).min(1.0)),
     };
-    let speed_pts = match entry.speed_bps {
+    let download_pts = match entry.download_bps {
         None => 0.0,
-        Some(bps) => 15.0 * (bps / config.SPEED_CAP_BPS).min(1.0),
+        Some(bps) => 7.5 * (bps / config.SPEED_CAP_BPS).min(1.0),
+    };
+    let upload_pts = match entry.upload_bps {
+        None => 0.0,
+        Some(bps) => 7.5 * (bps / config.UPLOAD_SPEED_CAP_BPS).min(1.0),
     };
     let all_present = entry.tcp_latency_ms.is_some()
         && entry.tls_ok
         && entry.cert_valid
         && entry.ttfb_ms.is_some()
-        && entry.speed_bps.is_some();
+        && entry.download_bps.is_some()
+        && entry.upload_bps.is_some();
     let bonus = if all_present { 10.0 } else { 0.0 };
     entry.score =
-        (tcp_pts + tls_flat + tls_pts + cert_pts + ttfb_pts + speed_pts + bonus).round() as u8;
+        (tcp_pts + tls_flat + tls_pts + cert_pts + ttfb_pts + download_pts + upload_pts + bonus)
+            .round() as u8;
 }
 
 #[cfg(test)]
@@ -449,7 +578,8 @@ mod tests {
         tls_ok: bool,
         tls_ms: Option<u64>,
         ttfb: Option<u64>,
-        speed: Option<f64>,
+        download: Option<f64>,
+        upload: Option<f64>,
     ) -> SniProbeEntry {
         let cfg = dummy_config();
         let mut e = SniProbeEntry {
@@ -460,7 +590,8 @@ mod tests {
             tls_latency_ms: tls_ms,
             cert_valid: tls_ok,
             ttfb_ms: ttfb,
-            speed_bps: speed,
+            download_bps: download,
+            upload_bps: upload,
             http_status: None,
             score: 0,
         };
@@ -470,7 +601,14 @@ mod tests {
 
     #[test]
     fn score_with_all_perfect() {
-        let e = make_entry(Some(0), true, Some(0), Some(0), Some(f64::MAX));
+        let e = make_entry(
+            Some(0),
+            true,
+            Some(0),
+            Some(0),
+            Some(f64::MAX),
+            Some(f64::MAX),
+        );
         assert_eq!(e.score, 100);
     }
 
@@ -485,23 +623,36 @@ mod tests {
     #[test]
     fn score_tcp_only() {
         // TCP at 0 ms, no TLS = 25 pts
-        let e = make_entry(Some(0), false, None, None, None);
+        let e = make_entry(Some(0), false, None, None, None, None);
         assert_eq!(e.score, 25);
     }
 
     #[test]
     fn score_partial_tls_no_ttfb() {
         // TCP 100ms (20), TLS flat (10), TLS 200ms (12), cert (5) = 47
-        let e = make_entry(Some(100), true, Some(200), None, None);
+        let e = make_entry(Some(100), true, Some(200), None, None, None);
         assert_eq!(e.score, 47);
     }
 
     #[test]
     fn score_all_phases_with_bonus() {
-        // TCP 250ms (12.5→13), TLS flat (10), TLS 500ms (7.5→8), cert (5),
-        // TTFB 1000ms (10), speed 1024000 B/s (7.5→8), bonus (10) = 63
-        let e = make_entry(Some(250), true, Some(500), Some(1000), Some(1_024_000.0));
+        // TCP 250ms (12.5), TLS flat (10), TLS 500ms (7.5), cert (5),
+        // TTFB 1000ms (10), down/up 1024000 B/s (3.75 each), bonus (10) = 62.5 → 63
+        let e = make_entry(
+            Some(250),
+            true,
+            Some(500),
+            Some(1000),
+            Some(1_024_000.0),
+            Some(1_024_000.0),
+        );
         assert_eq!(e.score, 63);
+    }
+
+    #[test]
+    fn score_all_phases_without_upload_has_no_bonus() {
+        let e = make_entry(Some(0), true, Some(0), Some(0), Some(f64::MAX), None);
+        assert_eq!(e.score, 83);
     }
 
     #[test]

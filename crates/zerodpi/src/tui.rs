@@ -104,6 +104,18 @@ fn label_style() -> Style {
     Style::default().fg(Color::Gray)
 }
 
+fn fmt_rate_bps(speed: Option<f64>) -> String {
+    speed
+        .map(|bps| {
+            if bps >= 1_048_576.0 {
+                format!("{:.1}MB/s", bps / 1_048_576.0)
+            } else {
+                format!("{:.0}KB/s", bps / 1024.0)
+            }
+        })
+        .unwrap_or_else(|| "—".into())
+}
+
 // ---------------------------------------------------------------------------
 // Dashboard mode descriptor
 // ---------------------------------------------------------------------------
@@ -273,16 +285,8 @@ fn draw_scan_progress(
                     .ttfb_ms
                     .map(|ms| format!("{ms}ms"))
                     .unwrap_or_else(|| "—".into());
-                let speed_str = e
-                    .speed_bps
-                    .map(|bps| {
-                        if bps >= 1_048_576.0 {
-                            format!("{:.1}MB/s", bps / 1_048_576.0)
-                        } else {
-                            format!("{:.0}KB/s", bps / 1024.0)
-                        }
-                    })
-                    .unwrap_or_else(|| "—".into());
+                let down_str = fmt_rate_bps(e.download_bps);
+                let up_str = fmt_rate_bps(e.upload_bps);
                 let http_str = e
                     .http_status
                     .map(|s| s.to_string())
@@ -294,7 +298,8 @@ fn draw_scan_progress(
                     Cell::from(tcp_str).style(tcp_style(e.tcp_latency_ms)),
                     Cell::from(tls_str).style(tls_style(e.tls_ok)),
                     Cell::from(ttfb_str),
-                    Cell::from(speed_str),
+                    Cell::from(down_str),
+                    Cell::from(up_str),
                     Cell::from(http_str).style(http_style(e.http_status)),
                 ])
             })
@@ -308,12 +313,13 @@ fn draw_scan_progress(
             Constraint::Length(12),
             Constraint::Length(8),
             Constraint::Length(10),
+            Constraint::Length(10),
             Constraint::Length(6),
         ];
         let table = Table::new(rows, widths)
             .header(
                 Row::new(vec![
-                    "Score", "SNI", "IP", "TCP", "TLS", "TTFB", "Speed", "HTTP",
+                    "Score", "SNI", "IP", "TCP", "TLS", "TTFB", "Down", "Up", "HTTP",
                 ])
                 .style(
                     Style::default()
@@ -433,16 +439,8 @@ fn draw_selection(frame: &mut ratatui::Frame, entries: &[SniProbeEntry], state: 
                 .ttfb_ms
                 .map(|ms| format!("{ms}ms"))
                 .unwrap_or_else(|| "—".into());
-            let speed_str = e
-                .speed_bps
-                .map(|bps| {
-                    if bps >= 1_048_576.0 {
-                        format!("{:.1}MB/s", bps / 1_048_576.0)
-                    } else {
-                        format!("{:.0}KB/s", bps / 1024.0)
-                    }
-                })
-                .unwrap_or_else(|| "—".into());
+            let down_str = fmt_rate_bps(e.download_bps);
+            let up_str = fmt_rate_bps(e.upload_bps);
             let http_str = e
                 .http_status
                 .map(|s| s.to_string())
@@ -456,7 +454,8 @@ fn draw_selection(frame: &mut ratatui::Frame, entries: &[SniProbeEntry], state: 
                 Cell::from(tls_str).style(tls_style(e.tls_ok)),
                 Cell::from(cert).style(cert_style(e.cert_valid)),
                 Cell::from(ttfb_str),
-                Cell::from(speed_str),
+                Cell::from(down_str),
+                Cell::from(up_str),
                 Cell::from(http_str).style(http_style(e.http_status)),
             ])
         })
@@ -472,12 +471,13 @@ fn draw_selection(frame: &mut ratatui::Frame, entries: &[SniProbeEntry], state: 
         Constraint::Length(5),
         Constraint::Length(8),
         Constraint::Length(10),
+        Constraint::Length(10),
         Constraint::Length(6),
     ];
     let table = Table::new(rows, widths)
         .header(
             Row::new(vec![
-                "#", "Score", "SNI", "IP", "TCP", "TLS", "Cert", "TTFB", "Speed", "HTTP",
+                "#", "Score", "SNI", "IP", "TCP", "TLS", "Cert", "TTFB", "Down", "Up", "HTTP",
             ])
             .style(
                 Style::default()
@@ -1473,16 +1473,8 @@ fn draw_ip_scan_progress(
                     .map(|ms| format!("{ms}ms"))
                     .unwrap_or_else(|| "—".into());
                 let cert = if e.cert_valid { "✓" } else { "✗" };
-                let speed_str = e
-                    .speed_bps
-                    .map(|bps| {
-                        if bps >= 1_048_576.0 {
-                            format!("{:.1}MB/s", bps / 1_048_576.0)
-                        } else {
-                            format!("{:.0}KB/s", bps / 1024.0)
-                        }
-                    })
-                    .unwrap_or_else(|| "—".into());
+                let down_str = fmt_rate_bps(e.download_bps);
+                let up_str = fmt_rate_bps(e.upload_bps);
                 let http_str = e
                     .http_status
                     .map(|s| s.to_string())
@@ -1494,7 +1486,8 @@ fn draw_ip_scan_progress(
                     Cell::from(tls_str).style(tls_style(e.tls_ok)),
                     Cell::from(cert).style(cert_style(e.cert_valid)),
                     Cell::from(ttfb_str),
-                    Cell::from(speed_str),
+                    Cell::from(down_str),
+                    Cell::from(up_str),
                     Cell::from(http_str).style(http_style(e.http_status)),
                 ])
             })
@@ -1508,12 +1501,13 @@ fn draw_ip_scan_progress(
             Constraint::Length(5),
             Constraint::Length(8),
             Constraint::Length(10),
+            Constraint::Length(10),
             Constraint::Length(6),
         ];
         let table = Table::new(rows, widths)
             .header(
                 Row::new(vec![
-                    "Score", "IP", "TCP", "TLS", "Cert", "TTFB", "Speed", "HTTP",
+                    "Score", "IP", "TCP", "TLS", "Cert", "TTFB", "Down", "Up", "HTTP",
                 ])
                 .style(
                     Style::default()
@@ -1629,16 +1623,8 @@ fn draw_ip_selection(frame: &mut ratatui::Frame, entries: &[IpProbeEntry], state
                 .map(|ms| format!("{ms}ms"))
                 .unwrap_or_else(|| "—".into());
             let cert = if e.cert_valid { "✓" } else { "✗" };
-            let speed_str = e
-                .speed_bps
-                .map(|bps| {
-                    if bps >= 1_048_576.0 {
-                        format!("{:.1}MB/s", bps / 1_048_576.0)
-                    } else {
-                        format!("{:.0}KB/s", bps / 1024.0)
-                    }
-                })
-                .unwrap_or_else(|| "—".into());
+            let down_str = fmt_rate_bps(e.download_bps);
+            let up_str = fmt_rate_bps(e.upload_bps);
             let http_str = e
                 .http_status
                 .map(|s| s.to_string())
@@ -1651,7 +1637,8 @@ fn draw_ip_selection(frame: &mut ratatui::Frame, entries: &[IpProbeEntry], state
                 Cell::from(tls_str).style(tls_style(e.tls_ok)),
                 Cell::from(cert).style(cert_style(e.cert_valid)),
                 Cell::from(ttfb_str),
-                Cell::from(speed_str),
+                Cell::from(down_str),
+                Cell::from(up_str),
                 Cell::from(http_str).style(http_style(e.http_status)),
             ])
         })
@@ -1666,12 +1653,13 @@ fn draw_ip_selection(frame: &mut ratatui::Frame, entries: &[IpProbeEntry], state
         Constraint::Length(5),
         Constraint::Length(8),
         Constraint::Length(10),
+        Constraint::Length(10),
         Constraint::Length(6),
     ];
     let table = Table::new(rows, widths)
         .header(
             Row::new(vec![
-                "#", "Score", "IP", "TCP", "TLS", "Cert", "TTFB", "Speed", "HTTP",
+                "#", "Score", "IP", "TCP", "TLS", "Cert", "TTFB", "Down", "Up", "HTTP",
             ])
             .style(
                 Style::default()
@@ -1805,16 +1793,8 @@ fn draw_sni_results_view(
                 .ttfb_ms
                 .map(|ms| format!("{ms}ms"))
                 .unwrap_or_else(|| "—".into());
-            let speed_str = e
-                .speed_bps
-                .map(|bps| {
-                    if bps >= 1_048_576.0 {
-                        format!("{:.1}MB/s", bps / 1_048_576.0)
-                    } else {
-                        format!("{:.0}KB/s", bps / 1024.0)
-                    }
-                })
-                .unwrap_or_else(|| "—".into());
+            let down_str = fmt_rate_bps(e.download_bps);
+            let up_str = fmt_rate_bps(e.upload_bps);
             let http_str = e
                 .http_status
                 .map(|s| s.to_string())
@@ -1828,7 +1808,8 @@ fn draw_sni_results_view(
                 Cell::from(tls_str).style(tls_style(e.tls_ok)),
                 Cell::from(cert).style(cert_style(e.cert_valid)),
                 Cell::from(ttfb_str),
-                Cell::from(speed_str),
+                Cell::from(down_str),
+                Cell::from(up_str),
                 Cell::from(http_str).style(http_style(e.http_status)),
             ])
         })
@@ -1844,12 +1825,13 @@ fn draw_sni_results_view(
         Constraint::Length(5),
         Constraint::Length(8),
         Constraint::Length(10),
+        Constraint::Length(10),
         Constraint::Length(6),
     ];
     let table = Table::new(rows, widths)
         .header(
             Row::new(vec![
-                "#", "Score", "SNI", "IP", "TCP", "TLS", "Cert", "TTFB", "Speed", "HTTP",
+                "#", "Score", "SNI", "IP", "TCP", "TLS", "Cert", "TTFB", "Down", "Up", "HTTP",
             ])
             .style(
                 Style::default()
@@ -2203,16 +2185,8 @@ fn draw_ip_results_view(
                 .ttfb_ms
                 .map(|ms| format!("{ms}ms"))
                 .unwrap_or_else(|| "—".into());
-            let speed_str = e
-                .speed_bps
-                .map(|bps| {
-                    if bps >= 1_048_576.0 {
-                        format!("{:.1}MB/s", bps / 1_048_576.0)
-                    } else {
-                        format!("{:.0}KB/s", bps / 1024.0)
-                    }
-                })
-                .unwrap_or_else(|| "—".into());
+            let down_str = fmt_rate_bps(e.download_bps);
+            let up_str = fmt_rate_bps(e.upload_bps);
             let http_str = e
                 .http_status
                 .map(|s| s.to_string())
@@ -2225,7 +2199,8 @@ fn draw_ip_results_view(
                 Cell::from(tls_str).style(tls_style(e.tls_ok)),
                 Cell::from(cert).style(cert_style(e.cert_valid)),
                 Cell::from(ttfb_str),
-                Cell::from(speed_str),
+                Cell::from(down_str),
+                Cell::from(up_str),
                 Cell::from(http_str).style(http_style(e.http_status)),
             ])
         })
@@ -2240,12 +2215,13 @@ fn draw_ip_results_view(
         Constraint::Length(5),
         Constraint::Length(8),
         Constraint::Length(10),
+        Constraint::Length(10),
         Constraint::Length(6),
     ];
     let table = Table::new(rows, widths)
         .header(
             Row::new(vec![
-                "#", "Score", "IP", "TCP", "TLS", "Cert", "TTFB", "Speed", "HTTP",
+                "#", "Score", "IP", "TCP", "TLS", "Cert", "TTFB", "Down", "Up", "HTTP",
             ])
             .style(
                 Style::default()

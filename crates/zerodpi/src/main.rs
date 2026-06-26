@@ -470,7 +470,8 @@ async fn resolve_single_sni(sni: &str) -> anyhow::Result<Vec<SniProbeEntry>> {
             tls_latency_ms: None,
             cert_valid: false,
             ttfb_ms: None,
-            speed_bps: None,
+            download_bps: None,
+            upload_bps: None,
             http_status: None,
             score: 0,
         })
@@ -1732,7 +1733,8 @@ mod tests {
             tls_latency_ms: Some(20),
             cert_valid: true,
             ttfb_ms: Some(30),
-            speed_bps: Some(1000.0),
+            download_bps: Some(1000.0),
+            upload_bps: Some(1000.0),
             http_status: Some(200),
             score,
         }

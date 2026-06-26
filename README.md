@@ -1107,10 +1107,10 @@ python build.py --platform linux --linux-target all
 <details>
 <summary><b>Windows</b> (click to expand)</summary>
 
-Requires MSYS2 and the GNU toolchain. When using `build.py`, WinDivert is downloaded into the repo-local `windivert/` folder automatically.
+Requires the MSVC toolchain. When using `build.py`, WinDivert is downloaded into the repo-local `windivert/` folder automatically.
 
 ```powershell
-cargo +stable-x86_64-pc-windows-gnu build --release
+cargo +stable-x86_64-pc-windows-msvc build --release
 ```
 
 Or use the build script:
@@ -1123,8 +1123,7 @@ Useful Windows build options:
 
 ```sh
 python build.py --platform windows --windivert-version 2.2.2
-python build.py --platform windows --toolchain stable-x86_64-pc-windows-gnu
-python build.py --platform windows --msys2-path C:\msys64
+python build.py --platform windows --toolchain stable-x86_64-pc-windows-msvc
 ```
 </details>
 

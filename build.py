@@ -19,7 +19,7 @@ Linux:
 Windows:
   1. Downloads/verifies the repo-local windivert/ folder and sets WINDIVERT_PATH.
   2. Runs `cargo +<toolchain> build --workspace --release` (default toolchain:
-     stable-x86_64-pc-windows-gnu). Pass --toolchain="" to use the workspace
+     stable-x86_64-pc-windows-msvc). Pass --toolchain="" to use the workspace
      default toolchain instead.
   3. Copies zerodpi.exe + WinDivert.dll + WinDivert64.sys + config.toml +
      sni_list.txt + ip_list.txt + README.md to dist/windows/.
@@ -51,8 +51,8 @@ WINDIVERT_DEFAULT_VERSION = "2.2.2"
 WINDIVERT_VERSION_FILE = ".version"
 WINDIVERT_REQUIRED_FILES = ("WinDivert.dll", "WinDivert.lib", "WinDivert64.sys")
 WINDIVERT_RELEASE_URL = "https://github.com/basil00/WinDivert/releases/download/v{version}/WinDivert-{version}-A.zip"
-# On Windows this project targets the GNU toolchain by default.
-WINDOWS_DEFAULT_TOOLCHAIN = "stable-x86_64-pc-windows-gnu"
+# On Windows this project targets the MSVC toolchain by default.
+WINDOWS_DEFAULT_TOOLCHAIN = "stable-x86_64-pc-windows-msvc"
 # Default MSYS2 installation path; its mingw64/bin is prepended to PATH when
 # building with a GNU toolchain so that gcc, dlltool, ld, etc. are reachable.
 WINDOWS_DEFAULT_MSYS2_PATH = r"C:\msys64"

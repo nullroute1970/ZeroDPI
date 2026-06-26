@@ -100,6 +100,12 @@ IP_MAX_P2_CONCURRENT = 32
 # Maximum bytes downloaded for speed tests.
 SCAN_DOWNLOAD_CAP = 10240
 
+# Maximum bytes uploaded for upload speed tests.
+SCAN_UPLOAD_CAP = 10240
+
+# Candidate-relative HTTP path used for upload speed tests.
+SCAN_UPLOAD_PATH = "/"
+
 # SNI hostname used *only* during the TLS phase of the IP scan.
 IP_SCAN_SNI = "cloudflare.com"
 
@@ -121,6 +127,9 @@ TTFB_CAP_MS = 2000.0
 
 # Download speed cap for scoring (bytes/sec).
 SPEED_CAP_BPS = 2048000.0
+
+# Upload speed cap for scoring (bytes/sec).
+UPLOAD_SPEED_CAP_BPS = 2048000.0
 
 # ---------------------------------------------------------------------------
 # Bypass Engine

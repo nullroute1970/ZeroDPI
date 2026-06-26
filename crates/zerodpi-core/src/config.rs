@@ -372,6 +372,14 @@ pub struct Config {
     #[serde(default = "default_scan_download_cap")]
     pub SCAN_DOWNLOAD_CAP: usize,
 
+    /// Max bytes uploaded for upload speed tests.
+    #[serde(default = "default_scan_upload_cap")]
+    pub SCAN_UPLOAD_CAP: usize,
+
+    /// Candidate-relative HTTP path used for upload speed tests.
+    #[serde(default = "default_scan_upload_path")]
+    pub SCAN_UPLOAD_PATH: String,
+
     /// Max valid TCP latency for scoring (ms).
     #[serde(default = "default_tcp_latency_cap_ms")]
     pub TCP_LATENCY_CAP_MS: f64,
@@ -387,6 +395,10 @@ pub struct Config {
     /// Download speed cap for scoring (bytes/sec).
     #[serde(default = "default_speed_cap_bps")]
     pub SPEED_CAP_BPS: f64,
+
+    /// Upload speed cap for scoring (bytes/sec).
+    #[serde(default = "default_upload_speed_cap_bps")]
+    pub UPLOAD_SPEED_CAP_BPS: f64,
 
     // -----------------------------------------------------------------------
     // proxy_scan mode
@@ -511,6 +523,12 @@ fn default_ip_max_p2_concurrent() -> usize {
 fn default_scan_download_cap() -> usize {
     10_240
 }
+fn default_scan_upload_cap() -> usize {
+    10_240
+}
+fn default_scan_upload_path() -> String {
+    "/".into()
+}
 fn default_tcp_latency_cap_ms() -> f64 {
     500.0
 }
@@ -521,6 +539,9 @@ fn default_ttfb_cap_ms() -> f64 {
     2_000.0
 }
 fn default_speed_cap_bps() -> f64 {
+    2_048_000.0
+}
+fn default_upload_speed_cap_bps() -> f64 {
     2_048_000.0
 }
 fn default_sni_switch_min_score() -> u8 {
@@ -571,6 +592,27 @@ impl Config {
         }
         if self.SNI_SWITCH_MIN_SCORE > 100 {
             anyhow::bail!("SNI_SWITCH_MIN_SCORE must be <= 100");
+        }
+        if self.SCAN_DOWNLOAD_CAP == 0 {
+            anyhow::bail!("SCAN_DOWNLOAD_CAP must be > 0");
+        }
+        if self.SCAN_UPLOAD_CAP == 0 {
+            anyhow::bail!("SCAN_UPLOAD_CAP must be > 0");
+        }
+        if self.SCAN_UPLOAD_PATH.is_empty()
+            || !self.SCAN_UPLOAD_PATH.starts_with('/')
+            || self.SCAN_UPLOAD_PATH.contains('\r')
+            || self.SCAN_UPLOAD_PATH.contains('\n')
+        {
+            anyhow::bail!(
+                "SCAN_UPLOAD_PATH must be a non-empty HTTP path starting with '/' and containing no CR/LF"
+            );
+        }
+        if !self.SPEED_CAP_BPS.is_finite() || self.SPEED_CAP_BPS <= 0.0 {
+            anyhow::bail!("SPEED_CAP_BPS must be a finite value > 0");
+        }
+        if !self.UPLOAD_SPEED_CAP_BPS.is_finite() || self.UPLOAD_SPEED_CAP_BPS <= 0.0 {
+            anyhow::bail!("UPLOAD_SPEED_CAP_BPS must be a finite value > 0");
         }
         if let Some(ref sni) = self.SELECTED_SNI {
             if sni.len() > MAX_SNI_LEN {
@@ -1342,6 +1384,80 @@ mod tests {
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.SCAN_OUTPUT.as_deref(), Some("results.json"));
+    }
+
+    #[test]
+    fn scanner_upload_defaults() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.SCAN_UPLOAD_CAP, 10_240);
+        assert_eq!(cfg.SCAN_UPLOAD_PATH, "/");
+        assert!((cfg.UPLOAD_SPEED_CAP_BPS - 2_048_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parses_scanner_upload_fields() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            SCAN_UPLOAD_CAP = 32768
+            SCAN_UPLOAD_PATH = "/upload"
+            UPLOAD_SPEED_CAP_BPS = 4096000.0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.SCAN_UPLOAD_CAP, 32_768);
+        assert_eq!(cfg.SCAN_UPLOAD_PATH, "/upload");
+        assert!((cfg.UPLOAD_SPEED_CAP_BPS - 4_096_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_zero_scan_upload_cap() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            SCAN_UPLOAD_CAP = 0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_scan_upload_path() {
+        for path in ["", "upload"] {
+            let toml_str = format!(
+                r#"
+                LISTEN_HOST = "0.0.0.0"
+                LISTEN_PORT = 40443
+                SCAN_UPLOAD_PATH = "{path}"
+            "#
+            );
+            let cfg: Config = toml::from_str(&toml_str).unwrap();
+            assert!(cfg.validate().is_err());
+        }
+
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            SCAN_UPLOAD_PATH = "/bad\r\nInjected: yes"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_upload_speed_cap() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            UPLOAD_SPEED_CAP_BPS = 0.0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

@@ -96,7 +96,7 @@ Keep the upstream VPN profile's **real server name/SNI** in the VPN app. Change 
 
 ### Ranked SNI Selection
 
-![ZeroDPI SNI selection table showing ranked SNI candidates with scores, selected IPs, TCP and TLS latency, certificate status, TTFB, download speed, and HTTP result.](images/sni-selection.png)
+![ZeroDPI SNI selection table showing ranked SNI candidates with scores, selected IPs, TCP and TLS latency, certificate status, TTFB, download and upload speed, and HTTP result.](images/sni-selection.png)
 
 After an SNI scan, ZeroDPI shows a ranked table of candidates. Use it to compare score, latency, certificate validity, response speed, and HTTP behavior before selecting the target that new proxy connections should use.
 
@@ -546,6 +546,8 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | `IP_MAX_P1_CONCURRENT` | `usize` | `128` | Max concurrent TCP connections in IP phase 1 |
 | `IP_MAX_P2_CONCURRENT` | `usize` | `32` | Max concurrent TLS probes in IP phase 2 |
 | `SCAN_DOWNLOAD_CAP` | `usize` | `10240` | Max bytes downloaded for speed tests |
+| `SCAN_UPLOAD_CAP` | `usize` | `10240` | Max bytes uploaded for upload speed tests |
+| `SCAN_UPLOAD_PATH` | `string` | `"/"` | Candidate-relative HTTP path used for upload speed tests |
 | `IP_SCAN_SNI` | `string` | `"cloudflare.com"` | SNI used during IP scan TLS phase only |
 | `IPV6_MAX_HOSTS` | `u64` | `65536` | Max hosts expanded from a single IPv6 CIDR |
 
@@ -557,6 +559,7 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | `TLS_LATENCY_CAP_MS` | `f64` | `1000.0` | TLS handshake latency cap (ms) |
 | `TTFB_CAP_MS` | `f64` | `2000.0` | Time-to-first-byte cap (ms) |
 | `SPEED_CAP_BPS` | `f64` | `2048000` | Download speed cap for scoring (bytes/sec) |
+| `UPLOAD_SPEED_CAP_BPS` | `f64` | `2048000` | Upload speed cap for scoring (bytes/sec) |
 
 ### 🛠️ Bypass Engine
 
@@ -662,13 +665,14 @@ Both the SNI and IP scanners use the same scoring formula. Each `(SNI, IP)` pair
 | ⏱️ TLS latency | **15** | Linear: 0 ms → 15 pts, ≥ `TLS_LATENCY_CAP_MS` → 0 pts |
 | 🏷️ Cert valid | **5** | Flat bonus for valid certificate (Mozilla roots via `webpki-roots`) |
 | 🚀 TTFB | **20** | Linear: 0 ms → 20 pts, ≥ `TTFB_CAP_MS` → 0 pts |
-| ⚡ Download speed | **15** | Linear: 0 B/s → 0 pts, ≥ `SPEED_CAP_BPS` → 15 pts |
-| 🏆 All phases bonus | **10** | All five signals present |
+| ⚡ Download speed | **7.5** | Linear: 0 B/s → 0 pts, ≥ `SPEED_CAP_BPS` → 7.5 pts |
+| ⬆️ Upload speed | **7.5** | Linear: 0 B/s → 0 pts, ≥ `UPLOAD_SPEED_CAP_BPS` → 7.5 pts |
+| 🏆 All phases bonus | **10** | TCP, TLS, cert, TTFB, download, and upload signals present |
 
 **Tiebreaker:** Score (desc) → TCP latency (asc).
 
-- **SNI probe endpoint:** `GET /` on each resolved IPv4 address.
-- **IP probe endpoint:** `GET /cdn-cgi/trace` with `IP_SCAN_SNI` in the `Host` header.
+- **SNI probe endpoint:** `GET /` on each resolved IPv4 address, then `POST SCAN_UPLOAD_PATH` for upload timing.
+- **IP probe endpoint:** `GET /cdn-cgi/trace` with `IP_SCAN_SNI` in the `Host` header, then `POST SCAN_UPLOAD_PATH` for upload timing.
 
 ---
 
@@ -686,7 +690,8 @@ The scanners are quality filters, not bypass methods. They help ZeroDPI choose a
 4. Certificate validity through the bundled Mozilla root store from `webpki-roots`.
 5. HTTP `GET /` time-to-first-byte.
 6. Download speed up to `SCAN_DOWNLOAD_CAP` bytes.
-7. HTTP status code from the first response line.
+7. Upload speed up to `SCAN_UPLOAD_CAP` bytes using `POST SCAN_UPLOAD_PATH`.
+8. HTTP status code from the first response line.
 
 The result list is sorted by score descending, then TCP latency ascending. A high score usually means the candidate is reachable, fast, and able to complete normal TLS/HTTP checks from your network.
 
@@ -700,6 +705,7 @@ The IP scanner runs a pipelined flow:
 2. Phase 2: TLS handshake using `IP_SCAN_SNI`.
 3. Phase 3: HTTP `GET /cdn-cgi/trace`.
 4. Phase 4: small download sample up to `SCAN_DOWNLOAD_CAP`.
+5. Phase 5: separate upload sample up to `SCAN_UPLOAD_CAP` using `POST SCAN_UPLOAD_PATH`.
 
 `IP_SCAN_SNI` is only used for the scan's TLS/HTTP probe. It is not inserted into real proxied VPN traffic in `ip_bypass` or `ip_bypass_plus`; the upstream VPN client's own TLS handshake passes through unchanged.
 
@@ -737,6 +743,8 @@ SNI scan results are an array of objects like:
     "tls_latency_ms": 88,
     "cert_valid": true,
     "ttfb_ms": 140,
+    "download_bps": 1048576.0,
+    "upload_bps": 786432.0,
     "speed_bps": 1048576.0,
     "http_status": 200,
     "score": 91
@@ -755,6 +763,8 @@ IP scan results are similar, but the object starts with `ip` and has no `sni` fi
     "tls_latency_ms": 70,
     "cert_valid": true,
     "ttfb_ms": 120,
+    "download_bps": 2048000.0,
+    "upload_bps": 1048576.0,
     "speed_bps": 2048000.0,
     "http_status": 200,
     "score": 96
@@ -763,6 +773,7 @@ IP scan results are similar, but the object starts with `ip` and has no `sni` fi
 ```
 
 Failed phases are stored as `null` for optional numeric fields and `false` for boolean success flags. A low score is still useful: it tells you whether the candidate failed at TCP, TLS, HTTP, or speed measurement.
+`speed_bps` is retained as a legacy alias for `download_bps` in scan-result JSON.
 
 ---
 
@@ -772,7 +783,7 @@ ZeroDPI uses [ratatui](https://github.com/ratatui-org/ratatui) for a live termin
 
 | Mode | View 1 | View 2 | View 3 |
 |------|--------|--------|--------|
-| `sni_spoof` | 📊 Scan progress (Score · SNI · IP · TCP · TLS · TTFB · Speed · HTTP) | 🎯 Selection table | 📈 Dashboard |
+| `sni_spoof` | 📊 Scan progress (Score · SNI · IP · TCP · TLS · TTFB · Down · Up · HTTP) | 🎯 Selection table | 📈 Dashboard |
 | `ip_bypass` | 📊 IP scan progress | 🎯 Selection table | 📈 Dashboard |
 | `ip_bypass_plus` | 📊 IP scan progress | 🎯 Selection table | 📈 Dashboard |
 | `sni_scan` | 📊 Scan progress | 📋 Results table (view-only) | — |

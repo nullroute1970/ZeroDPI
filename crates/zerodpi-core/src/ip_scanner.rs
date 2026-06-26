@@ -8,7 +8,7 @@
 //!    TLS latency and cert validity.
 //! 3. **TTFB** — sends `GET /cdn-cgi/trace HTTP/1.1` over the TLS connection and
 //!    measures time-to-first-byte and parses the HTTP status code.
-//! 4. **Speed** — continues downloading up to 10 KB and measures throughput.
+//! 4. **Speed** — measures separate download and upload throughput samples.
 //!
 //! ## Scoring (0–100) — unified with the SNI scanner
 //! - TCP latency:  25 pts (linear: 0 ms → 25, ≥500 ms → 0)
@@ -16,7 +16,8 @@
 //! - TLS latency:  15 pts (linear: 0 ms → 15, ≥1 000 ms → 0)
 //! - Cert valid:    5 pts flat
 //! - TTFB:         20 pts (linear: 0 ms → 20, ≥2 000 ms → 0)
-//! - Download speed: 15 pts (linear: 0 B/s → 0, ≥2 000 KB/s → 15)
+//! - Download speed: 7.5 pts (linear: 0 B/s → 0, ≥2 000 KB/s → 7.5)
+//! - Upload speed:   7.5 pts (linear: 0 B/s → 0, ≥2 000 KB/s → 7.5)
 //! - All phases:   10 pts bonus
 
 use std::net::{IpAddr, SocketAddr};
@@ -24,7 +25,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use serde::ser::SerializeStruct;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, trace};
@@ -51,7 +53,7 @@ pub enum IpScanEvent {
 }
 
 /// Result for one scanned IP address.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct IpProbeEntry {
     pub ip: IpAddr,
     /// TCP connect latency in milliseconds; `None` if TCP failed.
@@ -66,18 +68,41 @@ pub struct IpProbeEntry {
     /// Time-to-first-byte in milliseconds; `None` if the HTTP phase failed.
     pub ttfb_ms: Option<u64>,
     /// Download throughput in bytes/sec (~10 KB sample); `None` if unavailable.
-    pub speed_bps: Option<f64>,
+    pub download_bps: Option<f64>,
+    /// Upload throughput in bytes/sec (~10 KB sample); `None` if unavailable.
+    pub upload_bps: Option<f64>,
     /// HTTP status code returned by `GET /cdn-cgi/trace`; `None` if request failed.
     pub http_status: Option<u16>,
     /// Composite score 0–100.
     pub score: u8,
 }
 
+impl serde::Serialize for IpProbeEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("IpProbeEntry", 11)?;
+        state.serialize_field("ip", &self.ip)?;
+        state.serialize_field("tcp_latency_ms", &self.tcp_latency_ms)?;
+        state.serialize_field("tls_ok", &self.tls_ok)?;
+        state.serialize_field("tls_latency_ms", &self.tls_latency_ms)?;
+        state.serialize_field("cert_valid", &self.cert_valid)?;
+        state.serialize_field("ttfb_ms", &self.ttfb_ms)?;
+        state.serialize_field("download_bps", &self.download_bps)?;
+        state.serialize_field("upload_bps", &self.upload_bps)?;
+        state.serialize_field("speed_bps", &self.download_bps)?;
+        state.serialize_field("http_status", &self.http_status)?;
+        state.serialize_field("score", &self.score)?;
+        state.end()
+    }
+}
+
 impl IpProbeEntry {
     /// One-line summary suitable for log output or TUI table cells.
     pub fn summary_line(&self) -> String {
         format!(
-            "{:<45} tcp={:<6} tls={:<6} cert={} ttfb={:<6} speed={:<12} http={:<3} score={}",
+            "{:<45} tcp={:<6} tls={:<6} cert={} ttfb={:<6} down={:<12} up={:<12} http={:<3} score={}",
             self.ip.to_string(),
             self.tcp_latency_ms
                 .map(|v| format!("{v}ms"))
@@ -93,20 +118,25 @@ impl IpProbeEntry {
             self.ttfb_ms
                 .map(|v| format!("{v}ms"))
                 .unwrap_or_else(|| "—".into()),
-            self.speed_bps
-                .map(|v| {
-                    if v >= 1_048_576.0 {
-                        format!("{:.1}MB/s", v / 1_048_576.0)
-                    } else {
-                        format!("{:.0}KB/s", v / 1024.0)
-                    }
-                })
+            self.download_bps
+                .map(format_bps)
+                .unwrap_or_else(|| "—".into()),
+            self.upload_bps
+                .map(format_bps)
                 .unwrap_or_else(|| "—".into()),
             self.http_status
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "—".into()),
             self.score,
         )
+    }
+}
+
+fn format_bps(bps: f64) -> String {
+    if bps >= 1_048_576.0 {
+        format!("{:.1}MB/s", bps / 1_048_576.0)
+    } else {
+        format!("{:.0}KB/s", bps / 1024.0)
     }
 }
 
@@ -130,17 +160,23 @@ fn compute_score(entry: &IpProbeEntry, config: &crate::config::Config) -> u8 {
         None => 0.0,
         Some(ms) => 20.0 * (1.0 - (ms as f64 / config.TTFB_CAP_MS).min(1.0)),
     };
-    let speed_pts = match entry.speed_bps {
+    let download_pts = match entry.download_bps {
         None => 0.0,
-        Some(bps) => 15.0 * (bps / config.SPEED_CAP_BPS).min(1.0),
+        Some(bps) => 7.5 * (bps / config.SPEED_CAP_BPS).min(1.0),
+    };
+    let upload_pts = match entry.upload_bps {
+        None => 0.0,
+        Some(bps) => 7.5 * (bps / config.UPLOAD_SPEED_CAP_BPS).min(1.0),
     };
     let all_present = entry.tcp_latency_ms.is_some()
         && entry.tls_ok
         && entry.cert_valid
         && entry.ttfb_ms.is_some()
-        && entry.speed_bps.is_some();
+        && entry.download_bps.is_some()
+        && entry.upload_bps.is_some();
     let bonus = if all_present { 10.0 } else { 0.0 };
-    (tcp_pts + tls_flat + tls_pts + cert_pts + ttfb_pts + speed_pts + bonus).round() as u8
+    (tcp_pts + tls_flat + tls_pts + cert_pts + ttfb_pts + download_pts + upload_pts + bonus).round()
+        as u8
 }
 
 // ---------------------------------------------------------------------------
@@ -319,7 +355,8 @@ pub async fn scan_ip_list(
                     tls_latency_ms: None,
                     cert_valid: false,
                     ttfb_ms: None,
-                    speed_bps: None,
+                    download_bps: None,
+                    upload_bps: None,
                     http_status: None,
                     score: 0,
                 };
@@ -363,23 +400,15 @@ async fn probe_tls_ttfb(
                 tls_latency_ms: None,
                 cert_valid: false,
                 ttfb_ms: None,
-                speed_bps: None,
+                download_bps: None,
+                upload_bps: None,
                 http_status: None,
                 score: 0,
             };
         }
     };
 
-    // Build TLS connector with the system/Mozilla root store.
-    let root_store = {
-        let mut store = rustls::RootCertStore::empty();
-        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        store
-    };
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let connector = make_tls_connector();
 
     let server_name = match rustls::pki_types::ServerName::try_from(sni.to_owned()) {
         Ok(n) => n,
@@ -391,7 +420,8 @@ async fn probe_tls_ttfb(
                 tls_latency_ms: None,
                 cert_valid: false,
                 ttfb_ms: None,
-                speed_bps: None,
+                download_bps: None,
+                upload_bps: None,
                 http_status: None,
                 score: 0,
             };
@@ -413,7 +443,8 @@ async fn probe_tls_ttfb(
                     tls_latency_ms: None,
                     cert_valid: false,
                     ttfb_ms: None,
-                    speed_bps: None,
+                    download_bps: None,
+                    upload_bps: None,
                     http_status: None,
                     score: 0,
                 };
@@ -433,7 +464,7 @@ async fn probe_tls_ttfb(
         .await
         .is_ok_and(|r| r.is_ok());
 
-    let (ttfb_ms, speed_bps, http_status) = if write_ok {
+    let (ttfb_ms, download_bps, http_status) = if write_ok {
         let mut buf = vec![0u8; config.SCAN_DOWNLOAD_CAP];
         let mut total_read = 0usize;
         let mut ttfb: Option<u64> = None;
@@ -475,6 +506,12 @@ async fn probe_tls_ttfb(
         (None, None, None)
     };
 
+    let upload_bps = if ttfb_ms.is_some() {
+        probe_ip_upload(ip, sni, timeout, &config, &connector).await
+    } else {
+        None
+    };
+
     let mut entry = IpProbeEntry {
         ip,
         tcp_latency_ms: Some(tcp_latency_ms),
@@ -482,7 +519,8 @@ async fn probe_tls_ttfb(
         tls_latency_ms: Some(tls_latency_ms),
         cert_valid: true, // rustls validates cert on every successful connect
         ttfb_ms,
-        speed_bps,
+        download_bps,
+        upload_bps,
         http_status,
         score: 0,
     };
@@ -497,6 +535,100 @@ fn parse_http_status(text: &str) -> Option<u16> {
     let mut parts = line.splitn(3, ' ');
     parts.next(); // "HTTP/1.x"
     parts.next()?.parse::<u16>().ok()
+}
+
+fn make_tls_connector() -> tokio_rustls::TlsConnector {
+    let root_store = {
+        let mut store = rustls::RootCertStore::empty();
+        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        store
+    };
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(Arc::new(tls_config))
+}
+
+async fn measure_upload<S>(
+    stream: &mut S,
+    host: &str,
+    upload_path: &str,
+    upload_bytes: usize,
+    timeout: Duration,
+) -> Option<f64>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let req = format!(
+        "POST {upload_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: zerodpi-scanner/0.1\r\nContent-Type: application/octet-stream\r\nContent-Length: {upload_bytes}\r\n\r\n"
+    );
+
+    if !matches!(
+        tokio::time::timeout(timeout, stream.write_all(req.as_bytes())).await,
+        Ok(Ok(()))
+    ) {
+        return None;
+    }
+
+    let result = tokio::time::timeout(timeout, async {
+        let chunk = vec![0u8; upload_bytes.min(16 * 1024)];
+        let start = Instant::now();
+        let mut remaining = upload_bytes;
+        while remaining > 0 {
+            let n = remaining.min(chunk.len());
+            stream.write_all(&chunk[..n]).await?;
+            remaining -= n;
+        }
+        stream.flush().await?;
+        Ok::<Duration, std::io::Error>(start.elapsed())
+    })
+    .await;
+
+    let elapsed = match result {
+        Ok(Ok(elapsed)) => elapsed.as_secs_f64(),
+        _ => return None,
+    };
+
+    let mut response = [0u8; 1024];
+    if let Ok(Ok(n)) = tokio::time::timeout(timeout, stream.read(&mut response)).await {
+        if let Ok(text) = std::str::from_utf8(&response[..n]) {
+            let _ = parse_http_status(text);
+        }
+    }
+
+    if elapsed > 0.0 {
+        Some(upload_bytes as f64 / elapsed)
+    } else {
+        None
+    }
+}
+
+async fn probe_ip_upload(
+    ip: IpAddr,
+    sni: &str,
+    timeout: Duration,
+    config: &crate::config::Config,
+    connector: &tokio_rustls::TlsConnector,
+) -> Option<f64> {
+    let addr = SocketAddr::new(ip, SCAN_PORT);
+    let tcp_stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+    let server_name = rustls::pki_types::ServerName::try_from(sni.to_owned()).ok()?;
+    let mut stream = tokio::time::timeout(timeout, connector.connect(server_name, tcp_stream))
+        .await
+        .ok()?
+        .ok()?;
+
+    measure_upload(
+        &mut stream,
+        sni,
+        &config.SCAN_UPLOAD_PATH,
+        config.SCAN_UPLOAD_CAP,
+        timeout,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +649,8 @@ mod tests {
         tls_ok: bool,
         tls_ms: Option<u64>,
         ttfb: Option<u64>,
-        speed: Option<f64>,
+        download: Option<f64>,
+        upload: Option<f64>,
     ) -> IpProbeEntry {
         let cfg = dummy_config();
         let mut e = IpProbeEntry {
@@ -527,7 +660,8 @@ mod tests {
             tls_latency_ms: tls_ms,
             cert_valid: tls_ok,
             ttfb_ms: ttfb,
-            speed_bps: speed,
+            download_bps: download,
+            upload_bps: upload,
             http_status: None,
             score: 0,
         };
@@ -538,27 +672,34 @@ mod tests {
     #[test]
     fn score_perfect() {
         // 0 ms everywhere + all phases present → 100
-        let e = make_entry(Some(0), true, Some(0), Some(0), Some(f64::MAX));
+        let e = make_entry(
+            Some(0),
+            true,
+            Some(0),
+            Some(0),
+            Some(f64::MAX),
+            Some(f64::MAX),
+        );
         assert_eq!(e.score, 100);
     }
 
     #[test]
     fn score_tcp_fail() {
-        let e = make_entry(None, false, None, None, None);
+        let e = make_entry(None, false, None, None, None, None);
         assert_eq!(e.score, 0);
     }
 
     #[test]
     fn score_tcp_only() {
         // TCP at 0 ms, no TLS = 25 pts
-        let e = make_entry(Some(0), false, None, None, None);
+        let e = make_entry(Some(0), false, None, None, None, None);
         assert_eq!(e.score, 25);
     }
 
     #[test]
     fn score_tcp_at_cap() {
         // TCP exactly at cap → 0 TCP pts; no TLS
-        let e = make_entry(Some(500), false, None, None, None);
+        let e = make_entry(Some(500), false, None, None, None, None);
         assert_eq!(e.score, 0);
     }
 
@@ -570,16 +711,29 @@ mod tests {
         // tls_ms: 15 * (1 - 200/1000) = 12
         // cert: 5 (cert_valid = tls_ok = true)
         // ttfb: 0, speed: 0, bonus: 0
-        let e = make_entry(Some(100), true, Some(200), None, None);
+        let e = make_entry(Some(100), true, Some(200), None, None, None);
         assert_eq!(e.score, 47);
     }
 
     #[test]
     fn score_all_phases_with_bonus() {
-        // TCP 250ms (12.5→13), TLS flat (10), TLS 500ms (7.5→8), cert (5),
-        // TTFB 1000ms (10), speed 1024000 B/s (7.5→8), bonus (10) = 63
-        let e = make_entry(Some(250), true, Some(500), Some(1000), Some(1_024_000.0));
+        // TCP 250ms (12.5), TLS flat (10), TLS 500ms (7.5), cert (5),
+        // TTFB 1000ms (10), down/up 1024000 B/s (3.75 each), bonus (10) = 62.5 → 63
+        let e = make_entry(
+            Some(250),
+            true,
+            Some(500),
+            Some(1000),
+            Some(1_024_000.0),
+            Some(1_024_000.0),
+        );
         assert_eq!(e.score, 63);
+    }
+
+    #[test]
+    fn score_all_phases_without_upload_has_no_bonus() {
+        let e = make_entry(Some(0), true, Some(0), Some(0), Some(f64::MAX), None);
+        assert_eq!(e.score, 83);
     }
 
     #[test]

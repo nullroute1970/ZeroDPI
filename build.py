@@ -3,7 +3,7 @@
 build.py – Build ZeroDPI for the current platform, Windows, Linux, or Termux.
 
 Usage:
-    python build.py [--platform linux|windows|termux|all]
+    python build.py [--platform linux|windows|termux|android-app|all]
                    [--windivert-version <ver>] [--toolchain <toolchain>]
                    [--msys2-path <path>]
                    [--termux-arch all|armv7|armv8|<arch>] [--android-ndk <path>]
@@ -30,9 +30,18 @@ Termux:
   3. Runs `cargo build --workspace --release --target <android-target>`.
   4. Copies zerodpi + config.toml + sni_list.txt + ip_list.txt + README.md
      to dist/termux/<arch>/. The default `all` builds Android ARMv7 and ARMv8.
+
+Android app runtime:
+  1. Reuses the Android NDK target setup from Termux builds.
+  2. Builds ABI-specific zerodpi executables for APK packaging.
+  3. Stages jniLibs/<abi>/libzerodpi_exec.so plus bin/<abi>/zerodpi under
+     dist/android-app/<rootless|full>/.
+  4. The default rootless runtime disables NFQUEUE packet interception so the
+     first APK runtime can ship without external netfilter dependencies.
 """
 
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -98,6 +107,25 @@ TERMUX_CLANG_TARGETS = {
     "i686": "i686-linux-android",
 }
 TERMUX_ARCH_CHOICES = ("all",) + tuple(sorted(TERMUX_RUST_TARGETS))
+ANDROID_APP_PUBLIC_ABIS = ("arm64-v8a", "armeabi-v7a")
+ANDROID_APP_DEBUG_ABIS = ANDROID_APP_PUBLIC_ABIS + ("x86_64",)
+ANDROID_APP_ABI_TARGETS = {
+    "armeabi-v7a": ("armv7", "armv7-linux-androideabi"),
+    "arm64-v8a": ("armv8", "aarch64-linux-android"),
+    "x86_64": ("x86_64", "x86_64-linux-android"),
+}
+ANDROID_APP_ABI_ALIASES = {
+    "armv7": "armeabi-v7a",
+    "arm": "armeabi-v7a",
+    "armeabi-v7a": "armeabi-v7a",
+    "armv8": "arm64-v8a",
+    "aarch64": "arm64-v8a",
+    "arm64": "arm64-v8a",
+    "arm64-v8a": "arm64-v8a",
+    "x86_64": "x86_64",
+}
+ANDROID_APP_ABI_CHOICES = ("all", "public", "debug") + tuple(sorted(ANDROID_APP_ABI_ALIASES))
+ANDROID_APP_RUNTIME_CHOICES = ("rootless", "full", "both")
 REPO_ROOT = Path(__file__).resolve().parent
 CARGO_RELEASE_DIR = REPO_ROOT / "target" / "release"
 COMMON_DIST_FILES = ("config.toml", "sni_list.txt", "ip_list.txt", "README.md")
@@ -769,6 +797,184 @@ def build_termux(arch_arg: str, android_ndk: str | None, android_api: int) -> No
 
 
 # ---------------------------------------------------------------------------
+# Android app runtime artifacts
+# ---------------------------------------------------------------------------
+
+def resolve_android_app_abis(abi_arg: str) -> list[str]:
+    """Resolve the Android app ABI argument to APK ABI directory names."""
+    if abi_arg in ("all", "public"):
+        return list(ANDROID_APP_PUBLIC_ABIS)
+    if abi_arg == "debug":
+        return list(ANDROID_APP_DEBUG_ABIS)
+
+    abis: list[str] = []
+    for raw in abi_arg.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        abi = ANDROID_APP_ABI_ALIASES.get(item)
+        if abi is None:
+            supported = ", ".join(ANDROID_APP_ABI_CHOICES)
+            die(f"Unsupported Android app ABI: {item}. Supported values: {supported}")
+        if abi not in abis:
+            abis.append(abi)
+
+    if not abis:
+        die("At least one Android app ABI must be selected.")
+    return abis
+
+
+def resolve_android_app_runtimes(runtime_arg: str) -> list[str]:
+    if runtime_arg == "both":
+        return ["rootless", "full"]
+    if runtime_arg in ANDROID_APP_RUNTIME_CHOICES:
+        return [runtime_arg]
+    supported = ", ".join(ANDROID_APP_RUNTIME_CHOICES)
+    die(f"Unsupported Android app runtime variant: {runtime_arg}. Supported values: {supported}")
+
+
+def android_build_env(
+    arch: str,
+    rust_target: str,
+    ndk_path: Path,
+    android_api: int,
+) -> dict:
+    linker = android_clang_path(ndk_path, arch, android_api)
+    cxx = android_clang_path(ndk_path, arch, android_api, cxx=True)
+    ar = android_ar_path(ndk_path)
+    if not linker.is_file():
+        die(
+            "Expected Android NDK clang linker not found: "
+            f"{linker}\nCheck --android-ndk, Android ABI, and --android-api."
+        )
+    if not cxx.is_file():
+        die(f"Expected Android NDK clang++ compiler not found: {cxx}")
+    if not ar.is_file():
+        die(f"Expected Android NDK llvm-ar not found: {ar}")
+
+    env = {
+        "CARGO_TERM_COLOR": "always",
+        cargo_target_env_name(rust_target, "LINKER"): str(linker),
+    }
+    add_target_tool_env(env, "CC", rust_target, linker)
+    add_target_tool_env(env, "CXX", rust_target, cxx)
+    add_target_tool_env(env, "AR", rust_target, ar)
+    return env
+
+
+def copy_android_app_runtime_templates(dist_dir: Path) -> None:
+    assets_dir = dist_dir / "assets" / "zerodpi"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    for filename in ("config.toml", "sni_list.txt", "ip_list.txt"):
+        copy_required_file(REPO_ROOT / filename, assets_dir / filename)
+
+
+def write_android_app_manifest(
+    dist_dir: Path,
+    runtime: str,
+    android_api: int,
+    entries: list[dict],
+) -> None:
+    manifest = {
+        "artifact": "zerodpi-android-app-runtime",
+        "runtime": runtime,
+        "androidApi": android_api,
+        "packetInterception": runtime == "full",
+        "nativeLibraryExecutable": "libzerodpi_exec.so",
+        "command": "zerodpi --config <app-private>/config.toml --no-tui --auto-select --json-events",
+        "packaging": {
+            "jniLibs": "Copy jniLibs/ into the Android app module so PackageManager extracts the ABI-matched native artifact into nativeLibraryDir.",
+            "standaloneBin": "bin/<abi>/zerodpi is for adb/device smoke tests and is not the normal APK execution path.",
+            "policy": "Do not rely on executing a binary copied into writable app data. The process-wrapper MVP should execute the extracted native artifact from nativeLibraryDir unless device testing proves another location is allowed.",
+        },
+        "abis": entries,
+    }
+    (dist_dir / "zerodpi-runtime-manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def print_android_app_contents(dist_dir: Path) -> None:
+    print(f"\n=== Android app runtime artifacts in: {dist_dir} ===")
+    for f in sorted(dist_dir.rglob("*")):
+        if f.is_file():
+            print(f"  {f.relative_to(dist_dir)}")
+
+
+def build_android_app_abi(
+    abi: str,
+    runtime: str,
+    ndk_path: Path,
+    android_api: int,
+    dist_dir: Path,
+) -> dict:
+    arch, rust_target = ANDROID_APP_ABI_TARGETS[abi]
+    print(f"\n--- Building Android app runtime ({runtime}, {abi}) ---")
+    env = android_build_env(arch, rust_target, ndk_path, android_api)
+
+    cargo_cmd = ["cargo", "build", "-p", "zerodpi", "--release", "--target", rust_target]
+    if runtime == "rootless":
+        cargo_cmd.append("--no-default-features")
+    run(cargo_cmd, env=env)
+
+    binary = REPO_ROOT / "target" / rust_target / "release" / "zerodpi"
+    if not binary.exists():
+        die(f"Expected binary not found: {binary}")
+
+    standalone_dir = dist_dir / "bin" / abi
+    standalone_dir.mkdir(parents=True, exist_ok=True)
+    standalone_binary = standalone_dir / "zerodpi"
+    copy_required_file(binary, standalone_binary)
+    standalone_binary.chmod(0o755)
+
+    jni_dir = dist_dir / "jniLibs" / abi
+    jni_dir.mkdir(parents=True, exist_ok=True)
+    native_artifact = jni_dir / "libzerodpi_exec.so"
+    copy_required_file(binary, native_artifact)
+    native_artifact.chmod(0o755)
+
+    return {
+        "abi": abi,
+        "rustTarget": rust_target,
+        "standaloneExecutable": str(standalone_binary.relative_to(dist_dir)).replace("\\", "/"),
+        "nativeLibraryArtifact": str(native_artifact.relative_to(dist_dir)).replace("\\", "/"),
+    }
+
+
+def build_android_app_runtime(
+    abi_arg: str,
+    runtime_arg: str,
+    android_ndk: str | None,
+    android_api: int,
+) -> None:
+    abis = resolve_android_app_abis(abi_arg)
+    runtimes = resolve_android_app_runtimes(runtime_arg)
+    label = ", ".join(abis)
+    runtime_label = ", ".join(runtimes)
+    print(f"=== Building ZeroDPI Android app runtime artifacts ({runtime_label}; {label}) ===")
+
+    if android_api < ANDROID_DEFAULT_API_LEVEL:
+        die(f"Android API level must be {ANDROID_DEFAULT_API_LEVEL} or newer.")
+
+    rust_targets = sorted({ANDROID_APP_ABI_TARGETS[abi][1] for abi in abis})
+    ensure_rustup_targets(rust_targets)
+
+    ndk_path = resolve_android_ndk(android_ndk)
+    for runtime in runtimes:
+        dist_dir = REPO_ROOT / "dist" / "android-app" / runtime
+        dist_dir.mkdir(parents=True, exist_ok=True)
+        copy_android_app_runtime_templates(dist_dir)
+
+        entries = [
+            build_android_app_abi(abi, runtime, ndk_path, android_api, dist_dir)
+            for abi in abis
+        ]
+        write_android_app_manifest(dist_dir, runtime, android_api, entries)
+        print_android_app_contents(dist_dir)
+
+
+# ---------------------------------------------------------------------------
 # All platforms
 # ---------------------------------------------------------------------------
 
@@ -836,12 +1042,12 @@ def build_all(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build ZeroDPI for the current platform, Windows, Linux, or Termux.")
+    parser = argparse.ArgumentParser(description="Build ZeroDPI for the current platform, Windows, Linux, Termux, or Android app runtime packaging.")
     parser.add_argument(
         "--platform",
         "--target",
         dest="platform",
-        choices=("auto", "linux", "windows", "termux", "all"),
+        choices=("auto", "linux", "windows", "termux", "android-app", "all"),
         default="auto",
         help="Build platform (default: auto-detect host OS). Use 'all' to build for Windows, Linux, and Termux.",
     )
@@ -884,14 +1090,34 @@ def main() -> None:
     parser.add_argument(
         "--android-ndk",
         metavar="PATH",
-        help="Android NDK path for Termux builds. Defaults to ANDROID_NDK_HOME.",
+        help="Android NDK path for Termux and Android app runtime builds. Defaults to ANDROID_NDK_HOME.",
     )
     parser.add_argument(
         "--android-api",
         type=int,
         default=ANDROID_DEFAULT_API_LEVEL,
         metavar="LEVEL",
-        help=f"Android API level for the NDK clang linker (Termux only, default: {ANDROID_DEFAULT_API_LEVEL}).",
+        help=f"Android API level for the NDK clang linker (Termux and Android app runtime, default: {ANDROID_DEFAULT_API_LEVEL}).",
+    )
+    parser.add_argument(
+        "--android-app-abi",
+        default="all",
+        metavar="ABI",
+        help=(
+            "Android app ABI to build (default: all, meaning first-release "
+            "public ABIs arm64-v8a and armeabi-v7a). Use 'debug' to also "
+            "include x86_64, or pass a comma-separated ABI list."
+        ),
+    )
+    parser.add_argument(
+        "--android-app-runtime",
+        choices=ANDROID_APP_RUNTIME_CHOICES,
+        default="rootless",
+        help=(
+            "Android app runtime variant (default: rootless). 'rootless' "
+            "builds without NFQUEUE packet interception; 'full' keeps the "
+            "default packet-interception feature; 'both' builds both variants."
+        ),
     )
     parser.add_argument(
         "--linux-target",
@@ -927,6 +1153,13 @@ def main() -> None:
         build_windows(args.windivert_version, args.toolchain, args.msys2_path)
     elif selected_platform == "termux":
         build_termux(args.termux_arch, args.android_ndk, args.android_api)
+    elif selected_platform == "android-app":
+        build_android_app_runtime(
+            args.android_app_abi,
+            args.android_app_runtime,
+            args.android_ndk,
+            args.android_api,
+        )
     elif selected_platform == "all":
         build_all(
             args.windivert_version,

@@ -6,14 +6,27 @@
 //!
 //! Both implement [`zerodpi_core::interceptor::PacketInterceptor`].
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    feature = "packet-interception"
+))]
 pub mod linux;
 #[cfg(windows)]
 pub mod windows;
 
 use anyhow::Result;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(feature = "packet-interception")
+))]
+use zerodpi_core::interceptor::{
+    FilterSpec, InterceptorShutdown, PacketHandler, PacketInterceptor,
+};
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    feature = "packet-interception"
+))]
 pub use linux::NfqInterceptor as DefaultInterceptor;
 
 #[cfg(windows)]
@@ -21,6 +34,38 @@ pub use windows::WinDivertInterceptor as DefaultInterceptor;
 
 #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 compile_error!("zerodpi-platform: no interceptor backend for this target OS");
+
+/// Placeholder interceptor used by Android app rootless artifacts that are
+/// intentionally built without NFQUEUE support.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(feature = "packet-interception")
+))]
+pub struct PacketInterceptionUnavailable;
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(feature = "packet-interception")
+))]
+pub use PacketInterceptionUnavailable as DefaultInterceptor;
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(feature = "packet-interception")
+))]
+impl PacketInterceptor for PacketInterceptionUnavailable {
+    fn open(_filter: FilterSpec) -> Result<Self> {
+        anyhow::bail!("{}", packet_interception_access_error())
+    }
+
+    fn run_until<H: PacketHandler>(
+        self,
+        _handler: H,
+        _shutdown: InterceptorShutdown,
+    ) -> Result<()> {
+        anyhow::bail!("{}", packet_interception_access_error())
+    }
+}
 
 /// Return an actionable startup error when the current process cannot use the
 /// platform packet interception backend.
@@ -40,11 +85,25 @@ fn packet_interception_access_error() -> &'static str {
      or MODE = \"ip_bypass\"."
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    feature = "packet-interception"
+))]
 fn packet_interception_access_error() -> &'static str {
     "ZeroDPI needs root privileges or CAP_NET_ADMIN for packet interception via NFQUEUE. \
      Run ZeroDPI with sudo/root, grant CAP_NET_ADMIN to the binary, or use \
      BYPASS_METHOD = \"tls_frag\" or MODE = \"ip_bypass\"."
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(feature = "packet-interception")
+))]
+fn packet_interception_access_error() -> &'static str {
+    "This ZeroDPI artifact was built without packet interception support. \
+     It can run rootless modes such as MODE = \"ip_bypass\", scan-only modes, \
+     or BYPASS_METHOD = \"tls_frag\" where supported. NFQUEUE modes need an \
+     artifact built with the packet-interception feature and root/CAP_NET_ADMIN."
 }
 
 #[cfg(windows)]
@@ -110,7 +169,10 @@ fn has_packet_interception_access() -> bool {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    feature = "packet-interception"
+))]
 fn has_packet_interception_access() -> bool {
     extern "C" {
         fn geteuid() -> u32;
@@ -119,26 +181,47 @@ fn has_packet_interception_access() -> bool {
     (unsafe { geteuid() == 0 }) || has_effective_cap_net_admin()
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(feature = "packet-interception")
+))]
+fn has_packet_interception_access() -> bool {
+    false
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    feature = "packet-interception"
+))]
 fn has_effective_cap_net_admin() -> bool {
     effective_capabilities_from_status("/proc/self/status")
         .map(|caps| caps & (1_u64 << 12) != 0)
         .unwrap_or(false)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    feature = "packet-interception"
+))]
 fn effective_capabilities_from_status(path: &str) -> Option<u64> {
     let status = std::fs::read_to_string(path).ok()?;
     status.lines().find_map(parse_effective_capabilities_line)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    feature = "packet-interception"
+))]
 fn parse_effective_capabilities_line(line: &str) -> Option<u64> {
     let value = line.strip_prefix("CapEff:")?.trim();
     u64::from_str_radix(value, 16).ok()
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "android"),
+    feature = "packet-interception"
+))]
 mod tests {
     use super::parse_effective_capabilities_line;
 

@@ -13,6 +13,10 @@ default-run = "zerodpi"
 name = "zerodpi"
 path = "src/main.rs"
 
+[features]
+default = ["packet-interception"]
+packet-interception = ["zerodpi-platform/packet-interception"]
+
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
@@ -28,4 +32,4 @@ crossterm.workspace = true
 rustls.workspace = true
 
 zerodpi-core = { path = "../zerodpi-core" }
-zerodpi-platform = { path = "../zerodpi-platform" }
+zerodpi-platform = { path = "../zerodpi-platform", default-features = false }

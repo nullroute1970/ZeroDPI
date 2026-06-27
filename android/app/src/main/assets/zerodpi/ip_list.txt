@@ -1,0 +1,27 @@
+# ip_list.txt — IP addresses for ZeroDPI ip_bypass mode
+#
+# One entry per line.  Supported formats:
+#   - Plain IPv4 address:    104.16.132.229
+#   - Plain IPv6 address:    2606:4700::6810:84e5
+#   - IPv4 CIDR range:       104.16.0.0/20
+#   - IPv6 CIDR range:       2606:4700::/32
+#
+# Lines starting with '#' and blank lines are ignored.
+# Hostnames (e.g. cloudflare.com) are silently skipped — use IPs only.
+#
+# ZeroDPI will scan these IPs in three phases:
+#   1. TCP connect to port 443
+#   2. TLS handshake (using IP_SCAN_SNI from config.toml, default: cloudflare.com)
+#   3. HTTP GET /cdn-cgi/trace — measures time-to-first-byte
+#
+# The best IP is selected automatically (AUTO_SELECT = true) or you can pick
+# one from the interactive table.  The selected IP is used as the relay target
+# for ALL incoming connections; your upstream app's own SNI is passed through
+# untouched.
+#
+# Add your own IPs or CIDR ranges below:
+
+# Cloudflare anycast (examples — replace with your own)
+# 104.16.132.229
+# 104.16.133.229
+# 104.16.0.0/24

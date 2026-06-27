@@ -1,0 +1,75 @@
+# sni_list.txt — SNI candidates for ZeroDPI
+#
+# List one hostname per line.  Lines that start with '#' and blank lines are
+# ignored.  ZeroDPI will:
+#   1. Resolve each hostname to all its IPv4 addresses via DNS.
+#   2. Probe each (hostname, IP) pair: TCP connect → TLS handshake → HTTP GET.
+#   3. Rank the results by a composite score (latency, TLS quality, HTTP ok).
+#   4. Let you pick one from the interactive table — or auto-select rank-1
+#      when AUTO_SELECT = true in config.toml.
+#
+# Tips:
+#   • CDN edge hostnames (Cloudflare, Fastly, Akamai, …) often resolve to
+#     many IPs and tend to rank highly because they are fast and reachable.
+#   • The scan runs concurrently, so total time is often dominated by the
+#     slowest probes, but very large candidate lists may still take longer
+#     due to resource limits and scheduler contention.
+#   • Hostnames that fail DNS are silently skipped.
+
+health-check.hcaptcha.com
+serverless.hcaptcha.com
+challenge-tasks.hcaptcha.com
+loader.hcaptcha.com
+proxy.hcaptcha.com
+auth.hcaptcha.com
+account.hcaptcha.com
+developer.hcaptcha.com
+download.hcaptcha.com
+hcaptcha.com
+data.hcaptcha.com
+api.hcaptcha.com
+jobs.hcaptcha.com
+imgs.hcaptcha.com
+server.hcaptcha.com
+content.hcaptcha.com
+assets.hcaptcha.com
+monitor.hcaptcha.com
+anycast.hcaptcha.com
+www.hcaptcha.com
+a2.hcaptcha.com
+developers.hcaptcha.com
+images.hcaptcha.com
+live.hcaptcha.com
+direct.hcaptcha.com
+health.hcaptcha.com
+accounts.hcaptcha.com
+files.hcaptcha.com
+app.hcaptcha.com
+upload.hcaptcha.com
+origin.hcaptcha.com
+mobile.hcaptcha.com
+gateway.hcaptcha.com
+community.hcaptcha.com
+video.hcaptcha.com
+docs.hcaptcha.com
+newassets.hcaptcha.com
+blog.hcaptcha.com
+support.hcaptcha.com
+edge.hcaptcha.com
+status.hcaptcha.com
+forum.hcaptcha.com
+v2.hcaptcha.com
+cdn.hcaptcha.com
+cache.hcaptcha.com
+secure.hcaptcha.com
+css.hcaptcha.com
+js.hcaptcha.com
+imgs2.hcaptcha.com
+imgs3.hcaptcha.com
+analytics.hcaptcha.com
+stats.hcaptcha.com
+three-cust.hcaptcha.com
+tg.hcaptcha.com
+primary.hcaptcha.com
+dashboard.hcaptcha.com
+billing.hcaptcha.com

@@ -328,10 +328,10 @@ Results are blended using a configurable weight and displayed in the TUI.
 | `wrong_ack` | Injects fake ClientHello with deliberately old TCP ACK number | ✅ Yes | DPI that accepts forged data but servers reject old ACKs |
 | `wrong_timestamp` | Injects fake ClientHello with backdated TCP Timestamp TSval | ✅ Yes | DPI that accepts forged data but servers enforce PAWS |
 | `tls_record_frag` | TLS Record Fragment: splits the real ClientHello record body into multiple tiny TLS records | ✅ Yes | DPI that can't reassemble TLS records |
-| `wrong_seq_tls_frag` | Sends a wrong-sequence fake ClientHello, then writes the intact real ClientHello in tiny TCP segments | ✅ Yes | Layered TCP-segment DPI paths |
-| `wrong_md5_tls_frag` | Sends a TCP-MD5 fake ClientHello, then writes the intact real ClientHello in tiny TCP segments | ✅ Yes | Layered TCP-MD5 plus TCP-segment DPI paths |
+| `wrong_seq_tls_frag` | Sends a wrong-sequence fake ClientHello, then fragments selected real client data with `TLS_FRAG_*` settings | ✅ Yes | Layered TCP-segment DPI paths |
+| `wrong_md5_tls_frag` | Sends a TCP-MD5 fake ClientHello, then fragments selected real client data with `TLS_FRAG_*` settings | ✅ Yes | Layered TCP-MD5 plus TCP-segment DPI paths |
 | `wrong_seq_tls_record_frag` | Sends a wrong-sequence fake ClientHello, then splits the real ClientHello body into tiny TLS records | ✅ Yes | Layered TLS-record DPI paths |
-| `tls_frag` | TLS Fragment: writes an intact ClientHello record in tiny TCP segments | ❌ No | DPI that inspects individual TCP segments |
+| `tls_frag` | TLS Fragment: writes selected client data in small TCP chunks without changing TLS bytes | ❌ No | DPI that inspects individual TCP segments |
 
 ---
 
@@ -357,10 +357,10 @@ Method behavior in more detail:
 - `wrong_seq_wrong_md5` sends one fake ClientHello with both the `wrong_seq` sequence rewrite and the `wrong_md5` TCP-MD5 option.
 - `wrong_timestamp` is ZeroDPI's snake_case name for sing-box's `wrong-timestamp` spoof behavior. It requires TCP timestamps on the intercepted flow and backdates `TSval` so PAWS rejects the forged segment.
 - `tls_record_frag` rewrites the real first TLS record into many smaller TLS records. The server should reassemble the TLS handshake normally.
-- `tls_frag` keeps the TLS bytes unchanged and writes them in small TCP chunks from the proxy. It avoids WinDivert/NFQUEUE and is the easiest method to run in restricted environments.
+- `tls_frag` keeps the TLS bytes unchanged and writes selected client data in small TCP chunks from the proxy. It can fragment the first TLS ClientHello (`TLS_FRAG_PACKETS = "tlshello"`) or a 1-based range of client writes such as `"1-3"`.
 - The combo methods such as `wrong_seq_tls_frag` and `wrong_md5_tls_frag` first send a decoy ClientHello, then also fragment the real ClientHello path.
 
-If a method works but connection setup is slow, increase fragment sizes gradually (`TCP_SEG_SIZE`, `TLS_RECORD_FRAG_SIZE`) or try a higher-scoring SNI/IP. Very small fragments are aggressive and can add connection-start overhead.
+If a method works but connection setup is slow, increase fragment sizes gradually (`TLS_FRAG_LENGTH`, `TLS_RECORD_FRAG_SIZE`) or try a higher-scoring SNI/IP. Very small fragments are aggressive and can add connection-start overhead.
 
 ---
 
@@ -406,11 +406,13 @@ Use this when WinDivert/NFQUEUE is unavailable or you want TCP-level TLS Fragmen
 ```toml
 MODE = "sni_spoof"
 BYPASS_METHOD = "tls_frag"
-TCP_SEG_SIZE = 1
+TLS_FRAG_PACKETS = "tlshello"
+TLS_FRAG_LENGTH = "1"
+TLS_FRAG_INTERVAL_MS = "0"
 TCP_SEG_NODELAY = true
 ```
 
-This still requires your VPN client to connect to ZeroDPI's local listener. The TLS layer stays intact; ZeroDPI only controls how the ClientHello bytes are written into TCP segments.
+This still requires your VPN client to connect to ZeroDPI's local listener. The TLS layer stays intact; ZeroDPI only controls how the ClientHello bytes are written into TCP segments. Use `TLS_FRAG_PACKETS = "1-3"` to fragment the first through third client-to-upstream writes instead of only the first TLS record.
 
 ### Scan Only and Save Results
 
@@ -598,7 +600,7 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | `WRONG_MD5_BUMP_IP_IDENT` | `bool` | `true` | Bump IPv4 Identification field |
 | `WRONG_MD5_COMPLETE_IMMEDIATELY` | `bool` | `true` | Signal bypass complete immediately after emission |
 
-`wrong_seq_wrong_md5` uses the TCP-MD5 option and `WRONG_MD5_COMPLETE_IMMEDIATELY` from this group, while its PSH flag and IPv4 Identification behavior come from the `wrong_seq` parameter group. `wrong_md5_tls_frag` uses `WRONG_MD5_SET_PSH` and `WRONG_MD5_BUMP_IP_IDENT` from this group, then uses the `tls_frag` parameter group for the real ClientHello. `WRONG_MD5_COMPLETE_IMMEDIATELY` does not affect `wrong_md5_tls_frag`; that combo waits for the segmented real ClientHello stage.
+`wrong_seq_wrong_md5` uses the TCP-MD5 option and `WRONG_MD5_COMPLETE_IMMEDIATELY` from this group, while its PSH flag and IPv4 Identification behavior come from the `wrong_seq` parameter group. `wrong_md5_tls_frag` uses `WRONG_MD5_SET_PSH` and `WRONG_MD5_BUMP_IP_IDENT` from this group, then uses the `tls_frag` parameter group for the real client-data fragmentation stage. `WRONG_MD5_COMPLETE_IMMEDIATELY` does not affect `wrong_md5_tls_frag`; that combo waits for the segmented real-data stage.
 
 #### `wrong_ack` Parameters
 
@@ -632,8 +634,13 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `TCP_SEG_SIZE` | `usize` | `1` | Max intact ClientHello bytes per TCP segment (≥ 1) |
+| `TLS_FRAG_PACKETS` | `string` | `"tlshello"` | `"tlshello"` for first TLS record, or a 1-based client-write range like `"1-3"` |
+| `TLS_FRAG_LENGTH` | `Int32Range` | uses `TCP_SEG_SIZE` | Fragment chunk length in bytes; accepts `N` or `"A-B"` (≥ 1) |
+| `TLS_FRAG_INTERVAL_MS` | `Int32Range` | `0` | Delay between chunks in ms; accepts `N` or `"A-B"` (≥ 0) |
+| `TCP_SEG_SIZE` | `usize` | `1` | Legacy fixed-length fallback used when `TLS_FRAG_LENGTH` is omitted |
 | `TCP_SEG_NODELAY` | `bool` | `true` | Enable TCP_NODELAY to prevent Nagle coalescing |
+
+`TLS_FRAG_LENGTH` and `TLS_FRAG_INTERVAL_MS` use Xray-style range syntax: `5` means a fixed value, while `"1-5"` chooses a fresh random value in that inclusive range for each fragment chunk. With `TLS_FRAG_INTERVAL_MS = "0"`, ZeroDPI writes chunks back-to-back; actual TCP packet coalescing still depends on `TCP_SEG_NODELAY`, MSS/MTU, and the host TCP stack.
 
 `wrong_seq_tls_frag` uses both the `wrong_seq` and `tls_frag` parameter groups. `wrong_md5_tls_frag` uses the `wrong_md5` and `tls_frag` parameter groups.
 
@@ -1172,7 +1179,7 @@ Unit tests cover:
 - `ip_bypass` does not spoof SNI. It relays the upstream VPN client's original TLS bytes to the selected IP.
 - `ip_bypass_plus` also preserves the upstream VPN client's original SNI, but can fragment the first real ClientHello with `tls_record_frag` or `tls_frag`.
 - `wrong_timestamp` requires TCP timestamps to be negotiated by the host OS on the upstream connection. If the intercepted ACK has no Timestamp option, ZeroDPI aborts that bypass attempt.
-- Very aggressive fragmentation (`TCP_SEG_SIZE = 1` or `TLS_RECORD_FRAG_SIZE = 1`) can add overhead during connection setup.
+- Very aggressive fragmentation (`TLS_FRAG_LENGTH = "1"` or `TLS_RECORD_FRAG_SIZE = 1`) can add overhead during connection setup.
 - Firewall, antivirus, endpoint security, or kernel driver policy can block WinDivert/NFQUEUE even when ZeroDPI is configured correctly.
 
 ---

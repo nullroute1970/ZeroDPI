@@ -172,9 +172,9 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   "wrong_md5_tls_frag"
 #     Combines wrong_md5 with TLS Fragment / TCP-level fragmentation for
 #     layered filtering.  First, it injects a fake TCP-MD5 ClientHello on the
-#     handshake ACK.  Then it sends the normal, intact real ClientHello in tiny
-#     TCP segments, so later DPI layers still do not see the complete SNI in
-#     any single TCP segment.
+#     handshake ACK.  Then it fragments configured real client data using the
+#     TLS_FRAG_* settings, so later DPI layers still do not see the complete
+#     SNI in any single TCP segment.
 #
 #   "wrong_ack"
 #     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
@@ -202,10 +202,10 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   "wrong_seq_tls_frag"
 #     Combines wrong_seq with TLS Fragment / TCP-level fragmentation for
 #     layered filtering.  First, it injects a fake wrong-sequence ClientHello
-#     on the handshake ACK.  Then it sends the normal, intact real ClientHello
-#     in tiny TCP segments, so later DPI layers still do not see the complete
-#     SNI in any single TCP segment even if the fake packet was dropped by an
-#     earlier firewall.
+#     on the handshake ACK.  Then it fragments configured real client data
+#     using the TLS_FRAG_* settings, so later DPI layers still do not see the
+#     complete SNI in any single TCP segment even if the fake packet was
+#     dropped by an earlier firewall.
 #
 #   "wrong_seq_tls_record_frag"
 #     Combines wrong_seq with TLS Record Fragment / TLS-layer fragmentation for
@@ -218,12 +218,11 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   "tls_frag"
 #     TLS Fragment / TCP-level fragmentation.  Does NOT inject fake packets
 #     and does NOT use WinDivert or NFQUEUE packet interception.  Instead, it
-#     reads the normal, intact TLS ClientHello record from the client socket
-#     and writes it to the upstream server socket in tiny TCP segments
-#     (controlled by TCP_SEG_SIZE).  With TCP_NODELAY enabled, the OS sends
-#     each chunk as a separate TCP segment so no single packet carries the full
-#     SNI.  The upstream server reassembles the stream normally and sees an
-#     identical ClientHello.
+#     fragments the first TLS ClientHello record or a configured range of
+#     client-to-upstream data writes using TLS_FRAG_PACKETS, TLS_FRAG_LENGTH,
+#     and TLS_FRAG_INTERVAL_MS.  With TCP_NODELAY enabled, the OS is less
+#     likely to coalesce small writes, so no single packet carries the full
+#     SNI.  The upstream server reassembles the stream normally.
 #
 # This setting is used by SNI-based modes ("sni_spoof", "sni_scan", and
 # "proxy_scan").  MODE = "ip_bypass_plus" supports only "tls_record_frag" or
@@ -481,28 +480,57 @@ TLS_RECORD_FRAG_BUMP_IP_IDENT = true
 # while these TCP segment settings control how the real
 # ClientHello is written after the fake packet stage.
 
-# Maximum ClientHello bytes sent in each TCP segment of the split ClientHello.
+# Which client data to fragment.
 #
-# The normal, intact TLS ClientHello record is sliced into chunks of at most
-# this many bytes.  Each chunk is written to the upstream socket individually.
-# With TCP_SEG_NODELAY = true the OS sends each chunk as a separate TCP
-# segment, so no single packet carries the full SNI.
+# Supported values:
+#   "tlshello" — fragment the first complete TLS record (the ClientHello).
+#   "1-3"      — fragment the 1st through 3rd client-to-upstream data writes
+#                observed by ZeroDPI.
 #
-# Smaller values produce more segments and are harder for DPI to reassemble,
-# at the cost of slightly higher connection-setup overhead:
-#   1   — one byte per segment (most aggressive, maximum fragmentation)
-#   10  — ten bytes per segment
-#   128 — moderate fragmentation
+# Default: "tlshello".
+TLS_FRAG_PACKETS = "tlshello"
+
+# Fragment length range in bytes.
 #
-# Must be >= 1.  Default: 1.
+# Accepts either a fixed integer or an inclusive range string:
+#   1     — one byte per fragment chunk
+#   "1-5" — randomly choose 1 through 5 bytes for each chunk
+#   128   — moderate fragmentation
+#
+# A fresh value is chosen for each fragment chunk. Smaller values produce more
+# chunks and are harder for DPI to reassemble, at the cost of connection-start
+# overhead. If this field is omitted, ZeroDPI falls back to legacy TCP_SEG_SIZE.
+#
+# Must be >= 1.  Default: unset (uses TCP_SEG_SIZE).
+TLS_FRAG_LENGTH = "1"
+
+# Delay between fragment chunks, in milliseconds.
+#
+# Accepts either a fixed integer or an inclusive range string:
+#   0      — write chunks back-to-back
+#   "0-10" — randomly wait 0 through 10 ms between chunks
+#   5      — wait 5 ms between chunks
+#
+# A fresh value is chosen between each pair of chunks. ZeroDPI does not sleep
+# after the last chunk.
+#
+# Must be >= 0.  Default: 0.
+TLS_FRAG_INTERVAL_MS = "0"
+
+# Legacy fixed fragment length fallback.
+#
+# Existing configs can keep using TCP_SEG_SIZE. New configs should prefer
+# TLS_FRAG_LENGTH because it supports Xray-style ranges.
+#
+# Used only when TLS_FRAG_LENGTH is omitted. Must be >= 1. Default: 1.
 TCP_SEG_SIZE = 1
 
 # Whether to set TCP_NODELAY on the upstream socket before writing the
-# segmented ClientHello.
+# fragmented ClientHello or selected client writes.
 #
 # TCP_NODELAY disables Nagle's algorithm, which would otherwise accumulate
 # small writes into a single large TCP segment and completely defeat this
-# bypass method.  Keep this enabled for normal use.
+# bypass method.  Keep this enabled for normal TCP-segmentation use.
 #
 # Set to false only when debugging a specific network or middlebox that
 # reacts poorly to TCP_NODELAY connections.

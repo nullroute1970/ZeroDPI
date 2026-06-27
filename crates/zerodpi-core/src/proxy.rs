@@ -11,8 +11,8 @@
 //!    the flow is still being intercepted.
 //! 5. Once the bypass completes, the proxy runs a normal bidirectional copy
 //!    between the two sockets.
-//! 6. For `wrong_seq_tls_frag` and `wrong_md5_tls_frag`, step 4 writes the
-//!    intact ClientHello in small TCP segments using the same `TCP_SEG_*`
+//! 6. For `wrong_seq_tls_frag` and `wrong_md5_tls_frag`, step 4 writes
+//!    configured client data in small TCP chunks using the same `TLS_FRAG_*`
 //!    settings as `tls_frag`.
 //!
 //! For `ip_bypass_plus`, IP scanning selects the upstream IPv4 address, then
@@ -22,10 +22,10 @@
 //! For socket-based methods (`tls_frag`, TCP-level TLS Fragment):
 //! 1. Accept incoming TCP on `LISTEN_HOST:LISTEN_PORT`.
 //! 2. Connect to the upstream server (no FlowTable registration, no interceptor).
-//! 3. Read one complete TLS record (the ClientHello) from the client socket.
-//! 4. Write the intact TLS record to the upstream socket in tiny chunks with
-//!    `TCP_NODELAY` so each chunk arrives as a separate TCP segment.
-//! 5. Hand off to the normal bidirectional relay.
+//! 3. In `tlshello` mode, read one complete TLS record (the ClientHello) and
+//!    write it to the upstream socket in configured chunks.
+//! 4. In packet-range mode, let the relay fragment selected client writes.
+//! 5. Relay the rest of the session normally.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,14 +33,14 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Context;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, TlsFragPackets};
 use crate::flow::{BypassOutcome, FlowEntry, FlowKey, FlowTable};
-use crate::methods::tcp_segmentation::{read_one_tls_record, write_segmented, TcpSegmentation};
+use crate::methods::tcp_segmentation::{read_one_tls_record, write_fragmented, TcpSegmentation};
 use crate::tls_template::build_client_hello;
 
 // ---------------------------------------------------------------------------
@@ -138,8 +138,7 @@ struct ConnectionSettings {
     bypass_timeout: Duration,
     max_lifetime: Option<Duration>,
     segment_first_client_hello: bool,
-    tcp_seg_size: usize,
-    tcp_seg_nodelay: bool,
+    tcp_segmentation: TcpSegmentation,
 }
 
 impl ConnectionSettings {
@@ -149,8 +148,7 @@ impl ConnectionSettings {
             bypass_timeout: Duration::from_secs(cfg.BYPASS_TIMEOUT_SECS),
             max_lifetime: configured_relay_max_lifetime(cfg),
             segment_first_client_hello: method_segments_first_client_hello(&cfg.BYPASS_METHOD),
-            tcp_seg_size: tcp_segmentation.seg_size,
-            tcp_seg_nodelay: tcp_segmentation.nodelay,
+            tcp_segmentation,
         }
     }
 }
@@ -182,6 +180,105 @@ fn emit(tx: &Option<ProxyEventSender>, event: ProxyEvent) {
 
 fn configured_relay_max_lifetime(cfg: &Config) -> Option<Duration> {
     (cfg.RELAY_MAX_LIFETIME_SECS > 0).then(|| Duration::from_secs(cfg.RELAY_MAX_LIFETIME_SECS))
+}
+
+async fn read_one_client_write(src: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = src
+        .read(&mut buf)
+        .await
+        .context("reading client data write")?;
+    if n == 0 {
+        anyhow::bail!("client closed before sending data");
+    }
+    buf.truncate(n);
+    Ok(buf)
+}
+
+async fn write_client_data<W>(
+    dst: &mut W,
+    data: &[u8],
+    segmentation: TcpSegmentation,
+    write_index: u32,
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if segmentation.fragments_write(write_index) {
+        write_fragmented(dst, data, segmentation.length, segmentation.interval_ms).await
+    } else {
+        dst.write_all(data).await.context("writing client data")?;
+        dst.flush().await.context("flushing client data")?;
+        Ok(())
+    }
+}
+
+async fn read_client_tls_record_with_timeout(
+    incoming: &mut TcpStream,
+    timeout: Duration,
+    entry: &FlowEntry,
+    event_tx: &Option<ProxyEventSender>,
+    src_port: u16,
+) -> anyhow::Result<Vec<u8>> {
+    match tokio::time::timeout(timeout, read_one_tls_record(incoming)).await {
+        Ok(Ok(record)) => Ok(record),
+        Ok(Err(e)) => {
+            entry.finish(BypassOutcome::UnexpectedClose);
+            emit(
+                event_tx,
+                ProxyEvent::BypassComplete {
+                    src_port,
+                    outcome: BypassOutcome::UnexpectedClose,
+                },
+            );
+            Err(e).context("reading ClientHello from client")
+        }
+        Err(_) => {
+            entry.finish(BypassOutcome::UnexpectedClose);
+            emit(
+                event_tx,
+                ProxyEvent::BypassComplete {
+                    src_port,
+                    outcome: BypassOutcome::UnexpectedClose,
+                },
+            );
+            anyhow::bail!("timed out reading ClientHello from client");
+        }
+    }
+}
+
+async fn read_client_write_with_timeout(
+    incoming: &mut TcpStream,
+    timeout: Duration,
+    entry: &FlowEntry,
+    event_tx: &Option<ProxyEventSender>,
+    src_port: u16,
+) -> anyhow::Result<Vec<u8>> {
+    match tokio::time::timeout(timeout, read_one_client_write(incoming)).await {
+        Ok(Ok(data)) => Ok(data),
+        Ok(Err(e)) => {
+            entry.finish(BypassOutcome::UnexpectedClose);
+            emit(
+                event_tx,
+                ProxyEvent::BypassComplete {
+                    src_port,
+                    outcome: BypassOutcome::UnexpectedClose,
+                },
+            );
+            Err(e).context("reading client data from client")
+        }
+        Err(_) => {
+            entry.finish(BypassOutcome::UnexpectedClose);
+            emit(
+                event_tx,
+                ProxyEvent::BypassComplete {
+                    src_port,
+                    outcome: BypassOutcome::UnexpectedClose,
+                },
+            );
+            anyhow::bail!("timed out reading client data from client");
+        }
+    }
 }
 
 /// How long to wait for the bypass to complete before giving up.
@@ -457,6 +554,8 @@ async fn handle_intercept_connection(
         }
     };
 
+    let mut client_fragmentation_after_prefix = None;
+
     // Wait until the interceptor either completes a fake-packet bypass or asks
     // us to send the first real ClientHello while the flow is still tracked.
     match wait_for_initial_bypass_progress(&entry, settings.bypass_timeout).await {
@@ -470,57 +569,79 @@ async fn handle_intercept_connection(
             )?;
         }
         Some(BypassProgress::ReadyForData) => {
-            let client_hello = match tokio::time::timeout(
-                settings.bypass_timeout,
-                read_one_tls_record(&mut incoming),
-            )
-            .await
-            {
-                Ok(Ok(record)) => record,
-                Ok(Err(e)) => {
-                    entry.finish(BypassOutcome::UnexpectedClose);
-                    emit(
-                        &event_tx,
-                        ProxyEvent::BypassComplete {
-                            src_port,
-                            outcome: BypassOutcome::UnexpectedClose,
-                        },
-                    );
-                    return Err(e).context("reading ClientHello from client");
-                }
-                Err(_) => {
-                    entry.finish(BypassOutcome::UnexpectedClose);
-                    emit(
-                        &event_tx,
-                        ProxyEvent::BypassComplete {
-                            src_port,
-                            outcome: BypassOutcome::UnexpectedClose,
-                        },
-                    );
-                    anyhow::bail!("timed out reading ClientHello from client");
-                }
-            };
-
             if settings.segment_first_client_hello {
-                if settings.tcp_seg_nodelay {
+                let segmentation = settings.tcp_segmentation;
+                if segmentation.nodelay {
                     outgoing
                         .set_nodelay(true)
                         .context("combo tls_frag: set_nodelay on upstream socket")?;
                 }
-                if let Err(e) =
-                    write_segmented(&mut outgoing, &client_hello, settings.tcp_seg_size).await
-                {
-                    entry.finish(BypassOutcome::UnexpectedClose);
-                    emit(
-                        &event_tx,
-                        ProxyEvent::BypassComplete {
+
+                match segmentation.packets {
+                    TlsFragPackets::TlsHello => {
+                        let client_hello = read_client_tls_record_with_timeout(
+                            &mut incoming,
+                            settings.bypass_timeout,
+                            &entry,
+                            &event_tx,
                             src_port,
-                            outcome: BypassOutcome::UnexpectedClose,
-                        },
-                    );
-                    return Err(e).context("combo tls_frag: writing segmented ClientHello");
+                        )
+                        .await?;
+                        if let Err(e) = write_fragmented(
+                            &mut outgoing,
+                            &client_hello,
+                            segmentation.length,
+                            segmentation.interval_ms,
+                        )
+                        .await
+                        {
+                            entry.finish(BypassOutcome::UnexpectedClose);
+                            emit(
+                                &event_tx,
+                                ProxyEvent::BypassComplete {
+                                    src_port,
+                                    outcome: BypassOutcome::UnexpectedClose,
+                                },
+                            );
+                            return Err(e)
+                                .context("combo tls_frag: writing fragmented ClientHello");
+                        }
+                    }
+                    TlsFragPackets::WriteRange { .. } => {
+                        let client_data = read_client_write_with_timeout(
+                            &mut incoming,
+                            settings.bypass_timeout,
+                            &entry,
+                            &event_tx,
+                            src_port,
+                        )
+                        .await?;
+                        if let Err(e) =
+                            write_client_data(&mut outgoing, &client_data, segmentation, 1).await
+                        {
+                            entry.finish(BypassOutcome::UnexpectedClose);
+                            emit(
+                                &event_tx,
+                                ProxyEvent::BypassComplete {
+                                    src_port,
+                                    outcome: BypassOutcome::UnexpectedClose,
+                                },
+                            );
+                            return Err(e).context("combo tls_frag: writing first client data");
+                        }
+                        client_fragmentation_after_prefix = Some((segmentation, 1));
+                    }
                 }
             } else {
+                let client_hello = read_client_tls_record_with_timeout(
+                    &mut incoming,
+                    settings.bypass_timeout,
+                    &entry,
+                    &event_tx,
+                    src_port,
+                )
+                .await?;
+
                 if let Err(e) = outgoing.write_all(&client_hello).await {
                     entry.finish(BypassOutcome::UnexpectedClose);
                     emit(
@@ -565,12 +686,13 @@ async fn handle_intercept_connection(
     drop(cleanup);
 
     // Bidirectional relay with periodic progress events.
-    let relay = counting_relay(
+    let relay = counting_relay_with_client_fragmentation(
         incoming,
         outgoing,
         &event_tx,
         src_port,
         settings.max_lifetime,
+        client_fragmentation_after_prefix,
     )
     .await;
     debug!(
@@ -703,10 +825,9 @@ impl<F: FnOnce()> Drop for ScopeGuard<F> {
 /// the platform packet interceptor.  Instead:
 ///
 /// 1. Connects to the upstream server (with `TCP_NODELAY` if configured).
-/// 2. Reads exactly one complete TLS record from the client — the ClientHello.
-/// 3. Writes it to the upstream socket in chunks of `TCP_SEG_SIZE` bytes.
-///    With `TCP_NODELAY` each chunk is sent as a separate TCP segment.
-/// 4. Hands off to the normal bidirectional relay.
+/// 2. In `tlshello` mode, reads and fragments the first complete TLS record.
+/// 3. In packet-range mode, lets the relay fragment selected client writes.
+/// 4. Hands off to the normal bidirectional relay for all unselected data.
 async fn handle_tcp_seg_connection_with_ip(
     cfg: Arc<Config>,
     connect_ip: Ipv4Addr,
@@ -742,22 +863,43 @@ async fn handle_tcp_seg_connection_with_ip(
             .context("tls_frag: set_nodelay on upstream socket")?;
     }
 
-    // Read exactly one TLS record (the ClientHello) from the client.
-    let client_hello = read_one_tls_record(&mut incoming)
-        .await
-        .context("tls_frag: reading ClientHello from client")?;
+    let client_fragmentation = match method.packets {
+        TlsFragPackets::TlsHello => {
+            // Read exactly one TLS record (the ClientHello) from the client.
+            let client_hello = read_one_tls_record(&mut incoming)
+                .await
+                .context("tls_frag: reading ClientHello from client")?;
 
-    // Write it to the upstream socket in small segments.
-    write_segmented(&mut outgoing, &client_hello, method.seg_size)
-        .await
-        .context("tls_frag: writing segmented ClientHello")?;
+            // Write it to the upstream socket in configured fragments.
+            write_fragmented(
+                &mut outgoing,
+                &client_hello,
+                method.length,
+                method.interval_ms,
+            )
+            .await
+            .context("tls_frag: writing fragmented ClientHello")?;
 
-    debug!(
-        seg_size = method.seg_size,
-        nodelay = method.nodelay,
-        total_bytes = client_hello.len(),
-        "tls_frag: ClientHello written in segments; handing off to relay"
-    );
+            debug!(
+                length = %method.length,
+                interval_ms = %method.interval_ms,
+                nodelay = method.nodelay,
+                total_bytes = client_hello.len(),
+                "tls_frag: ClientHello written in fragments; handing off to relay"
+            );
+            None
+        }
+        TlsFragPackets::WriteRange { .. } => {
+            debug!(
+                packets = ?method.packets,
+                length = %method.length,
+                interval_ms = %method.interval_ms,
+                nodelay = method.nodelay,
+                "tls_frag: fragmenting selected client writes in relay"
+            );
+            Some((method, 0))
+        }
+    };
 
     emit(
         &event_tx,
@@ -768,13 +910,15 @@ async fn handle_tcp_seg_connection_with_ip(
     );
 
     // Bidirectional relay for the rest of the session.
-    // The ClientHello has already been forwarded; the relay starts mid-stream.
-    let relay = counting_relay(
+    // In tlshello mode, the ClientHello has already been forwarded; in write
+    // range mode, selected client writes are fragmented by the relay itself.
+    let relay = counting_relay_with_client_fragmentation(
         incoming,
         outgoing,
         &event_tx,
         src_port,
         configured_relay_max_lifetime(&cfg),
+        client_fragmentation,
     )
     .await;
     debug!(
@@ -812,13 +956,37 @@ async fn counting_relay(
     src_port: u16,
     max_lifetime: Option<Duration>,
 ) -> RelayResult {
+    counting_relay_with_client_fragmentation(
+        incoming,
+        outgoing,
+        event_tx,
+        src_port,
+        max_lifetime,
+        None,
+    )
+    .await
+}
+
+async fn counting_relay_with_client_fragmentation(
+    incoming: TcpStream,
+    outgoing: TcpStream,
+    event_tx: &Option<ProxyEventSender>,
+    src_port: u16,
+    max_lifetime: Option<Duration>,
+    client_fragmentation: Option<(TcpSegmentation, u32)>,
+) -> RelayResult {
     let (inc_rd, inc_wr) = incoming.into_split();
     let (out_rd, out_wr) = outgoing.into_split();
 
     let c2s_atomic = Arc::new(AtomicU64::new(0));
     let s2c_atomic = Arc::new(AtomicU64::new(0));
 
-    let mut c2s_task = tokio::spawn(copy_counting(inc_rd, out_wr, c2s_atomic.clone()));
+    let mut c2s_task = tokio::spawn(copy_counting_client_to_server(
+        inc_rd,
+        out_wr,
+        c2s_atomic.clone(),
+        client_fragmentation,
+    ));
     let mut s2c_task = tokio::spawn(copy_counting(out_rd, inc_wr, s2c_atomic.clone()));
 
     // Progress ticker — only spawned in interactive mode.
@@ -903,6 +1071,43 @@ async fn counting_relay(
 /// Copy all bytes from `reader` to `writer`, updating `counter` after each
 /// chunk.  Shuts down `writer` gracefully on EOF or error, then returns the
 /// total bytes copied.
+async fn copy_counting_client_to_server(
+    mut reader: tokio::net::tcp::OwnedReadHalf,
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    counter: Arc<AtomicU64>,
+    client_fragmentation: Option<(TcpSegmentation, u32)>,
+) -> u64 {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    let mut write_index = client_fragmentation.map(|(_, index)| index).unwrap_or(0);
+    let segmentation = client_fragmentation.map(|(segmentation, _)| segmentation);
+
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+
+        write_index = write_index.saturating_add(1);
+        let write_result = if let Some(segmentation) = segmentation {
+            write_client_data(&mut writer, &buf[..n], segmentation, write_index).await
+        } else {
+            writer
+                .write_all(&buf[..n])
+                .await
+                .map_err(anyhow::Error::from)
+        };
+
+        if write_result.is_err() {
+            break;
+        }
+        total += n as u64;
+        counter.store(total, Ordering::Relaxed);
+    }
+    let _ = writer.shutdown().await;
+    total
+}
+
 async fn copy_counting(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
@@ -1040,7 +1245,11 @@ async fn handle_ip_bypass_connection(
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
+
     use super::*;
+    use tokio::io::AsyncWrite;
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -1049,6 +1258,45 @@ mod tests {
         let accept = listener.accept();
         let (client, accepted) = tokio::join!(connect, accept);
         (client.unwrap(), accepted.unwrap().0)
+    }
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes.push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn test_segmentation() -> TcpSegmentation {
+        TcpSegmentation {
+            packets: TlsFragPackets::WriteRange { start: 1, end: 1 },
+            length: crate::config::Int32Range::exact(1),
+            interval_ms: crate::config::Int32Range::exact(0),
+            nodelay: true,
+        }
     }
 
     #[tokio::test]
@@ -1101,6 +1349,31 @@ mod tests {
         assert_eq!(result.reason, RelayEndReason::MaxLifetime);
         assert_eq!(result.c2s_bytes, 0);
         assert_eq!(result.s2c_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn selected_client_write_is_fragmented() {
+        let mut writer = RecordingWriter::default();
+
+        write_client_data(&mut writer, b"abc", test_segmentation(), 1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            writer.writes,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn unselected_client_write_is_forwarded_once() {
+        let mut writer = RecordingWriter::default();
+
+        write_client_data(&mut writer, b"abc", test_segmentation(), 2)
+            .await
+            .unwrap();
+
+        assert_eq!(writer.writes, vec![b"abc".to_vec()]);
     }
 
     #[tokio::test]

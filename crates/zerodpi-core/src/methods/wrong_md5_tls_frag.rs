@@ -2,8 +2,8 @@
 //!
 //! The first stage injects a fake ClientHello with a TCP-MD5 Signature option
 //! so DPI can classify the flow from a decoy packet the server should reject.
-//! The second stage lets the proxy write the intact real ClientHello in small
-//! TCP segments for downstream DPI layers that still inspect the real stream.
+//! The second stage lets the proxy fragment configured real client data for
+//! downstream DPI layers that still inspect the real stream.
 
 use tracing::trace;
 

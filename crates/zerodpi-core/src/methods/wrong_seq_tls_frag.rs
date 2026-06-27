@@ -2,9 +2,9 @@
 //!
 //! This method targets layered DPI paths.  The first stage injects a fake
 //! ClientHello with an old TCP sequence number so the first DPI layer can be
-//! desynchronized.  The second stage lets the proxy write the intact real
-//! ClientHello as small TCP segments so downstream DPI layers that never saw
-//! the fake packet still have to reassemble the real TCP stream.
+//! desynchronized.  The second stage lets the proxy fragment configured real
+//! client data so downstream DPI layers that never saw the fake packet still
+//! have to reassemble the real TCP stream.
 
 use tracing::trace;
 

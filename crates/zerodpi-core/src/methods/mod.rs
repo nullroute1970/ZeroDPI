@@ -25,9 +25,9 @@
 //! `TcpStream` directly.  They do **not** implement [`BypassMethod`] and the
 //! flow is never registered in the [`crate::flow::FlowTable`].
 //!
-//! - `tls_frag` — TCP-level TLS Fragment. Writes the intact real
-//!   ClientHello record in tiny TCP segments with `TCP_NODELAY` so DPI cannot
-//!   reassemble the SNI from any single packet.
+//! - `tls_frag` — TCP-level TLS Fragment. Writes selected client data in
+//!   small chunks with `TCP_NODELAY` so DPI cannot reassemble the SNI from any
+//!   single packet.
 //!
 //! New interceptor-based methods only need to implement this trait and be
 //! registered in [`build_method`].  New socket-based methods must be wired

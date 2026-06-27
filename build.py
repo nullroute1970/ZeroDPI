@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-build.py – Build ZeroDPI for the current platform, Windows, Linux, or Termux.
+build.py - Build ZeroDPI for the current platform, Windows, Linux, Termux, or Android.
 
 Usage:
-    python build.py [--platform linux|windows|termux|android-app|all]
+    python build.py [--platform linux|windows|termux|android|android-app|all]
                    [--windivert-version <ver>] [--toolchain <toolchain>]
                    [--msys2-path <path>]
                    [--termux-arch all|armv7|armv8|<arch>] [--android-ndk <path>]
@@ -36,7 +36,8 @@ Android app runtime:
   2. Builds ABI-specific zerodpi executables for APK packaging.
   3. Stages jniLibs/<abi>/libzerodpi_exec.so plus bin/<abi>/zerodpi under
      dist/android-app/<rootless|full>/.
-  4. The default rootless runtime disables NFQUEUE packet interception so the
+  4. Runs the Android Gradle project and copies the APK into the same dist dir.
+  5. The default rootless runtime disables NFQUEUE packet interception so the
      first APK runtime can ship without external netfilter dependencies.
 """
 
@@ -126,7 +127,13 @@ ANDROID_APP_ABI_ALIASES = {
 }
 ANDROID_APP_ABI_CHOICES = ("all", "public", "debug") + tuple(sorted(ANDROID_APP_ABI_ALIASES))
 ANDROID_APP_RUNTIME_CHOICES = ("rootless", "full", "both")
+ANDROID_APP_BUILD_TYPES = ("debug", "release")
+ANDROID_GRADLE_FALLBACK_VERSION = "9.5.0"
+ANDROID_GRADLE_INCOMPATIBLE_MIN_VERSION = (9, 6)
 REPO_ROOT = Path(__file__).resolve().parent
+ANDROID_PROJECT_DIR = REPO_ROOT / "android"
+ANDROID_APP_MODULE_DIR = ANDROID_PROJECT_DIR / "app"
+ANDROID_GRADLE_DIST_DIR = REPO_ROOT / ".gradle-dist"
 CARGO_RELEASE_DIR = REPO_ROOT / "target" / "release"
 COMMON_DIST_FILES = ("config.toml", "sni_list.txt", "ip_list.txt", "README.md")
 LINUX_DIST_FILES = ("install-systemd.sh",)
@@ -902,6 +909,335 @@ def print_android_app_contents(dist_dir: Path) -> None:
             print(f"  {f.relative_to(dist_dir)}")
 
 
+def parse_gradle_version(output: str) -> tuple[int, ...] | None:
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("Gradle "):
+            continue
+        raw_version = line.split(None, 1)[1]
+        parts: list[int] = []
+        for part in raw_version.split("."):
+            digits = ""
+            for ch in part:
+                if not ch.isdigit():
+                    break
+                digits += ch
+            if not digits:
+                break
+            parts.append(int(digits))
+        if parts:
+            return tuple(parts)
+    return None
+
+
+def version_at_least(version: tuple[int, ...], minimum: tuple[int, ...]) -> bool:
+    width = max(len(version), len(minimum))
+    padded_version = version + (0,) * (width - len(version))
+    padded_minimum = minimum + (0,) * (width - len(minimum))
+    return padded_version >= padded_minimum
+
+
+def format_gradle_version(version: tuple[int, ...] | None) -> str:
+    if version is None:
+        return "unknown"
+    return ".".join(str(part) for part in version)
+
+
+def gradle_command_version(cmd: list[str]) -> tuple[int, ...] | None:
+    result = subprocess.run(
+        [*cmd, "-v"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return parse_gradle_version(f"{result.stdout}\n{result.stderr}")
+
+
+def is_android_gradle_incompatible(version: tuple[int, ...] | None) -> bool:
+    return version is not None and version_at_least(
+        version,
+        ANDROID_GRADLE_INCOMPATIBLE_MIN_VERSION,
+    )
+
+
+def android_gradle_executable(dist_dir: Path) -> Path:
+    script = "gradle.bat" if platform.system() == "Windows" else "gradle"
+    return dist_dir / "bin" / script
+
+
+def ensure_android_gradle_distribution(version: str = ANDROID_GRADLE_FALLBACK_VERSION) -> Path:
+    dist_dir = ANDROID_GRADLE_DIST_DIR / f"gradle-{version}"
+    gradle = android_gradle_executable(dist_dir)
+    if gradle.is_file():
+        return gradle
+
+    url = f"https://services.gradle.org/distributions/gradle-{version}-bin.zip"
+    print(
+        "\nDownloading compatible Gradle distribution "
+        f"{version} for Android APK builds:\n  {url}"
+    )
+    ANDROID_GRADLE_DIST_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        urllib.request.urlretrieve(url, tmp_path)
+        with zipfile.ZipFile(tmp_path, "r") as zf:
+            zf.extractall(ANDROID_GRADLE_DIST_DIR)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    if not gradle.is_file():
+        die(f"Downloaded Gradle {version}, but expected executable was not found: {gradle}")
+    if platform.system() != "Windows":
+        gradle.chmod(gradle.stat().st_mode | 0o111)
+    return gradle
+
+
+def resolve_explicit_gradle_command(android_gradle: str) -> list[str]:
+    gradle_path = Path(android_gradle).expanduser()
+    if gradle_path.is_file():
+        return [str(gradle_path.resolve())]
+    gradle_on_path = shutil.which(android_gradle)
+    if gradle_on_path:
+        return [gradle_on_path]
+    die(f"Gradle executable not found: {android_gradle}")
+
+
+def resolve_android_sdk(ndk_path: Path | None) -> Path | None:
+    for name in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        sdk = os.environ.get(name)
+        if sdk:
+            sdk_path = Path(sdk).expanduser().resolve()
+            if sdk_path.is_dir():
+                return sdk_path
+
+    if ndk_path and ndk_path.parent.name == "ndk":
+        sdk_path = ndk_path.parent.parent
+        if sdk_path.is_dir():
+            return sdk_path
+
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    if local_appdata:
+        sdk_path = Path(local_appdata) / "Android" / "Sdk"
+        if sdk_path.is_dir():
+            return sdk_path.resolve()
+
+    return None
+
+
+def java_executable(java_home: Path) -> Path:
+    script = "java.exe" if platform.system() == "Windows" else "java"
+    return java_home / "bin" / script
+
+
+def java_home_major_version(java_home: Path) -> int | None:
+    java = java_executable(java_home)
+    if not java.is_file():
+        return None
+
+    result = subprocess.run(
+        [str(java), "-version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = f"{result.stdout}\n{result.stderr}"
+    marker = 'version "'
+    start = output.find(marker)
+    if start == -1:
+        return None
+    start += len(marker)
+    end = output.find('"', start)
+    if end == -1:
+        return None
+
+    raw_version = output[start:end]
+    if raw_version.startswith("1."):
+        raw_version = raw_version[2:]
+    major = raw_version.split(".", 1)[0]
+    return int(major) if major.isdigit() else None
+
+
+def android_java_home_candidates() -> list[Path]:
+    candidates: list[Path] = []
+
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        candidates.append(Path(java_home).expanduser())
+
+    if platform.system() == "Windows":
+        for env_name in ("ProgramFiles", "ProgramW6432"):
+            program_files = os.environ.get(env_name)
+            if not program_files:
+                continue
+            candidates.append(Path(program_files) / "Android" / "Android Studio" / "jbr")
+            java_dir = Path(program_files) / "Java"
+            if java_dir.is_dir():
+                candidates.extend(sorted(java_dir.glob("jdk-21*"), reverse=True))
+                candidates.extend(sorted(java_dir.glob("jdk-17*"), reverse=True))
+    elif platform.system() == "Darwin":
+        candidates.append(Path("/Applications/Android Studio.app/Contents/jbr/Contents/Home"))
+        java_vm_dir = Path("/Library/Java/JavaVirtualMachines")
+        if java_vm_dir.is_dir():
+            candidates.extend(sorted(java_vm_dir.glob("jdk-21*.jdk/Contents/Home"), reverse=True))
+            candidates.extend(sorted(java_vm_dir.glob("jdk-17*.jdk/Contents/Home"), reverse=True))
+    else:
+        jvm_dir = Path("/usr/lib/jvm")
+        if jvm_dir.is_dir():
+            candidates.extend(sorted(jvm_dir.glob("java-21*"), reverse=True))
+            candidates.extend(sorted(jvm_dir.glob("jdk-21*"), reverse=True))
+            candidates.extend(sorted(jvm_dir.glob("java-17*"), reverse=True))
+            candidates.extend(sorted(jvm_dir.glob("jdk-17*"), reverse=True))
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved not in seen:
+            seen.add(resolved)
+            deduped.append(resolved)
+    return deduped
+
+
+def resolve_android_java_home() -> Path | None:
+    fallback: Path | None = None
+    for candidate in android_java_home_candidates():
+        major = java_home_major_version(candidate)
+        if major is None:
+            continue
+        if fallback is None:
+            fallback = candidate
+        if 17 <= major <= 21:
+            return candidate
+    return fallback
+
+
+def android_gradle_env(ndk_path: Path | None) -> dict:
+    env: dict = {}
+    sdk_path = resolve_android_sdk(ndk_path)
+    if sdk_path is None:
+        local_properties = ANDROID_PROJECT_DIR / "local.properties"
+        if not local_properties.is_file():
+            die(
+                "Android SDK not found. Set ANDROID_HOME or ANDROID_SDK_ROOT, "
+                f"or create {local_properties} with sdk.dir=<path>."
+            )
+    else:
+        print(f"Android SDK detected at: {sdk_path}")
+        env.update(
+            {
+                "ANDROID_HOME": str(sdk_path),
+                "ANDROID_SDK_ROOT": str(sdk_path),
+            }
+        )
+
+    java_home = resolve_android_java_home()
+    if java_home is not None:
+        print(f"Android Gradle JAVA_HOME: {java_home}")
+        env["JAVA_HOME"] = str(java_home)
+        env["PATH"] = f"{java_home / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
+
+    return env
+
+
+def resolve_gradle_command(android_gradle: str | None) -> list[str]:
+    if not ANDROID_PROJECT_DIR.is_dir():
+        die(f"Android project directory not found: {ANDROID_PROJECT_DIR}")
+
+    if android_gradle:
+        cmd = resolve_explicit_gradle_command(android_gradle)
+        version = gradle_command_version(cmd)
+        if is_android_gradle_incompatible(version):
+            die(
+                f"Gradle {format_gradle_version(version)} is incompatible with "
+                "this Android Gradle Plugin 8.x project. Use Gradle "
+                f"{ANDROID_GRADLE_FALLBACK_VERSION}, or omit --android-gradle "
+                "to let build.py use a compatible local distribution."
+            )
+        return cmd
+
+    wrapper = ANDROID_PROJECT_DIR / ("gradlew.bat" if platform.system() == "Windows" else "gradlew")
+    if wrapper.is_file():
+        cmd = [str(wrapper)]
+        version = gradle_command_version(cmd)
+        if not is_android_gradle_incompatible(version):
+            return cmd
+        print(
+            f"Android Gradle wrapper version {format_gradle_version(version)} is "
+            "incompatible with this AGP 8.x project; using a compatible local "
+            f"Gradle {ANDROID_GRADLE_FALLBACK_VERSION} distribution."
+        )
+
+    gradle_on_path = shutil.which("gradle")
+    if gradle_on_path:
+        cmd = [gradle_on_path]
+        version = gradle_command_version(cmd)
+        if not is_android_gradle_incompatible(version):
+            return cmd
+        print(
+            f"Gradle {format_gradle_version(version)} on PATH is incompatible "
+            "with this AGP 8.x project; using a compatible local "
+            f"Gradle {ANDROID_GRADLE_FALLBACK_VERSION} distribution."
+        )
+
+    return [str(ensure_android_gradle_distribution())]
+
+
+def android_gradle_task(build_type: str) -> str:
+    return f":app:assemble{build_type.capitalize()}"
+
+
+def find_android_apk(build_type: str) -> Path:
+    output_dir = ANDROID_APP_MODULE_DIR / "build" / "outputs" / "apk" / build_type
+    for name in (f"app-{build_type}.apk", f"app-{build_type}-unsigned.apk"):
+        apk = output_dir / name
+        if apk.is_file():
+            return apk
+
+    apks = sorted(
+        output_dir.glob("*.apk"),
+        key=lambda apk: apk.stat().st_mtime,
+        reverse=True,
+    )
+    if not apks:
+        die(f"Expected Android APK not found under: {output_dir}")
+    return apks[0]
+
+
+def build_android_app_apk(
+    runtime: str,
+    dist_dir: Path,
+    build_type: str,
+    android_gradle: str | None,
+    ndk_path: Path | None,
+) -> Path:
+    print(f"\n--- Building Android APK ({runtime}, {build_type}) ---")
+    gradle_cmd = resolve_gradle_command(android_gradle)
+    run(
+        [
+            *gradle_cmd,
+            "-p",
+            str(ANDROID_PROJECT_DIR),
+            f"-PzerodpiRuntimeDir={dist_dir}",
+            android_gradle_task(build_type),
+            "--no-daemon",
+            "--rerun-tasks",
+        ],
+        env=android_gradle_env(ndk_path),
+    )
+
+    apk = find_android_apk(build_type)
+    packaged_apk = dist_dir / f"zerodpi-android-{runtime}-{build_type}.apk"
+    copy_required_file(apk, packaged_apk)
+    print(f"Android APK copied to: {packaged_apk}")
+    return packaged_apk
+
+
 def build_android_app_abi(
     abi: str,
     runtime: str,
@@ -947,12 +1283,14 @@ def build_android_app_runtime(
     runtime_arg: str,
     android_ndk: str | None,
     android_api: int,
+    build_type: str,
+    android_gradle: str | None,
 ) -> None:
     abis = resolve_android_app_abis(abi_arg)
     runtimes = resolve_android_app_runtimes(runtime_arg)
     label = ", ".join(abis)
     runtime_label = ", ".join(runtimes)
-    print(f"=== Building ZeroDPI Android app runtime artifacts ({runtime_label}; {label}) ===")
+    print(f"=== Building ZeroDPI Android app APK ({runtime_label}; {label}; {build_type}) ===")
 
     if android_api < ANDROID_DEFAULT_API_LEVEL:
         die(f"Android API level must be {ANDROID_DEFAULT_API_LEVEL} or newer.")
@@ -971,6 +1309,7 @@ def build_android_app_runtime(
             for abi in abis
         ]
         write_android_app_manifest(dist_dir, runtime, android_api, entries)
+        build_android_app_apk(runtime, dist_dir, build_type, android_gradle, ndk_path)
         print_android_app_contents(dist_dir)
 
 
@@ -1042,14 +1381,14 @@ def build_all(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build ZeroDPI for the current platform, Windows, Linux, Termux, or Android app runtime packaging.")
+    parser = argparse.ArgumentParser(description="Build ZeroDPI for the current platform, Windows, Linux, Termux, or Android APK packaging.")
     parser.add_argument(
         "--platform",
         "--target",
         dest="platform",
-        choices=("auto", "linux", "windows", "termux", "android-app", "all"),
+        choices=("auto", "linux", "windows", "termux", "android", "android-app", "all"),
         default="auto",
-        help="Build platform (default: auto-detect host OS). Use 'all' to build for Windows, Linux, and Termux.",
+        help="Build platform (default: auto-detect host OS). Use 'android' or 'android-app' to build the APK.",
     )
     parser.add_argument(
         "--windivert-version",
@@ -1120,6 +1459,21 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--android-app-build-type",
+        choices=ANDROID_APP_BUILD_TYPES,
+        default="debug",
+        help="Android app Gradle build type to assemble (default: debug).",
+    )
+    parser.add_argument(
+        "--android-gradle",
+        metavar="PATH",
+        help=(
+            "Gradle executable for Android APK builds. Defaults to android/gradlew "
+            "if present, then compatible gradle on PATH, then a local Gradle "
+            f"{ANDROID_GRADLE_FALLBACK_VERSION} download."
+        ),
+    )
+    parser.add_argument(
         "--linux-target",
         default=DEFAULT_LINUX_TARGET,
         metavar="TARGET",
@@ -1153,12 +1507,14 @@ def main() -> None:
         build_windows(args.windivert_version, args.toolchain, args.msys2_path)
     elif selected_platform == "termux":
         build_termux(args.termux_arch, args.android_ndk, args.android_api)
-    elif selected_platform == "android-app":
+    elif selected_platform in ("android", "android-app"):
         build_android_app_runtime(
             args.android_app_abi,
             args.android_app_runtime,
             args.android_ndk,
             args.android_api,
+            args.android_app_build_type,
+            args.android_gradle,
         )
     elif selected_platform == "all":
         build_all(

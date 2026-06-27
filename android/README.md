@@ -10,8 +10,8 @@ Current Phase 4 scope:
 - Service-owned `ZeroDpiRunner` interface.
 - `FakeZeroDpiRunner` for UI and service lifecycle testing without a native binary.
 - `ProcessZeroDpiRunner` placeholder for the process-wrapper MVP once
-  `dist/android-app/<runtime>/jniLibs/<abi>/libzerodpi_exec.so` is copied into
-  the app module.
+  `dist/android-app/<runtime>/jniLibs/<abi>/libzerodpi_exec.so` is packaged
+  into the APK.
 - App-private runtime storage under `files/zerodpi/`.
 - First-launch defaults copied from packaged assets:
   `config.toml`, `sni_list.txt`, and `ip_list.txt`.
@@ -20,12 +20,14 @@ Current Phase 4 scope:
 - `logs/` and `scan_results/` runtime directories.
 - AndroidX dependencies are pinned to the AGP 8.13 / compileSdk 36 generation.
 
-Build from this directory with Android Studio or an installed Gradle:
+Build the APK from the repository root:
 
 ```powershell
-cd android
-gradle :app:assembleDebug
+python build.py --platform android
 ```
+
+The APK is copied to `dist/android-app/<runtime>/zerodpi-android-<runtime>-debug.apk`.
+Pass `--android-app-build-type release` to assemble the release variant.
 
 The first run uses the fake runner unless an extracted native artifact named
 `libzerodpi_exec.so` exists in the app native library directory.

@@ -213,6 +213,7 @@ dist/windows/
 dist/linux/
 dist/linux/<target>/
 dist/termux/<arch>/
+dist/android-app/<runtime>/
 ```
 
 Copy or deploy the whole generated directory, not only the binary.
@@ -1163,12 +1164,14 @@ python build.py --platform termux --termux-arch armv8 --android-api 23
 python build.py --platform termux --termux-arch x86_64 --android-ndk /path/to/android-ndk
 ```
 
-Android app runtime artifacts for the future native APK are staged separately:
+Android app APK packaging stages the native runtime and then runs the Android
+Gradle project:
 
 ```sh
-python build.py --platform android-app
-python build.py --platform android-app --android-app-runtime both
-python build.py --platform android-app --android-app-abi debug --android-ndk /path/to/android-ndk
+python build.py --platform android
+python build.py --platform android --android-app-runtime both
+python build.py --platform android --android-app-abi debug --android-ndk /path/to/android-ndk
+python build.py --platform android --android-app-build-type release
 ```
 
 The default Android app build creates the first-release public ABIs
@@ -1194,13 +1197,14 @@ dist/android-app/rootless/
   bin/<abi>/zerodpi
   jniLibs/<abi>/libzerodpi_exec.so
   zerodpi-runtime-manifest.json
+  zerodpi-android-rootless-debug.apk
 ```
 
-For the process-wrapper APK, copy `jniLibs/` into the Android app module and
-run the ABI-matched `libzerodpi_exec.so` from `ApplicationInfo.nativeLibraryDir`.
-Do not rely on executing a binary copied into writable app data unless that is
-validated on target devices. `bin/<abi>/zerodpi` is provided for `adb` smoke
-tests such as `zerodpi --version` and rootless listener checks.
+`build.py` passes the staged runtime directory to Gradle, so the APK packages
+`jniLibs/` and the default config/list assets without a manual copy into the app
+module. The app runs the ABI-matched `libzerodpi_exec.so` from
+`ApplicationInfo.nativeLibraryDir`. `bin/<abi>/zerodpi` is still provided for
+`adb` smoke tests such as `zerodpi --version` and rootless listener checks.
 </details>
 
 ---

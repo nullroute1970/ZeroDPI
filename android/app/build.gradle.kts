@@ -6,6 +6,9 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val zeroDpiRuntimeDir = providers.gradleProperty("zerodpiRuntimeDir")
+    .map { file(it) }
+
 android {
     namespace = "dev.zerodpi.android"
     compileSdk = 36
@@ -26,6 +29,15 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        getByName("main") {
+            zeroDpiRuntimeDir.orNull?.let { runtimeDir ->
+                assets.setSrcDirs(listOf(runtimeDir.resolve("assets")))
+                jniLibs.srcDir(runtimeDir.resolve("jniLibs"))
+            }
+        }
     }
 }
 

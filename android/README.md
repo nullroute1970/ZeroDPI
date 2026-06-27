@@ -2,7 +2,7 @@
 
 This is the separate native Android app scaffold for ZeroDPI.
 
-Current Phase 3 scope:
+Current Phase 4 scope:
 
 - Kotlin Android application module under `android/app`.
 - Jetpack Compose dashboard UI.
@@ -12,6 +12,12 @@ Current Phase 3 scope:
 - `ProcessZeroDpiRunner` placeholder for the process-wrapper MVP once
   `dist/android-app/<runtime>/jniLibs/<abi>/libzerodpi_exec.so` is copied into
   the app module.
+- App-private runtime storage under `files/zerodpi/`.
+- First-launch defaults copied from packaged assets:
+  `config.toml`, `sni_list.txt`, and `ip_list.txt`.
+- Raw runtime file editor with Save and Reset to defaults actions.
+- Atomic runtime file saves with `.bak` backups.
+- `logs/` and `scan_results/` runtime directories.
 - AndroidX dependencies are pinned to the AGP 8.13 / compileSdk 36 generation.
 
 Build from this directory with Android Studio or an installed Gradle:

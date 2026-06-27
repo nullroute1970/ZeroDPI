@@ -27,11 +27,17 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val state by viewModel.uiState.collectAsState()
+            val runtimeFilesState by viewModel.runtimeFilesState.collectAsState()
             ZeroDpiTheme {
                 DashboardScreen(
                     state = state,
+                    runtimeFilesState = runtimeFilesState,
                     onStart = viewModel::start,
                     onStop = viewModel::stop,
+                    onRuntimeFileSelected = viewModel::selectRuntimeFile,
+                    onRuntimeFileTextChanged = viewModel::updateRuntimeFileText,
+                    onSaveRuntimeFile = viewModel::saveSelectedRuntimeFile,
+                    onResetRuntimeFile = viewModel::resetSelectedRuntimeFileToDefaults,
                 )
             }
         }

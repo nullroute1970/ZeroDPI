@@ -15,6 +15,7 @@ import dev.zerodpi.android.runtime.ProcessZeroDpiRunner
 import dev.zerodpi.android.runtime.ZeroDpiRunRequest
 import dev.zerodpi.android.runtime.ZeroDpiRunner
 import dev.zerodpi.android.runtime.ZeroDpiRunnerEvent
+import dev.zerodpi.android.storage.RuntimeStorage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -54,9 +55,11 @@ class ZeroDpiService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val state = MutableStateFlow(ZeroDpiServiceState())
     private lateinit var runner: ZeroDpiRunner
+    private lateinit var runtimeStorage: RuntimeStorage
 
     override fun onCreate() {
         super.onCreate()
+        runtimeStorage = RuntimeStorage(this)
         runner = createRunner()
         scope.launch {
             runner.events().collect { event ->
@@ -85,12 +88,26 @@ class ZeroDpiService : Service() {
     fun startZeroDpi() {
         ensureForeground()
         scope.launch {
-            val runtimeDir = File(filesDir, "zerodpi").apply {
-                mkdirs()
+            val runtimeFiles = runCatching {
+                runtimeStorage.ensureInitialized()
+            }.getOrElse { error ->
+                val message = error.message ?: "Failed to initialize runtime storage."
+                appendLog(message)
+                state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
+                return@launch
             }
+            runCatching {
+                runtimeStorage.prepareConfiguredDirectories()
+            }.getOrElse { error ->
+                val message = error.message ?: "Failed to prepare runtime paths."
+                appendLog(message)
+                state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
+                return@launch
+            }
+            appendLog("Runtime storage ready at ${runtimeFiles.runtimeDir.absolutePath}.")
             val request = ZeroDpiRunRequest(
-                configPath = File(runtimeDir, "config.toml").absolutePath,
-                workingDirectory = runtimeDir.absolutePath,
+                configPath = runtimeFiles.configFile.absolutePath,
+                workingDirectory = runtimeFiles.runtimeDir.absolutePath,
             )
             runner.start(request)
         }

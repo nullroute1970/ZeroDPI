@@ -4,6 +4,45 @@ This document is a planning artifact only. It does not implement the Android
 app. Use it as a phased checklist for building a separate native Android UI
 that controls ZeroDPI on Android.
 
+## Confirmed Product Scope
+
+Phase 0 is confirmed as of 2026-06-27. This is the scope record to use before
+any Android app scaffolding starts.
+
+First version scope:
+
+- Distribution is sideload-only APK releases from GitHub.
+- The initial Android `minSdk` is Android 6.0 / API 23.
+- First public release ABIs are `arm64-v8a` and `armeabi-v7a`.
+- `x86_64` is allowed for debug and emulator builds, but it is not required for
+  the first public sideload release.
+- The MVP runtime uses a process-wrapper/root-helper runner that starts a
+  headless `zerodpi` executable.
+- The runner must remain replaceable so a JNI/native-library runner can be added
+  later without rewriting the Android UI.
+- The app manages ZeroDPI configuration and runtime files in app-private
+  storage.
+- Users must configure their upstream VPN app to connect to
+  `127.0.0.1:LISTEN_PORT`.
+- A raw TOML editor is required from day one, even if structured settings are
+  incomplete.
+- Root is requested only when the selected mode and bypass method require
+  packet interception.
+- Non-root settings, list editing, scan-only, plain relay, and socket-only
+  `tls_frag` workflows remain usable on non-root devices where the underlying
+  ZeroDPI mode supports them.
+
+Explicit first-version non-goals:
+
+- The app is not a standalone Android VPN client.
+- The app will not implement Android `VpnService`.
+- The first version is not Play Store compatible.
+- The first version will not deep-link into, rewrite, or automatically manage
+  upstream VPN app profiles.
+- The normal APK workflow will not require Termux.
+- The MVP will not start with a JNI/native-library refactor unless the
+  process-wrapper approach is proven unworkable.
+
 ## Goals
 
 - Build a separate native Android app that acts as a UI and controller for
@@ -106,24 +145,29 @@ Root-required startup should also check:
 
 ## Phase 0: Confirm Product Scope
 
-- Use sideload-only GitHub APK releases as the initial distribution model.
-- Use Android 6.0 / API 23 as the initial `minSdk`.
-- Build first for `arm64-v8a` and `armeabi-v7a`.
-- Keep `x86_64` as an optional debug/emulator ABI.
-- Prioritize the process-wrapper/root-helper MVP first, while keeping the
+Status: complete. The confirmed scope record is the
+[Confirmed Product Scope](#confirmed-product-scope) section above.
+
+Completed decisions:
+
+- [x] Use sideload-only GitHub APK releases as the initial distribution model.
+- [x] Use Android 6.0 / API 23 as the initial `minSdk`.
+- [x] Build first for `arm64-v8a` and `armeabi-v7a`.
+- [x] Keep `x86_64` as an optional debug/emulator ABI.
+- [x] Prioritize the process-wrapper/root-helper MVP first, while keeping the
   runner replaceable.
-- Do not implement Android `VpnService`.
-- Instruct users to point their upstream VPN app at
+- [x] Do not implement Android `VpnService`.
+- [x] Instruct users to point their upstream VPN app at
   `127.0.0.1:LISTEN_PORT`.
-- Do not try to deep-link or rewrite upstream VPN profiles in the first
+- [x] Do not try to deep-link or rewrite upstream VPN profiles in the first
   version.
-- Include a raw TOML editor from day one.
+- [x] Include a raw TOML editor from day one.
 
 Acceptance criteria:
 
-- Product scope is recorded before app scaffolding starts.
-- Non-goals are explicit, especially "not a standalone Android VPN client" and
-  "not Play Store compatible" for the first version.
+- [x] Product scope is recorded before app scaffolding starts.
+- [x] Non-goals are explicit, especially "not a standalone Android VPN client"
+  and "not Play Store compatible" for the first version.
 
 ## Phase 1: Define Android-Facing ZeroDPI Contract
 

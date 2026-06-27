@@ -959,6 +959,7 @@ pub fn run_dashboard(
 
 fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
     match event {
+        ProxyEvent::ListenerStarted { .. } => {}
         ProxyEvent::ConnectionAccepted { peer, src_port } => {
             state.total += 1;
             state.active += 1;

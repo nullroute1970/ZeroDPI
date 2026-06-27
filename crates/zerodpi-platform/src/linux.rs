@@ -11,6 +11,7 @@
 use std::io::ErrorKind;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
@@ -18,8 +19,8 @@ use nfq::{Queue, Verdict as NfqVerdict};
 use tracing::{debug, info, warn};
 
 use zerodpi_core::interceptor::{
-    Direction, FilterSpec, LinuxFirewallBackend, PacketHandler, PacketInterceptor, PacketView,
-    TcpFlags, Verdict,
+    Direction, FilterSpec, InterceptorShutdown, LinuxFirewallBackend, PacketHandler,
+    PacketInterceptor, PacketView, TcpFlags, Verdict,
 };
 
 const HOOK_LOCAL_IN: u8 = 1;
@@ -61,12 +62,25 @@ impl PacketInterceptor for NfqInterceptor {
         })
     }
 
-    fn run<H: PacketHandler>(mut self, mut handler: H) -> Result<()> {
+    fn run_until<H: PacketHandler>(
+        mut self,
+        mut handler: H,
+        shutdown: InterceptorShutdown,
+    ) -> Result<()> {
+        self.queue.set_nonblocking(true);
         loop {
+            if shutdown.is_requested() {
+                info!("NFQUEUE shutdown requested");
+                return Ok(());
+            }
             let mut msg = match self.queue.recv() {
                 Ok(m) => m,
                 Err(e) if e.kind() == ErrorKind::Interrupted => {
                     debug!(error = %e, "NFQUEUE recv interrupted; retrying");
+                    continue;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
                     continue;
                 }
                 Err(e) => {

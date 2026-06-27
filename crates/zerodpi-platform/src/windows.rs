@@ -14,7 +14,8 @@ use windivert::prelude::{WinDivert, WinDivertFlags, WinDivertPacket};
 use windivert_sys::ChecksumFlags;
 
 use zerodpi_core::interceptor::{
-    Direction, FilterSpec, PacketHandler, PacketInterceptor, PacketView, TcpFlags, Verdict,
+    Direction, FilterSpec, InterceptorShutdown, PacketHandler, PacketInterceptor, PacketView,
+    TcpFlags, Verdict,
 };
 
 pub struct WinDivertInterceptor {
@@ -30,7 +31,11 @@ impl PacketInterceptor for WinDivertInterceptor {
         Ok(Self { divert })
     }
 
-    fn run<H: PacketHandler>(self, mut handler: H) -> Result<()> {
+    fn run_until<H: PacketHandler>(
+        self,
+        mut handler: H,
+        _shutdown: InterceptorShutdown,
+    ) -> Result<()> {
         let mut buf = vec![0u8; 0xFFFF];
         loop {
             let packet = match self.divert.recv(Some(&mut buf)) {

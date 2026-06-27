@@ -32,13 +32,13 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 use crate::config::Config;
 use crate::flow::new_flow_table;
 use crate::handler::Handler;
-use crate::interceptor::{FilterSpec, PacketInterceptor};
+use crate::interceptor::{FilterSpec, InterceptorShutdown, PacketInterceptor};
 use crate::methods::build_method;
 use crate::proxy::{run_proxy, ActiveSniTarget, CONNECT_PORT};
 use crate::sni_scanner::SniProbeEntry;
@@ -219,24 +219,24 @@ where
     };
 
     let handler = Handler::new(flows.clone(), method);
-    // Spawn the intercept thread.  It exits naturally when the WinDivert
-    // handle is closed (interceptor is dropped at end of this fn).
+    let shutdown = InterceptorShutdown::default();
+    let thread_shutdown = shutdown.clone();
+    let (done_tx, done_rx) = oneshot::channel();
     let _intercept_thread = std::thread::Builder::new()
         .name(format!("zerodpi-intercept-test-{}", candidate.sni))
         .spawn(move || {
-            if let Err(e) = interceptor.run(handler) {
+            if let Err(e) = interceptor.run_until(handler, thread_shutdown) {
                 debug!(error = %e, "proxy_scan intercept thread ended");
             }
+            let _ = done_tx.send(());
         });
 
     // Start the proxy listener on LISTEN_PORT.
     let probe_result =
         run_socks5_probe(config.clone(), active_target, flows, interface_ip, timeout).await;
 
-    // When this function returns, `interceptor` was moved into the thread
-    // closure. The thread will exit on the next recv() after the handle is
-    // dropped inside the closure (WinDivert drop closes the handle).
-    // The thread join is best-effort — we don't block on it.
+    shutdown.request();
+    let _ = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
 
     build_entry(candidate, probe_result, &config)
 }

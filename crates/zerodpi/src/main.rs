@@ -12,6 +12,7 @@
 //!   6. If `RESCAN_INTERVAL_SECS > 0`, run the scanner again in the background
 //!      every that many seconds and switch new connections to better targets.
 
+mod runtime_events;
 mod tui;
 
 use std::io::{self, Write};
@@ -30,7 +31,7 @@ use tracing_subscriber::EnvFilter;
 use zerodpi_core::config::Config;
 use zerodpi_core::flow::new_flow_table;
 use zerodpi_core::handler::Handler;
-use zerodpi_core::interceptor::{FilterSpec, PacketInterceptor};
+use zerodpi_core::interceptor::{FilterSpec, InterceptorShutdown, PacketInterceptor};
 use zerodpi_core::ip_scanner::{load_ip_list, scan_ip_list, IpProbeEntry, IpScanEvent};
 use zerodpi_core::methods::build_method;
 use zerodpi_core::net::default_interface_ipv4;
@@ -41,6 +42,10 @@ use zerodpi_core::proxy::{
 use zerodpi_core::proxy_tester::{test_candidate_full, ProxyTestEntry};
 use zerodpi_core::sni_scanner::{scan_sni_list, SniProbeEntry};
 use zerodpi_platform::{ensure_packet_interception_access, DefaultInterceptor};
+
+use runtime_events::{
+    BypassStatus, RuntimeEvent, RuntimeEventEmitter, ScanKind, TargetKind, CONTRACT_VERSION,
+};
 
 #[derive(Clone, Copy)]
 struct TuiAwareStderr;
@@ -97,6 +102,9 @@ struct Args {
     /// Disable ratatui screens; suitable for systemd and other headless runs.
     #[arg(long)]
     no_tui: bool,
+    /// Emit newline-delimited JSON runtime events to stdout; implies --no-tui.
+    #[arg(long)]
+    json_events: bool,
     /// Override `SELECTED_SNI` — skip scanning and use this hostname.
     #[arg(long)]
     sni: Option<String>,
@@ -152,8 +160,27 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let events = RuntimeEventEmitter::new(args.json_events);
+    events.emit(RuntimeEvent::Startup {
+        contract_version: CONTRACT_VERSION,
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        pid: std::process::id(),
+    });
 
-    let no_tui = args.no_tui;
+    let result = run(args, events.clone());
+    if let Err(error) = &result {
+        events.emit(RuntimeEvent::FatalError {
+            message: format!("{error:#}"),
+        });
+    }
+    result
+}
+
+fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
+    let no_tui = args.no_tui || args.json_events;
+    if args.json_events && !args.no_tui {
+        warn!("--json-events implies --no-tui");
+    }
 
     // ---- config ----
     let cfg_path = args.config.clone().unwrap_or_else(|| {
@@ -208,8 +235,27 @@ fn main() -> Result<()> {
         cfg.RELAY_MAX_LIFETIME_SECS = v;
     }
     cfg.validate()?;
-    if requires_packet_interception(&cfg) {
-        ensure_packet_interception_access()?;
+    let root_required = requires_packet_interception(&cfg);
+    events.emit(RuntimeEvent::ConfigLoaded {
+        path: cfg_path.display().to_string(),
+        mode: cfg.MODE.clone(),
+        bypass_method: cfg.BYPASS_METHOD.clone(),
+        listen_host: cfg.LISTEN_HOST.clone(),
+        listen_port: cfg.LISTEN_PORT,
+        auto_select: cfg.AUTO_SELECT,
+        no_tui,
+        root_required,
+    });
+    if root_required {
+        if let Err(error) = ensure_packet_interception_access() {
+            events.emit(RuntimeEvent::RootRequired {
+                mode: cfg.MODE.clone(),
+                bypass_method: cfg.BYPASS_METHOD.clone(),
+                message: root_required_message(&cfg),
+                rootless_alternatives: rootless_alternatives(),
+            });
+            return Err(error).context(root_required_message(&cfg));
+        }
     }
     let cfg = Arc::new(cfg);
 
@@ -220,7 +266,7 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return ip_bypass_main(cfg_clone, cfg_path_clone, rt, no_tui);
+        return ip_bypass_main(cfg_clone, cfg_path_clone, rt, no_tui, events);
     }
     if cfg.MODE == "ip_bypass_plus" {
         let cfg_clone = cfg.clone();
@@ -228,7 +274,7 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return ip_bypass_plus_main(cfg_clone, cfg_path_clone, rt, no_tui);
+        return ip_bypass_plus_main(cfg_clone, cfg_path_clone, rt, no_tui, events);
     }
 
     // ---- branch: scan-only modes ----
@@ -238,7 +284,7 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return sni_scan_main(cfg_clone, cfg_path_clone, rt, no_tui);
+        return sni_scan_main(cfg_clone, cfg_path_clone, rt, no_tui, events);
     }
     if cfg.MODE == "ip_scan" {
         let cfg_clone = cfg.clone();
@@ -246,7 +292,7 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return ip_scan_main(cfg_clone, cfg_path_clone, rt, no_tui);
+        return ip_scan_main(cfg_clone, cfg_path_clone, rt, no_tui, events);
     }
 
     if cfg.MODE == "proxy_scan" {
@@ -255,7 +301,7 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return proxy_scan_main(cfg_clone, cfg_path_clone, rt, no_tui);
+        return proxy_scan_main(cfg_clone, cfg_path_clone, rt, no_tui, events);
     }
 
     // ---- resolve SNI list path relative to the config file ----
@@ -290,7 +336,13 @@ fn main() -> Result<()> {
         let path = sni_list_path.clone();
         let cfg_clone = cfg.clone();
         let entries = if no_tui {
-            let entries = rt.block_on(scan_sni_list(&path, scan_timeout, cfg_clone, None))?;
+            let entries = rt.block_on(scan_sni_list_headless(
+                cfg_clone,
+                &path,
+                scan_timeout,
+                &events,
+                ScanKind::Sni,
+            ))?;
             log_sni_scan_results("headless scan", &entries);
             entries
         } else {
@@ -333,6 +385,12 @@ fn main() -> Result<()> {
             }
         }
     };
+    events.emit(RuntimeEvent::SelectedTarget {
+        target: TargetKind::Sni,
+        sni: Some(selected.sni.clone()),
+        ip: selected.ip.to_string(),
+        score: Some(selected.score),
+    });
 
     let active_target = Arc::new(std::sync::RwLock::new(ActiveSniTarget::new(
         selected.sni.clone(),
@@ -348,9 +406,9 @@ fn main() -> Result<()> {
 
     let flows = new_flow_table();
 
-    let (_intercept_thread, intercept_done_rx) = if cfg.BYPASS_METHOD == "tls_frag" {
+    let interceptor_runtime = if cfg.BYPASS_METHOD == "tls_frag" {
         info!("tls_frag selected; skipping packet interceptor");
-        (None, None)
+        None
     } else {
         let method_box = build_method(&cfg)
             .with_context(|| format!("unknown BYPASS_METHOD '{}'", cfg.BYPASS_METHOD))?;
@@ -367,17 +425,22 @@ fn main() -> Result<()> {
 
         let handler = Handler::new(flows.clone(), method);
         let (intercept_done_tx, intercept_done_rx) = oneshot::channel();
-        let thread = std::thread::Builder::new()
+        let shutdown = InterceptorShutdown::default();
+        let thread_shutdown = shutdown.clone();
+        std::thread::Builder::new()
             .name("zerodpi-intercept".into())
             .spawn(move || {
-                let result = interceptor.run(handler);
+                let result = interceptor.run_until(handler, thread_shutdown);
                 if let Err(ref e) = result {
                     error!(error = %e, "intercept loop ended with error");
                 }
                 let _ = intercept_done_tx.send(result);
             })
             .context("spawn intercept thread")?;
-        (Some(thread), Some(intercept_done_rx))
+        Some(InterceptorRuntime {
+            shutdown,
+            done_rx: intercept_done_rx,
+        })
     };
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
@@ -388,7 +451,11 @@ fn main() -> Result<()> {
     if cfg.RESCAN_INTERVAL_SECS > 0 {
         let interval = cfg.RESCAN_INTERVAL_SECS;
         let active_target = active_target.clone();
-        let rescan_event_tx = if no_tui { None } else { Some(event_tx.clone()) };
+        let rescan_event_tx = if no_tui && !events.enabled() {
+            None
+        } else {
+            Some(event_tx.clone())
+        };
         rt.spawn(async move {
             background_rescan(
                 rescan_cfg,
@@ -416,7 +483,8 @@ fn main() -> Result<()> {
         let result = rt.block_on(run_headless_proxy(
             proxy_handle,
             event_rx,
-            intercept_done_rx,
+            interceptor_runtime,
+            events.clone(),
         ));
         info!("shutting down");
         return result;
@@ -432,6 +500,7 @@ fn main() -> Result<()> {
     tui::leave_tui(terminal)?;
 
     proxy_handle.abort();
+    rt.block_on(stop_interceptor(interceptor_runtime))?;
     info!("shutting down");
     dash_result?;
 
@@ -541,6 +610,122 @@ fn count_hostnames(path: &std::path::Path) -> usize {
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .count()
+}
+
+async fn scan_sni_list_headless(
+    cfg: Arc<Config>,
+    path: &Path,
+    timeout: Duration,
+    events: &RuntimeEventEmitter,
+    scan: ScanKind,
+) -> anyhow::Result<Vec<SniProbeEntry>> {
+    let total = count_hostnames(path);
+    events.emit(RuntimeEvent::ScanStarted {
+        scan,
+        path: Some(path.display().to_string()),
+        total: Some(total),
+    });
+
+    if !events.enabled() {
+        let entries = scan_sni_list(path, timeout, cfg, None).await?;
+        events.emit(RuntimeEvent::ScanCompleted {
+            scan,
+            results: entries.len(),
+        });
+        return Ok(entries);
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
+    let progress_events = events.clone();
+    let progress_handle = tokio::spawn(async move {
+        let mut completed = 0usize;
+        while let Some(entry) = rx.recv().await {
+            completed += 1;
+            progress_events.emit(RuntimeEvent::ScanProgress {
+                scan,
+                phase: None,
+                completed,
+                total: Some(total),
+                sni: Some(entry.sni),
+                ip: Some(entry.ip.to_string()),
+                score: Some(entry.score),
+            });
+        }
+    });
+
+    let entries = scan_sni_list(path, timeout, cfg, Some(tx)).await?;
+    let _ = progress_handle.await;
+    events.emit(RuntimeEvent::ScanCompleted {
+        scan,
+        results: entries.len(),
+    });
+    Ok(entries)
+}
+
+async fn scan_ip_list_headless(
+    ips: Vec<IpAddr>,
+    scan_sni: Arc<str>,
+    timeout: Duration,
+    cfg: Arc<Config>,
+    events: &RuntimeEventEmitter,
+    path: Option<&Path>,
+) -> Vec<IpProbeEntry> {
+    let total = ips.len();
+    events.emit(RuntimeEvent::ScanStarted {
+        scan: ScanKind::Ip,
+        path: path.map(|p| p.display().to_string()),
+        total: Some(total),
+    });
+
+    if !events.enabled() {
+        let entries = scan_ip_list(ips, scan_sni, timeout, cfg, None).await;
+        events.emit(RuntimeEvent::ScanCompleted {
+            scan: ScanKind::Ip,
+            results: entries.len(),
+        });
+        return entries;
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<IpScanEvent>();
+    let progress_events = events.clone();
+    let progress_handle = tokio::spawn(async move {
+        let mut probe_completed = 0usize;
+        while let Some(event) = rx.recv().await {
+            match event {
+                IpScanEvent::TcpDone { tcp_tested } => {
+                    progress_events.emit(RuntimeEvent::ScanProgress {
+                        scan: ScanKind::Ip,
+                        phase: Some("tcp".to_owned()),
+                        completed: tcp_tested,
+                        total: Some(total),
+                        sni: None,
+                        ip: None,
+                        score: None,
+                    });
+                }
+                IpScanEvent::ProbeComplete(entry) => {
+                    probe_completed += 1;
+                    progress_events.emit(RuntimeEvent::ScanProgress {
+                        scan: ScanKind::Ip,
+                        phase: Some("probe".to_owned()),
+                        completed: probe_completed,
+                        total: Some(total),
+                        sni: None,
+                        ip: Some(entry.ip.to_string()),
+                        score: Some(entry.score),
+                    });
+                }
+            }
+        }
+    });
+
+    let entries = scan_ip_list(ips, scan_sni, timeout, cfg, Some(tx)).await;
+    let _ = progress_handle.await;
+    events.emit(RuntimeEvent::ScanCompleted {
+        scan: ScanKind::Ip,
+        results: entries.len(),
+    });
+    entries
 }
 
 fn log_sni_scan_results(context: &str, entries: &[SniProbeEntry]) {
@@ -693,41 +878,88 @@ fn mode_requires_packet_interception(mode: &str, bypass_method: &str) -> bool {
     matches!(mode, "sni_spoof" | "proxy_scan" | "ip_bypass_plus") && bypass_method != "tls_frag"
 }
 
+fn root_required_message(cfg: &Config) -> String {
+    format!(
+        "MODE = \"{}\" with BYPASS_METHOD = \"{}\" requires packet interception; on Android the app must start ZeroDPI through su/root. Rootless alternatives are MODE = \"ip_bypass\", scan-only modes, or BYPASS_METHOD = \"tls_frag\" where supported.",
+        cfg.MODE, cfg.BYPASS_METHOD
+    )
+}
+
+fn rootless_alternatives() -> Vec<String> {
+    vec![
+        "MODE = \"ip_bypass\"".to_owned(),
+        "MODE = \"sni_scan\"".to_owned(),
+        "MODE = \"ip_scan\"".to_owned(),
+        "BYPASS_METHOD = \"tls_frag\" for supported relay modes".to_owned(),
+    ]
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const INTERCEPTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct InterceptorRuntime {
+    shutdown: InterceptorShutdown,
+    done_rx: oneshot::Receiver<anyhow::Result<()>>,
+}
+
+async fn stop_interceptor(interceptor: Option<InterceptorRuntime>) -> anyhow::Result<()> {
+    let Some(interceptor) = interceptor else {
+        return Ok(());
+    };
+
+    interceptor.shutdown.request();
+    let mut report_rx = spawn_interceptor_report(interceptor.done_rx);
+    wait_for_interceptor_shutdown(&mut report_rx).await
+}
+
 async fn run_headless_proxy(
     proxy_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     event_rx: mpsc::UnboundedReceiver<ProxyEvent>,
-    intercept_done_rx: Option<oneshot::Receiver<anyhow::Result<()>>>,
+    interceptor: Option<InterceptorRuntime>,
+    events: RuntimeEventEmitter,
 ) -> anyhow::Result<()> {
     log_headless_proxy_start();
     let mut proxy_handle = proxy_handle;
-    let event_log_handle = tokio::spawn(log_headless_proxy_events(event_rx));
+    let event_log_handle = tokio::spawn(log_headless_proxy_events(event_rx, events.clone()));
 
-    if let Some(intercept_done_rx) = intercept_done_rx {
+    if let Some(interceptor) = interceptor {
+        let shutdown = interceptor.shutdown.clone();
+        let mut intercept_report_rx = spawn_interceptor_report(interceptor.done_rx);
         tokio::select! {
             signal = shutdown_signal() => {
-                signal?;
+                let reason = signal?;
                 proxy_handle.abort();
+                shutdown.request();
+                let result = wait_for_interceptor_shutdown(&mut intercept_report_rx).await;
+                if result.is_ok() {
+                    events.emit(RuntimeEvent::GracefulShutdown { reason });
+                }
                 event_log_handle.abort();
-                Ok(())
+                result
             }
             result = &mut proxy_handle => {
+                shutdown.request();
+                let proxy_result = result.context("proxy task panicked")?;
+                let stop_result = wait_for_interceptor_shutdown(&mut intercept_report_rx).await;
                 event_log_handle.abort();
-                result.context("proxy task panicked")?
+                proxy_result?;
+                stop_result
             }
-            intercept_result = intercept_done_rx => {
+            intercept_result = intercept_report_rx.recv() => {
                 proxy_handle.abort();
                 event_log_handle.abort();
                 match intercept_result {
-                    Ok(Ok(())) => Err(anyhow::anyhow!("packet interceptor stopped unexpectedly")),
-                    Ok(Err(e)) => Err(e.context("packet interceptor stopped")),
-                    Err(_) => Err(anyhow::anyhow!("packet interceptor thread stopped before reporting a result")),
+                    Some(Ok(())) => Err(anyhow::anyhow!("packet interceptor stopped unexpectedly")),
+                    Some(Err(e)) => Err(e.context("packet interceptor stopped")),
+                    None => Err(anyhow::anyhow!("packet interceptor thread stopped before reporting a result")),
                 }
             }
         }
     } else {
         tokio::select! {
             signal = shutdown_signal() => {
-                signal?;
+                let reason = signal?;
+                events.emit(RuntimeEvent::GracefulShutdown { reason });
                 proxy_handle.abort();
                 event_log_handle.abort();
                 Ok(())
@@ -740,17 +972,79 @@ async fn run_headless_proxy(
     }
 }
 
-async fn log_headless_proxy_events(mut event_rx: mpsc::UnboundedReceiver<ProxyEvent>) {
+fn spawn_interceptor_report(
+    done_rx: oneshot::Receiver<anyhow::Result<()>>,
+) -> mpsc::UnboundedReceiver<anyhow::Result<()>> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let result = match done_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "packet interceptor thread stopped before reporting a result"
+            )),
+        };
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn wait_for_interceptor_shutdown(
+    report_rx: &mut mpsc::UnboundedReceiver<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    match tokio::time::timeout(INTERCEPTOR_SHUTDOWN_TIMEOUT, report_rx.recv()).await {
+        Ok(Some(Ok(()))) => Ok(()),
+        Ok(Some(Err(e))) => Err(e.context("packet interceptor stopped during shutdown")),
+        Ok(None) => Err(anyhow::anyhow!(
+            "packet interceptor thread stopped before reporting a result"
+        )),
+        Err(_) => Err(anyhow::anyhow!(
+            "packet interceptor did not stop within {} seconds",
+            INTERCEPTOR_SHUTDOWN_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+async fn wait_for_interceptor_shutdown(
+    report_rx: &mut mpsc::UnboundedReceiver<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    let _ = tokio::time::timeout(Duration::from_millis(100), report_rx.recv()).await;
+    Ok(())
+}
+
+async fn log_headless_proxy_events(
+    mut event_rx: mpsc::UnboundedReceiver<ProxyEvent>,
+    events: RuntimeEventEmitter,
+) {
     while let Some(event) = event_rx.recv().await {
         match event {
+            ProxyEvent::ListenerStarted { mode, listen_addr } => {
+                events.emit(RuntimeEvent::ListenerStarted {
+                    mode,
+                    listen_addr: listen_addr.to_string(),
+                });
+            }
             ProxyEvent::ConnectionAccepted { peer, src_port } => {
+                events.emit(RuntimeEvent::ConnectionAccepted {
+                    peer: peer.to_string(),
+                    src_port,
+                });
                 info!(%peer, src_port, "accepted proxy connection");
             }
             ProxyEvent::BypassComplete { src_port, outcome } => match outcome {
                 zerodpi_core::flow::BypassOutcome::FakeDataAcked => {
+                    events.emit(RuntimeEvent::BypassFinished {
+                        src_port,
+                        status: BypassStatus::Completed,
+                    });
                     info!(src_port, "bypass complete; relaying");
                 }
                 zerodpi_core::flow::BypassOutcome::UnexpectedClose => {
+                    events.emit(RuntimeEvent::BypassFinished {
+                        src_port,
+                        status: BypassStatus::Failed,
+                    });
                     warn!(src_port, "bypass failed before relay");
                 }
             },
@@ -761,9 +1055,21 @@ async fn log_headless_proxy_events(mut event_rx: mpsc::UnboundedReceiver<ProxyEv
                 reason,
             } => match reason {
                 RelayEndReason::Completed => {
+                    events.emit(RuntimeEvent::RelayBytes {
+                        src_port,
+                        c2s_bytes,
+                        s2c_bytes,
+                        is_final: true,
+                    });
                     info!(src_port, c2s_bytes, s2c_bytes, "relay finished");
                 }
                 RelayEndReason::MaxLifetime => {
+                    events.emit(RuntimeEvent::RelayBytes {
+                        src_port,
+                        c2s_bytes,
+                        s2c_bytes,
+                        is_final: true,
+                    });
                     info!(
                         src_port,
                         c2s_bytes, s2c_bytes, "relay rotated after max lifetime"
@@ -771,13 +1077,40 @@ async fn log_headless_proxy_events(mut event_rx: mpsc::UnboundedReceiver<ProxyEv
                 }
             },
             ProxyEvent::ConnectionError { src_port, error } => {
+                events.emit(RuntimeEvent::BypassFinished {
+                    src_port,
+                    status: BypassStatus::Failed,
+                });
                 warn!(src_port, %error, "proxy connection failed");
             }
-            ProxyEvent::RelayProgress { .. } => {}
+            ProxyEvent::RelayProgress {
+                src_port,
+                c2s_bytes,
+                s2c_bytes,
+            } => {
+                events.emit(RuntimeEvent::RelayBytes {
+                    src_port,
+                    c2s_bytes,
+                    s2c_bytes,
+                    is_final: false,
+                });
+            }
             ProxyEvent::SniTargetChanged { sni, ip, score } => {
+                events.emit(RuntimeEvent::ActiveTargetChanged {
+                    target: TargetKind::Sni,
+                    sni: Some(sni.clone()),
+                    ip: ip.to_string(),
+                    score: Some(score),
+                });
                 info!(%sni, %ip, score, "active SNI target changed");
             }
             ProxyEvent::IpTargetChanged { ip } => {
+                events.emit(RuntimeEvent::ActiveTargetChanged {
+                    target: TargetKind::Ip,
+                    sni: None,
+                    ip: ip.to_string(),
+                    score: None,
+                });
                 info!(%ip, "active IP target changed");
             }
         }
@@ -795,7 +1128,7 @@ fn log_headless_proxy_start() {
 }
 
 #[cfg(unix)]
-async fn shutdown_signal() -> anyhow::Result<()> {
+async fn shutdown_signal() -> anyhow::Result<String> {
     use tokio::signal::unix::{signal, SignalKind};
 
     let mut interrupt = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
@@ -809,7 +1142,7 @@ async fn shutdown_signal() -> anyhow::Result<()> {
             }
             _ = terminate.recv() => {
                 info!("received SIGTERM");
-                return Ok(());
+                return Ok("SIGTERM".to_owned());
             }
             _ = hangup.recv() => {
                 warn!("received SIGHUP; continuing because --no-tui is running headless");
@@ -819,12 +1152,12 @@ async fn shutdown_signal() -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn shutdown_signal() -> anyhow::Result<()> {
+async fn shutdown_signal() -> anyhow::Result<String> {
     tokio::signal::ctrl_c()
         .await
         .context("waiting for Ctrl-C")?;
     info!("received Ctrl-C");
-    Ok(())
+    Ok("ctrl_c".to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -836,6 +1169,7 @@ fn ip_bypass_main(
     cfg_path: PathBuf,
     rt: tokio::runtime::Runtime,
     no_tui: bool,
+    events: RuntimeEventEmitter,
 ) -> Result<()> {
     let ip_list_path = {
         let raw = PathBuf::from(&cfg.IP_LIST);
@@ -852,12 +1186,14 @@ fn ip_bypass_main(
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
 
     // ---- step 1: obtain active IP ----
-    let active_ip: std::net::IpAddr = if let Some(ref forced_ip) = cfg.SELECTED_IP {
+    let (active_ip, active_score): (std::net::IpAddr, Option<u8>) = if let Some(ref forced_ip) =
+        cfg.SELECTED_IP
+    {
         let ip: std::net::IpAddr = forced_ip
             .parse()
             .with_context(|| format!("parsing SELECTED_IP '{forced_ip}'"))?;
         info!(%ip, "SELECTED_IP set — skipping scan");
-        ip
+        (ip, None)
     } else {
         let ips = load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS)
             .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
@@ -873,7 +1209,14 @@ fn ip_bypass_main(
         let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
         let cfg_clone = cfg.clone();
         let entries = if no_tui {
-            let entries = rt.block_on(scan_ip_list(ips, scan_sni, scan_timeout, cfg_clone, None));
+            let entries = rt.block_on(scan_ip_list_headless(
+                ips,
+                scan_sni,
+                scan_timeout,
+                cfg_clone,
+                &events,
+                Some(&ip_list_path),
+            ));
             log_ip_scan_results("headless IP scan", &entries);
             Ok(entries)
         } else {
@@ -899,8 +1242,14 @@ fn ip_bypass_main(
             info!(ip = %entry.ip, score = entry.score, "selected IP");
             entry
         };
-        selected_entry.ip
+        (selected_entry.ip, Some(selected_entry.score))
     };
+    events.emit(RuntimeEvent::SelectedTarget {
+        target: TargetKind::Ip,
+        sni: None,
+        ip: active_ip.to_string(),
+        score: active_score,
+    });
 
     let active_ip_arc = Arc::new(std::sync::RwLock::new(active_ip));
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
@@ -911,7 +1260,11 @@ fn ip_bypass_main(
         let rescan_path = ip_list_path.clone();
         let interval = cfg.RESCAN_INTERVAL_SECS;
         let active_clone = active_ip_arc.clone();
-        let rescan_event_tx = if no_tui { None } else { Some(event_tx.clone()) };
+        let rescan_event_tx = if no_tui && !events.enabled() {
+            None
+        } else {
+            Some(event_tx.clone())
+        };
         rt.spawn(async move {
             background_ip_rescan(
                 rescan_cfg,
@@ -940,7 +1293,12 @@ fn ip_bypass_main(
         rt.spawn(async move { run_ip_bypass_proxy(cfg, proxy_active, dashboard_event_tx).await });
 
     if no_tui {
-        let result = rt.block_on(run_headless_proxy(proxy_handle, event_rx, None));
+        let result = rt.block_on(run_headless_proxy(
+            proxy_handle,
+            event_rx,
+            None,
+            events.clone(),
+        ));
         info!("shutting down");
         return result;
     }
@@ -966,6 +1324,7 @@ fn ip_bypass_plus_main(
     cfg_path: PathBuf,
     rt: tokio::runtime::Runtime,
     no_tui: bool,
+    events: RuntimeEventEmitter,
 ) -> Result<()> {
     let ip_list_path = {
         let raw = PathBuf::from(&cfg.IP_LIST);
@@ -982,13 +1341,15 @@ fn ip_bypass_plus_main(
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
 
     // ---- step 1: obtain active IPv4 ----
-    let active_ip: IpAddr = if let Some(ref forced_ip) = cfg.SELECTED_IP {
+    let (active_ip, active_score): (IpAddr, Option<u8>) = if let Some(ref forced_ip) =
+        cfg.SELECTED_IP
+    {
         let ip: IpAddr = forced_ip
             .parse()
             .with_context(|| format!("parsing SELECTED_IP '{forced_ip}'"))?;
         let _ = require_ipv4_target(ip, "ip_bypass_plus")?;
         info!(%ip, "ip_bypass_plus: SELECTED_IP set — skipping scan");
-        ip
+        (ip, None)
     } else {
         let ips = load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS)
             .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
@@ -1005,7 +1366,14 @@ fn ip_bypass_plus_main(
         let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
         let cfg_clone = cfg.clone();
         let entries = if no_tui {
-            let entries = rt.block_on(scan_ip_list(ips, scan_sni, scan_timeout, cfg_clone, None));
+            let entries = rt.block_on(scan_ip_list_headless(
+                ips,
+                scan_sni,
+                scan_timeout,
+                cfg_clone,
+                &events,
+                Some(&ip_list_path),
+            ));
             log_ip_scan_results("ip_bypass_plus: headless IP scan", &entries);
             Ok(entries)
         } else {
@@ -1031,8 +1399,14 @@ fn ip_bypass_plus_main(
             info!(ip = %entry.ip, score = entry.score, "ip_bypass_plus: selected IP");
             entry
         };
-        selected_entry.ip
+        (selected_entry.ip, Some(selected_entry.score))
     };
+    events.emit(RuntimeEvent::SelectedTarget {
+        target: TargetKind::Ip,
+        sni: None,
+        ip: active_ip.to_string(),
+        score: active_score,
+    });
 
     let active_v4 = require_ipv4_target(active_ip, "ip_bypass_plus")?;
     let interface_ip = default_interface_ipv4(active_v4)
@@ -1047,7 +1421,11 @@ fn ip_bypass_plus_main(
         let rescan_path = ip_list_path.clone();
         let interval = cfg.RESCAN_INTERVAL_SECS;
         let active_clone = active_ip_arc.clone();
-        let rescan_event_tx = if no_tui { None } else { Some(event_tx.clone()) };
+        let rescan_event_tx = if no_tui && !events.enabled() {
+            None
+        } else {
+            Some(event_tx.clone())
+        };
         rt.spawn(async move {
             background_ip_rescan(
                 rescan_cfg,
@@ -1074,9 +1452,9 @@ fn ip_bypass_plus_main(
 
     // ---- step 3: optional packet interceptor ----
     let flows = new_flow_table();
-    let (_intercept_thread, intercept_done_rx) = if cfg.BYPASS_METHOD == "tls_frag" {
+    let interceptor_runtime = if cfg.BYPASS_METHOD == "tls_frag" {
         info!("ip_bypass_plus: tls_frag selected; skipping packet interceptor");
-        (None, None)
+        None
     } else {
         let method_box = build_method(&cfg)
             .with_context(|| format!("unknown BYPASS_METHOD '{}'", cfg.BYPASS_METHOD))?;
@@ -1093,17 +1471,22 @@ fn ip_bypass_plus_main(
 
         let handler = Handler::new(flows.clone(), method);
         let (intercept_done_tx, intercept_done_rx) = oneshot::channel();
-        let thread = std::thread::Builder::new()
+        let shutdown = InterceptorShutdown::default();
+        let thread_shutdown = shutdown.clone();
+        std::thread::Builder::new()
             .name("zerodpi-ip-plus-intercept".into())
             .spawn(move || {
-                let result = interceptor.run(handler);
+                let result = interceptor.run_until(handler, thread_shutdown);
                 if let Err(ref e) = result {
                     error!(error = %e, "ip_bypass_plus intercept loop ended with error");
                 }
                 let _ = intercept_done_tx.send(result);
             })
             .context("spawn intercept thread")?;
-        (Some(thread), Some(intercept_done_rx))
+        Some(InterceptorRuntime {
+            shutdown,
+            done_rx: intercept_done_rx,
+        })
     };
 
     // ---- step 4: run the proxy ----
@@ -1118,7 +1501,8 @@ fn ip_bypass_plus_main(
         let result = rt.block_on(run_headless_proxy(
             proxy_handle,
             event_rx,
-            intercept_done_rx,
+            interceptor_runtime,
+            events.clone(),
         ));
         info!("shutting down");
         return result;
@@ -1130,6 +1514,7 @@ fn ip_bypass_plus_main(
     tui::leave_tui(terminal)?;
 
     proxy_handle.abort();
+    rt.block_on(stop_interceptor(interceptor_runtime))?;
     info!("shutting down");
     dash_result?;
 
@@ -1287,6 +1672,7 @@ fn sni_scan_main(
     cfg_path: PathBuf,
     rt: tokio::runtime::Runtime,
     no_tui: bool,
+    events: RuntimeEventEmitter,
 ) -> Result<()> {
     let sni_list_path = {
         let raw = PathBuf::from(&cfg.SNI_LIST);
@@ -1308,7 +1694,13 @@ fn sni_scan_main(
     let path = sni_list_path.clone();
     let cfg_clone = cfg.clone();
     let sorted = if no_tui {
-        rt.block_on(scan_sni_list(&path, scan_timeout, cfg_clone, None))?
+        rt.block_on(scan_sni_list_headless(
+            cfg_clone,
+            &path,
+            scan_timeout,
+            &events,
+            ScanKind::Sni,
+        ))?
     } else {
         let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
         let scan_handle =
@@ -1373,6 +1765,7 @@ fn ip_scan_main(
     cfg_path: PathBuf,
     rt: tokio::runtime::Runtime,
     no_tui: bool,
+    events: RuntimeEventEmitter,
 ) -> Result<()> {
     let ip_list_path = {
         let raw = PathBuf::from(&cfg.IP_LIST);
@@ -1402,7 +1795,14 @@ fn ip_scan_main(
 
     let cfg_clone = cfg.clone();
     let sorted = if no_tui {
-        rt.block_on(scan_ip_list(ips, scan_sni, scan_timeout, cfg_clone, None))
+        rt.block_on(scan_ip_list_headless(
+            ips,
+            scan_sni,
+            scan_timeout,
+            cfg_clone,
+            &events,
+            Some(&ip_list_path),
+        ))
     } else {
         let (tx, mut rx) = mpsc::unbounded_channel::<IpScanEvent>();
         let scan_handle = rt.spawn(async move {
@@ -1502,6 +1902,7 @@ fn proxy_scan_main(
     cfg_path: PathBuf,
     rt: tokio::runtime::Runtime,
     no_tui: bool,
+    events: RuntimeEventEmitter,
 ) -> Result<()> {
     // ---- resolve SNI list path ----
     let sni_list_path = {
@@ -1523,7 +1924,13 @@ fn proxy_scan_main(
     let path = sni_list_path.clone();
     let cfg_clone = cfg.clone();
     let phase1_sorted = if no_tui {
-        rt.block_on(scan_sni_list(&path, scan_timeout, cfg_clone, None))?
+        rt.block_on(scan_sni_list_headless(
+            cfg_clone,
+            &path,
+            scan_timeout,
+            &events,
+            ScanKind::Sni,
+        ))?
     } else {
         let total_hostnames = count_hostnames(&sni_list_path);
         let (tx1, mut rx1) = mpsc::unbounded_channel::<SniProbeEntry>();
@@ -1621,9 +2028,10 @@ fn proxy_scan_main(
         candidates.len()
     );
 
-    let (tx2, mut rx2) = mpsc::unbounded_channel::<ProxyTestEntry>();
+    let (tx2, rx2) = mpsc::unbounded_channel::<ProxyTestEntry>();
     let cfg_for_phase2 = cfg.clone();
     let candidates_for_phase2 = candidates.clone();
+    let total_proxy_tests = candidates.len();
 
     // Each candidate spins up an OS thread (WinDivert/NFQUEUE), so we run
     // the loop inside spawn_blocking to avoid blocking the async executor.
@@ -1657,9 +2065,39 @@ fn proxy_scan_main(
     });
 
     let mut phase2_results: Vec<ProxyTestEntry> = if no_tui {
-        rt.block_on(phase2_handle)
-            .context("proxy_scan phase2 task panicked")?
+        events.emit(RuntimeEvent::ScanStarted {
+            scan: ScanKind::Proxy,
+            path: None,
+            total: Some(total_proxy_tests),
+        });
+        let progress_events = events.clone();
+        let mut rx2 = rx2;
+        let progress_handle = rt.spawn(async move {
+            let mut completed = 0usize;
+            while let Some(entry) = rx2.recv().await {
+                completed += 1;
+                progress_events.emit(RuntimeEvent::ScanProgress {
+                    scan: ScanKind::Proxy,
+                    phase: Some("proxy_test".to_owned()),
+                    completed,
+                    total: Some(total_proxy_tests),
+                    sni: Some(entry.sni),
+                    ip: Some(entry.ip.to_string()),
+                    score: Some(entry.final_score),
+                });
+            }
+        });
+        let results = rt
+            .block_on(phase2_handle)
+            .context("proxy_scan phase2 task panicked")?;
+        let _ = rt.block_on(progress_handle);
+        events.emit(RuntimeEvent::ScanCompleted {
+            scan: ScanKind::Proxy,
+            results: results.len(),
+        });
+        results
     } else {
+        let mut rx2 = rx2;
         let mut terminal = tui::enter_tui()?;
         let (proxy_arrived, _) =
             tui::run_proxy_scan_progress(&mut terminal, &mut rx2, candidates.len())?;

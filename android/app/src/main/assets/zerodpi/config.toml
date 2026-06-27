@@ -1,0 +1,586 @@
+# ZeroDPI configuration file
+# All fields have sensible defaults and can be customized.
+# Field names are UPPER_CASE; values follow TOML syntax.
+
+# ---------------------------------------------------------------------------
+# Proxy Listener
+# ---------------------------------------------------------------------------
+
+# IP address the local TCP proxy listens on.
+# Use "0.0.0.0" to accept connections from all interfaces,
+# or "127.0.0.1" to restrict to the local machine only.
+LISTEN_HOST = "127.0.0.1"
+
+# TCP port the local proxy listens on.
+# Point your upstream VPN app (xray-core, sing-box, v2ray, etc.) here
+# instead of pointing it directly at your VPN server.
+LISTEN_PORT = 44444
+
+# ---------------------------------------------------------------------------
+# Operating Mode
+# ---------------------------------------------------------------------------
+
+# Operating mode. Valid values: "sni_spoof" (default), "ip_bypass",
+# "ip_bypass_plus", "sni_scan", "ip_scan", "proxy_scan".
+# - "sni_spoof"     — DPI bypass via SNI spoofing (default).
+# - "ip_bypass"     — plain TCP relay through a scanned IP; no packet interception.
+# - "ip_bypass_plus" — IPv4 relay through a scanned IP plus real-SNI-preserving
+#                      BYPASS_METHOD ("tls_record_frag" or "tls_frag").
+# - "sni_scan"      — scan sni_list.txt and display/save results, then exit.
+# - "ip_scan"       — scan ip_list.txt and display/save results, then exit.
+# - "proxy_scan"    — scan sni_list.txt (Phase 1), then test each working SNI
+#                     through your V2RayN SOCKS5 mixed port (Phase 2); display
+#                     blended results and exit.  Requires V2RayN to be running.
+MODE = "sni_spoof"
+
+# When true, ZeroDPI automatically picks the highest-ranked candidate
+# after scanning instead of showing the manual selection table.
+# TUI progress, results, and dashboard views are still shown.
+# For systemd/headless runs, use the CLI flag: --no-tui.
+AUTO_SELECT = false
+
+# If set to a hostname, skip the scan entirely and use this hostname as the spoofed SNI.
+# The IP address is resolved from DNS automatically.
+# Leave as an empty string ("") to use the scanner.
+SELECTED_SNI = ""
+
+# If set to a valid IP, skip the IP scan entirely and use this IP directly.
+# Leave as an empty string ("") to use the IP scanner.
+SELECTED_IP = ""
+
+# ---------------------------------------------------------------------------
+# Input Files
+# ---------------------------------------------------------------------------
+
+# Path to the file that lists candidate SNI hostnames, one per line.
+# Default: "sni_list.txt" (next to config.toml).
+SNI_LIST = "sni_list.txt"
+
+# Path to the IP list file (ip_bypass, ip_bypass_plus, and ip_scan modes).
+# One entry per line: plain IPs (IPv4 or IPv6) or CIDR ranges.
+# ip_bypass_plus is IPv4-only and rejects IPv6 entries.
+# Default: "ip_list.txt".
+IP_LIST = "ip_list.txt"
+
+# ---------------------------------------------------------------------------
+# Scan Behavior
+# ---------------------------------------------------------------------------
+
+# Maximum time (in seconds) each individual probe may take before
+# it is abandoned.
+SCAN_TIMEOUT_SECS = 5
+
+# How often (in seconds) ZeroDPI re-runs the full SNI scan in the background
+# while the proxy is running. In sni_spoof mode, a better top result switches
+# the active SNI/IP for new connections. Set to 0 to disable periodic rescanning.
+RESCAN_INTERVAL_SECS = 0
+
+# Minimum score required before a background SNI rescan can switch the active
+# SNI/IP target.
+SNI_SWITCH_MIN_SCORE = 1
+
+# Optional path to write scan results as a JSON file after a scan-only
+# run (MODE = "sni_scan" or "ip_scan").
+# Leave as an empty string ("") to disable saving.
+SCAN_OUTPUT = ""
+
+# ---------------------------------------------------------------------------
+# Scanner Tuning
+# ---------------------------------------------------------------------------
+
+# Maximum concurrent SNI probes.
+SNI_MAX_CONCURRENT = 64
+
+# Maximum concurrent TCP connections in IP phase 1.
+IP_MAX_P1_CONCURRENT = 128
+
+# Maximum concurrent TLS probes in IP phase 2.
+IP_MAX_P2_CONCURRENT = 32
+
+# Maximum bytes downloaded for speed tests.
+SCAN_DOWNLOAD_CAP = 10240
+
+# Maximum bytes uploaded for upload speed tests.
+SCAN_UPLOAD_CAP = 10240
+
+# Candidate-relative HTTP path used for upload speed tests.
+SCAN_UPLOAD_PATH = "/"
+
+# SNI hostname used *only* during the TLS phase of the IP scan.
+IP_SCAN_SNI = "cloudflare.com"
+
+# Maximum number of host addresses expanded from a single IPv6 CIDR block.
+IPV6_MAX_HOSTS = 65536
+
+# ---------------------------------------------------------------------------
+# Scoring Parameters
+# ---------------------------------------------------------------------------
+
+# Maximum valid TCP latency for scoring (ms).
+TCP_LATENCY_CAP_MS = 500.0
+
+# Maximum valid TLS latency for scoring (ms).
+TLS_LATENCY_CAP_MS = 1000.0
+
+# Maximum valid Time-To-First-Byte for scoring (ms).
+TTFB_CAP_MS = 2000.0
+
+# Download speed cap for scoring (bytes/sec).
+SPEED_CAP_BPS = 2048000.0
+
+# Upload speed cap for scoring (bytes/sec).
+UPLOAD_SPEED_CAP_BPS = 2048000.0
+
+# ---------------------------------------------------------------------------
+# Bypass Engine
+# ---------------------------------------------------------------------------
+
+# Bypass method to use for SNI-spoof mode.
+#
+# Supported values:
+#
+#   "wrong_seq" (default)
+#     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
+#     then injects a fake TLS ClientHello on that packet with a deliberately
+#     old TCP sequence number.  DPI devices inspect the payload using the
+#     allowed SNI; the real upstream server treats the segment as old/duplicate
+#     and discards its payload, so the real TLS handshake proceeds unaffected.
+#
+#   "wrong_checksum"
+#     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
+#     then injects a fake TLS ClientHello on that packet with the normal valid
+#     TCP sequence number and ACK number.  ZeroDPI computes normal IPv4/TCP
+#     checksums first, then deliberately corrupts the TCP checksum.  DPI
+#     devices can inspect the payload using the allowed SNI, while the real
+#     upstream server drops the invalid-checksum segment before consuming data.
+#
+#   "wrong_md5"
+#     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
+#     then injects a fake TLS ClientHello on that packet with the normal valid
+#     TCP sequence number and ACK number plus a TCP-MD5 Signature option.  DPI
+#     devices can inspect the payload using the allowed SNI, while the real
+#     upstream server rejects the segment because no TCP-MD5 key was negotiated.
+#
+#   "wrong_seq_wrong_md5"
+#     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
+#     then injects a fake TLS ClientHello on that packet with a deliberately
+#     old TCP sequence number plus a TCP-MD5 Signature option.  DPI devices can
+#     inspect the payload using the allowed SNI, while the real upstream server
+#     rejects the segment because it is out of window and no TCP-MD5 key was
+#     negotiated.
+#
+#   "wrong_md5_tls_frag"
+#     Combines wrong_md5 with TLS Fragment / TCP-level fragmentation for
+#     layered filtering.  First, it injects a fake TCP-MD5 ClientHello on the
+#     handshake ACK.  Then it fragments configured real client data using the
+#     TLS_FRAG_* settings, so later DPI layers still do not see the complete
+#     SNI in any single TCP segment.
+#
+#   "wrong_ack"
+#     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
+#     then injects a fake TLS ClientHello on that packet with the normal valid
+#     TCP sequence number and a deliberately old TCP ACK number.  DPI devices
+#     can inspect the payload using the allowed SNI, while the real upstream
+#     server rejects the segment because its ACK is before the server send
+#     window.
+#
+#   "wrong_timestamp"
+#     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
+#     then injects a fake TLS ClientHello on that packet with the normal valid
+#     TCP sequence and ACK numbers but a backdated TCP Timestamp TSval.  DPI
+#     devices can inspect the payload using the allowed SNI, while the real
+#     upstream server rejects the segment as a PAWS replay.
+#
+#   "tls_record_frag"
+#     TLS Record Fragment / TLS-layer fragmentation.  Does NOT inject any fake
+#     packet.  Instead, it intercepts the first outbound data packet carrying
+#     the real TLS ClientHello, splits the TLS record body, and re-wraps those
+#     chunks as multiple small TLS records.  DPI engines that cannot reassemble
+#     TLS records across fragment boundaries will fail to extract the SNI.  The
+#     upstream TLS server reassembles the fragments normally.
+#
+#   "wrong_seq_tls_frag"
+#     Combines wrong_seq with TLS Fragment / TCP-level fragmentation for
+#     layered filtering.  First, it injects a fake wrong-sequence ClientHello
+#     on the handshake ACK.  Then it fragments configured real client data
+#     using the TLS_FRAG_* settings, so later DPI layers still do not see the
+#     complete SNI in any single TCP segment even if the fake packet was
+#     dropped by an earlier firewall.
+#
+#   "wrong_seq_tls_record_frag"
+#     Combines wrong_seq with TLS Record Fragment / TLS-layer fragmentation for
+#     layered filtering.  First, it injects a fake wrong-sequence ClientHello
+#     on the handshake ACK.  Then it intercepts the real first ClientHello and
+#     re-wraps it as TLS record fragments, so later DPI layers still do not see
+#     an unfragmented TLS record containing the SNI even if the fake packet was
+#     dropped by an earlier firewall.
+#
+#   "tls_frag"
+#     TLS Fragment / TCP-level fragmentation.  Does NOT inject fake packets
+#     and does NOT use WinDivert or NFQUEUE packet interception.  Instead, it
+#     fragments the first TLS ClientHello record or a configured range of
+#     client-to-upstream data writes using TLS_FRAG_PACKETS, TLS_FRAG_LENGTH,
+#     and TLS_FRAG_INTERVAL_MS.  With TCP_NODELAY enabled, the OS is less
+#     likely to coalesce small writes, so no single packet carries the full
+#     SNI.  The upstream server reassembles the stream normally.
+#
+# This setting is used by SNI-based modes ("sni_spoof", "sni_scan", and
+# "proxy_scan").  MODE = "ip_bypass_plus" supports only "tls_record_frag" or
+# "tls_frag" so the upstream VPN client's real SNI is preserved. The
+# "ip_bypass" and "ip_scan" modes do not use a bypass method.
+BYPASS_METHOD = "wrong_seq"
+
+# Seconds the proxy waits for the intercept thread to confirm that the spoofed
+# packet was acknowledged and the bypass phase completed.
+#
+# Increase this on very high-latency links or slow systems if otherwise valid
+# connections time out during startup.  Lower values fail faster when the
+# bypass cannot complete.  Must be at least 1.
+BYPASS_TIMEOUT_SECS = 2
+
+# Maximum lifetime (in seconds) for an established relay before ZeroDPI closes
+# it and lets the upstream VPN client reconnect. This is useful for protocols
+# such as gRPC that keep one TCP/TLS connection open for hours; reconnecting
+# lets new connections use the latest scanned SNI/IP target.
+#
+# Set to 0 to disable relay rotation. This is the default.
+RELAY_MAX_LIFETIME_SECS = 0
+
+# (Linux only) NFQUEUE queue number used to intercept packets.
+#
+# ZeroDPI installs firewall rules that send selected TCP packets to this queue.
+# If you change this value, the queue number in the installed rules must match.
+# Windows builds use WinDivert instead, so this setting has no effect there.
+NFQUEUE_NUM = 1
+
+# (Linux only) Firewall rule backend used for NFQUEUE interception.
+#
+# Valid values:
+#   "iptables" — legacy/default behavior.
+#   "nftables" — use the nft command and an inet table.
+# Windows builds use WinDivert instead, so this setting has no effect there.
+LINUX_FIREWALL_BACKEND = "iptables"
+
+# ---------------------------------------------------------------------------
+# wrong_seq method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "wrong_seq" or
+# "wrong_seq_wrong_md5" or "wrong_seq_tls_frag" or
+# "wrong_seq_tls_record_frag".
+
+# Extra bytes subtracted from the injected TCP sequence number in addition to
+# the spoofed ClientHello payload length.
+#
+# The default formula is:
+#   injected_seq = syn_seq + 1 - payload_len - WRONG_SEQ_EXTRA_OFFSET
+#
+# With the default value of 0, the fake segment is placed exactly one payload
+# length behind the server's expected receive sequence.  A positive value pushes
+# the fake segment farther behind the receive window, which can help on some
+# networks with stricter TCP window checks.  Start with 0 and only increase it
+# when testing shows the default is not effective.
+WRONG_SEQ_EXTRA_OFFSET = 0
+
+# Whether to set the TCP PSH flag on the spoofed ClientHello packet.
+#
+# Keep this enabled for normal use.  Many DPI implementations treat PSH-marked
+# packets as application data that should be inspected immediately.  Disable it
+# only when testing a network or middlebox that reacts poorly to PSH.
+WRONG_SEQ_SET_PSH = true
+
+# Whether to increment the IPv4 Identification field on the spoofed packet.
+#
+# Bumping the ID makes the injected packet look like a fresh IPv4 datagram
+# rather than a retransmission of a previous packet.  This helps some stateful
+# middleboxes accept and inspect the fake ClientHello.  This only affects IPv4
+# packets; IPv6 has no IPv4 Identification field.
+WRONG_SEQ_BUMP_IP_IDENT = true
+
+# ---------------------------------------------------------------------------
+# wrong_checksum method parameters
+# ---------------------------------------------------------------------------
+# These settings only apply when BYPASS_METHOD = "wrong_checksum".
+
+# Non-zero value added to the valid computed TCP checksum on the spoofed
+# ClientHello packet.
+#
+# ZeroDPI first rebuilds the packet with correct IPv4/TCP checksums, then
+# corrupts the TCP checksum by wrapping-addition with this value.  DPI engines
+# that do not verify TCP checksums can still parse the fake ClientHello, while
+# the real upstream server should silently drop it.
+#
+# Must be >= 1.  Default: 1.
+WRONG_CHECKSUM_DELTA = 1
+
+# Whether to set the TCP PSH flag on the spoofed ClientHello packet.
+#
+# Keep this enabled for normal use.  Disable it only when testing a network or
+# middlebox that reacts poorly to PSH.
+WRONG_CHECKSUM_SET_PSH = true
+
+# Whether to increment the IPv4 Identification field on the spoofed packet.
+#
+# Bumping the ID makes the spoofed packet look like a fresh IPv4 datagram.
+# This only affects IPv4 packets; IPv6 has no IPv4 Identification field.
+WRONG_CHECKSUM_BUMP_IP_IDENT = true
+
+# Whether to signal the bypass phase complete immediately after the corrupted
+# packet is emitted.
+#
+# The default is true because a correctly invalid-checksum packet should be
+# dropped silently by the real server and therefore will not produce an ACK.
+WRONG_CHECKSUM_COMPLETE_IMMEDIATELY = true
+
+# ---------------------------------------------------------------------------
+# wrong_md5 method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "wrong_md5" or
+# "wrong_md5_tls_frag". "wrong_seq_wrong_md5" uses the TCP-MD5 option and
+# WRONG_MD5_COMPLETE_IMMEDIATELY, but uses the wrong_seq PSH/IP-ident settings
+# for packet shape. WRONG_MD5_COMPLETE_IMMEDIATELY does not affect
+# "wrong_md5_tls_frag"; that combo waits for the real ClientHello segmentation
+# stage.
+
+# Whether to set the TCP PSH flag on the spoofed TCP-MD5 ClientHello packet.
+#
+# Keep this enabled for normal use.  Disable it only when testing a network or
+# middlebox that reacts poorly to PSH.
+WRONG_MD5_SET_PSH = true
+
+# Whether to increment the IPv4 Identification field on the spoofed TCP-MD5
+# packet.
+#
+# Bumping the ID makes the spoofed packet look like a fresh IPv4 datagram.
+# This only affects IPv4 packets; IPv6 has no IPv4 Identification field.
+WRONG_MD5_BUMP_IP_IDENT = true
+
+# Whether to signal the bypass phase complete immediately after the TCP-MD5
+# packet is emitted.
+#
+# The default is true because a server without a negotiated TCP-MD5 key should
+# reject or drop the forged segment.
+WRONG_MD5_COMPLETE_IMMEDIATELY = true
+
+# ---------------------------------------------------------------------------
+# wrong_ack method parameters
+# ---------------------------------------------------------------------------
+# These settings only apply when BYPASS_METHOD = "wrong_ack".
+
+# Bytes subtracted from syn_ack_seq + 1 for the spoofed TCP ACK number.
+#
+# With the default value of 1, the fake segment's ACK is placed one byte before
+# the server's current send-window left edge:
+#   injected_ack = syn_ack_seq + 1 - WRONG_ACK_OFFSET
+#
+# Increase only when testing shows the default is not effective.
+#
+# Must be >= 1.  Default: 1.
+WRONG_ACK_OFFSET = 1
+
+# Whether to set the TCP PSH flag on the spoofed ClientHello packet.
+#
+# Keep this enabled for normal use.  Disable it only when testing a network or
+# middlebox that reacts poorly to PSH.
+WRONG_ACK_SET_PSH = true
+
+# Whether to increment the IPv4 Identification field on the spoofed packet.
+#
+# Bumping the ID makes the spoofed packet look like a fresh IPv4 datagram.
+# This only affects IPv4 packets; IPv6 has no IPv4 Identification field.
+WRONG_ACK_BUMP_IP_IDENT = true
+
+# Whether to signal the bypass phase complete immediately after the old-ACK
+# packet is emitted.
+#
+# The default is true because out-of-window ACK handling can be dropped or
+# answered inconsistently by real servers.
+WRONG_ACK_COMPLETE_IMMEDIATELY = true
+
+# ---------------------------------------------------------------------------
+# wrong_timestamp method parameters
+# ---------------------------------------------------------------------------
+# These settings only apply when BYPASS_METHOD = "wrong_timestamp".
+
+# Value subtracted from the captured TCP Timestamp TSval on the spoofed
+# ClientHello packet.
+#
+# With the default value of 1, the fake segment's timestamp is one tick older
+# than the timestamp the server has already seen from this flow, so PAWS should
+# reject it as a replay.  Increase only when testing shows the default is not
+# effective.
+#
+# Must be >= 1.  Default: 1.
+WRONG_TIMESTAMP_OFFSET = 1
+
+# Whether to set the TCP PSH flag on the spoofed ClientHello packet.
+#
+# Keep this enabled for normal use.  Disable it only when testing a network or
+# middlebox that reacts poorly to PSH.
+WRONG_TIMESTAMP_SET_PSH = true
+
+# Whether to increment the IPv4 Identification field on the spoofed packet.
+#
+# Bumping the ID makes the spoofed packet look like a fresh IPv4 datagram.
+# This only affects IPv4 packets; IPv6 has no IPv4 Identification field.
+WRONG_TIMESTAMP_BUMP_IP_IDENT = true
+
+# Whether to signal the bypass phase complete immediately after the
+# backdated-timestamp packet is emitted.
+#
+# The default is true because a PAWS-rejected packet should not be acknowledged
+# as new data by the real server.
+WRONG_TIMESTAMP_COMPLETE_IMMEDIATELY = true
+
+# ---------------------------------------------------------------------------
+# tls_record_frag method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "tls_record_frag" or
+# "wrong_seq_tls_record_frag".
+
+# Maximum number of TLS record body bytes placed in each TLS record fragment.
+#
+# The real TLS ClientHello record body is split into chunks of at most this
+# many bytes.  Each chunk is wrapped in its own 5-byte TLS record header and
+# the results are concatenated into a single TCP segment.  The upstream server
+# reassembles the records into an identical ClientHello.
+#
+# Smaller values produce more fragments and are harder for DPI to reassemble:
+#   1  — one body byte per record (most aggressive, maximum fragmentation)
+#   5  — five body bytes per record
+#   128 — moderate fragmentation, balances effectiveness and overhead
+#
+# Must be >= 1.  Default: 1.
+TLS_RECORD_FRAG_SIZE = 1
+
+# Whether to set the TCP PSH flag on the packet carrying the fragmented
+# ClientHello.
+#
+# PSH signals to the receiver that it should pass the data to the application
+# immediately.  Keep this enabled for normal use.  Disable it only when
+# debugging a specific DPI device that reacts poorly to PSH-marked packets.
+TLS_RECORD_FRAG_SET_PSH = true
+
+# Whether to increment the IPv4 Identification field on the packet carrying
+# the fragmented ClientHello.
+#
+# Bumping the ID makes the modified packet look like a fresh IPv4 datagram
+# rather than a retransmission.  This only affects IPv4 packets; IPv6 has
+# no IPv4 Identification field.
+TLS_RECORD_FRAG_BUMP_IP_IDENT = true
+
+# ---------------------------------------------------------------------------
+# tls_frag method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "tls_frag" or
+# "wrong_seq_tls_frag" or "wrong_md5_tls_frag".
+#
+# Unlike "wrong_seq" and "tls_record_frag", this method does NOT use the
+# WinDivert / NFQUEUE packet interceptor when used alone as "tls_frag".
+# In combo methods, the fake packet stage still requires packet interception,
+# while these TCP segment settings control how the real
+# ClientHello is written after the fake packet stage.
+
+# Which client data to fragment.
+#
+# Supported values:
+#   "tlshello" — fragment the first complete TLS record (the ClientHello).
+#   "1-3"      — fragment the 1st through 3rd client-to-upstream data writes
+#                observed by ZeroDPI.
+#
+# Default: "tlshello".
+TLS_FRAG_PACKETS = "tlshello"
+
+# Fragment length range in bytes.
+#
+# Accepts either a fixed integer or an inclusive range string:
+#   1     — one byte per fragment chunk
+#   "1-5" — randomly choose 1 through 5 bytes for each chunk
+#   128   — moderate fragmentation
+#
+# A fresh value is chosen for each fragment chunk. Smaller values produce more
+# chunks and are harder for DPI to reassemble, at the cost of connection-start
+# overhead. If this field is omitted, ZeroDPI falls back to legacy TCP_SEG_SIZE.
+#
+# Must be >= 1.  Default: unset (uses TCP_SEG_SIZE).
+TLS_FRAG_LENGTH = "1"
+
+# Delay between fragment chunks, in milliseconds.
+#
+# Accepts either a fixed integer or an inclusive range string:
+#   0      — write chunks back-to-back
+#   "0-10" — randomly wait 0 through 10 ms between chunks
+#   5      — wait 5 ms between chunks
+#
+# A fresh value is chosen between each pair of chunks. ZeroDPI does not sleep
+# after the last chunk.
+#
+# Must be >= 0.  Default: 0.
+TLS_FRAG_INTERVAL_MS = "0"
+
+# Legacy fixed fragment length fallback.
+#
+# Existing configs can keep using TCP_SEG_SIZE. New configs should prefer
+# TLS_FRAG_LENGTH because it supports Xray-style ranges.
+#
+# Used only when TLS_FRAG_LENGTH is omitted. Must be >= 1. Default: 1.
+TCP_SEG_SIZE = 1
+
+# Whether to set TCP_NODELAY on the upstream socket before writing the
+# fragmented ClientHello or selected client writes.
+#
+# TCP_NODELAY disables Nagle's algorithm, which would otherwise accumulate
+# small writes into a single large TCP segment and completely defeat this
+# bypass method.  Keep this enabled for normal TCP-segmentation use.
+#
+# Set to false only when debugging a specific network or middlebox that
+# reacts poorly to TCP_NODELAY connections.
+TCP_SEG_NODELAY = true
+
+# ---------------------------------------------------------------------------
+# Proxy Scan Mode
+# ---------------------------------------------------------------------------
+# These settings only apply when MODE = "proxy_scan".
+# proxy_scan first runs the standard SNI scan (Phase 1) then tests each
+# passing candidate end-to-end through your VPN proxy (Phase 2).
+
+# Minimum SNI-scan score (0–100) a candidate must reach in Phase 1 to
+# be eligible for the proxy test in Phase 2.
+# Default: 1 (any candidate that scored any points proceeds).
+PROXY_TEST_MIN_SNI_SCORE = 1
+
+# Maximum number of Phase 1 candidates to carry into Phase 2.
+# 0 = no cap (test all passing candidates).
+# Default: 0.
+PROXY_TEST_TOP_N = 0
+
+# Host of the SOCKS5 mixed proxy (V2RayN default).
+PROXY_TEST_SOCKS5_HOST = "127.0.0.1"
+
+# Port of the SOCKS5 mixed proxy (V2RayN default).
+PROXY_TEST_SOCKS5_PORT = 10808
+
+# HTTPS URL to fetch through the proxy for speed / latency measurement.
+# Must be an HTTPS URL.  The Cloudflare speed endpoint below downloads a
+# fixed ~512 KB chunk — ideal for measuring real-world VPN throughput.
+PROXY_TEST_URL = "https://speed.cloudflare.com/__down?bytes=524288"
+
+# Timeout for each individual proxy test probe (seconds).
+# Increase on very slow or high-latency VPN links.
+PROXY_TEST_TIMEOUT_SECS = 30
+
+# Weight (0.0–1.0) given to the Phase 1 SNI-scan score when computing the
+# blended final score.  The proxy-test score weight = 1.0 - this value.
+# 0.5 = equal blend; 1.0 = SNI score only; 0.0 = proxy score only.
+PROXY_TEST_SNI_WEIGHT = 0.5
+
+# Scoring caps for the Phase 2 proxy test.
+# These mirror SCAN_* caps but apply to the proxy-measured values.
+
+# TCP latency cap to the SOCKS5 proxy (ms).  Latency above this → 0 pts.
+PROXY_TEST_LATENCY_CAP_MS = 500.0
+
+# TTFB cap through the proxy (ms).  TTFB above this → 0 pts.
+PROXY_TEST_TTFB_CAP_MS = 3000.0
+
+# Download speed cap through the proxy (bytes/sec).  Speed above this → max pts.
+PROXY_TEST_SPEED_CAP_BPS = 2048000.0

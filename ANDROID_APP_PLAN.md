@@ -282,32 +282,35 @@ Acceptance criteria:
 
 ## Phase 4: Runtime Storage Model
 
+Status: complete. Implemented under `android/` as of 2026-06-27.
+
 Steps:
 
-- Create an app-private runtime directory:
+- [x] Create an app-private runtime directory:
   - `files/zerodpi/config.toml`,
   - `files/zerodpi/sni_list.txt`,
   - `files/zerodpi/ip_list.txt`,
   - `files/zerodpi/logs/`,
   - `files/zerodpi/scan_results/`.
-- On first launch:
+- [x] On first launch:
   - copy default config/list templates,
   - preserve user edits on upgrades,
   - add "Reset to defaults" actions.
-- Save files atomically:
+- [x] Save files atomically:
   - write to temp file,
   - fsync where practical,
   - rename into place.
-- Keep simple backups:
+- [x] Keep simple backups:
   - `config.toml.bak`,
   - previous `sni_list.txt`,
   - previous `ip_list.txt`.
-- Resolve relative paths in config to the runtime directory.
+- [x] Resolve relative paths in config to the runtime directory.
 
 Acceptance criteria:
 
-- Users can edit config and lists, close the app, reopen, and see saved data.
-- Corrupt saves do not destroy the last known good config.
+- [x] Users can edit config and lists, close the app, reopen, and see saved
+  data.
+- [x] Corrupt saves do not destroy the last known good config.
 
 ## Phase 5: Full Config Settings UI
 

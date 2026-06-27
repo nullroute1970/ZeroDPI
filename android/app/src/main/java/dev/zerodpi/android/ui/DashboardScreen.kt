@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -16,6 +17,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -28,12 +30,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import dev.zerodpi.android.service.RuntimeStatus
 import dev.zerodpi.android.service.ZeroDpiServiceState
+import dev.zerodpi.android.storage.RuntimeFileKind
 
 @Composable
 fun DashboardScreen(
     state: ZeroDpiServiceState,
+    runtimeFilesState: RuntimeFilesUiState,
     onStart: () -> Unit,
     onStop: () -> Unit,
+    onRuntimeFileSelected: (RuntimeFileKind) -> Unit,
+    onRuntimeFileTextChanged: (String) -> Unit,
+    onSaveRuntimeFile: () -> Unit,
+    onResetRuntimeFile: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Scaffold(
@@ -49,6 +57,13 @@ fun DashboardScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             StatusPanel(state = state, onStart = onStart, onStop = onStop)
+            RuntimeFilesPanel(
+                state = runtimeFilesState,
+                onRuntimeFileSelected = onRuntimeFileSelected,
+                onRuntimeFileTextChanged = onRuntimeFileTextChanged,
+                onSaveRuntimeFile = onSaveRuntimeFile,
+                onResetRuntimeFile = onResetRuntimeFile,
+            )
             RuntimeDetails(state = state)
             LogsPanel(logs = state.recentLogs)
         }
@@ -112,6 +127,98 @@ private fun StatusPanel(
                         Text("Stop")
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RuntimeFilesPanel(
+    state: RuntimeFilesUiState,
+    onRuntimeFileSelected: (RuntimeFileKind) -> Unit,
+    onRuntimeFileTextChanged: (String) -> Unit,
+    onSaveRuntimeFile: () -> Unit,
+    onResetRuntimeFile: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        tonalElevation = 1.dp,
+        shape = MaterialTheme.shapes.medium,
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text("Runtime files", fontWeight = FontWeight.SemiBold)
+            if (state.runtimeDir.isNotBlank()) {
+                Text(
+                    text = state.runtimeDir,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                RuntimeFileKind.entries.forEach { kind ->
+                    val label = if (kind in state.dirtyFiles) {
+                        "${kind.title} *"
+                    } else {
+                        kind.title
+                    }
+                    if (kind == state.selectedFile) {
+                        Button(
+                            onClick = { onRuntimeFileSelected(kind) },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text(label)
+                        }
+                    } else {
+                        OutlinedButton(
+                            onClick = { onRuntimeFileSelected(kind) },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text(label)
+                        }
+                    }
+                }
+            }
+            if (state.isLoading) {
+                Text("Loading runtime files.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                OutlinedTextField(
+                    value = state.selectedText,
+                    onValueChange = onRuntimeFileTextChanged,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 220.dp, max = 360.dp),
+                    enabled = !state.isSaving,
+                    label = { Text(state.selectedFile.fileName) },
+                    textStyle = MaterialTheme.typography.bodySmall.copy(
+                        fontFamily = FontFamily.Monospace,
+                    ),
+                    minLines = 10,
+                    maxLines = 18,
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = onSaveRuntimeFile,
+                    enabled = !state.isLoading && !state.isSaving,
+                ) {
+                    Text(if (state.isSaving) "Saving" else "Save")
+                }
+                OutlinedButton(
+                    onClick = onResetRuntimeFile,
+                    enabled = !state.isLoading && !state.isSaving,
+                ) {
+                    Text("Reset to defaults")
+                }
+            }
+            state.statusMessage?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            state.errorMessage?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.error)
             }
         }
     }

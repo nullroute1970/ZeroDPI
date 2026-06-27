@@ -1162,6 +1162,45 @@ Additional Termux options:
 python build.py --platform termux --termux-arch armv8 --android-api 23
 python build.py --platform termux --termux-arch x86_64 --android-ndk /path/to/android-ndk
 ```
+
+Android app runtime artifacts for the future native APK are staged separately:
+
+```sh
+python build.py --platform android-app
+python build.py --platform android-app --android-app-runtime both
+python build.py --platform android-app --android-app-abi debug --android-ndk /path/to/android-ndk
+```
+
+The default Android app build creates the first-release public ABIs
+`arm64-v8a` and `armeabi-v7a` under `dist/android-app/rootless/`. Use
+`--android-app-abi debug` to also build `x86_64` for emulator work.
+
+Runtime variants:
+
+- `rootless`: builds `zerodpi` with packet interception disabled. Scan-only,
+  `ip_bypass`, and supported `tls_frag` workflows still run; NFQUEUE modes fail
+  with a clear unsupported-artifact/rootless-alternative error.
+- `full`: keeps the default packet-interception feature for rooted NFQUEUE
+  testing. Device support still depends on root, firewall commands, and kernel
+  NFQUEUE support.
+
+Output layout:
+
+```text
+dist/android-app/rootless/
+  assets/zerodpi/config.toml
+  assets/zerodpi/sni_list.txt
+  assets/zerodpi/ip_list.txt
+  bin/<abi>/zerodpi
+  jniLibs/<abi>/libzerodpi_exec.so
+  zerodpi-runtime-manifest.json
+```
+
+For the process-wrapper APK, copy `jniLibs/` into the Android app module and
+run the ABI-matched `libzerodpi_exec.so` from `ApplicationInfo.nativeLibraryDir`.
+Do not rely on executing a binary copied into writable app data unless that is
+validated on target devices. `bin/<abi>/zerodpi` is provided for `adb` smoke
+tests such as `zerodpi --version` and rootless listener checks.
 </details>
 
 ---

@@ -8,6 +8,10 @@ authors.workspace = true
 repository.workspace = true
 description = "Platform packet-interception backends for ZeroDPI (WinDivert on Windows, NFQUEUE on Linux/Android)."
 
+[features]
+default = ["packet-interception"]
+packet-interception = ["dep:nfq"]
+
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
@@ -17,7 +21,7 @@ etherparse.workspace = true
 parking_lot.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-nfq = "0.2"
+nfq = { version = "0.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windivert = "0.6"

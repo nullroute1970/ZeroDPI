@@ -76,6 +76,11 @@ pub type SharedSniTarget = Arc<RwLock<ActiveSniTarget>>;
 /// dashboard when running in interactive mode.
 #[derive(Debug)]
 pub enum ProxyEvent {
+    /// The local listener was bound and is ready to accept inbound connections.
+    ListenerStarted {
+        mode: String,
+        listen_addr: SocketAddr,
+    },
     /// A new inbound connection was accepted and the outbound source port is known.
     ConnectionAccepted { peer: SocketAddr, src_port: u16 },
     /// The SNI-bypass phase finished (successfully or not).
@@ -444,6 +449,13 @@ pub async fn run_proxy(
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
     info!(%listen_addr, "listening");
+    emit(
+        &event_tx,
+        ProxyEvent::ListenerStarted {
+            mode: cfg.MODE.clone(),
+            listen_addr,
+        },
+    );
 
     loop {
         let (incoming, peer) = match listener.accept().await {
@@ -745,6 +757,13 @@ pub async fn run_ip_bypass_plus_proxy(
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
     info!(%listen_addr, method = %cfg.BYPASS_METHOD, "ip_bypass_plus: listening");
+    emit(
+        &event_tx,
+        ProxyEvent::ListenerStarted {
+            mode: cfg.MODE.clone(),
+            listen_addr,
+        },
+    );
 
     loop {
         let (incoming, peer) = match listener.accept().await {
@@ -1156,6 +1175,13 @@ pub async fn run_ip_bypass_proxy(
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
     info!(%listen_addr, "ip_bypass: listening");
+    emit(
+        &event_tx,
+        ProxyEvent::ListenerStarted {
+            mode: cfg.MODE.clone(),
+            listen_addr,
+        },
+    );
 
     loop {
         let (incoming, peer) = match listener.accept().await {

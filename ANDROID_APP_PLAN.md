@@ -171,19 +171,22 @@ Acceptance criteria:
 
 ## Phase 1: Define Android-Facing ZeroDPI Contract
 
+Status: complete. Implemented in the CLI as of 2026-06-27.
+
 Create a small, stable control contract between Android and ZeroDPI before UI
 work gets deep.
 
 Steps:
 
-- Add a headless run mode contract for Android:
+- [x] Add a headless run mode contract for Android:
   - command shape: `zerodpi --config <path> --no-tui --auto-select`,
   - stop shape: send SIGTERM and wait for graceful cleanup,
   - fallback stop: kill only after timeout.
-- Define machine-readable runtime status:
+- [x] Define machine-readable runtime status:
   - minimum acceptable MVP: parse headless logs,
-  - preferred next step: add `--json-events` to stream structured events.
-- Define events the app needs:
+  - implemented preferred path: add `--json-events` to stream structured
+    newline-delimited JSON events on stdout while logs remain on stderr.
+- [x] Define events the app needs:
   - startup,
   - config loaded,
   - scan started,
@@ -196,16 +199,16 @@ Steps:
   - active target changed,
   - fatal error,
   - graceful shutdown.
-- Define process exit semantics:
+- [x] Define process exit semantics:
   - exit code `0`: stopped or scan completed,
   - non-zero: show error and retain logs,
   - root denial: show root-required explanation and rootless alternatives.
 
 Acceptance criteria:
 
-- The Android side can start ZeroDPI without the TUI.
-- The Android side can stop ZeroDPI gracefully.
-- Logs or JSON events are enough to show useful dashboard state.
+- [x] The Android side can start ZeroDPI without the TUI.
+- [x] The Android side can stop ZeroDPI gracefully.
+- [x] Logs or JSON events are enough to show useful dashboard state.
 
 ## Phase 2: Build Android ZeroDPI Runtime Artifacts
 

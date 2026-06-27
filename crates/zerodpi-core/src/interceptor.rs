@@ -9,6 +9,8 @@
 //! request mutations, and returns a [`Verdict`].
 
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::flow::FlowTable;
 
@@ -164,6 +166,21 @@ impl LinuxFirewallBackend {
 }
 
 /// A platform packet-interception backend.
+#[derive(Clone, Debug, Default)]
+pub struct InterceptorShutdown {
+    requested: Arc<AtomicBool>,
+}
+
+impl InterceptorShutdown {
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+}
+
 pub trait PacketInterceptor: Sized + Send + 'static {
     /// Open the interceptor with the given filter. Backend may install
     /// system rules here; they're removed in `Drop`.
@@ -172,7 +189,16 @@ pub trait PacketInterceptor: Sized + Send + 'static {
     /// Run the intercept loop, calling `handler` for each captured packet.
     /// Returns when the underlying queue is closed or an unrecoverable
     /// error occurs.
-    fn run<H: PacketHandler>(self, handler: H) -> anyhow::Result<()>;
+    fn run<H: PacketHandler>(self, handler: H) -> anyhow::Result<()> {
+        self.run_until(handler, InterceptorShutdown::default())
+    }
+
+    /// Run until the backend ends or `shutdown` is requested.
+    fn run_until<H: PacketHandler>(
+        self,
+        handler: H,
+        shutdown: InterceptorShutdown,
+    ) -> anyhow::Result<()>;
 }
 
 /// Convenience: many handlers want shared access to the flow table.

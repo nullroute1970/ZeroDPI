@@ -812,6 +812,7 @@ Options:
       --listen-port <PORT>             Override LISTEN_PORT
       --auto-select                    Auto-select top-ranked candidate
       --no-tui                         Disable ratatui screens for headless/service runs
+      --json-events                    Emit newline-delimited JSON runtime events to stdout; implies --no-tui
       --sni <SNI>                      Override SELECTED_SNI (skip scan)
       --method <METHOD>                Override BYPASS_METHOD (e.g. wrong_seq, wrong_timestamp, tls_frag)
       --queue-num <N>                  Override NFQUEUE_NUM (Linux)
@@ -992,6 +993,18 @@ Runtime behavior to know:
 - `tls_frag` does not open WinDivert/NFQUEUE because it operates by controlling socket writes inside the proxy.
 - Scan-only modes do not start the local proxy and do not need your VPN client to be running.
 - `proxy_scan` requires the configured SOCKS5 proxy to be running before ZeroDPI starts Phase 2.
+
+### Headless / Android Controller Contract
+
+Android process-wrapper runners should start ZeroDPI without the terminal UI:
+
+```sh
+zerodpi --config <path> --no-tui --auto-select --json-events
+```
+
+`--json-events` emits newline-delimited JSON to stdout and leaves human logs on stderr. It implies `--no-tui`, so the stream remains parseable for app controllers. Event names include `startup`, `config_loaded`, `scan_started`, `scan_progress`, `scan_completed`, `selected_target`, `listener_started`, `connection_accepted`, `bypass_finished`, `relay_bytes`, `active_target_changed`, `root_required`, `fatal_error`, and `graceful_shutdown`.
+
+To stop a headless run, send `SIGTERM` and wait for ZeroDPI to exit. On Linux/Android NFQUEUE paths, ZeroDPI requests interceptor shutdown before returning so firewall guards can clean up. A controller may kill the process only after its own timeout. Exit code `0` means a scan completed or a headless proxy stopped cleanly; non-zero means the controller should show the error and retain stderr/stdout logs. If root is required but unavailable, the JSON stream includes `root_required` with rootless alternatives.
 
 ### 🐧 Linux
 

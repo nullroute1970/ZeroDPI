@@ -1,11 +1,134 @@
 //! Configuration loaded from `config.toml`.
 
+use std::fmt;
 use std::path::Path;
 
+use serde::de;
 use serde::{Deserialize, Serialize};
 
 use crate::interceptor::LinuxFirewallBackend;
 use crate::tls_template::MAX_SNI_LEN;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Int32Range {
+    pub min: i32,
+    pub max: i32,
+}
+
+impl Int32Range {
+    pub const fn exact(value: i32) -> Self {
+        Self {
+            min: value,
+            max: value,
+        }
+    }
+
+    pub fn parse(input: &str) -> Result<Self, String> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Err("range cannot be empty".into());
+        }
+
+        if let Some((start, end)) = input.split_once('-') {
+            let min = parse_i32(start.trim())?;
+            let max = parse_i32(end.trim())?;
+            if max < min {
+                return Err(format!("range '{input}' has max lower than min"));
+            }
+            Ok(Self { min, max })
+        } else {
+            Ok(Self::exact(parse_i32(input)?))
+        }
+    }
+
+    pub fn validate_at_least(&self, field: &str, min_value: i32) -> anyhow::Result<()> {
+        if self.min < min_value {
+            anyhow::bail!("{field} must be >= {min_value}");
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for Int32Range {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Int(i32),
+            Text(String),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Int(value) => Ok(Self::exact(value)),
+            Repr::Text(value) => Self::parse(&value).map_err(de::Error::custom),
+        }
+    }
+}
+
+fn parse_i32(value: &str) -> Result<i32, String> {
+    value
+        .parse::<i32>()
+        .map_err(|_| format!("'{value}' is not a valid Int32 value"))
+}
+
+impl fmt::Display for Int32Range {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.min == self.max {
+            write!(f, "{}", self.min)
+        } else {
+            write!(f, "{}-{}", self.min, self.max)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsFragPackets {
+    TlsHello,
+    WriteRange { start: u32, end: u32 },
+}
+
+impl TlsFragPackets {
+    pub fn parse(input: &str) -> Result<Self, String> {
+        let input = input.trim();
+        if input.eq_ignore_ascii_case("tlshello") {
+            return Ok(Self::TlsHello);
+        }
+
+        let parse_packet_index = |value: &str| -> Result<u32, String> {
+            let parsed = value
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("'{value}' is not a valid packet index"))?;
+            if parsed == 0 {
+                return Err("packet indexes are 1-based and must be >= 1".into());
+            }
+            Ok(parsed)
+        };
+
+        let (start, end) = if let Some((start, end)) = input.split_once('-') {
+            (parse_packet_index(start)?, parse_packet_index(end)?)
+        } else {
+            let index = parse_packet_index(input)?;
+            (index, index)
+        };
+
+        if end < start {
+            return Err(format!("packet range '{input}' has end lower than start"));
+        }
+
+        Ok(Self::WriteRange { start, end })
+    }
+
+    pub fn includes_write(self, write_index: u32) -> bool {
+        match self {
+            Self::TlsHello => false,
+            Self::WriteRange { start, end } => (start..=end).contains(&write_index),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
@@ -76,11 +199,9 @@ pub struct Config {
     ///   single record contains the full SNI. No fake packet is injected; the
     ///   server reassembles normally.
     /// - `"wrong_seq_tls_frag"` — injects a `wrong_seq` fake ClientHello,
-    ///   then sends the intact real ClientHello in small TCP segments for
-    ///   downstream DPI layers.
+    ///   then fragments configured real client data for downstream DPI layers.
     /// - `"wrong_md5_tls_frag"` — injects a `wrong_md5` fake ClientHello,
-    ///   then sends the intact real ClientHello in small TCP segments for
-    ///   downstream DPI layers.
+    ///   then fragments configured real client data for downstream DPI layers.
     /// - `"wrong_seq_tls_record_frag"` — injects a `wrong_seq` fake
     ///   ClientHello, then fragments the real ClientHello into multiple small
     ///   TLS records for downstream DPI layers.
@@ -263,8 +384,40 @@ pub struct Config {
     // -----------------------------------------------------------------------
     // tls_frag method parameters
     // -----------------------------------------------------------------------
+    /// Which client data should be fragmented by `tls_frag`,
+    /// `wrong_seq_tls_frag`, or `wrong_md5_tls_frag`.
+    ///
+    /// Supported values:
+    /// - `"tlshello"` fragments the first complete TLS record, preserving the
+    ///   historical ZeroDPI behavior.
+    /// - `"N-M"` fragments the Nth through Mth client-to-upstream data writes
+    ///   seen by ZeroDPI. Packet indexes are 1-based.
+    ///
+    /// Default: `"tlshello"`.
+    #[serde(default = "default_tls_frag_packets")]
+    pub TLS_FRAG_PACKETS: String,
+
+    /// Xray-style fragment length range, in bytes, for TCP-level
+    /// fragmentation. Accepts either an integer (`1`) or an inclusive range
+    /// string (`"1-5"`). A fresh value is sampled for every fragment chunk.
+    ///
+    /// If unset, ZeroDPI falls back to the legacy `TCP_SEG_SIZE` value.
+    /// Must be `>= 1` when set.
+    #[serde(default)]
+    pub TLS_FRAG_LENGTH: Option<Int32Range>,
+
+    /// Xray-style interval range, in milliseconds, between TCP-level
+    /// fragments. Accepts either an integer (`0`) or an inclusive range string
+    /// (`"0-10"`). A fresh value is sampled between fragment chunks.
+    /// Must be `>= 0`. Default: `0`.
+    #[serde(default = "default_tls_frag_interval_ms")]
+    pub TLS_FRAG_INTERVAL_MS: Int32Range,
+
     /// Maximum ClientHello bytes sent in each TCP segment when using
     /// `tls_frag`, `wrong_seq_tls_frag`, or `wrong_md5_tls_frag`.
+    ///
+    /// Legacy alias for fixed `TLS_FRAG_LENGTH`; used only when
+    /// `TLS_FRAG_LENGTH` is not set.
     ///
     /// The normal, intact TLS ClientHello record is sliced into chunks of at
     /// most this many bytes and each chunk is written to the upstream socket
@@ -493,6 +646,12 @@ fn default_wrong_timestamp_offset() -> u32 {
 fn default_tls_frag_size() -> usize {
     1
 }
+fn default_tls_frag_packets() -> String {
+    "tlshello".into()
+}
+fn default_tls_frag_interval_ms() -> Int32Range {
+    Int32Range::exact(0)
+}
 fn default_tcp_seg_size() -> usize {
     1
 }
@@ -656,6 +815,14 @@ impl Config {
         if self.TCP_SEG_SIZE == 0 {
             anyhow::bail!("TCP_SEG_SIZE must be >= 1");
         }
+        if self.TCP_SEG_SIZE > i32::MAX as usize {
+            anyhow::bail!("TCP_SEG_SIZE must be <= i32::MAX");
+        }
+        let _ = self.tls_frag_packets()?;
+        self.tls_frag_length_range()?
+            .validate_at_least("TLS_FRAG_LENGTH", 1)?;
+        self.TLS_FRAG_INTERVAL_MS
+            .validate_at_least("TLS_FRAG_INTERVAL_MS", 0)?;
         if LinuxFirewallBackend::parse(&self.LINUX_FIREWALL_BACKEND).is_none() {
             anyhow::bail!(
                 "Unknown LINUX_FIREWALL_BACKEND '{}'. Valid values: \"iptables\", \"nftables\"",
@@ -693,6 +860,20 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    pub fn tls_frag_packets(&self) -> anyhow::Result<TlsFragPackets> {
+        TlsFragPackets::parse(&self.TLS_FRAG_PACKETS)
+            .map_err(|e| anyhow::anyhow!("TLS_FRAG_PACKETS is invalid: {e}"))
+    }
+
+    pub fn tls_frag_length_range(&self) -> anyhow::Result<Int32Range> {
+        if let Some(range) = self.TLS_FRAG_LENGTH {
+            return Ok(range);
+        }
+        let value = i32::try_from(self.TCP_SEG_SIZE)
+            .map_err(|_| anyhow::anyhow!("TCP_SEG_SIZE must be <= i32::MAX"))?;
+        Ok(Int32Range::exact(value))
     }
 
     pub fn linux_firewall_backend(&self) -> LinuxFirewallBackend {
@@ -749,6 +930,10 @@ mod tests {
         assert!(cfg.TLS_RECORD_FRAG_SET_PSH);
         assert!(cfg.TLS_RECORD_FRAG_BUMP_IP_IDENT);
         // tls_frag defaults
+        assert_eq!(cfg.TLS_FRAG_PACKETS, "tlshello");
+        assert_eq!(cfg.TLS_FRAG_LENGTH, None);
+        assert_eq!(cfg.tls_frag_length_range().unwrap(), Int32Range::exact(1));
+        assert_eq!(cfg.TLS_FRAG_INTERVAL_MS, Int32Range::exact(0));
         assert_eq!(cfg.TCP_SEG_SIZE, 1);
         assert!(cfg.TCP_SEG_NODELAY);
         // proxy timing defaults
@@ -1524,6 +1709,9 @@ mod tests {
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.BYPASS_METHOD, "tls_frag");
+        assert_eq!(cfg.tls_frag_packets().unwrap(), TlsFragPackets::TlsHello);
+        assert_eq!(cfg.tls_frag_length_range().unwrap(), Int32Range::exact(1));
+        assert_eq!(cfg.TLS_FRAG_INTERVAL_MS, Int32Range::exact(0));
         assert_eq!(cfg.TCP_SEG_SIZE, 1);
         assert!(cfg.TCP_SEG_NODELAY);
     }
@@ -1539,8 +1727,102 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
+        assert_eq!(cfg.TLS_FRAG_LENGTH, None);
+        assert_eq!(cfg.tls_frag_length_range().unwrap(), Int32Range::exact(16));
         assert_eq!(cfg.TCP_SEG_SIZE, 16);
         assert!(!cfg.TCP_SEG_NODELAY);
+    }
+
+    #[test]
+    fn parses_tls_frag_xray_style_fields() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "tls_frag"
+            TLS_FRAG_PACKETS = "1-3"
+            TLS_FRAG_LENGTH = "2-7"
+            TLS_FRAG_INTERVAL_MS = "0-10"
+            TCP_SEG_SIZE = 16
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.tls_frag_packets().unwrap(),
+            TlsFragPackets::WriteRange { start: 1, end: 3 }
+        );
+        assert_eq!(
+            cfg.tls_frag_length_range().unwrap(),
+            Int32Range { min: 2, max: 7 }
+        );
+        assert_eq!(cfg.TLS_FRAG_INTERVAL_MS, Int32Range { min: 0, max: 10 });
+    }
+
+    #[test]
+    fn parses_tls_frag_integer_ranges() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "tls_frag"
+            TLS_FRAG_PACKETS = "2"
+            TLS_FRAG_LENGTH = 5
+            TLS_FRAG_INTERVAL_MS = 0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.tls_frag_packets().unwrap(),
+            TlsFragPackets::WriteRange { start: 2, end: 2 }
+        );
+        assert_eq!(cfg.tls_frag_length_range().unwrap(), Int32Range::exact(5));
+        assert_eq!(cfg.TLS_FRAG_INTERVAL_MS, Int32Range::exact(0));
+    }
+
+    #[test]
+    fn rejects_invalid_tls_frag_packets() {
+        for packets in ["", "0-3", "3-1", "abc"] {
+            let toml_str = format!(
+                r#"
+                LISTEN_HOST = "0.0.0.0"
+                LISTEN_PORT = 40443
+                BYPASS_METHOD = "tls_frag"
+                TLS_FRAG_PACKETS = "{packets}"
+            "#
+            );
+            let cfg: Config = toml::from_str(&toml_str).unwrap();
+            assert!(
+                cfg.validate().is_err(),
+                "accepted invalid TLS_FRAG_PACKETS={packets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_tls_frag_ranges() {
+        let bad_length = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "tls_frag"
+            TLS_FRAG_LENGTH = "0-5"
+        "#;
+        let cfg: Config = toml::from_str(bad_length).unwrap();
+        assert!(cfg.validate().is_err());
+
+        let bad_interval = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "tls_frag"
+            TLS_FRAG_INTERVAL_MS = -1
+        "#;
+        let cfg: Config = toml::from_str(bad_interval).unwrap();
+        assert!(cfg.validate().is_err());
+
+        let reversed = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "tls_frag"
+            TLS_FRAG_LENGTH = "9-2"
+        "#;
+        assert!(toml::from_str::<Config>(reversed).is_err());
     }
 
     #[test]

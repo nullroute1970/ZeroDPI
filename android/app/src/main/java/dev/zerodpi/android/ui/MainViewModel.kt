@@ -9,6 +9,8 @@ import android.os.IBinder
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import dev.zerodpi.android.config.ConfigEditorState
+import dev.zerodpi.android.config.ZeroDpiConfigToml
 import dev.zerodpi.android.service.RuntimeStatus
 import dev.zerodpi.android.service.ZeroDpiService
 import dev.zerodpi.android.service.ZeroDpiServiceState
@@ -27,6 +29,7 @@ data class RuntimeFilesUiState(
     val configText: String = "",
     val sniListText: String = "",
     val ipListText: String = "",
+    val configEditor: ConfigEditorState = ZeroDpiConfigToml.analyze(""),
     val dirtyFiles: Set<RuntimeFileKind> = emptySet(),
     val isLoading: Boolean = true,
     val isSaving: Boolean = false,
@@ -45,7 +48,10 @@ data class RuntimeFilesUiState(
 
     fun withText(kind: RuntimeFileKind, text: String): RuntimeFilesUiState =
         when (kind) {
-            RuntimeFileKind.Config -> copy(configText = text)
+            RuntimeFileKind.Config -> copy(
+                configText = text,
+                configEditor = ZeroDpiConfigToml.analyze(text),
+            )
             RuntimeFileKind.SniList -> copy(sniListText = text)
             RuntimeFileKind.IpList -> copy(ipListText = text)
         }
@@ -98,6 +104,26 @@ class MainViewModel(
 
     fun start() {
         viewModelScope.launch {
+            val validation = ZeroDpiConfigToml.analyze(_runtimeFilesState.value.configText)
+            if (!validation.canStart) {
+                _runtimeFilesState.update {
+                    it.copy(
+                        configEditor = validation,
+                        statusMessage = null,
+                        errorMessage = "Fix config validation errors before starting ZeroDPI.",
+                    )
+                }
+                return@launch
+            }
+
+            _runtimeFilesState.update {
+                it.copy(
+                    configEditor = validation,
+                    statusMessage = validation.rootRequirement.message,
+                    errorMessage = null,
+                )
+            }
+
             if (saveRuntimeFiles(_runtimeFilesState.value.dirtyFiles)) {
                 startService()
             }
@@ -119,6 +145,23 @@ class MainViewModel(
                 .copy(
                     dirtyFiles = current.dirtyFiles + current.selectedFile,
                     statusMessage = "Unsaved edits.",
+                    errorMessage = null,
+                )
+        }
+    }
+
+    fun updateConfigField(fieldName: String, value: String) {
+        _runtimeFilesState.update { current ->
+            val updatedConfig = ZeroDpiConfigToml.replaceOrAppendField(
+                text = current.configText,
+                fieldName = fieldName,
+                value = value,
+            )
+            current
+                .withText(RuntimeFileKind.Config, updatedConfig)
+                .copy(
+                    dirtyFiles = current.dirtyFiles + RuntimeFileKind.Config,
+                    statusMessage = "Unsaved config setting.",
                     errorMessage = null,
                 )
         }
@@ -192,6 +235,7 @@ class MainViewModel(
                     configText = contents.configText,
                     sniListText = contents.sniListText,
                     ipListText = contents.ipListText,
+                    configEditor = ZeroDpiConfigToml.analyze(contents.configText),
                     isLoading = false,
                     statusMessage = "Runtime files loaded.",
                 )

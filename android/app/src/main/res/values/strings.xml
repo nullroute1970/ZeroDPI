@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">ZeroDPI</string>
+    <string name="zerodpi_notification_channel">ZeroDPI runtime</string>
+    <string name="zerodpi_notification_title">ZeroDPI is running</string>
+</resources>

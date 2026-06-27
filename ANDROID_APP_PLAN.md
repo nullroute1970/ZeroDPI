@@ -244,6 +244,8 @@ Acceptance criteria:
 
 ## Phase 3: Scaffold The Separate Android App
 
+Status: complete. Implemented under `android/` as of 2026-06-27.
+
 Future file layout:
 
 ```text
@@ -258,25 +260,25 @@ android/
 
 Steps:
 
-- Create a Kotlin Android app module.
-- Use Jetpack Compose for UI.
-- Use a foreground service for running ZeroDPI because the proxy must continue
+- [x] Create a Kotlin Android app module.
+- [x] Use Jetpack Compose for UI.
+- [x] Use a foreground service for running ZeroDPI because the proxy must continue
   while the user leaves the UI.
-- Add required Android permissions:
+- [x] Add required Android permissions:
   - `INTERNET`,
   - foreground service permission(s),
   - notification permission flow for Android 13+ if notifications are shown.
-- Add one service-owned runtime controller:
+- [x] Add one service-owned runtime controller:
   - `ZeroDpiRunner` interface,
   - `ProcessZeroDpiRunner` implementation for MVP,
   - later `JniZeroDpiRunner`.
-- Keep UI state in a ViewModel that observes service state.
+- [x] Keep UI state in a ViewModel that observes service state.
 
 Acceptance criteria:
 
-- App launches to the dashboard.
-- Service can be bound from the UI.
-- Fake runner can drive UI without a real ZeroDPI binary.
+- [x] App launches to the dashboard.
+- [x] Service can be bound from the UI.
+- [x] Fake runner can drive UI without a real ZeroDPI binary.
 
 ## Phase 4: Runtime Storage Model
 

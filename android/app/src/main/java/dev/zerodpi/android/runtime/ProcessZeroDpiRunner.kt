@@ -16,10 +16,13 @@ import java.util.concurrent.TimeUnit
 class ProcessZeroDpiRunner(
     context: Context,
     private val scope: CoroutineScope,
+    private val rootManager: RootManager,
 ) : ZeroDpiRunner {
     private val appContext = context.applicationContext
     private val events = MutableSharedFlow<ZeroDpiRunnerEvent>(extraBufferCapacity = 128)
     private var process: Process? = null
+    private var rootProcessPid: Long? = null
+    private var runningAsRoot: Boolean = false
     private var outputJob: Job? = null
     private var waitJob: Job? = null
     private val exitEmitted = AtomicBoolean(false)
@@ -49,21 +52,39 @@ class ProcessZeroDpiRunner(
             "--json-events",
         )
 
-        val builder = if (request.useRoot) {
-            ProcessBuilder("su", "-c", shellCommand(command))
-        } else {
-            ProcessBuilder(command)
-        }
-            .directory(File(request.workingDirectory))
-            .redirectErrorStream(true)
-
-        process = runCatching {
-            withContext(Dispatchers.IO) {
-                builder.start()
+        val workingDirectory = File(request.workingDirectory)
+        if (request.useRoot) {
+            when (val launch = rootManager.runAsRoot(command, workingDirectory)) {
+                is RootProcessLaunchResult.Started -> {
+                    process = launch.process
+                    rootProcessPid = launch.pid
+                    runningAsRoot = true
+                    events.emit(ZeroDpiRunnerEvent.Log("Started ZeroDPI through su."))
+                }
+                is RootProcessLaunchResult.Failed -> {
+                    events.emit(
+                        ZeroDpiRunnerEvent.Failed(
+                            "${launch.message} ${launch.startFailure}".trim(),
+                        ),
+                    )
+                    return
+                }
             }
-        }.getOrElse { error ->
-            events.emit(ZeroDpiRunnerEvent.Failed(error.message ?: "Failed to start ZeroDPI."))
-            return
+        } else {
+            val builder = ProcessBuilder(command)
+                .directory(workingDirectory)
+                .redirectErrorStream(true)
+
+            process = runCatching {
+                withContext(Dispatchers.IO) {
+                    builder.start()
+                }
+            }.getOrElse { error ->
+                events.emit(ZeroDpiRunnerEvent.Failed(error.message ?: "Failed to start ZeroDPI."))
+                return
+            }
+            rootProcessPid = null
+            runningAsRoot = false
         }
 
         outputJob = scope.launch(Dispatchers.IO) {
@@ -76,8 +97,10 @@ class ProcessZeroDpiRunner(
 
         waitJob = scope.launch(Dispatchers.IO) {
             val exitCode = process?.waitFor() ?: -1
-            emitExited(exitCode)
             process = null
+            rootProcessPid = null
+            runningAsRoot = false
+            emitExited(exitCode)
         }
     }
 
@@ -87,6 +110,7 @@ class ProcessZeroDpiRunner(
             return
         }
 
+        stopRootProcessIfNeeded()
         current.destroy()
         val stopped = withContext(Dispatchers.IO) {
             current.waitFor(5, TimeUnit.SECONDS)
@@ -105,6 +129,7 @@ class ProcessZeroDpiRunner(
             return
         }
 
+        stopRootProcessIfNeeded()
         current.destroyForcibly()
         withContext(Dispatchers.IO) {
             current.waitFor(2, TimeUnit.SECONDS)
@@ -119,24 +144,24 @@ class ProcessZeroDpiRunner(
         outputJob = null
         waitJob = null
         process = null
+        rootProcessPid = null
+        runningAsRoot = false
+    }
+
+    private suspend fun stopRootProcessIfNeeded() {
+        val pid = rootProcessPid
+        if (!runningAsRoot || pid == null) {
+            return
+        }
+        val result = rootManager.stopRootProcess(pid)
+        if (!result.isSuccess) {
+            events.emit(ZeroDpiRunnerEvent.Log(result.diagnosticLine()))
+        }
     }
 
     private suspend fun emitExited(exitCode: Int) {
         if (exitEmitted.compareAndSet(false, true)) {
             events.emit(ZeroDpiRunnerEvent.Exited(exitCode))
         }
-    }
-
-    private fun shellCommand(args: List<String>): String =
-        args.joinToString(" ") { arg ->
-            if (arg.matches(SAFE_SHELL_ARG)) {
-                arg
-            } else {
-                "'${arg.replace("'", "'\"'\"'")}'"
-            }
-        }
-
-    private companion object {
-        val SAFE_SHELL_ARG = Regex("""^[A-Za-z0-9_./:=+-]+$""")
     }
 }

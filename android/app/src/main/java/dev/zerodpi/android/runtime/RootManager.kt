@@ -123,22 +123,8 @@ class SuRootManager(
         )
     }
 
-    override suspend fun requestRootFor(reason: String): RootAccessResult {
-        grantedForSession?.let { cached ->
-            return cached.copy(message = "Root already granted for this app session; continuing $reason.")
-        }
-
-        val uidResult = runRootShellCommand(
-            label = "su -c id -u",
-            shell = "id -u",
-            timeoutSeconds = ROOT_TIMEOUT_SECONDS,
-        )
-        val result = rootAccessResultFor(reason, uidResult)
-        if (result.state == RootAccessState.Granted) {
-            grantedForSession = result
-        }
-        return result
-    }
+    override suspend fun requestRootFor(reason: String): RootAccessResult =
+        checkRootFor(reason = reason, allowCachedGrant = true)
 
     override suspend fun runAsRoot(
         command: List<String>,
@@ -174,7 +160,7 @@ class SuRootManager(
         )
 
     override suspend fun runDiagnostics(firewallBackend: String): RootDiagnosticReport {
-        val rootAccess = requestRootFor("root diagnostics")
+        val rootAccess = checkRootFor(reason = "root diagnostics", allowCachedGrant = false)
         if (rootAccess.state != RootAccessState.Granted) {
             return RootDiagnosticReport(
                 rootAccess = rootAccess,
@@ -209,6 +195,28 @@ class SuRootManager(
                 "Selected firewall backend command: $selectedBackend.",
             ),
         )
+    }
+
+    private suspend fun checkRootFor(
+        reason: String,
+        allowCachedGrant: Boolean,
+    ): RootAccessResult {
+        if (allowCachedGrant) {
+            grantedForSession?.let { cached ->
+                return cached.copy(message = "Root already granted for this app session; continuing $reason.")
+            }
+        }
+
+        val uidResult = runRootShellCommand(
+            label = "su -c id -u",
+            shell = "id -u",
+            timeoutSeconds = ROOT_TIMEOUT_SECONDS,
+        )
+        val result = rootAccessResultFor(reason, uidResult)
+        if (result.state == RootAccessState.Granted) {
+            grantedForSession = result
+        }
+        return result
     }
 
     private fun rootAccessResultFor(reason: String, uidResult: RootCommandResult): RootAccessResult {
@@ -368,7 +376,7 @@ private fun String.compactForDiagnostic(): String {
         .map { it.trim() }
         .filter { it.isNotEmpty() }
         .joinToString(" | ")
-    return if (compact.length <= SuRootManager.MAX_DIAGNOSTIC_TEXT) {
+    return if (compact.length <= MAX_DIAGNOSTIC_TEXT) {
         compact
     } else {
         compact.take(MAX_DIAGNOSTIC_TEXT) + "..."

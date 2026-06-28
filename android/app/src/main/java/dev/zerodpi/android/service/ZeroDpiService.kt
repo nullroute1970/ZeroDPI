@@ -13,8 +13,10 @@ import dev.zerodpi.android.R
 import dev.zerodpi.android.config.ZeroDpiConfigToml
 import dev.zerodpi.android.runtime.FakeZeroDpiRunner
 import dev.zerodpi.android.runtime.ProcessZeroDpiRunner
-import dev.zerodpi.android.runtime.RootAccessChecker
 import dev.zerodpi.android.runtime.RootAccessState
+import dev.zerodpi.android.runtime.RootDiagnosticReport
+import dev.zerodpi.android.runtime.RootManager
+import dev.zerodpi.android.runtime.SuRootManager
 import dev.zerodpi.android.runtime.ZeroDpiRunRequest
 import dev.zerodpi.android.runtime.ZeroDpiRunner
 import dev.zerodpi.android.runtime.ZeroDpiRunnerEvent
@@ -68,6 +70,7 @@ class ZeroDpiService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val state = MutableStateFlow(ZeroDpiServiceState())
     private lateinit var runner: ZeroDpiRunner
+    private lateinit var rootManager: RootManager
     private lateinit var runtimeStorage: RuntimeStorage
     private val activeConnections = mutableSetOf<Int>()
     private val activeRelayBytes = mutableMapOf<Int, Long>()
@@ -76,6 +79,7 @@ class ZeroDpiService : Service() {
     override fun onCreate() {
         super.onCreate()
         runtimeStorage = RuntimeStorage(this)
+        rootManager = SuRootManager()
         runner = createRunner()
         scope.launch {
             runner.events().collect { event ->
@@ -147,9 +151,8 @@ class ZeroDpiService : Service() {
             }
             if (rootRequired) {
                 appendLog(editorState.rootRequirement.message)
-                val rootResult = RootAccessChecker.requestRoot(
-                    editorState.valueFor("LINUX_FIREWALL_BACKEND").ifBlank { "iptables" },
-                )
+                appendRootlessAlternatives(editorState.rootRequirement.alternatives)
+                val rootResult = rootManager.requestRootFor("starting $mode with $bypassMethod")
                 appendLog(rootResult.message)
                 when (rootResult.state) {
                     RootAccessState.Granted -> {
@@ -179,6 +182,35 @@ class ZeroDpiService : Service() {
         }
     }
 
+    fun runRootDiagnostics(
+        rootExplanation: String,
+        rootlessAlternatives: List<String>,
+        firewallBackend: String,
+    ) {
+        scope.launch {
+            appendLog("Root diagnostics requested by user; invoking su.")
+            appendLog(rootExplanation)
+            appendRootlessAlternatives(rootlessAlternatives)
+
+            val report = rootManager.runDiagnostics(firewallBackend)
+            appendRootDiagnosticReport(report)
+            state.update {
+                it.copy(
+                    rootStatus = when (report.rootAccess.state) {
+                        RootAccessState.Granted -> RootStatus.Granted
+                        RootAccessState.Denied -> RootStatus.Denied
+                        RootAccessState.Unsupported -> RootStatus.Unsupported
+                    },
+                    lastError = if (report.rootAccess.state == RootAccessState.Granted) {
+                        null
+                    } else {
+                        report.rootAccess.message
+                    },
+                )
+            }
+        }
+    }
+
     fun stopZeroDpi() {
         state.update { it.copy(status = RuntimeStatus.Stopping, forceStopAvailable = false) }
         scope.launch {
@@ -196,7 +228,7 @@ class ZeroDpiService : Service() {
     private fun createRunner(): ZeroDpiRunner {
         val nativeExecutable = File(applicationInfo.nativeLibraryDir, "libzerodpi_exec.so")
         return if (nativeExecutable.isFile) {
-            ProcessZeroDpiRunner(this, scope)
+            ProcessZeroDpiRunner(this, scope, rootManager)
         } else {
             FakeZeroDpiRunner(scope)
         }
@@ -395,9 +427,28 @@ class ZeroDpiService : Service() {
         finishForegroundRun()
     }
 
+    private fun appendRootDiagnosticReport(report: RootDiagnosticReport) {
+        appendLog(report.rootAccess.message)
+        report.rootAccess.commandResult?.let { result ->
+            appendLog(result.diagnosticLine())
+        }
+        report.checks.forEach { result ->
+            appendLog(result.diagnosticLine())
+        }
+        report.skipped.forEach { message ->
+            appendLog(message)
+        }
+    }
+
     private fun appendLog(message: String) {
         state.update { current ->
             current.copy(recentLogs = (current.recentLogs + message).takeLast(12))
+        }
+    }
+
+    private fun appendRootlessAlternatives(alternatives: List<String>) {
+        if (alternatives.isNotEmpty()) {
+            appendLog("Rootless alternatives: ${alternatives.joinToString()}.")
         }
     }
 

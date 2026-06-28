@@ -199,6 +199,35 @@ class MainViewModel(
         service?.forceStopZeroDpi()
     }
 
+    fun runRootDiagnostics() {
+        val validation = ZeroDpiConfigToml.analyze(_runtimeFilesState.value.configText)
+        _runtimeFilesState.update {
+            it.copy(
+                configEditor = validation,
+                statusMessage = "Root diagnostics will invoke su. ${validation.rootRequirement.message}",
+                errorMessage = null,
+            )
+        }
+
+        val connectedService = service
+        if (connectedService == null) {
+            bindService()
+            _runtimeFilesState.update {
+                it.copy(
+                    statusMessage = null,
+                    errorMessage = "Service is still connecting; try root diagnostics again.",
+                )
+            }
+            return
+        }
+
+        connectedService.runRootDiagnostics(
+            rootExplanation = validation.rootRequirement.message,
+            rootlessAlternatives = validation.rootRequirement.alternatives,
+            firewallBackend = validation.valueFor("LINUX_FIREWALL_BACKEND").ifBlank { "iptables" },
+        )
+    }
+
     fun selectRuntimeFile(kind: RuntimeFileKind) {
         _runtimeFilesState.update { it.copy(selectedFile = kind) }
     }

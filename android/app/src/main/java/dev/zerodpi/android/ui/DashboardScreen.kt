@@ -67,6 +67,7 @@ fun DashboardScreen(
     onExportRuntimeFile: (RuntimeFileKind) -> Unit,
     onShareRuntimeFile: (RuntimeFileKind) -> Unit,
     onRunTestScan: (RuntimeFileKind) -> Unit,
+    onRunRootDiagnostics: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Scaffold(
@@ -94,6 +95,7 @@ fun DashboardScreen(
                 editorState = runtimeFilesState.configEditor,
                 enabled = !runtimeFilesState.isLoading && !runtimeFilesState.isSaving,
                 onConfigFieldChanged = onConfigFieldChanged,
+                onRunRootDiagnostics = onRunRootDiagnostics,
             )
             RuntimeFilesPanel(
                 state = runtimeFilesState,
@@ -191,6 +193,7 @@ private fun ConfigSettingsPanel(
     editorState: ConfigEditorState,
     enabled: Boolean,
     onConfigFieldChanged: (String, String) -> Unit,
+    onRunRootDiagnostics: () -> Unit,
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -217,6 +220,17 @@ private fun ConfigSettingsPanel(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodySmall,
                 )
+            }
+            Text(
+                text = "Root diagnostics invoke su to check UID 0, firewall commands, and NFQUEUE hints.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            OutlinedButton(
+                onClick = onRunRootDiagnostics,
+                enabled = enabled,
+            ) {
+                Text("Run root diagnostics")
             }
             if (editorState.issues.isEmpty()) {
                 Text("Config validation passed.", color = MaterialTheme.colorScheme.onSurfaceVariant)

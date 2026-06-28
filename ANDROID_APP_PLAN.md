@@ -461,36 +461,39 @@ Acceptance criteria:
 
 ## Phase 8: Root Manager
 
+Status: complete. Implemented under `android/` as of 2026-06-28.
+
 Steps:
 
-- Build a `RootManager` abstraction:
-  - `isRootAvailable()`,
-  - `requestRootFor(reason)`,
-  - `runAsRoot(command)`,
-  - `stopRootProcess(pid)`.
-- Trigger root prompt only from a user action:
-  - starting root-required mode,
-  - running root diagnostics.
-- Show root explanation before invoking `su`:
-  - why root is needed,
-  - which mode/method needs it,
-  - which non-root alternatives are available.
-- Invoke the device root manager directly via `su`; do not shell out through
+- [x] Build a `RootManager` abstraction:
+  - [x] `isRootAvailable()`,
+  - [x] `requestRootFor(reason)`,
+  - [x] `runAsRoot(command)`,
+  - [x] `stopRootProcess(pid)`.
+- [x] Trigger root prompt only from a user action:
+  - [x] starting root-required mode,
+  - [x] running root diagnostics.
+- [x] Show root explanation before invoking `su`:
+  - [x] why root is needed,
+  - [x] which mode/method needs it,
+  - [x] which non-root alternatives are available.
+- [x] Invoke the device root manager directly via `su`; do not shell out through
   Termux and do not require Termux to be installed.
-- Cache root state only for the app session.
-- Do not hide root failure. Surface `su` stderr and exit status in diagnostics.
-- Add diagnostics:
-  - `id -u`,
-  - `which iptables`,
-  - `which nft`,
-  - kernel/NFQUEUE checks where possible,
-  - ZeroDPI dry startup if a validation command exists later.
+- [x] Cache root state only for the app session.
+- [x] Do not hide root failure. Surface `su` stderr and exit status in diagnostics.
+- [x] Add diagnostics:
+  - [x] `id -u`,
+  - [x] `which iptables`,
+  - [x] `which nft`,
+  - [x] kernel/NFQUEUE checks where possible,
+  - [x] ZeroDPI dry startup is reported as skipped until a validation command
+    exists later.
 
 Acceptance criteria:
 
-- Root is never requested for rootless actions.
-- Root-required starts fail with actionable errors.
-- The app can run rootless workflows after root was denied.
+- [x] Root is never requested for rootless actions.
+- [x] Root-required starts fail with actionable errors.
+- [x] The app can run rootless workflows after root was denied.
 
 ## Phase 9: Logs, Diagnostics, And Support Bundle
 

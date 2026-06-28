@@ -66,6 +66,7 @@ class MainActivity : ComponentActivity() {
                     onExportRuntimeFile = ::launchRuntimeFileExport,
                     onShareRuntimeFile = ::shareRuntimeFile,
                     onRunTestScan = viewModel::runTestScan,
+                    onRunRootDiagnostics = viewModel::runRootDiagnostics,
                 )
             }
         }

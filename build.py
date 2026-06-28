@@ -247,13 +247,39 @@ def download_android_ndk(ndk_version: str) -> Path:
 # Linux build
 # ---------------------------------------------------------------------------
 
+def _detect_pkg_manager() -> str:
+    """Return 'apt', 'pacman', or 'dnf' based on the current distro."""
+    if shutil.which("dpkg") and shutil.which("apt-get"):
+        return "apt"
+    if shutil.which("pacman"):
+        return "pacman"
+    if shutil.which("dnf"):
+        return "dnf"
+    return "unknown"
+
+
 def check_nfqueue_dev() -> bool:
-    """Return True if libnetfilter-queue-dev headers are present."""
-    result = subprocess.run(
-        ["dpkg", "-s", "libnetfilter-queue-dev"],
-        capture_output=True,
-    )
-    return result.returncode == 0
+    """Return True if libnetfilter-queue headers are present."""
+    pm = _detect_pkg_manager()
+    if pm == "apt":
+        result = subprocess.run(
+            ["dpkg", "-s", "libnetfilter-queue-dev"],
+            capture_output=True,
+        )
+        return result.returncode == 0
+    if pm == "pacman":
+        result = subprocess.run(
+            ["pacman", "-Q", "libnetfilter_queue"],
+            capture_output=True,
+        )
+        return result.returncode == 0
+    if pm == "dnf":
+        result = subprocess.run(
+            ["rpm", "-q", "libnetfilter_queue-devel"],
+            capture_output=True,
+        )
+        return result.returncode == 0
+    return False
 
 
 def build_linux() -> None:
@@ -261,13 +287,31 @@ def build_linux() -> None:
 
     # Check libnetfilter-queue-dev
     if not check_nfqueue_dev():
-        print("libnetfilter-queue-dev is not installed.")
-        answer = input("Install it now with apt-get? [Y/n]: ").strip().lower()
-        if answer in ("", "y", "yes"):
-            run(["sudo", "apt-get", "update"])
-            run(["sudo", "apt-get", "install", "-y", "libnetfilter-queue-dev"])
+        pm = _detect_pkg_manager()
+        if pm == "apt":
+            pkg = "libnetfilter-queue-dev"
+            answer = input(f"{pkg} is not installed. Install with apt-get? [Y/n]: ").strip().lower()
+            if answer in ("", "y", "yes"):
+                run(["sudo", "apt-get", "update"])
+                run(["sudo", "apt-get", "install", "-y", pkg])
+            else:
+                die(f"{pkg} is required. Aborting.")
+        elif pm == "pacman":
+            pkg = "libnetfilter_queue"
+            answer = input(f"{pkg} is not installed. Install with pacman? [Y/n]: ").strip().lower()
+            if answer in ("", "y", "yes"):
+                run(["sudo", "pacman", "-S", "--noconfirm", pkg])
+            else:
+                die(f"{pkg} is required. Aborting.")
+        elif pm == "dnf":
+            pkg = "libnetfilter_queue-devel"
+            answer = input(f"{pkg} is not installed. Install with dnf? [Y/n]: ").strip().lower()
+            if answer in ("", "y", "yes"):
+                run(["sudo", "dnf", "install", "-y", pkg])
+            else:
+                die(f"{pkg} is required. Aborting.")
         else:
-            die("libnetfilter-queue-dev is required. Aborting.")
+            die("Cannot detect package manager. Install libnetfilter-queue development headers manually.")
 
     # Cargo build
     run(["cargo", "build", "--workspace", "--release"], env={"CARGO_TERM_COLOR": "always"})

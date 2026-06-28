@@ -3,6 +3,7 @@ package dev.zerodpi.android.service
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.os.Binder
@@ -97,6 +98,11 @@ class ZeroDpiService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            stopZeroDpi()
+            return START_NOT_STICKY
+        }
+
         ensureForeground()
         return START_STICKY
     }
@@ -528,6 +534,16 @@ class ZeroDpiService : Service() {
             .setSmallIcon(R.drawable.ic_stat_zerodpi)
             .setContentTitle(getString(R.string.zerodpi_notification_title))
             .setContentText("Listening for upstream VPN traffic.")
+            .addAction(
+                R.drawable.ic_stat_zerodpi,
+                getString(R.string.zerodpi_notification_stop),
+                PendingIntent.getService(
+                    this,
+                    0,
+                    Intent(this, ZeroDpiService::class.java).setAction(ACTION_STOP),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                ),
+            )
             .setOngoing(true)
             .build()
 
@@ -536,6 +552,7 @@ class ZeroDpiService : Service() {
     }
 
     companion object {
+        const val ACTION_STOP = "dev.zerodpi.android.action.STOP"
         private const val CHANNEL_ID = "zerodpi-runtime"
         private const val NOTIFICATION_ID = 1001
         private const val LOG_FLUSH_TIMEOUT_MS = 1_000L

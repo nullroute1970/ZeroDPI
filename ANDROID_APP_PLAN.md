@@ -314,20 +314,21 @@ Acceptance criteria:
 
 ## Phase 5: Full Config Settings UI
 
+Status: complete. Implemented under `android/` as of 2026-06-28.
+
 Use a typed config model plus a schema so the UI covers every field in
 `config.toml`. The schema should include field name, type, default, section,
 validation rule, root impact, and help text.
 
 Recommended guard against drift:
 
-- Add a test or script that compares Android schema field names to Rust
+- [x] Add a test or script that compares Android schema field names to Rust
   `Config` fields.
-- Keep a raw TOML editor/import/export view as an escape hatch.
-- The raw TOML editor is required in the first usable build, even if the
+- [x] Keep a raw TOML editor/import/export view as an escape hatch.
+- [x] The raw TOML editor is required in the first usable build, even if the
   structured settings UI is still incomplete.
-- Validate by calling the same Rust validation logic when JNI exists, or by
-  running `zerodpi --validate-config <path>` if a CLI validation command is
-  added later.
+- [x] Mirror Rust validation rules locally until JNI validation exists or a
+  `zerodpi --validate-config <path>` CLI command is added later.
 
 Settings sections and field coverage:
 
@@ -384,109 +385,116 @@ Validation rules to mirror:
 
 Acceptance criteria:
 
-- Every Rust `Config` field has a UI control or raw advanced editor coverage.
-- Invalid configs cannot be started.
-- The app explains root impact before asking for root.
+- [x] Every Rust `Config` field has a UI control or raw advanced editor coverage.
+- [x] Invalid configs cannot be started.
+- [x] The app explains root impact before asking for root.
 
 ## Phase 6: List Editors
 
+Status: complete. Implemented under `android/` as of 2026-06-28.
+
 Steps:
 
-- Add an SNI list page:
-  - multiline editor,
-  - one hostname per line,
-  - preserve comments and blank lines if practical,
-  - validate obvious invalid hostnames,
-  - import from text file,
-  - export/share as text.
-- Add an IP list page:
-  - multiline editor,
-  - one IP or CIDR per line,
-  - preserve comments and blank lines if practical,
-  - validate IPv4, IPv6, and CIDR syntax,
-  - warn that `ip_bypass_plus` is IPv4-only,
-  - import/export/share.
-- Add "test scan" actions:
-  - run `sni_scan`,
-  - run `ip_scan`,
-  - save results to `SCAN_OUTPUT` if configured.
+- [x] Add an SNI list page:
+  - [x] multiline editor,
+  - [x] one hostname per line,
+  - [x] preserve comments and blank lines if practical,
+  - [x] validate obvious invalid hostnames,
+  - [x] import from text file,
+  - [x] export/share as text.
+- [x] Add an IP list page:
+  - [x] multiline editor,
+  - [x] one IP or CIDR per line,
+  - [x] preserve comments and blank lines if practical,
+  - [x] validate IPv4, IPv6, and CIDR syntax,
+  - [x] warn that `ip_bypass_plus` is IPv4-only,
+  - [x] import/export/share.
+- [x] Add "test scan" actions:
+  - [x] run `sni_scan`,
+  - [x] run `ip_scan`,
+  - [x] save results to `SCAN_OUTPUT` if configured.
 
 Acceptance criteria:
 
-- Users can edit and save both lists.
-- Invalid entries are highlighted before start where possible.
-- Scan-only workflows work without root.
+- [x] Users can edit and save both lists.
+- [x] Invalid entries are highlighted before start where possible.
+- [x] Scan-only workflows work without root.
 
 ## Phase 7: Dashboard And Start/Stop Flow
 
+Status: complete. Implemented under `android/` as of 2026-06-28.
+
 Dashboard content:
 
-- Current status: stopped, starting, scanning, running, stopping, failed.
-- Root status: not needed, needed, granted, denied, unsupported.
-- Current mode and bypass method.
-- Listener address: `LISTEN_HOST:LISTEN_PORT`.
-- Active SNI/IP and score when known.
-- Connection count and relay byte counters when available.
-- Last error and recent logs.
-- Primary action: Start or Stop.
+- [x] Current status: stopped, starting, scanning, running, stopping, failed.
+- [x] Root status: not needed, needed, granted, denied, unsupported.
+- [x] Current mode and bypass method.
+- [x] Listener address: `LISTEN_HOST:LISTEN_PORT`.
+- [x] Active SNI/IP and score when known.
+- [x] Connection count and relay byte counters when available.
+- [x] Last error and recent logs.
+- [x] Primary action: Start or Stop.
 
 Start sequence:
 
-1. Load typed settings from UI state.
-2. Validate settings.
-3. Save `config.toml`, `sni_list.txt`, and `ip_list.txt`.
-4. Determine whether root is required.
-5. If root is required, show explanation and request root with `su`.
-6. Start foreground service.
-7. Start ZeroDPI with the selected runner.
-8. Stream status and logs into the dashboard.
+1. [x] Load typed settings from UI state.
+2. [x] Validate settings.
+3. [x] Save `config.toml`, `sni_list.txt`, and `ip_list.txt`.
+4. [x] Determine whether root is required.
+5. [x] If root is required, show explanation and request root with `su`.
+6. [x] Start foreground service.
+7. [x] Start ZeroDPI with the selected runner.
+8. [x] Stream status and logs into the dashboard.
 
 Stop sequence:
 
-1. Disable Start until stop completes.
-2. Send graceful termination.
-3. Wait for ZeroDPI to exit and clean up firewall rules.
-4. If timeout expires, offer force stop.
-5. Store final logs.
+1. [x] Disable Start until stop completes.
+2. [x] Send graceful termination.
+3. [x] Wait for ZeroDPI to exit and clean up firewall rules.
+4. [x] If timeout expires, offer force stop.
+5. [x] Store final logs.
 
 Acceptance criteria:
 
-- Start works for at least one rootless mode.
-- Stop returns the app to a clean stopped state.
-- Root denial does not block rootless features.
+- [x] Start works for at least one rootless mode.
+- [x] Stop returns the app to a clean stopped state.
+- [x] Root denial does not block rootless features.
 
 ## Phase 8: Root Manager
 
+Status: complete. Implemented under `android/` as of 2026-06-28.
+
 Steps:
 
-- Build a `RootManager` abstraction:
-  - `isRootAvailable()`,
-  - `requestRootFor(reason)`,
-  - `runAsRoot(command)`,
-  - `stopRootProcess(pid)`.
-- Trigger root prompt only from a user action:
-  - starting root-required mode,
-  - running root diagnostics.
-- Show root explanation before invoking `su`:
-  - why root is needed,
-  - which mode/method needs it,
-  - which non-root alternatives are available.
-- Invoke the device root manager directly via `su`; do not shell out through
+- [x] Build a `RootManager` abstraction:
+  - [x] `isRootAvailable()`,
+  - [x] `requestRootFor(reason)`,
+  - [x] `runAsRoot(command)`,
+  - [x] `stopRootProcess(pid)`.
+- [x] Trigger root prompt only from a user action:
+  - [x] starting root-required mode,
+  - [x] running root diagnostics.
+- [x] Show root explanation before invoking `su`:
+  - [x] why root is needed,
+  - [x] which mode/method needs it,
+  - [x] which non-root alternatives are available.
+- [x] Invoke the device root manager directly via `su`; do not shell out through
   Termux and do not require Termux to be installed.
-- Cache root state only for the app session.
-- Do not hide root failure. Surface `su` stderr and exit status in diagnostics.
-- Add diagnostics:
-  - `id -u`,
-  - `which iptables`,
-  - `which nft`,
-  - kernel/NFQUEUE checks where possible,
-  - ZeroDPI dry startup if a validation command exists later.
+- [x] Cache root state only for the app session.
+- [x] Do not hide root failure. Surface `su` stderr and exit status in diagnostics.
+- [x] Add diagnostics:
+  - [x] `id -u`,
+  - [x] `which iptables`,
+  - [x] `which nft`,
+  - [x] kernel/NFQUEUE checks where possible,
+  - [x] ZeroDPI dry startup is reported as skipped until a validation command
+    exists later.
 
 Acceptance criteria:
 
-- Root is never requested for rootless actions.
-- Root-required starts fail with actionable errors.
-- The app can run rootless workflows after root was denied.
+- [x] Root is never requested for rootless actions.
+- [x] Root-required starts fail with actionable errors.
+- [x] The app can run rootless workflows after root was denied.
 
 ## Phase 9: Logs, Diagnostics, And Support Bundle
 

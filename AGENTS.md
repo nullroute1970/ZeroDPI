@@ -23,7 +23,7 @@ Runtime files include `config.toml`, `sni_list.txt`, and `ip_list.txt`. Windows 
 - `cargo run --bin zerodpi -- --config ./config.toml`: run locally with the repository config.
 - `python build.py --platform windows|linux|termux`: use the packaging and cross-build helper.
 
-Linux builds require `libnetfilter-queue-dev`. Windows GNU builds require MSYS2, `stable-x86_64-pc-windows-gnu`, and the repo-local `windivert/` files.
+Linux builds require `libnetfilter-queue-dev`. Windows GNU builds require MSYS2, `stable-x86_64-pc-windows-gnu`, and the repo-local `windivert/` files. Android SDK is located at `~/Android/Sdk/`.
 
 ## Coding Style & Naming Conventions
 

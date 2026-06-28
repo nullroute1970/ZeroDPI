@@ -12,16 +12,19 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.lifecycle.lifecycleScope
 import dev.zerodpi.android.storage.RuntimeFileKind
 import dev.zerodpi.android.ui.DashboardScreen
 import dev.zerodpi.android.ui.MainViewModel
 import dev.zerodpi.android.ui.theme.ZeroDpiTheme
+import kotlinx.coroutines.launch
 import java.nio.charset.StandardCharsets
 
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
     private var pendingImportKind: RuntimeFileKind? = null
     private var pendingExportKind: RuntimeFileKind? = null
+    private var pendingSupportBundleIncludeLists: Boolean = false
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) {
             // Permission denial is non-fatal; Android will still keep service state visible in-app.
@@ -42,6 +45,14 @@ class MainActivity : ComponentActivity() {
                 exportRuntimeFile(kind, uri)
             }
         }
+    private val exportSupportBundleLauncher =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+            val includePrivateLists = pendingSupportBundleIncludeLists
+            pendingSupportBundleIncludeLists = false
+            if (uri != null) {
+                exportSupportBundle(uri, includePrivateLists)
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -50,10 +61,12 @@ class MainActivity : ComponentActivity() {
         setContent {
             val state by viewModel.uiState.collectAsState()
             val runtimeFilesState by viewModel.runtimeFilesState.collectAsState()
+            val diagnosticsState by viewModel.diagnosticsState.collectAsState()
             ZeroDpiTheme {
                 DashboardScreen(
                     state = state,
                     runtimeFilesState = runtimeFilesState,
+                    diagnosticsState = diagnosticsState,
                     onStart = viewModel::start,
                     onStop = viewModel::stop,
                     onForceStop = viewModel::forceStop,
@@ -67,6 +80,8 @@ class MainActivity : ComponentActivity() {
                     onShareRuntimeFile = ::shareRuntimeFile,
                     onRunTestScan = viewModel::runTestScan,
                     onRunRootDiagnostics = viewModel::runRootDiagnostics,
+                    onRefreshDiagnostics = viewModel::refreshDiagnostics,
+                    onExportSupportBundle = ::launchSupportBundleExport,
                 )
             }
         }
@@ -89,6 +104,11 @@ class MainActivity : ComponentActivity() {
     private fun launchRuntimeFileExport(kind: RuntimeFileKind) {
         pendingExportKind = kind
         exportRuntimeFileLauncher.launch(kind.fileName)
+    }
+
+    private fun launchSupportBundleExport(includePrivateLists: Boolean) {
+        pendingSupportBundleIncludeLists = includePrivateLists
+        exportSupportBundleLauncher.launch("zerodpi-support-bundle.zip")
     }
 
     private fun importRuntimeFile(kind: RuntimeFileKind, uri: Uri) {
@@ -136,5 +156,24 @@ class MainActivity : ComponentActivity() {
             putExtra(Intent.EXTRA_TEXT, text)
         }
         startActivity(Intent.createChooser(sendIntent, "Share ${kind.fileName}"))
+    }
+
+    private fun exportSupportBundle(uri: Uri, includePrivateLists: Boolean) {
+        lifecycleScope.launch {
+            try {
+                contentResolver.openOutputStream(uri)?.use { output ->
+                    viewModel.exportSupportBundle(output, includePrivateLists)
+                } ?: error("Could not open support bundle destination.")
+                viewModel.reportSupportBundleExportResult(
+                    successMessage = "Exported support bundle.",
+                    errorMessage = null,
+                )
+            } catch (error: Throwable) {
+                viewModel.reportSupportBundleExportResult(
+                    successMessage = null,
+                    errorMessage = error.message ?: "Failed to export support bundle.",
+                )
+            }
+        }
     }
 }

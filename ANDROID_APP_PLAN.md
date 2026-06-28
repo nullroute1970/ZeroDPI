@@ -498,30 +498,32 @@ Acceptance criteria:
 
 ## Phase 9: Logs, Diagnostics, And Support Bundle
 
+Status: complete. Implemented under `android/` as of 2026-06-28.
+
 Steps:
 
-- Capture stdout/stderr or JSON events from ZeroDPI.
-- Keep current session logs in memory.
-- Persist recent logs under `files/zerodpi/logs/`.
-- Add a diagnostics page:
-  - app version,
-  - ZeroDPI version,
-  - ABI,
-  - Android version,
-  - root status,
-  - firewall backend availability,
-  - config validation result,
-  - last exit code.
-- Add "export support bundle":
-  - config with sensitive fields reviewed,
-  - logs,
-  - device diagnostics,
-  - no private production lists unless user explicitly includes them.
+- [x] Capture stdout/stderr or JSON events from ZeroDPI.
+- [x] Keep current session logs in memory.
+- [x] Persist recent logs under `files/zerodpi/logs/`.
+- [x] Add a diagnostics page:
+  - [x] app version,
+  - [x] ZeroDPI version,
+  - [x] ABI,
+  - [x] Android version,
+  - [x] root status,
+  - [x] firewall backend availability,
+  - [x] config validation result,
+  - [x] last exit code.
+- [x] Add "export support bundle":
+  - [x] config with sensitive fields reviewed,
+  - [x] logs,
+  - [x] device diagnostics,
+  - [x] no private production lists unless user explicitly includes them.
 
 Acceptance criteria:
 
-- A failed start leaves enough information to debug.
-- Export does not silently leak private SNI/IP lists.
+- [x] A failed start leaves enough information to debug.
+- [x] Export does not silently leak private SNI/IP lists.
 
 ## Phase 10: Testing Plan
 

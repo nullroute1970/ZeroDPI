@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.TimeUnit
 
 class ProcessZeroDpiRunner(
@@ -21,6 +22,7 @@ class ProcessZeroDpiRunner(
     private var process: Process? = null
     private var outputJob: Job? = null
     private var waitJob: Job? = null
+    private val exitEmitted = AtomicBoolean(false)
 
     override fun events(): Flow<ZeroDpiRunnerEvent> = events.asSharedFlow()
 
@@ -37,6 +39,7 @@ class ProcessZeroDpiRunner(
         }
 
         events.emit(ZeroDpiRunnerEvent.Starting)
+        exitEmitted.set(false)
         val command = mutableListOf(
             executable.absolutePath,
             "--config",
@@ -47,29 +50,33 @@ class ProcessZeroDpiRunner(
         )
 
         val builder = if (request.useRoot) {
-            ProcessBuilder("su", "-c", command.joinToString(" "))
+            ProcessBuilder("su", "-c", shellCommand(command))
         } else {
             ProcessBuilder(command)
         }
             .directory(File(request.workingDirectory))
             .redirectErrorStream(true)
 
-        process = withContext(Dispatchers.IO) {
-            builder.start()
+        process = runCatching {
+            withContext(Dispatchers.IO) {
+                builder.start()
+            }
+        }.getOrElse { error ->
+            events.emit(ZeroDpiRunnerEvent.Failed(error.message ?: "Failed to start ZeroDPI."))
+            return
         }
-        events.emit(ZeroDpiRunnerEvent.Running)
 
         outputJob = scope.launch(Dispatchers.IO) {
             process?.inputStream?.bufferedReader()?.useLines { lines ->
                 lines.forEach { line ->
-                    events.emit(ZeroDpiRunnerEvent.Log(line))
+                    events.emit(RuntimeEventLineParser.parse(line) ?: ZeroDpiRunnerEvent.Log(line))
                 }
             }
         }
 
         waitJob = scope.launch(Dispatchers.IO) {
             val exitCode = process?.waitFor() ?: -1
-            events.emit(ZeroDpiRunnerEvent.Exited(exitCode))
+            emitExited(exitCode)
             process = null
         }
     }
@@ -85,11 +92,51 @@ class ProcessZeroDpiRunner(
             current.waitFor(5, TimeUnit.SECONDS)
         }
         if (!stopped) {
-            current.destroyForcibly()
+            events.emit(ZeroDpiRunnerEvent.StopTimedOut)
+            return
         }
+        cleanupProcess()
+        emitExited(0)
+    }
+
+    override suspend fun forceStop() {
+        val current = process ?: run {
+            emitExited(0)
+            return
+        }
+
+        current.destroyForcibly()
+        withContext(Dispatchers.IO) {
+            current.waitFor(2, TimeUnit.SECONDS)
+        }
+        cleanupProcess()
+        emitExited(-1)
+    }
+
+    private fun cleanupProcess() {
         outputJob?.cancel()
         waitJob?.cancel()
+        outputJob = null
+        waitJob = null
         process = null
-        events.emit(ZeroDpiRunnerEvent.Exited(if (stopped) 0 else -1))
+    }
+
+    private suspend fun emitExited(exitCode: Int) {
+        if (exitEmitted.compareAndSet(false, true)) {
+            events.emit(ZeroDpiRunnerEvent.Exited(exitCode))
+        }
+    }
+
+    private fun shellCommand(args: List<String>): String =
+        args.joinToString(" ") { arg ->
+            if (arg.matches(SAFE_SHELL_ARG)) {
+                arg
+            } else {
+                "'${arg.replace("'", "'\"'\"'")}'"
+            }
+        }
+
+    private companion object {
+        val SAFE_SHELL_ARG = Regex("""^[A-Za-z0-9_./:=+-]+$""")
     }
 }

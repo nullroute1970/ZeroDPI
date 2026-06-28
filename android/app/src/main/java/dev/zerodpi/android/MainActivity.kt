@@ -56,6 +56,7 @@ class MainActivity : ComponentActivity() {
                     runtimeFilesState = runtimeFilesState,
                     onStart = viewModel::start,
                     onStop = viewModel::stop,
+                    onForceStop = viewModel::forceStop,
                     onRuntimeFileSelected = viewModel::selectRuntimeFile,
                     onRuntimeFileTextChanged = viewModel::updateRuntimeFileText,
                     onConfigFieldChanged = viewModel::updateConfigField,

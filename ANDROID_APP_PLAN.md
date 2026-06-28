@@ -421,41 +421,43 @@ Acceptance criteria:
 
 ## Phase 7: Dashboard And Start/Stop Flow
 
+Status: complete. Implemented under `android/` as of 2026-06-28.
+
 Dashboard content:
 
-- Current status: stopped, starting, scanning, running, stopping, failed.
-- Root status: not needed, needed, granted, denied, unsupported.
-- Current mode and bypass method.
-- Listener address: `LISTEN_HOST:LISTEN_PORT`.
-- Active SNI/IP and score when known.
-- Connection count and relay byte counters when available.
-- Last error and recent logs.
-- Primary action: Start or Stop.
+- [x] Current status: stopped, starting, scanning, running, stopping, failed.
+- [x] Root status: not needed, needed, granted, denied, unsupported.
+- [x] Current mode and bypass method.
+- [x] Listener address: `LISTEN_HOST:LISTEN_PORT`.
+- [x] Active SNI/IP and score when known.
+- [x] Connection count and relay byte counters when available.
+- [x] Last error and recent logs.
+- [x] Primary action: Start or Stop.
 
 Start sequence:
 
-1. Load typed settings from UI state.
-2. Validate settings.
-3. Save `config.toml`, `sni_list.txt`, and `ip_list.txt`.
-4. Determine whether root is required.
-5. If root is required, show explanation and request root with `su`.
-6. Start foreground service.
-7. Start ZeroDPI with the selected runner.
-8. Stream status and logs into the dashboard.
+1. [x] Load typed settings from UI state.
+2. [x] Validate settings.
+3. [x] Save `config.toml`, `sni_list.txt`, and `ip_list.txt`.
+4. [x] Determine whether root is required.
+5. [x] If root is required, show explanation and request root with `su`.
+6. [x] Start foreground service.
+7. [x] Start ZeroDPI with the selected runner.
+8. [x] Stream status and logs into the dashboard.
 
 Stop sequence:
 
-1. Disable Start until stop completes.
-2. Send graceful termination.
-3. Wait for ZeroDPI to exit and clean up firewall rules.
-4. If timeout expires, offer force stop.
-5. Store final logs.
+1. [x] Disable Start until stop completes.
+2. [x] Send graceful termination.
+3. [x] Wait for ZeroDPI to exit and clean up firewall rules.
+4. [x] If timeout expires, offer force stop.
+5. [x] Store final logs.
 
 Acceptance criteria:
 
-- Start works for at least one rootless mode.
-- Stop returns the app to a clean stopped state.
-- Root denial does not block rootless features.
+- [x] Start works for at least one rootless mode.
+- [x] Stop returns the app to a clean stopped state.
+- [x] Root denial does not block rootless features.
 
 ## Phase 8: Root Manager
 

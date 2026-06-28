@@ -57,6 +57,7 @@ fun DashboardScreen(
     runtimeFilesState: RuntimeFilesUiState,
     onStart: () -> Unit,
     onStop: () -> Unit,
+    onForceStop: () -> Unit,
     onRuntimeFileSelected: (RuntimeFileKind) -> Unit,
     onRuntimeFileTextChanged: (String) -> Unit,
     onConfigFieldChanged: (String, String) -> Unit,
@@ -87,6 +88,7 @@ fun DashboardScreen(
                     !runtimeFilesState.isSaving,
                 onStart = onStart,
                 onStop = onStop,
+                onForceStop = onForceStop,
             )
             ConfigSettingsPanel(
                 editorState = runtimeFilesState.configEditor,
@@ -127,6 +129,7 @@ private fun StatusPanel(
     canStart: Boolean,
     onStart: () -> Unit,
     onStop: () -> Unit,
+    onForceStop: () -> Unit,
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -160,12 +163,22 @@ private fun StatusPanel(
                     RuntimeStatus.Starting,
                     RuntimeStatus.Scanning,
                     RuntimeStatus.Running,
-                    RuntimeStatus.Stopping,
                     -> OutlinedButton(
                         onClick = onStop,
-                        enabled = state.status != RuntimeStatus.Stopping,
+                        enabled = true,
                     ) {
                         Text("Stop")
+                    }
+
+                    RuntimeStatus.Stopping -> {
+                        OutlinedButton(onClick = onStop, enabled = false) {
+                            Text("Stopping")
+                        }
+                        if (state.forceStopAvailable) {
+                            Button(onClick = onForceStop) {
+                                Text("Force stop")
+                            }
+                        }
                     }
                 }
             }
@@ -648,11 +661,12 @@ private fun RuntimeListValidationSummary(
 @Composable
 private fun RuntimeDetails(state: ZeroDpiServiceState) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        DetailRow("Root", state.rootStatus)
+        DetailRow("Root", state.rootStatus.label)
         DetailRow("Mode", state.mode)
         DetailRow("Bypass", state.bypassMethod)
         DetailRow("Listener", state.listener)
         DetailRow("Active target", state.activeTarget)
+        DetailRow("Active score", state.activeTargetScore?.toString() ?: "Unknown")
         DetailRow("Connections", state.connectionCount.toString())
         DetailRow("Relay bytes", state.relayBytes.toString())
     }

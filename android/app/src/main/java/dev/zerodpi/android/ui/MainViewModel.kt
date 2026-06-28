@@ -185,7 +185,7 @@ class MainViewModel(
                 )
             }
 
-            if (saveRuntimeFiles(_runtimeFilesState.value.dirtyFiles)) {
+            if (saveRuntimeFiles(RuntimeFileKind.entries.toSet())) {
                 startService()
             }
         }
@@ -193,6 +193,10 @@ class MainViewModel(
 
     fun stop() {
         service?.stopZeroDpi()
+    }
+
+    fun forceStop() {
+        service?.forceStopZeroDpi()
     }
 
     fun selectRuntimeFile(kind: RuntimeFileKind) {

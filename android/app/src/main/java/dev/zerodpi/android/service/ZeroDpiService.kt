@@ -23,14 +23,17 @@ import dev.zerodpi.android.runtime.ZeroDpiRunnerEvent
 import dev.zerodpi.android.storage.RuntimeStorage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 
 enum class RuntimeStatus {
@@ -61,6 +64,7 @@ data class ZeroDpiServiceState(
     val connectionCount: Int = 0,
     val relayBytes: Long = 0L,
     val lastError: String? = null,
+    val lastExitCode: Int? = null,
     val recentLogs: List<String> = emptyList(),
     val forceStopAvailable: Boolean = false,
 )
@@ -68,12 +72,14 @@ data class ZeroDpiServiceState(
 class ZeroDpiService : Service() {
     private val binder = LocalBinder()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val logScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val state = MutableStateFlow(ZeroDpiServiceState())
     private lateinit var runner: ZeroDpiRunner
     private lateinit var rootManager: RootManager
     private lateinit var runtimeStorage: RuntimeStorage
     private val activeConnections = mutableSetOf<Int>()
     private val activeRelayBytes = mutableMapOf<Int, Long>()
+    private val sessionLogLines = ArrayDeque<String>()
     private var completedRelayBytes = 0L
 
     override fun onCreate() {
@@ -99,7 +105,11 @@ class ZeroDpiService : Service() {
         runBlocking {
             runner.stop()
             runner.forceStop()
+            withTimeoutOrNull(LOG_FLUSH_TIMEOUT_MS) {
+                logScope.coroutineContext[Job]?.children?.toList()?.joinAll()
+            }
         }
+        logScope.cancel()
         scope.cancel()
         super.onDestroy()
     }
@@ -112,6 +122,9 @@ class ZeroDpiService : Service() {
             if (state.value.status in activeStatuses) {
                 appendLog("ZeroDPI is already ${state.value.status.name.lowercase()}.")
                 return@launch
+            }
+            runCatching {
+                runtimeStorage.startNewLogSession("runtime")
             }
 
             val runConfig = runCatching {
@@ -142,9 +155,12 @@ class ZeroDpiService : Service() {
                     connectionCount = 0,
                     relayBytes = 0L,
                     lastError = null,
+                    lastExitCode = null,
+                    recentLogs = emptyList(),
                     forceStopAvailable = false,
                 )
             }
+            sessionLogLines.clear()
             appendLog("Runtime storage ready at ${runConfig.files.runtimeDir.absolutePath}.")
             modeOverride?.let { modeName ->
                 appendLog("Running temporary $modeName test scan config.")
@@ -188,6 +204,9 @@ class ZeroDpiService : Service() {
         firewallBackend: String,
     ) {
         scope.launch {
+            runCatching {
+                runtimeStorage.startNewLogSession("diagnostics")
+            }
             appendLog("Root diagnostics requested by user; invoking su.")
             appendLog(rootExplanation)
             appendRootlessAlternatives(rootlessAlternatives)
@@ -389,6 +408,7 @@ class ZeroDpiService : Service() {
                         activeTarget = if (event.exitCode == 0) "None" else it.activeTarget,
                         activeTargetScore = if (event.exitCode == 0) null else it.activeTargetScore,
                         connectionCount = 0,
+                        lastExitCode = event.exitCode,
                         forceStopAvailable = false,
                         lastError = if (event.exitCode == 0) null else "ZeroDPI exited with code ${event.exitCode}.",
                     )
@@ -441,8 +461,19 @@ class ZeroDpiService : Service() {
     }
 
     private fun appendLog(message: String) {
+        val line = message.trimEnd()
+        if (line.isBlank()) {
+            return
+        }
+        sessionLogLines.addLast(line)
+        while (sessionLogLines.size > MAX_SESSION_LOG_LINES) {
+            sessionLogLines.removeFirst()
+        }
         state.update { current ->
-            current.copy(recentLogs = (current.recentLogs + message).takeLast(12))
+            current.copy(recentLogs = (current.recentLogs + line).takeLast(MAX_RECENT_LOG_LINES))
+        }
+        logScope.launch {
+            runtimeStorage.appendLogLine(line)
         }
     }
 
@@ -507,6 +538,9 @@ class ZeroDpiService : Service() {
     companion object {
         private const val CHANNEL_ID = "zerodpi-runtime"
         private const val NOTIFICATION_ID = 1001
+        private const val LOG_FLUSH_TIMEOUT_MS = 1_000L
+        private const val MAX_RECENT_LOG_LINES = 12
+        private const val MAX_SESSION_LOG_LINES = 500
         private val activeStatuses = setOf(
             RuntimeStatus.Starting,
             RuntimeStatus.Scanning,

@@ -11,6 +11,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.zerodpi.android.config.ConfigEditorState
 import dev.zerodpi.android.config.ZeroDpiConfigToml
+import dev.zerodpi.android.diagnostics.AndroidDiagnosticsProvider
+import dev.zerodpi.android.diagnostics.DeviceDiagnostics
 import dev.zerodpi.android.list.RuntimeListIssue
 import dev.zerodpi.android.list.RuntimeListValidation
 import dev.zerodpi.android.list.RuntimeListValidator
@@ -25,6 +27,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.OutputStream
 
 data class RuntimeFilesUiState(
     val selectedFile: RuntimeFileKind = RuntimeFileKind.Config,
@@ -99,18 +102,28 @@ data class RuntimeFilesUiState(
             RuntimeFileKind.Config -> null
             RuntimeFileKind.SniList -> sniListValidation
             RuntimeFileKind.IpList -> ipListValidation
-        }
+    }
 }
+
+data class DiagnosticsUiState(
+    val diagnostics: DeviceDiagnostics = DeviceDiagnostics.Empty,
+    val isRefreshing: Boolean = false,
+    val statusMessage: String? = null,
+    val errorMessage: String? = null,
+)
 
 class MainViewModel(
     application: Application,
 ) : AndroidViewModel(application) {
     private val appContext = application.applicationContext
     private val runtimeStorage = RuntimeStorage(appContext)
+    private val diagnosticsProvider = AndroidDiagnosticsProvider(appContext)
     private val _uiState = MutableStateFlow(ZeroDpiServiceState())
     val uiState: StateFlow<ZeroDpiServiceState> = _uiState.asStateFlow()
     private val _runtimeFilesState = MutableStateFlow(RuntimeFilesUiState())
     val runtimeFilesState: StateFlow<RuntimeFilesUiState> = _runtimeFilesState.asStateFlow()
+    private val _diagnosticsState = MutableStateFlow(DiagnosticsUiState())
+    val diagnosticsState: StateFlow<DiagnosticsUiState> = _diagnosticsState.asStateFlow()
 
     private var service: ZeroDpiService? = null
     private var serviceStateJob: Job? = null
@@ -226,6 +239,48 @@ class MainViewModel(
             rootlessAlternatives = validation.rootRequirement.alternatives,
             firewallBackend = validation.valueFor("LINUX_FIREWALL_BACKEND").ifBlank { "iptables" },
         )
+    }
+
+    fun refreshDiagnostics() {
+        viewModelScope.launch {
+            refreshDiagnosticsSnapshot()
+        }
+    }
+
+    suspend fun exportSupportBundle(
+        output: OutputStream,
+        includePrivateLists: Boolean,
+    ) {
+        val diagnostics = diagnosticsProvider.collect(
+            serviceState = _uiState.value,
+            configText = _runtimeFilesState.value.configText,
+        )
+        runtimeStorage.exportSupportBundle(
+            output = output,
+            diagnostics = diagnostics,
+            includePrivateLists = includePrivateLists,
+        )
+        _diagnosticsState.update {
+            it.copy(
+                diagnostics = diagnostics,
+                isRefreshing = false,
+                statusMessage = "Support bundle exported.",
+                errorMessage = null,
+            )
+        }
+    }
+
+    fun reportSupportBundleExportResult(
+        successMessage: String?,
+        errorMessage: String?,
+    ) {
+        _diagnosticsState.update { current ->
+            if (errorMessage == null) {
+                current.copy(statusMessage = successMessage, errorMessage = null)
+            } else {
+                current.copy(statusMessage = null, errorMessage = errorMessage)
+            }
+        }
     }
 
     fun selectRuntimeFile(kind: RuntimeFileKind) {
@@ -421,6 +476,7 @@ class MainViewModel(
                     isLoading = false,
                     statusMessage = "Runtime files loaded.",
                 )
+                refreshDiagnostics()
             }.onFailure { error ->
                 _runtimeFilesState.update {
                     it.copy(
@@ -428,6 +484,35 @@ class MainViewModel(
                         errorMessage = error.message ?: "Failed to load runtime files.",
                     )
                 }
+                refreshDiagnostics()
+            }
+        }
+    }
+
+    private suspend fun refreshDiagnosticsSnapshot() {
+        _diagnosticsState.update {
+            it.copy(isRefreshing = true, statusMessage = null, errorMessage = null)
+        }
+        runCatching {
+            diagnosticsProvider.collect(
+                serviceState = _uiState.value,
+                configText = _runtimeFilesState.value.configText,
+            )
+        }.onSuccess { diagnostics ->
+            _diagnosticsState.update {
+                it.copy(
+                    diagnostics = diagnostics,
+                    isRefreshing = false,
+                    statusMessage = "Diagnostics refreshed.",
+                    errorMessage = null,
+                )
+            }
+        }.onFailure { error ->
+            _diagnosticsState.update {
+                it.copy(
+                    isRefreshing = false,
+                    errorMessage = error.message ?: "Failed to refresh diagnostics.",
+                )
             }
         }
     }

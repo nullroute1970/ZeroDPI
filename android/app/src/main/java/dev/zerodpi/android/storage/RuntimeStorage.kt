@@ -4,12 +4,19 @@ import android.content.Context
 import android.system.Os
 import android.system.OsConstants
 import dev.zerodpi.android.config.ZeroDpiConfigToml
+import dev.zerodpi.android.diagnostics.DeviceDiagnostics
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.OutputStream
 import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 enum class RuntimeFileKind(
     val fileName: String,
@@ -59,6 +66,7 @@ data class ResolvedRuntimeConfigPaths(
 class RuntimeStorage(context: Context) {
     private val appContext = context.applicationContext
     private val lock = Any()
+    private var activeLogFile: File? = null
 
     private val runtimeDir = File(appContext.filesDir, RUNTIME_DIR_NAME)
     private val files = RuntimeStorageFiles(
@@ -170,6 +178,63 @@ class RuntimeStorage(context: Context) {
                 modeOverride = modeOverride,
             )
         }
+
+    suspend fun startNewLogSession(label: String): File =
+        withContext(Dispatchers.IO) {
+            synchronized(lock) {
+                val currentFiles = ensureInitializedBlocking()
+                currentFiles.logsDir.mkdirsOrThrow()
+                activeLogFile = File(
+                    currentFiles.logsDir,
+                    "${timestampForFile()}_${label.sanitizeFileName()}.log",
+                )
+                pruneLogFiles(currentFiles.logsDir)
+                activeLogFile ?: error("Failed to create log session.")
+            }
+        }
+
+    suspend fun appendLogLine(message: String) {
+        withContext(Dispatchers.IO) {
+            synchronized(lock) {
+                val currentFiles = ensureInitializedBlocking()
+                val target = activeLogFile ?: File(currentFiles.logsDir, "${timestampForFile()}_session.log").also {
+                    activeLogFile = it
+                    pruneLogFiles(currentFiles.logsDir)
+                }
+                FileOutputStream(target, true).use { output ->
+                    output.write("${timestampForLog()} $message\n".toByteArray(StandardCharsets.UTF_8))
+                }
+            }
+        }
+    }
+
+    suspend fun exportSupportBundle(
+        output: OutputStream,
+        diagnostics: DeviceDiagnostics,
+        includePrivateLists: Boolean,
+    ) {
+        withContext(Dispatchers.IO) {
+            val currentFiles = ensureInitializedBlocking()
+            val configText = currentFiles.configFile.readText(StandardCharsets.UTF_8)
+            ZipOutputStream(output).use { zip ->
+                zip.addText("README.txt", SupportBundleSanitizer.noticeText(includePrivateLists))
+                zip.addText("diagnostics.txt", diagnostics.asText())
+                zip.addText("config.redacted.toml", SupportBundleSanitizer.sanitizedConfig(configText))
+                recentLogFiles(currentFiles.logsDir).forEach { logFile ->
+                    zip.addFile("logs/${logFile.name}", logFile)
+                }
+                if (includePrivateLists) {
+                    zip.addFile(RuntimeFileKind.SniList.fileName, currentFiles.sniListFile)
+                    zip.addFile(RuntimeFileKind.IpList.fileName, currentFiles.ipListFile)
+                } else {
+                    zip.addText(
+                        "lists_omitted.txt",
+                        "sni_list.txt and ip_list.txt were omitted because they may contain private production targets.\n",
+                    )
+                }
+            }
+        }
+    }
 
     fun resolveConfigPaths(configText: String): ResolvedRuntimeConfigPaths =
         ResolvedRuntimeConfigPaths(
@@ -310,6 +375,46 @@ class RuntimeStorage(context: Context) {
         return File(parent, ".${target.name}.${System.nanoTime()}.tmp")
     }
 
+    private fun recentLogFiles(logsDir: File): List<File> =
+        logsDir.listFiles { file -> file.isFile && file.extension == "log" }
+            ?.sortedByDescending { it.lastModified() }
+            ?.take(MAX_LOG_FILES_IN_BUNDLE)
+            ?.reversed()
+            .orEmpty()
+
+    private fun pruneLogFiles(logsDir: File) {
+        logsDir.listFiles { file -> file.isFile && file.extension == "log" }
+            ?.sortedByDescending { it.lastModified() }
+            ?.drop(MAX_RETAINED_LOG_FILES)
+            ?.forEach { it.delete() }
+    }
+
+    private fun ZipOutputStream.addText(name: String, text: String) {
+        putNextEntry(ZipEntry(name))
+        write(text.toByteArray(StandardCharsets.UTF_8))
+        closeEntry()
+    }
+
+    private fun ZipOutputStream.addFile(name: String, file: File) {
+        if (!file.isFile) {
+            return
+        }
+        putNextEntry(ZipEntry(name))
+        FileInputStream(file).use { input ->
+            input.copyTo(this)
+        }
+        closeEntry()
+    }
+
+    private fun timestampForFile(): String =
+        SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())
+
+    private fun timestampForLog(): String =
+        SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
+
+    private fun String.sanitizeFileName(): String =
+        replace(Regex("""[^A-Za-z0-9_.-]"""), "_").ifBlank { "session" }
+
     private fun File.mkdirsOrThrow() {
         if (!isDirectory && !mkdirs()) {
             error("Failed to create directory: $absolutePath")
@@ -321,5 +426,7 @@ class RuntimeStorage(context: Context) {
         private const val LOGS_DIR_NAME = "logs"
         private const val SCAN_RESULTS_DIR_NAME = "scan_results"
         private const val ASSET_DIR = "zerodpi"
+        private const val MAX_RETAINED_LOG_FILES = 8
+        private const val MAX_LOG_FILES_IN_BUNDLE = 4
     }
 }

@@ -55,6 +55,7 @@ import dev.zerodpi.android.storage.RuntimeFileKind
 fun DashboardScreen(
     state: ZeroDpiServiceState,
     runtimeFilesState: RuntimeFilesUiState,
+    diagnosticsState: DiagnosticsUiState,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onForceStop: () -> Unit,
@@ -68,6 +69,8 @@ fun DashboardScreen(
     onShareRuntimeFile: (RuntimeFileKind) -> Unit,
     onRunTestScan: (RuntimeFileKind) -> Unit,
     onRunRootDiagnostics: () -> Unit,
+    onRefreshDiagnostics: () -> Unit,
+    onExportSupportBundle: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Scaffold(
@@ -109,6 +112,13 @@ fun DashboardScreen(
                 onRunTestScan = onRunTestScan,
             )
             RuntimeDetails(state = state)
+            DiagnosticsPanel(
+                serviceState = state,
+                runtimeFilesState = runtimeFilesState,
+                diagnosticsState = diagnosticsState,
+                onRefreshDiagnostics = onRefreshDiagnostics,
+                onExportSupportBundle = onExportSupportBundle,
+            )
             LogsPanel(logs = state.recentLogs)
         }
     }
@@ -683,6 +693,94 @@ private fun RuntimeDetails(state: ZeroDpiServiceState) {
         DetailRow("Active score", state.activeTargetScore?.toString() ?: "Unknown")
         DetailRow("Connections", state.connectionCount.toString())
         DetailRow("Relay bytes", state.relayBytes.toString())
+        DetailRow("Last exit code", state.lastExitCode?.toString() ?: "None")
+    }
+}
+
+@Composable
+private fun DiagnosticsPanel(
+    serviceState: ZeroDpiServiceState,
+    runtimeFilesState: RuntimeFilesUiState,
+    diagnosticsState: DiagnosticsUiState,
+    onRefreshDiagnostics: () -> Unit,
+    onExportSupportBundle: (Boolean) -> Unit,
+) {
+    var includePrivateLists by remember { mutableStateOf(false) }
+    val diagnostics = diagnosticsState.diagnostics
+    val configValidation = if (runtimeFilesState.configEditor.canStart) {
+        "Valid"
+    } else {
+        "${runtimeFilesState.configEditor.issues.size} error(s)"
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        tonalElevation = 1.dp,
+        shape = MaterialTheme.shapes.medium,
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("Diagnostics", fontWeight = FontWeight.SemiBold)
+            DetailRow("App version", diagnostics.appVersion)
+            DetailRow("ZeroDPI version", diagnostics.zeroDpiVersion)
+            DetailRow("ABI", diagnostics.abi)
+            DetailRow("Android", diagnostics.androidVersion)
+            DetailRow("Root status", serviceState.rootStatus.label)
+            DetailRow("Firewall backend", diagnostics.firewallBackendAvailability)
+            DetailRow("Config validation", configValidation)
+            DetailRow("Last exit code", serviceState.lastExitCode?.toString() ?: "None")
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onRefreshDiagnostics,
+                    enabled = !diagnosticsState.isRefreshing,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text(if (diagnosticsState.isRefreshing) "Refreshing" else "Refresh")
+                }
+                Button(
+                    onClick = { onExportSupportBundle(includePrivateLists) },
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("Export bundle")
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(end = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Text("Include private lists", fontWeight = FontWeight.Medium)
+                    Text(
+                        text = "Off by default so SNI/IP production lists are not exported silently.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(
+                    checked = includePrivateLists,
+                    onCheckedChange = { includePrivateLists = it },
+                )
+            }
+            diagnosticsState.statusMessage?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            diagnosticsState.errorMessage?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.error)
+            }
+        }
     }
 }
 
@@ -692,8 +790,16 @@ private fun DetailRow(label: String, value: String) {
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, fontWeight = FontWeight.Medium)
+        Text(
+            text = label,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(0.42f),
+        )
+        Text(
+            text = value,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.weight(0.58f),
+        )
     }
 }
 

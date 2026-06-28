@@ -10,6 +10,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import dev.zerodpi.android.BuildConfig
 import dev.zerodpi.android.R
 import dev.zerodpi.android.config.ZeroDpiConfigToml
 import dev.zerodpi.android.runtime.FakeZeroDpiRunner
@@ -252,11 +253,13 @@ class ZeroDpiService : Service() {
 
     private fun createRunner(): ZeroDpiRunner {
         val nativeExecutable = File(applicationInfo.nativeLibraryDir, "libzerodpi_exec.so")
-        return if (nativeExecutable.isFile) {
-            ProcessZeroDpiRunner(this, scope, rootManager)
-        } else {
-            FakeZeroDpiRunner(scope)
+        if (nativeExecutable.isFile) {
+            return ProcessZeroDpiRunner(this, scope, rootManager)
         }
+        if (BuildConfig.ZERODPI_ALLOW_FAKE_RUNNER) {
+            return FakeZeroDpiRunner(scope)
+        }
+        return ProcessZeroDpiRunner(this, scope, rootManager)
     }
 
     private fun handleRunnerEvent(event: ZeroDpiRunnerEvent) {

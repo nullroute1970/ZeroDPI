@@ -1,6 +1,18 @@
 package dev.zerodpi.android.runtime
 
 internal object RuntimeEventLineParser {
+    fun startupPid(line: String): Long? {
+        val json = line.trim()
+        if (!json.startsWith("{") || !json.endsWith("}")) {
+            return null
+        }
+        return if (stringValue(json, "event") == "startup") {
+            longValue(json, "pid")
+        } else {
+            null
+        }
+    }
+
     fun parse(line: String): ZeroDpiRunnerEvent? {
         val json = line.trim()
         if (!json.startsWith("{") || !json.endsWith("}")) {

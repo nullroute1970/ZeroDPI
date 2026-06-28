@@ -1,33 +1,62 @@
 # ZeroDPI Android App
 
-This is the separate native Android app scaffold for ZeroDPI.
+This is the native Android controller for ZeroDPI. The app prepares
+app-private runtime files, starts the packaged ZeroDPI executable, displays
+JSON runtime events, and provides config/list editing, import/export, reset to
+defaults, logs, scan results, and support bundle export.
 
-Current Phase 4 scope:
+The app does not implement an Android `VpnService`. Point the upstream VPN
+client at the local ZeroDPI listener from `config.toml`, usually
+`127.0.0.1:44444`.
 
-- Kotlin Android application module under `android/app`.
-- Jetpack Compose dashboard UI.
-- Bound foreground service for the ZeroDPI runtime.
-- Service-owned `ZeroDpiRunner` interface.
-- `FakeZeroDpiRunner` for UI and service lifecycle testing without a native binary.
-- `ProcessZeroDpiRunner` placeholder for the process-wrapper MVP once
-  `dist/android-app/<runtime>/jniLibs/<abi>/libzerodpi_exec.so` is packaged
-  into the APK.
-- App-private runtime storage under `files/zerodpi/`.
-- First-launch defaults copied from packaged assets:
-  `config.toml`, `sni_list.txt`, and `ip_list.txt`.
-- Raw runtime file editor with Save and Reset to defaults actions.
-- Atomic runtime file saves with `.bak` backups.
-- `logs/` and `scan_results/` runtime directories.
-- AndroidX dependencies are pinned to the AGP 8.13 / compileSdk 36 generation.
+## Runtime Modes
 
-Build the APK from the repository root:
+- Rootless builds package the ZeroDPI CLI and run modes that do not need packet
+  interception, such as `ip_bypass`, scan modes, and supported `tls_frag`
+  workflows.
+- Full builds package the same app with root-capable runtime assets. Modes that
+  use Android/Linux packet interception request `su` and use the configured
+  firewall backend.
+- Debug app builds may use `FakeZeroDpiRunner` when no native artifact is
+  packaged, so UI and service tests can run from Gradle alone. Release builds
+  fail loudly if the native artifact is missing.
+
+The native executable is packaged as `libzerodpi_exec.so` under
+`jniLibs/<abi>/` and is extracted to the app native library directory at
+install time.
+
+## Build
+
+From the repository root:
 
 ```powershell
 python build.py --platform android
 ```
 
-The APK is copied to `dist/android-app/<runtime>/zerodpi-android-<runtime>-debug.apk`.
-Pass `--android-app-build-type release` to assemble the release variant.
+Useful options:
 
-The first run uses the fake runner unless an extracted native artifact named
-`libzerodpi_exec.so` exists in the app native library directory.
+```powershell
+python build.py --platform android --android-app-runtime rootless
+python build.py --platform android --android-app-runtime full
+python build.py --platform android --android-app-abi x86_64 --android-app-build-type debug
+```
+
+The APK is copied to:
+
+```text
+dist/android-app/<runtime>/zerodpi-android-<runtime>-<build-type>.apk
+```
+
+The default public ABIs are `arm64-v8a` and `armeabi-v7a`. Use `x86_64` for
+emulator smoke tests.
+
+## Install And Smoke Test
+
+```powershell
+adb install -r dist/android-app/rootless/zerodpi-android-rootless-debug.apk
+adb shell am start -n dev.zerodpi.android/.MainActivity
+```
+
+After pressing Start, the session log should show `Loaded ... config` and
+`Listening on ...`. It should not show `Using fake ZeroDPI runner` when the APK
+was built through `build.py` with native runtime artifacts.

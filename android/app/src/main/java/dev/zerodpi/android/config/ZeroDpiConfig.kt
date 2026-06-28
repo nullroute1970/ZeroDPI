@@ -53,6 +53,7 @@ data class ConfigFieldSchema(
     val rootImpact: ConfigRootImpact,
     val helpText: String,
     val options: List<String> = emptyList(),
+    val required: Boolean = false,
 )
 
 sealed interface ConfigValue {
@@ -152,6 +153,7 @@ object ZeroDpiConfigSchema {
             section = ConfigSection.ProxyListener,
             validationRule = "A host or IP address accepted by ZeroDPI.",
             helpText = "Local address the proxy listens on.",
+            required = true,
         ),
         field(
             name = "LISTEN_PORT",
@@ -160,6 +162,7 @@ object ZeroDpiConfigSchema {
             section = ConfigSection.ProxyListener,
             validationRule = "TCP port from 0 to 65535.",
             helpText = "Port your upstream VPN app should connect to.",
+            required = true,
         ),
         field(
             name = "MODE",
@@ -726,6 +729,7 @@ object ZeroDpiConfigSchema {
         helpText: String,
         rootImpact: ConfigRootImpact = ConfigRootImpact.None,
         options: List<String> = emptyList(),
+        required: Boolean = false,
     ): ConfigFieldSchema =
         ConfigFieldSchema(
             name = name,
@@ -736,6 +740,7 @@ object ZeroDpiConfigSchema {
             rootImpact = rootImpact,
             helpText = helpText,
             options = options,
+            required = required,
         )
 }
 
@@ -858,6 +863,15 @@ object ZeroDpiConfigToml {
                 values[fieldName] = displayValue
             }
         }
+
+        ZeroDpiConfigSchema.fields
+            .filter { it.required && it.name !in seen }
+            .forEach { schema ->
+                issues += ConfigValidationIssue(
+                    fieldName = schema.name,
+                    message = "${schema.name} is required by ZeroDPI config.toml.",
+                )
+            }
 
         return ParsedFieldText(fieldText = values, issues = issues)
     }

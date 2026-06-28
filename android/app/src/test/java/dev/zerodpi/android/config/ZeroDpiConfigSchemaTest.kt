@@ -62,6 +62,21 @@ class ZeroDpiConfigSchemaTest {
     }
 
     @Test
+    fun validationRejectsMissingRustRequiredListenerFields() {
+        val editorState = ZeroDpiConfigToml.analyze(
+            """
+            MODE = "ip_bypass"
+            BYPASS_METHOD = "tls_frag"
+            SELECTED_IP = "1.1.1.1"
+            """.trimIndent(),
+        )
+
+        assertFalse(editorState.canStart)
+        assertTrue(editorState.issues.any { it.fieldName == "LISTEN_HOST" })
+        assertTrue(editorState.issues.any { it.fieldName == "LISTEN_PORT" })
+    }
+
+    @Test
     fun tomlEditRoundTripPreservesTypesEscapesAndComments() {
         val original = """
             # User-edited runtime config.

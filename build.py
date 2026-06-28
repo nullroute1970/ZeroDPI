@@ -709,35 +709,106 @@ def android_host_tag() -> str:
 
 
 def _find_android_studio_ndk() -> Path | None:
-    """Search common Android Studio NDK installation paths."""
+    """Search common NDK installation paths, prioritizing SDK subdirectories."""
+    # 1. Check environment variables
+    for name in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK_HOME"):
+        val = os.environ.get(name)
+        if val:
+            p = Path(val).expanduser().resolve()
+            if p.is_dir() and (p / "toolchains" / "llvm").is_dir():
+                return p
+
+    # Helper function to check an NDK dir or search within a parent 'ndk' dir
+    def check_ndk_dir(path: Path) -> Path | None:
+        if not path.is_dir():
+            return None
+        # If this is the 'ndk' parent directory containing version folders
+        if path.name == "ndk":
+            try:
+                # Find all version directories, sort descending to check newest version first
+                versions = sorted(
+                    [sub for sub in path.iterdir() if sub.is_dir()],
+                    key=lambda x: x.name,
+                    reverse=True,
+                )
+                for v in versions:
+                    if (v / "toolchains" / "llvm").is_dir():
+                        return v
+            except OSError:
+                pass
+        # If this is a specific NDK bundle or directory
+        elif (path / "toolchains" / "llvm").is_dir():
+            return path
+        return None
+
+    # 2. Find the SDK first, then check inside it
+    sdk = resolve_android_sdk(None)
+    if sdk:
+        for suffix in ("ndk", "ndk-bundle"):
+            res = check_ndk_dir(sdk / suffix)
+            if res:
+                return res
+
+    # 3. Check standard locations by OS
+    home = Path.home()
     candidates = []
+    if platform.system() == "Windows":
+        local_appdata = os.environ.get("LOCALAPPDATA", "")
+        if local_appdata:
+            candidates.append(Path(local_appdata) / "Android" / "Sdk" / "ndk")
+            candidates.append(Path(local_appdata) / "Android" / "Sdk" / "ndk-bundle")
+        candidates.append(home / "AppData" / "Local" / "Android" / "Sdk" / "ndk")
+        candidates.append(home / "AppData" / "Local" / "Android" / "Sdk" / "ndk-bundle")
+        for env_name in ("ProgramFiles", "ProgramW6432"):
+            pf = os.environ.get(env_name)
+            if pf:
+                candidates.append(Path(pf) / "Android" / "Android Studio" / "ndk")
+                candidates.append(Path(pf) / "Android" / "Android Studio" / "ndk-bundle")
+    elif platform.system() == "Darwin":
+        candidates.append(home / "Library" / "Android" / "sdk" / "ndk")
+        candidates.append(home / "Library" / "Android" / "sdk" / "ndk-bundle")
+        candidates.append(Path("/Library/Android/sdk/ndk"))
+        candidates.append(Path("/Library/Android/sdk/ndk-bundle"))
+    else:
+        candidates.extend([
+            home / "Android" / "Sdk" / "ndk",
+            home / "Android" / "Sdk" / "ndk-bundle",
+            home / "Android" / "sdk" / "ndk",
+            home / "Android" / "sdk" / "ndk-bundle",
+            Path("/opt/android-sdk/ndk"),
+            Path("/opt/android-sdk/ndk-bundle"),
+            Path("/usr/lib/android-sdk/ndk"),
+            Path("/usr/lib/android-sdk/ndk-bundle"),
+        ])
 
-    local_appdata = os.environ.get("LOCALAPPDATA", "")
-    if local_appdata:
-        sdk_ndk = Path(local_appdata) / "Android" / "Sdk" / "ndk"
-        if sdk_ndk.is_dir():
-            candidates.extend(sorted(sdk_ndk.iterdir()))
+    for c in candidates:
+        res = check_ndk_dir(c)
+        if res:
+            return res
 
-    for base in (
-        Path(os.environ.get("ProgramFiles", "C:\\Program Files")) / "Android" / "Android Studio" / "ndk",
-        Path(os.environ.get("ProgramW6432", "C:\\Program Files")) / "Android" / "Android Studio" / "ndk",
-    ):
-        if base.is_dir():
-            candidates.extend(sorted(base.iterdir()))
+    # 4. Check all environment variables containing 'ndk'
+    for key, value in os.environ.items():
+        if "ndk" in key.lower() and os.path.isdir(value):
+            p = Path(value).resolve()
+            if (p / "toolchains" / "llvm").is_dir():
+                return p
 
-    for candidate in candidates:
-        ndk_dir = candidate if candidate.is_dir() else None
-        if ndk_dir and (ndk_dir / "toolchains" / "llvm").is_dir():
-            return ndk_dir
     return None
 
 
 def resolve_android_ndk(android_ndk: str | None) -> Path:
-    ndk = android_ndk or os.environ.get("ANDROID_NDK_HOME")
-    if ndk:
-        ndk_path = Path(ndk).expanduser().resolve()
-        if ndk_path.is_dir():
+    if android_ndk:
+        ndk_path = Path(android_ndk).expanduser().resolve()
+        if ndk_path.is_dir() and (ndk_path / "toolchains" / "llvm").is_dir():
             return ndk_path
+
+    # First check default env vars specifically
+    for name in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK_HOME"):
+        val = os.environ.get(name)
+        if val:
+            p = Path(val).expanduser().resolve()
+            if p.is_dir() and (p / "toolchains" / "llvm").is_dir():
+                return p
 
     auto = _find_android_studio_ndk()
     if auto is not None:
@@ -1092,36 +1163,72 @@ def android_sdk_candidates(ndk_path: Path | None) -> list[Path]:
     if local_properties_sdk is not None:
         candidates.append(local_properties_sdk)
 
-    if ndk_path and ndk_path.parent.name == "ndk":
-        candidates.append(ndk_path.parent.parent)
+    if ndk_path:
+        # If NDK path is like <SDK>/ndk/<version> or <SDK>/ndk-bundle
+        if ndk_path.parent.name == "ndk":
+            candidates.append(ndk_path.parent.parent)
+        elif ndk_path.name == "ndk-bundle":
+            candidates.append(ndk_path.parent)
+        else:
+            candidates.append(ndk_path.parent)
 
+    # Common location detection using Path.home() which is cross-platform
+    home = Path.home()
     if platform.system() == "Windows":
         local_appdata = os.environ.get("LOCALAPPDATA", "")
         if local_appdata:
             candidates.append(Path(local_appdata) / "Android" / "Sdk")
+        candidates.append(home / "AppData" / "Local" / "Android" / "Sdk")
+        candidates.append(home / "Android" / "Sdk")
+        candidates.append(Path("C:\\Android\\sdk"))
+        candidates.append(Path("C:\\Android\\Sdk"))
     elif platform.system() == "Darwin":
-        candidates.append(Path.home() / "Library" / "Android" / "sdk")
+        candidates.append(home / "Library" / "Android" / "sdk")
+        candidates.append(Path("/Library/Android/sdk"))
     else:
         candidates.extend(
             [
-                Path.home() / "Android" / "Sdk",
-                Path.home() / "Android" / "sdk",
+                home / "Android" / "Sdk",
+                home / "Android" / "sdk",
+                home / "android-sdk",
                 Path("/opt/android-sdk"),
+                Path("/var/lib/android-sdk"),
                 Path("/usr/lib/android-sdk"),
             ]
         )
 
-    return candidates
+    # Let's also check if standard environment variables contain SDK paths
+    for key, value in os.environ.items():
+        if "sdk" in key.lower() or "android" in key.lower():
+            if os.path.isdir(value):
+                candidates.append(Path(value))
+
+    # Deduplicate candidates while maintaining order
+    seen = set()
+    deduped = []
+    for c in candidates:
+        try:
+            r = c.resolve()
+        except OSError:
+            continue
+        if r not in seen:
+            seen.add(r)
+            deduped.append(r)
+    return deduped
 
 
 def resolve_android_sdk(ndk_path: Path | None) -> Path | None:
+    # First pass: look for a fully valid SDK directory
     for sdk_path in android_sdk_candidates(ndk_path):
-        try:
-            resolved = sdk_path.resolve()
-        except OSError:
-            continue
-        if resolved.is_dir():
-            return resolved
+        if sdk_path.is_dir():
+            # Check structure
+            if (sdk_path / "platforms").is_dir() or (sdk_path / "platform-tools").is_dir() or (sdk_path / "build-tools").is_dir():
+                return sdk_path
+
+    # Second pass: fall back to any existing directory candidate
+    for sdk_path in android_sdk_candidates(ndk_path):
+        if sdk_path.is_dir():
+            return sdk_path
 
     return None
 

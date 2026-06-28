@@ -1479,8 +1479,284 @@ def build_all(
 # Entry point
 # ---------------------------------------------------------------------------
 
+def prompt_choice(question: str, choices: list, default: str) -> str:
+    choices_str = [str(c) for c in choices]
+    print(f"\n{question}")
+    for i, choice in enumerate(choices_str, 1):
+        print(f"  {i}) {choice}")
+    while True:
+        try:
+            val = input(f"Select choice [default: {default}]: ").strip()
+            if not val:
+                return default
+            if val.isdigit():
+                idx = int(val) - 1
+                if 0 <= idx < len(choices_str):
+                    return choices_str[idx]
+            if val in choices_str:
+                return val
+            print(f"Invalid choice. Please select 1-{len(choices_str)} or enter choice name.")
+        except (KeyboardInterrupt, EOFError):
+            print()
+            sys.exit(1)
+
+
+def prompt_input(question: str, default: str | None = None) -> str:
+    default_str = f" [default: {default}]" if default is not None else ""
+    while True:
+        try:
+            val = input(f"{question}{default_str}: ").strip()
+            if not val and default is not None:
+                return default
+            if val:
+                return val
+            print("Value cannot be empty.")
+        except (KeyboardInterrupt, EOFError):
+            print()
+            sys.exit(1)
+
+
+def run_interactive() -> None:
+    print("=" * 60)
+    print("  ZeroDPI Interactive Builder")
+    print("=" * 60)
+
+    # 1. Platform selection
+    platform_choices = ["linux", "windows", "termux", "android-app", "all"]
+    # Detect host to set a smart default
+    host_sys = platform.system()
+    if host_sys == "Linux":
+        default_platform = "linux"
+    elif host_sys == "Windows":
+        default_platform = "windows"
+    else:
+        default_platform = "all"
+        
+    selected_platform = prompt_choice("Select target build platform:", platform_choices, default_platform)
+
+    # Initialize all potential variables with defaults
+    windivert_version = WINDIVERT_DEFAULT_VERSION
+    toolchain = WINDOWS_DEFAULT_TOOLCHAIN
+    msys2_path = WINDOWS_DEFAULT_MSYS2_PATH
+    linux_target = DEFAULT_LINUX_TARGET
+    termux_arch = TERMUX_DEFAULT_ARCH
+    android_ndk = None
+    android_api = ANDROID_DEFAULT_API_LEVEL
+    android_app_abi = "all"
+    android_app_runtime = "rootless"
+    android_app_build_type = "debug"
+    android_gradle = None
+
+    # Step-by-step questions based on selected platform
+    if selected_platform == "linux":
+        if platform.system() == "Windows":
+            print("\nYou are building Linux binaries from Windows. We need to cross-compile.")
+            target_choices = [DEFAULT_LINUX_TARGET] + [t for t in LINUX_CROSS_TARGETS if t != DEFAULT_LINUX_TARGET] + ["all", "Custom"]
+            target_sel = prompt_choice("Select Linux target triple:", target_choices, DEFAULT_LINUX_TARGET)
+            if target_sel == "Custom":
+                linux_target = prompt_input("Enter custom Linux target triple (e.g. x86_64-unknown-linux-gnu):")
+            else:
+                linux_target = target_sel
+
+            msys2_path = prompt_input("MSYS2 path for Zig compiler (if not on PATH):", WINDOWS_DEFAULT_MSYS2_PATH)
+        else:
+            print("\nYou are building natively on Linux. No extra cross-compilation variables needed.")
+
+    elif selected_platform == "windows":
+        windivert_version = prompt_input("WinDivert version to download/verify:", WINDIVERT_DEFAULT_VERSION)
+        toolchain = prompt_input("Rust toolchain to use (press Enter for default, or empty for workspace default):", WINDOWS_DEFAULT_TOOLCHAIN)
+        msys2_path = prompt_input("MSYS2 install path (required for GNU toolchain dlltool/ld):", WINDOWS_DEFAULT_MSYS2_PATH)
+
+    elif selected_platform == "termux":
+        arch_choices = list(TERMUX_ARCH_CHOICES) + ["Custom"]
+        arch_sel = prompt_choice("Select Termux Android architecture:", arch_choices, TERMUX_DEFAULT_ARCH)
+        if arch_sel == "Custom":
+            termux_arch = prompt_input("Enter system architecture (e.g., aarch64, armv7):")
+        else:
+            termux_arch = arch_sel
+
+        # Android NDK location
+        default_ndk = os.environ.get("ANDROID_NDK_HOME", "")
+        if not default_ndk:
+            auto_ndk = _find_android_studio_ndk()
+            if auto_ndk:
+                default_ndk = str(auto_ndk)
+        
+        ndk_prompt = "Android NDK path (press Enter to auto-detect/download):"
+        if default_ndk:
+            android_ndk = prompt_input(ndk_prompt, default_ndk)
+        else:
+            ans = prompt_choice("Android NDK path selection:", ["Auto-detect or Download if missing", "Enter custom path"], "Auto-detect or Download if missing")
+            if ans == "Enter custom path":
+                android_ndk = prompt_input("Enter NDK path:")
+            else:
+                android_ndk = ""
+
+        # Android API Level
+        api_str = prompt_input("Android API level to use (>=23):", str(ANDROID_DEFAULT_API_LEVEL))
+        android_api = int(api_str)
+
+    elif selected_platform == "android-app":
+        # Android ABI options
+        abi_choices = ["all", "public", "debug", "Custom"]
+        abi_sel = prompt_choice("Select Target APK Architecture ABIs:", abi_choices, "all")
+        if abi_sel == "Custom":
+            android_app_abi = prompt_input("Enter comma-separated list of ABIs (e.g. arm64-v8a,armeabi-v7a):")
+        else:
+            android_app_abi = abi_sel
+
+        android_app_runtime = prompt_choice("Select App Runtime packet interception feature level:", list(ANDROID_APP_RUNTIME_CHOICES), "rootless")
+        android_app_build_type = prompt_choice("Select Gradle build type:", list(ANDROID_APP_BUILD_TYPES), "debug")
+
+        # Gradle command
+        gradle_choices = ["Auto-detect default gradle wrapper/PATH", "Enter custom Gradle executable path"]
+        gradle_sel = prompt_choice("Select Gradle wrapper / executable path option:", gradle_choices, "Auto-detect default gradle wrapper/PATH")
+        if gradle_sel == "Enter custom Gradle executable path":
+            android_gradle = prompt_input("Enter path to Gradle executable:")
+        else:
+            android_gradle = None
+
+        # NDK Location
+        default_ndk = os.environ.get("ANDROID_NDK_HOME", "")
+        if not default_ndk:
+            auto_ndk = _find_android_studio_ndk()
+            if auto_ndk:
+                default_ndk = str(auto_ndk)
+        
+        ndk_prompt = "Android NDK path (press Enter to auto-detect/download):"
+        if default_ndk:
+            android_ndk = prompt_input(ndk_prompt, default_ndk)
+        else:
+            ans = prompt_choice("Android NDK path selection:", ["Auto-detect or Download if missing", "Enter custom path"], "Auto-detect or Download if missing")
+            if ans == "Enter custom path":
+                android_ndk = prompt_input("Enter NDK path:")
+            else:
+                android_ndk = ""
+
+        # API
+        api_str = prompt_input("Android API level for NDK compilers (>=23):", str(ANDROID_DEFAULT_API_LEVEL))
+        android_api = int(api_str)
+
+    elif selected_platform == "all":
+        windivert_version = prompt_input("WinDivert version to download/verify (Windows only):", WINDIVERT_DEFAULT_VERSION)
+        toolchain = prompt_input("Rust toolchain to use for Windows target (press Enter for default):", WINDOWS_DEFAULT_TOOLCHAIN)
+        msys2_path = prompt_input("MSYS2 install path (required for Windows GNU toolchain and Linux Zig cross-compiler):", WINDOWS_DEFAULT_MSYS2_PATH)
+
+        target_choices = [DEFAULT_LINUX_TARGET] + [t for t in LINUX_CROSS_TARGETS if t != DEFAULT_LINUX_TARGET] + ["all", "Custom"]
+        target_sel = prompt_choice("Select Linux targets to cross-compile:", target_choices, DEFAULT_LINUX_TARGET)
+        if target_sel == "Custom":
+            linux_target = prompt_input("Enter custom Linux target triple (e.g. x86_64-unknown-linux-gnu):")
+        else:
+            linux_target = target_sel
+
+        arch_choices = list(TERMUX_ARCH_CHOICES) + ["Custom"]
+        arch_sel = prompt_choice("Select Termux Android architecture to build:", arch_choices, TERMUX_DEFAULT_ARCH)
+        if arch_sel == "Custom":
+            termux_arch = prompt_input("Enter system architecture (e.g., aarch64, armv7):")
+        else:
+            termux_arch = arch_sel
+
+        # Android NDK location
+        default_ndk = os.environ.get("ANDROID_NDK_HOME", "")
+        if not default_ndk:
+            auto_ndk = _find_android_studio_ndk()
+            if auto_ndk:
+                default_ndk = str(auto_ndk)
+        
+        ndk_prompt = "Android NDK path (press Enter to auto-detect/download):"
+        if default_ndk:
+            android_ndk = prompt_input(ndk_prompt, default_ndk)
+        else:
+            ans = prompt_choice("Android NDK path selection:", ["Auto-detect or Download if missing", "Enter custom path"], "Auto-detect or Download if missing")
+            if ans == "Enter custom path":
+                android_ndk = prompt_input("Enter NDK path:")
+            else:
+                android_ndk = ""
+
+        # Android API Level
+        api_str = prompt_input("Android API level to use (>=23):", str(ANDROID_DEFAULT_API_LEVEL))
+        android_api = int(api_str)
+
+    # Let's confirm the plan and start building!
+    print("\n" + "=" * 60)
+    print("  CONFIRM ACTION PLAN")
+    print("=" * 60)
+    print(f"Platform:              {selected_platform}")
+    if selected_platform in ("windows", "all"):
+        print(f"WinDivert Version:     {windivert_version}")
+        print(f"Windows Toolchain:     {toolchain or 'Workspace Default'}")
+        print(f"MSYS2 Path:            {msys2_path}")
+    if selected_platform == "linux" and platform.system() == "Windows":
+        print(f"Linux Target:          {linux_target}")
+        print(f"MSYS2 Path (for Zig):  {msys2_path}")
+    if selected_platform == "all":
+        print(f"Linux targets:         {linux_target}")
+    if selected_platform in ("termux", "all"):
+        print(f"Termux Architecture:   {termux_arch}")
+        print(f"Android NDK:           {android_ndk or 'Auto-detect / Download'}")
+        print(f"Android API level:     {android_api}")
+    if selected_platform == "android-app":
+        print(f"Android App ABIs:      {android_app_abi}")
+        print(f"Android App Runtime:   {android_app_runtime}")
+        print(f"App Build Type:        {android_app_build_type}")
+        print(f"Gradle executable:     {android_gradle or 'Auto-detect'}")
+        print(f"Android NDK:           {android_ndk or 'Auto-detect / Download'}")
+        print(f"Android API level:     {android_api}")
+    print("=" * 60)
+
+    try:
+        ans = input("\nProceed with this configuration? [Y/n]: ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        sys.exit(1)
+    if ans not in ("", "y", "yes"):
+        print("Aborted.")
+        sys.exit(0)
+
+    # Perform action based on selections
+    if selected_platform == "linux":
+        if platform.system() == "Windows":
+            targets = resolve_linux_targets(linux_target)
+            build_linux_cross_zigbuild(targets, msys2_path)
+        else:
+            build_linux()
+    elif selected_platform == "windows":
+        build_windows(windivert_version, toolchain, msys2_path)
+    elif selected_platform == "termux":
+        build_termux(termux_arch, android_ndk, android_api)
+    elif selected_platform in ("android", "android-app"):
+        build_android_app_runtime(
+            android_app_abi,
+            selected_platform if selected_platform != "android-app" else android_app_runtime,
+            android_ndk,
+            android_api,
+            android_app_build_type,
+            android_gradle,
+        )
+    elif selected_platform == "all":
+        build_all(
+            windivert_version,
+            toolchain,
+            msys2_path,
+            termux_arch,
+            android_ndk,
+            android_api,
+            resolve_linux_targets(linux_target),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build ZeroDPI for the current platform, Windows, Linux, Termux, or Android APK packaging.")
+    parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Run the builder in interactive mode, prompting for options step-by-step.",
+    )
     parser.add_argument(
         "--platform",
         "--target",
@@ -1585,6 +1861,10 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    if args.interactive or len(sys.argv) == 1:
+        run_interactive()
+        return
 
     selected_platform = args.platform
     if selected_platform == "auto":

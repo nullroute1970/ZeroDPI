@@ -1049,24 +1049,79 @@ def resolve_explicit_gradle_command(android_gradle: str) -> list[str]:
     die(f"Gradle executable not found: {android_gradle}")
 
 
-def resolve_android_sdk(ndk_path: Path | None) -> Path | None:
+def unescape_android_property_value(value: str) -> str:
+    return (
+        value.strip()
+        .replace(r"\ ", " ")
+        .replace(r"\:", ":")
+        .replace(r"\\", "\\")
+    )
+
+
+def read_android_local_properties_sdk() -> Path | None:
+    local_properties = ANDROID_PROJECT_DIR / "local.properties"
+    if not local_properties.is_file():
+        return None
+
+    for line in local_properties.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "!")):
+            continue
+        if stripped.startswith("sdk.dir"):
+            _, _, raw_value = stripped.partition("=")
+            if not raw_value:
+                _, _, raw_value = stripped.partition(":")
+            if raw_value:
+                sdk_path = Path(unescape_android_property_value(raw_value)).expanduser()
+                if not sdk_path.is_absolute():
+                    sdk_path = ANDROID_PROJECT_DIR / sdk_path
+                return sdk_path
+
+    return None
+
+
+def android_sdk_candidates(ndk_path: Path | None) -> list[Path]:
+    candidates: list[Path] = []
+
     for name in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
         sdk = os.environ.get(name)
         if sdk:
-            sdk_path = Path(sdk).expanduser().resolve()
-            if sdk_path.is_dir():
-                return sdk_path
+            candidates.append(Path(sdk).expanduser())
+
+    local_properties_sdk = read_android_local_properties_sdk()
+    if local_properties_sdk is not None:
+        candidates.append(local_properties_sdk)
 
     if ndk_path and ndk_path.parent.name == "ndk":
-        sdk_path = ndk_path.parent.parent
-        if sdk_path.is_dir():
-            return sdk_path
+        candidates.append(ndk_path.parent.parent)
 
-    local_appdata = os.environ.get("LOCALAPPDATA", "")
-    if local_appdata:
-        sdk_path = Path(local_appdata) / "Android" / "Sdk"
-        if sdk_path.is_dir():
-            return sdk_path.resolve()
+    if platform.system() == "Windows":
+        local_appdata = os.environ.get("LOCALAPPDATA", "")
+        if local_appdata:
+            candidates.append(Path(local_appdata) / "Android" / "Sdk")
+    elif platform.system() == "Darwin":
+        candidates.append(Path.home() / "Library" / "Android" / "sdk")
+    else:
+        candidates.extend(
+            [
+                Path.home() / "Android" / "Sdk",
+                Path.home() / "Android" / "sdk",
+                Path("/opt/android-sdk"),
+                Path("/usr/lib/android-sdk"),
+            ]
+        )
+
+    return candidates
+
+
+def resolve_android_sdk(ndk_path: Path | None) -> Path | None:
+    for sdk_path in android_sdk_candidates(ndk_path):
+        try:
+            resolved = sdk_path.resolve()
+        except OSError:
+            continue
+        if resolved.is_dir():
+            return resolved
 
     return None
 

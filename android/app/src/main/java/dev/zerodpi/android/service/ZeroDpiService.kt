@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import dev.zerodpi.android.R
+import dev.zerodpi.android.config.ZeroDpiConfigToml
 import dev.zerodpi.android.runtime.FakeZeroDpiRunner
 import dev.zerodpi.android.runtime.ProcessZeroDpiRunner
 import dev.zerodpi.android.runtime.ZeroDpiRunRequest
@@ -85,29 +86,38 @@ class ZeroDpiService : Service() {
 
     fun state(): StateFlow<ZeroDpiServiceState> = state.asStateFlow()
 
-    fun startZeroDpi() {
+    fun startZeroDpi(modeOverride: String? = null) {
         ensureForeground()
         scope.launch {
-            val runtimeFiles = runCatching {
-                runtimeStorage.ensureInitialized()
+            val runConfig = runCatching {
+                runtimeStorage.prepareRunConfig(modeOverride)
             }.getOrElse { error ->
-                val message = error.message ?: "Failed to initialize runtime storage."
+                val message = error.message ?: "Failed to prepare runtime storage."
                 appendLog(message)
                 state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
                 return@launch
             }
-            runCatching {
-                runtimeStorage.prepareConfiguredDirectories()
-            }.getOrElse { error ->
-                val message = error.message ?: "Failed to prepare runtime paths."
-                appendLog(message)
-                state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
-                return@launch
+            val editorState = ZeroDpiConfigToml.analyze(runConfig.configText)
+            val mode = runConfig.modeOverride ?: editorState.valueFor("MODE").ifBlank { "unknown" }
+            val listenHost = editorState.valueFor("LISTEN_HOST").ifBlank { "127.0.0.1" }
+            val listenPort = editorState.valueFor("LISTEN_PORT").ifBlank { "1080" }
+            state.update {
+                it.copy(
+                    rootStatus = if (editorState.rootRequirement.requiresRoot) "Needed" else "Not needed",
+                    mode = mode,
+                    bypassMethod = editorState.valueFor("BYPASS_METHOD").ifBlank { "unknown" },
+                    listener = "$listenHost:$listenPort",
+                    lastError = null,
+                )
             }
-            appendLog("Runtime storage ready at ${runtimeFiles.runtimeDir.absolutePath}.")
+            appendLog("Runtime storage ready at ${runConfig.files.runtimeDir.absolutePath}.")
+            modeOverride?.let { modeName ->
+                appendLog("Running temporary $modeName test scan config.")
+            }
             val request = ZeroDpiRunRequest(
-                configPath = runtimeFiles.configFile.absolutePath,
-                workingDirectory = runtimeFiles.runtimeDir.absolutePath,
+                configPath = runConfig.configFile.absolutePath,
+                workingDirectory = runConfig.files.runtimeDir.absolutePath,
+                mode = mode,
             )
             runner.start(request)
         }

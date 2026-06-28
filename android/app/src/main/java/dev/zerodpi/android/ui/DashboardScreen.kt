@@ -46,6 +46,7 @@ import dev.zerodpi.android.config.ConfigRootImpact
 import dev.zerodpi.android.config.ConfigSection
 import dev.zerodpi.android.config.ConfigValidationIssue
 import dev.zerodpi.android.config.ZeroDpiConfigSchema
+import dev.zerodpi.android.list.RuntimeListValidation
 import dev.zerodpi.android.service.RuntimeStatus
 import dev.zerodpi.android.service.ZeroDpiServiceState
 import dev.zerodpi.android.storage.RuntimeFileKind
@@ -61,6 +62,10 @@ fun DashboardScreen(
     onConfigFieldChanged: (String, String) -> Unit,
     onSaveRuntimeFile: () -> Unit,
     onResetRuntimeFile: () -> Unit,
+    onImportRuntimeFile: (RuntimeFileKind) -> Unit,
+    onExportRuntimeFile: (RuntimeFileKind) -> Unit,
+    onShareRuntimeFile: (RuntimeFileKind) -> Unit,
+    onRunTestScan: (RuntimeFileKind) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Scaffold(
@@ -77,7 +82,7 @@ fun DashboardScreen(
         ) {
             StatusPanel(
                 state = state,
-                canStart = runtimeFilesState.configEditor.canStart &&
+                canStart = runtimeFilesState.canStart &&
                     !runtimeFilesState.isLoading &&
                     !runtimeFilesState.isSaving,
                 onStart = onStart,
@@ -94,6 +99,10 @@ fun DashboardScreen(
                 onRuntimeFileTextChanged = onRuntimeFileTextChanged,
                 onSaveRuntimeFile = onSaveRuntimeFile,
                 onResetRuntimeFile = onResetRuntimeFile,
+                onImportRuntimeFile = onImportRuntimeFile,
+                onExportRuntimeFile = onExportRuntimeFile,
+                onShareRuntimeFile = onShareRuntimeFile,
+                onRunTestScan = onRunTestScan,
             )
             RuntimeDetails(state = state)
             LogsPanel(logs = state.recentLogs)
@@ -444,7 +453,15 @@ private fun RuntimeFilesPanel(
     onRuntimeFileTextChanged: (String) -> Unit,
     onSaveRuntimeFile: () -> Unit,
     onResetRuntimeFile: () -> Unit,
+    onImportRuntimeFile: (RuntimeFileKind) -> Unit,
+    onExportRuntimeFile: (RuntimeFileKind) -> Unit,
+    onShareRuntimeFile: (RuntimeFileKind) -> Unit,
+    onRunTestScan: (RuntimeFileKind) -> Unit,
 ) {
+    val selectedListValidation = state.selectedListValidation
+    val selectedFileIsList = state.selectedFile != RuntimeFileKind.Config
+    val actionsEnabled = !state.isLoading && !state.isSaving
+
     Surface(
         modifier = Modifier.fillMaxWidth(),
         tonalElevation = 1.dp,
@@ -487,6 +504,12 @@ private fun RuntimeFilesPanel(
                     }
                 }
             }
+            selectedListValidation?.let { validation ->
+                RuntimeListValidationSummary(
+                    kind = state.selectedFile,
+                    validation = validation,
+                )
+            }
             if (state.isLoading) {
                 Text("Loading runtime files.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
@@ -497,6 +520,7 @@ private fun RuntimeFilesPanel(
                         .fillMaxWidth()
                         .heightIn(min = 220.dp, max = 360.dp),
                     enabled = !state.isSaving,
+                    isError = selectedListValidation?.issues?.isNotEmpty() == true,
                     label = { Text(state.selectedFile.fileName) },
                     textStyle = MaterialTheme.typography.bodySmall.copy(
                         fontFamily = FontFamily.Monospace,
@@ -508,15 +532,55 @@ private fun RuntimeFilesPanel(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
                     onClick = onSaveRuntimeFile,
-                    enabled = !state.isLoading && !state.isSaving,
+                    enabled = actionsEnabled,
                 ) {
                     Text(if (state.isSaving) "Saving" else "Save")
                 }
                 OutlinedButton(
                     onClick = onResetRuntimeFile,
-                    enabled = !state.isLoading && !state.isSaving,
+                    enabled = actionsEnabled,
                 ) {
                     Text("Reset to defaults")
+                }
+            }
+            if (selectedFileIsList) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = { onImportRuntimeFile(state.selectedFile) },
+                        enabled = actionsEnabled,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text("Import")
+                    }
+                    OutlinedButton(
+                        onClick = { onExportRuntimeFile(state.selectedFile) },
+                        enabled = actionsEnabled,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text("Export")
+                    }
+                    OutlinedButton(
+                        onClick = { onShareRuntimeFile(state.selectedFile) },
+                        enabled = actionsEnabled,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text("Share")
+                    }
+                }
+                Button(
+                    onClick = { onRunTestScan(state.selectedFile) },
+                    enabled = actionsEnabled &&
+                        state.configEditor.canStart &&
+                        selectedListValidation?.isValid == true,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        when (state.selectedFile) {
+                            RuntimeFileKind.SniList -> "Run SNI test scan"
+                            RuntimeFileKind.IpList -> "Run IP test scan"
+                            RuntimeFileKind.Config -> "Run test scan"
+                        },
+                    )
                 }
             }
             state.statusMessage?.let { message ->
@@ -524,6 +588,58 @@ private fun RuntimeFilesPanel(
             }
             state.errorMessage?.let { message ->
                 Text(message, color = MaterialTheme.colorScheme.error)
+            }
+        }
+    }
+}
+
+@Composable
+private fun RuntimeListValidationSummary(
+    kind: RuntimeFileKind,
+    validation: RuntimeListValidation,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = when (kind) {
+                RuntimeFileKind.SniList -> "One hostname per line. Blank lines and lines starting with # are preserved."
+                RuntimeFileKind.IpList -> "One IPv4, IPv6, IPv4 CIDR, or IPv6 CIDR per line. Blank lines and # comments are preserved."
+                RuntimeFileKind.Config -> ""
+            },
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        validation.warnings.forEach { warning ->
+            Text(
+                text = warning,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        if (validation.issues.isEmpty()) {
+            Text(
+                text = "${validation.activeEntries} active entries look valid.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        } else {
+            Text(
+                text = "${validation.issues.size} invalid entries",
+                color = MaterialTheme.colorScheme.error,
+                fontWeight = FontWeight.Medium,
+            )
+            validation.issues.take(MAX_VISIBLE_LIST_ERRORS).forEach { issue ->
+                Text(
+                    text = "Line ${issue.lineNumber}: ${issue.entry} - ${issue.message}",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            if (validation.issues.size > MAX_VISIBLE_LIST_ERRORS) {
+                Text(
+                    text = "+ ${validation.issues.size - MAX_VISIBLE_LIST_ERRORS} more list errors",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
         }
     }
@@ -583,3 +699,4 @@ private fun LogsPanel(logs: List<String>) {
 }
 
 private const val MAX_VISIBLE_VALIDATION_ERRORS = 6
+private const val MAX_VISIBLE_LIST_ERRORS = 6

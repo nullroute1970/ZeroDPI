@@ -6,6 +6,7 @@ data class ZeroDpiRunRequest(
     val configPath: String,
     val workingDirectory: String,
     val useRoot: Boolean = false,
+    val mode: String = "",
 )
 
 sealed interface ZeroDpiRunnerEvent {

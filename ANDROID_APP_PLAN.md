@@ -390,32 +390,34 @@ Acceptance criteria:
 
 ## Phase 6: List Editors
 
+Status: complete. Implemented under `android/` as of 2026-06-28.
+
 Steps:
 
-- Add an SNI list page:
-  - multiline editor,
-  - one hostname per line,
-  - preserve comments and blank lines if practical,
-  - validate obvious invalid hostnames,
-  - import from text file,
-  - export/share as text.
-- Add an IP list page:
-  - multiline editor,
-  - one IP or CIDR per line,
-  - preserve comments and blank lines if practical,
-  - validate IPv4, IPv6, and CIDR syntax,
-  - warn that `ip_bypass_plus` is IPv4-only,
-  - import/export/share.
-- Add "test scan" actions:
-  - run `sni_scan`,
-  - run `ip_scan`,
-  - save results to `SCAN_OUTPUT` if configured.
+- [x] Add an SNI list page:
+  - [x] multiline editor,
+  - [x] one hostname per line,
+  - [x] preserve comments and blank lines if practical,
+  - [x] validate obvious invalid hostnames,
+  - [x] import from text file,
+  - [x] export/share as text.
+- [x] Add an IP list page:
+  - [x] multiline editor,
+  - [x] one IP or CIDR per line,
+  - [x] preserve comments and blank lines if practical,
+  - [x] validate IPv4, IPv6, and CIDR syntax,
+  - [x] warn that `ip_bypass_plus` is IPv4-only,
+  - [x] import/export/share.
+- [x] Add "test scan" actions:
+  - [x] run `sni_scan`,
+  - [x] run `ip_scan`,
+  - [x] save results to `SCAN_OUTPUT` if configured.
 
 Acceptance criteria:
 
-- Users can edit and save both lists.
-- Invalid entries are highlighted before start where possible.
-- Scan-only workflows work without root.
+- [x] Users can edit and save both lists.
+- [x] Invalid entries are highlighted before start where possible.
+- [x] Scan-only workflows work without root.
 
 ## Phase 7: Dashboard And Start/Stop Flow
 

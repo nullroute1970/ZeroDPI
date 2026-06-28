@@ -27,6 +27,15 @@ class FakeZeroDpiRunner(
             events.emit(ZeroDpiRunnerEvent.Log("Using fake ZeroDPI runner. No native binary is required."))
             delay(450)
             events.emit(ZeroDpiRunnerEvent.Log("Loaded config from ${request.configPath}."))
+            if (request.mode == "sni_scan" || request.mode == "ip_scan") {
+                events.emit(ZeroDpiRunnerEvent.Scanning)
+                delay(700)
+                events.emit(ZeroDpiRunnerEvent.Log("Fake ${request.mode} completed."))
+                events.emit(ZeroDpiRunnerEvent.Exited(0))
+                job = null
+                return@launch
+            }
+
             events.emit(ZeroDpiRunnerEvent.Scanning)
             delay(700)
             events.emit(ZeroDpiRunnerEvent.Log("Selected demo target cloudflare.com with score 95."))

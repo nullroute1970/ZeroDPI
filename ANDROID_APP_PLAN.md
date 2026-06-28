@@ -527,6 +527,11 @@ Acceptance criteria:
 
 ## Phase 10: Testing Plan
 
+Status: complete. Automated Android JVM and instrumented tests were added under
+`android/app/src/test/` and `android/app/src/androidTest/` as of 2026-06-28.
+Device test commands and the rooted-device opt-in path are documented in
+`android/TESTING.md`.
+
 Rust tests:
 
 - Keep running `cargo fmt --all -- --check`.
@@ -573,8 +578,8 @@ Device tests:
 
 Acceptance criteria:
 
-- Rootless regression tests pass without root.
-- Root-specific tests are isolated and clearly skipped when root is absent.
+- [x] Rootless regression tests pass without root.
+- [x] Root-specific tests are isolated and clearly skipped when root is absent.
 
 ## Phase 11: Documentation
 

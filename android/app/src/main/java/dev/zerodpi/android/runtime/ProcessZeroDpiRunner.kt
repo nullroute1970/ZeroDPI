@@ -13,12 +13,31 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.TimeUnit
 
-class ProcessZeroDpiRunner(
-    context: Context,
+private const val ZERO_DPI_EXECUTABLE_NAME = "libzerodpi_exec.so"
+
+internal interface ZeroDpiProcessLauncher {
+    suspend fun start(command: List<String>, workingDirectory: File): Process
+}
+
+class ProcessZeroDpiRunner internal constructor(
     private val scope: CoroutineScope,
     private val rootManager: RootManager,
+    private val executableProvider: () -> File,
+    private val processLauncher: ZeroDpiProcessLauncher,
 ) : ZeroDpiRunner {
-    private val appContext = context.applicationContext
+    constructor(
+        context: Context,
+        scope: CoroutineScope,
+        rootManager: RootManager,
+    ) : this(
+        scope = scope,
+        rootManager = rootManager,
+        executableProvider = {
+            File(context.applicationContext.applicationInfo.nativeLibraryDir, ZERO_DPI_EXECUTABLE_NAME)
+        },
+        processLauncher = SystemZeroDpiProcessLauncher,
+    )
+
     private val events = MutableSharedFlow<ZeroDpiRunnerEvent>(extraBufferCapacity = 128)
     private var process: Process? = null
     private var rootProcessPid: Long? = null
@@ -35,7 +54,7 @@ class ProcessZeroDpiRunner(
             return
         }
 
-        val executable = File(appContext.applicationInfo.nativeLibraryDir, "libzerodpi_exec.so")
+        val executable = executableProvider()
         if (!executable.isFile) {
             events.emit(ZeroDpiRunnerEvent.Failed("Missing native runtime artifact: ${executable.absolutePath}"))
             return
@@ -71,14 +90,8 @@ class ProcessZeroDpiRunner(
                 }
             }
         } else {
-            val builder = ProcessBuilder(command)
-                .directory(workingDirectory)
-                .redirectErrorStream(true)
-
             process = runCatching {
-                withContext(Dispatchers.IO) {
-                    builder.start()
-                }
+                processLauncher.start(command, workingDirectory)
             }.getOrElse { error ->
                 events.emit(ZeroDpiRunnerEvent.Failed(error.message ?: "Failed to start ZeroDPI."))
                 return
@@ -87,8 +100,12 @@ class ProcessZeroDpiRunner(
             runningAsRoot = false
         }
 
+        val launchedProcess = process ?: run {
+            events.emit(ZeroDpiRunnerEvent.Failed("Failed to retain ZeroDPI process handle."))
+            return
+        }
         outputJob = scope.launch(Dispatchers.IO) {
-            process?.inputStream?.bufferedReader()?.useLines { lines ->
+            launchedProcess.inputStream.bufferedReader().useLines { lines ->
                 lines.forEach { line ->
                     events.emit(RuntimeEventLineParser.parse(line) ?: ZeroDpiRunnerEvent.Log(line))
                 }
@@ -96,7 +113,7 @@ class ProcessZeroDpiRunner(
         }
 
         waitJob = scope.launch(Dispatchers.IO) {
-            val exitCode = process?.waitFor() ?: -1
+            val exitCode = launchedProcess.waitFor()
             process = null
             rootProcessPid = null
             runningAsRoot = false
@@ -164,4 +181,14 @@ class ProcessZeroDpiRunner(
             events.emit(ZeroDpiRunnerEvent.Exited(exitCode))
         }
     }
+}
+
+private object SystemZeroDpiProcessLauncher : ZeroDpiProcessLauncher {
+    override suspend fun start(command: List<String>, workingDirectory: File): Process =
+        withContext(Dispatchers.IO) {
+            ProcessBuilder(command)
+                .directory(workingDirectory)
+                .redirectErrorStream(true)
+                .start()
+        }
 }

@@ -62,6 +62,41 @@ class ZeroDpiConfigSchemaTest {
     }
 
     @Test
+    fun tomlEditRoundTripPreservesTypesEscapesAndComments() {
+        val original = """
+            # User-edited runtime config.
+            LISTEN_HOST = "127.0.0.1" # keep listener note
+            LISTEN_PORT = 44444
+            AUTO_SELECT = false
+            TLS_FRAG_PACKETS = "tlshello"
+            TLS_FRAG_LENGTH = 4
+        """.trimIndent()
+
+        val edited = listOf(
+            "LISTEN_HOST" to "vpn \"edge\"",
+            "LISTEN_PORT" to "45678",
+            "AUTO_SELECT" to "true",
+            "TLS_FRAG_PACKETS" to "2-4",
+            "TLS_FRAG_LENGTH" to "8-16",
+        ).fold(original) { text, (field, value) ->
+            ZeroDpiConfigToml.replaceOrAppendField(text, field, value)
+        }
+        val editorState = ZeroDpiConfigToml.analyze(edited)
+
+        assertTrue(
+            "Unexpected validation issues: ${editorState.issues}",
+            editorState.canStart,
+        )
+        assertEquals("vpn \"edge\"", editorState.valueFor("LISTEN_HOST"))
+        assertEquals("45678", editorState.valueFor("LISTEN_PORT"))
+        assertEquals("true", editorState.valueFor("AUTO_SELECT"))
+        assertEquals("2-4", editorState.valueFor("TLS_FRAG_PACKETS"))
+        assertEquals("8-16", editorState.valueFor("TLS_FRAG_LENGTH"))
+        assertTrue(edited.contains("""LISTEN_HOST = "vpn \"edge\"" # keep listener note"""))
+        assertTrue(edited.contains("TLS_FRAG_LENGTH = \"8-16\""))
+    }
+
+    @Test
     fun rootRequirementMatchesAndroidMatrix() {
         assertTrue(ZeroDpiConfigToml.requiresPacketInterception("sni_spoof", "wrong_seq"))
         assertFalse(ZeroDpiConfigToml.requiresPacketInterception("sni_spoof", "tls_frag"))

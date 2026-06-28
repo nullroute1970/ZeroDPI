@@ -10,17 +10,22 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.TimeUnit
 
 class ProcessZeroDpiRunner(
     context: Context,
     private val scope: CoroutineScope,
+    private val rootManager: RootManager,
 ) : ZeroDpiRunner {
     private val appContext = context.applicationContext
     private val events = MutableSharedFlow<ZeroDpiRunnerEvent>(extraBufferCapacity = 128)
     private var process: Process? = null
+    private var rootProcessPid: Long? = null
+    private var runningAsRoot: Boolean = false
     private var outputJob: Job? = null
     private var waitJob: Job? = null
+    private val exitEmitted = AtomicBoolean(false)
 
     override fun events(): Flow<ZeroDpiRunnerEvent> = events.asSharedFlow()
 
@@ -37,6 +42,7 @@ class ProcessZeroDpiRunner(
         }
 
         events.emit(ZeroDpiRunnerEvent.Starting)
+        exitEmitted.set(false)
         val command = mutableListOf(
             executable.absolutePath,
             "--config",
@@ -46,31 +52,55 @@ class ProcessZeroDpiRunner(
             "--json-events",
         )
 
-        val builder = if (request.useRoot) {
-            ProcessBuilder("su", "-c", command.joinToString(" "))
+        val workingDirectory = File(request.workingDirectory)
+        if (request.useRoot) {
+            when (val launch = rootManager.runAsRoot(command, workingDirectory)) {
+                is RootProcessLaunchResult.Started -> {
+                    process = launch.process
+                    rootProcessPid = launch.pid
+                    runningAsRoot = true
+                    events.emit(ZeroDpiRunnerEvent.Log("Started ZeroDPI through su."))
+                }
+                is RootProcessLaunchResult.Failed -> {
+                    events.emit(
+                        ZeroDpiRunnerEvent.Failed(
+                            "${launch.message} ${launch.startFailure}".trim(),
+                        ),
+                    )
+                    return
+                }
+            }
         } else {
-            ProcessBuilder(command)
-        }
-            .directory(File(request.workingDirectory))
-            .redirectErrorStream(true)
+            val builder = ProcessBuilder(command)
+                .directory(workingDirectory)
+                .redirectErrorStream(true)
 
-        process = withContext(Dispatchers.IO) {
-            builder.start()
+            process = runCatching {
+                withContext(Dispatchers.IO) {
+                    builder.start()
+                }
+            }.getOrElse { error ->
+                events.emit(ZeroDpiRunnerEvent.Failed(error.message ?: "Failed to start ZeroDPI."))
+                return
+            }
+            rootProcessPid = null
+            runningAsRoot = false
         }
-        events.emit(ZeroDpiRunnerEvent.Running)
 
         outputJob = scope.launch(Dispatchers.IO) {
             process?.inputStream?.bufferedReader()?.useLines { lines ->
                 lines.forEach { line ->
-                    events.emit(ZeroDpiRunnerEvent.Log(line))
+                    events.emit(RuntimeEventLineParser.parse(line) ?: ZeroDpiRunnerEvent.Log(line))
                 }
             }
         }
 
         waitJob = scope.launch(Dispatchers.IO) {
             val exitCode = process?.waitFor() ?: -1
-            events.emit(ZeroDpiRunnerEvent.Exited(exitCode))
             process = null
+            rootProcessPid = null
+            runningAsRoot = false
+            emitExited(exitCode)
         }
     }
 
@@ -80,16 +110,58 @@ class ProcessZeroDpiRunner(
             return
         }
 
+        stopRootProcessIfNeeded()
         current.destroy()
         val stopped = withContext(Dispatchers.IO) {
             current.waitFor(5, TimeUnit.SECONDS)
         }
         if (!stopped) {
-            current.destroyForcibly()
+            events.emit(ZeroDpiRunnerEvent.StopTimedOut)
+            return
         }
+        cleanupProcess()
+        emitExited(0)
+    }
+
+    override suspend fun forceStop() {
+        val current = process ?: run {
+            emitExited(0)
+            return
+        }
+
+        stopRootProcessIfNeeded()
+        current.destroyForcibly()
+        withContext(Dispatchers.IO) {
+            current.waitFor(2, TimeUnit.SECONDS)
+        }
+        cleanupProcess()
+        emitExited(-1)
+    }
+
+    private fun cleanupProcess() {
         outputJob?.cancel()
         waitJob?.cancel()
+        outputJob = null
+        waitJob = null
         process = null
-        events.emit(ZeroDpiRunnerEvent.Exited(if (stopped) 0 else -1))
+        rootProcessPid = null
+        runningAsRoot = false
+    }
+
+    private suspend fun stopRootProcessIfNeeded() {
+        val pid = rootProcessPid
+        if (!runningAsRoot || pid == null) {
+            return
+        }
+        val result = rootManager.stopRootProcess(pid)
+        if (!result.isSuccess) {
+            events.emit(ZeroDpiRunnerEvent.Log(result.diagnosticLine()))
+        }
+    }
+
+    private suspend fun emitExited(exitCode: Int) {
+        if (exitEmitted.compareAndSet(false, true)) {
+            events.emit(ZeroDpiRunnerEvent.Exited(exitCode))
+        }
     }
 }

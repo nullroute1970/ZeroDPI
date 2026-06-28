@@ -3,6 +3,7 @@ package dev.zerodpi.android.storage
 import android.content.Context
 import android.system.Os
 import android.system.OsConstants
+import dev.zerodpi.android.config.ZeroDpiConfigToml
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -40,6 +41,13 @@ data class RuntimeFileContents(
     val configText: String,
     val sniListText: String,
     val ipListText: String,
+)
+
+data class RuntimeRunConfig(
+    val files: RuntimeStorageFiles,
+    val configFile: File,
+    val configText: String,
+    val modeOverride: String?,
 )
 
 data class ResolvedRuntimeConfigPaths(
@@ -133,6 +141,34 @@ class RuntimeStorage(context: Context) {
             val resolvedPaths = resolveConfigPaths(configText)
             resolvedPaths.scanOutput?.parentFile?.mkdirsOrThrow()
             resolvedPaths
+        }
+
+    suspend fun prepareRunConfig(modeOverride: String? = null): RuntimeRunConfig =
+        withContext(Dispatchers.IO) {
+            val currentFiles = ensureInitializedBlocking()
+            val storedConfigText = currentFiles.configFile.readText(StandardCharsets.UTF_8)
+            val runConfigText = modeOverride?.let { mode ->
+                ZeroDpiConfigToml.replaceOrAppendField(
+                    text = storedConfigText,
+                    fieldName = "MODE",
+                    value = mode,
+                )
+            } ?: storedConfigText
+            val runConfigFile = modeOverride?.let { mode ->
+                File(currentFiles.runtimeDir, ".${mode}_config.toml").also { target ->
+                    atomicWrite(target = target, content = runConfigText, backup = null)
+                }
+            } ?: currentFiles.configFile
+
+            val resolvedPaths = resolveConfigPaths(runConfigText)
+            resolvedPaths.scanOutput?.parentFile?.mkdirsOrThrow()
+
+            RuntimeRunConfig(
+                files = currentFiles,
+                configFile = runConfigFile,
+                configText = runConfigText,
+                modeOverride = modeOverride,
+            )
         }
 
     fun resolveConfigPaths(configText: String): ResolvedRuntimeConfigPaths =

@@ -11,6 +11,9 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.zerodpi.android.config.ConfigEditorState
 import dev.zerodpi.android.config.ZeroDpiConfigToml
+import dev.zerodpi.android.list.RuntimeListIssue
+import dev.zerodpi.android.list.RuntimeListValidation
+import dev.zerodpi.android.list.RuntimeListValidator
 import dev.zerodpi.android.service.RuntimeStatus
 import dev.zerodpi.android.service.ZeroDpiService
 import dev.zerodpi.android.service.ZeroDpiServiceState
@@ -39,6 +42,41 @@ data class RuntimeFilesUiState(
     val selectedText: String
         get() = textFor(selectedFile)
 
+    val sniListValidation: RuntimeListValidation
+        get() = RuntimeListValidator.validate(
+            kind = RuntimeFileKind.SniList,
+            text = sniListText,
+            mode = configEditor.valueFor("MODE"),
+        )
+
+    val ipListValidation: RuntimeListValidation
+        get() = RuntimeListValidator.validate(
+            kind = RuntimeFileKind.IpList,
+            text = ipListText,
+            mode = configEditor.valueFor("MODE"),
+        )
+
+    val selectedListValidation: RuntimeListValidation?
+        get() = validationFor(selectedFile)
+
+    val blockingListIssuesForStart: List<RuntimeListIssue>
+        get() = when (configEditor.valueFor("MODE")) {
+            "sni_scan",
+            "sni_spoof",
+            "proxy_scan",
+            -> sniListValidation.issues
+
+            "ip_scan",
+            "ip_bypass",
+            "ip_bypass_plus",
+            -> ipListValidation.issues
+
+            else -> emptyList()
+        }
+
+    val canStart: Boolean
+        get() = configEditor.canStart && blockingListIssuesForStart.isEmpty()
+
     fun textFor(kind: RuntimeFileKind): String =
         when (kind) {
             RuntimeFileKind.Config -> configText
@@ -54,6 +92,13 @@ data class RuntimeFilesUiState(
             )
             RuntimeFileKind.SniList -> copy(sniListText = text)
             RuntimeFileKind.IpList -> copy(ipListText = text)
+        }
+
+    fun validationFor(kind: RuntimeFileKind): RuntimeListValidation? =
+        when (kind) {
+            RuntimeFileKind.Config -> null
+            RuntimeFileKind.SniList -> sniListValidation
+            RuntimeFileKind.IpList -> ipListValidation
         }
 }
 
@@ -71,6 +116,7 @@ class MainViewModel(
     private var serviceStateJob: Job? = null
     private var isBound = false
     private var startWhenConnected = false
+    private var startWhenConnectedModeOverride: String? = null
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -84,7 +130,9 @@ class MainViewModel(
             }
             if (startWhenConnected) {
                 startWhenConnected = false
-                service?.startZeroDpi()
+                val modeOverride = startWhenConnectedModeOverride
+                startWhenConnectedModeOverride = null
+                service?.startZeroDpi(modeOverride)
             }
         }
 
@@ -116,6 +164,19 @@ class MainViewModel(
                 return@launch
             }
 
+            val blockingListIssues = _runtimeFilesState.value.copy(configEditor = validation)
+                .blockingListIssuesForStart
+            if (blockingListIssues.isNotEmpty()) {
+                _runtimeFilesState.update {
+                    it.copy(
+                        configEditor = validation,
+                        statusMessage = null,
+                        errorMessage = "Fix list validation errors before starting ZeroDPI.",
+                    )
+                }
+                return@launch
+            }
+
             _runtimeFilesState.update {
                 it.copy(
                     configEditor = validation,
@@ -124,7 +185,7 @@ class MainViewModel(
                 )
             }
 
-            if (saveRuntimeFiles(_runtimeFilesState.value.dirtyFiles)) {
+            if (saveRuntimeFiles(RuntimeFileKind.entries.toSet())) {
                 startService()
             }
         }
@@ -132,6 +193,39 @@ class MainViewModel(
 
     fun stop() {
         service?.stopZeroDpi()
+    }
+
+    fun forceStop() {
+        service?.forceStopZeroDpi()
+    }
+
+    fun runRootDiagnostics() {
+        val validation = ZeroDpiConfigToml.analyze(_runtimeFilesState.value.configText)
+        _runtimeFilesState.update {
+            it.copy(
+                configEditor = validation,
+                statusMessage = "Root diagnostics will invoke su. ${validation.rootRequirement.message}",
+                errorMessage = null,
+            )
+        }
+
+        val connectedService = service
+        if (connectedService == null) {
+            bindService()
+            _runtimeFilesState.update {
+                it.copy(
+                    statusMessage = null,
+                    errorMessage = "Service is still connecting; try root diagnostics again.",
+                )
+            }
+            return
+        }
+
+        connectedService.runRootDiagnostics(
+            rootExplanation = validation.rootRequirement.message,
+            rootlessAlternatives = validation.rootRequirement.alternatives,
+            firewallBackend = validation.valueFor("LINUX_FIREWALL_BACKEND").ifBlank { "iptables" },
+        )
     }
 
     fun selectRuntimeFile(kind: RuntimeFileKind) {
@@ -173,6 +267,92 @@ class MainViewModel(
         }
     }
 
+    fun importRuntimeFileText(kind: RuntimeFileKind, text: String) {
+        _runtimeFilesState.update { current ->
+            current
+                .withText(kind, text)
+                .copy(
+                    selectedFile = kind,
+                    dirtyFiles = current.dirtyFiles + kind,
+                    statusMessage = "Imported ${kind.fileName}. Review and save the file.",
+                    errorMessage = null,
+                )
+        }
+    }
+
+    fun reportRuntimeFileTransferResult(
+        successMessage: String?,
+        errorMessage: String?,
+    ) {
+        _runtimeFilesState.update { current ->
+            if (errorMessage == null) {
+                current.copy(
+                    statusMessage = successMessage,
+                    errorMessage = null,
+                )
+            } else {
+                current.copy(
+                    statusMessage = null,
+                    errorMessage = errorMessage,
+                )
+            }
+        }
+    }
+
+    fun runTestScan(kind: RuntimeFileKind) {
+        val mode = when (kind) {
+            RuntimeFileKind.SniList -> "sni_scan"
+            RuntimeFileKind.IpList -> "ip_scan"
+            RuntimeFileKind.Config -> return
+        }
+
+        viewModelScope.launch {
+            val snapshot = _runtimeFilesState.value
+            val scanConfigText = ZeroDpiConfigToml.replaceOrAppendField(
+                text = snapshot.configText,
+                fieldName = "MODE",
+                value = mode,
+            )
+            val validation = ZeroDpiConfigToml.analyze(scanConfigText)
+            if (!validation.canStart) {
+                _runtimeFilesState.update {
+                    it.copy(
+                        statusMessage = null,
+                        errorMessage = "Fix config validation errors before running $mode.",
+                    )
+                }
+                return@launch
+            }
+
+            val listValidation = RuntimeListValidator.validate(
+                kind = kind,
+                text = snapshot.textFor(kind),
+                mode = mode,
+            )
+            if (!listValidation.isValid) {
+                _runtimeFilesState.update {
+                    it.copy(
+                        selectedFile = kind,
+                        statusMessage = null,
+                        errorMessage = "Fix ${kind.fileName} validation errors before running $mode.",
+                    )
+                }
+                return@launch
+            }
+
+            _runtimeFilesState.update {
+                it.copy(
+                    statusMessage = "Starting rootless $mode test scan.",
+                    errorMessage = null,
+                )
+            }
+
+            if (saveRuntimeFiles(_runtimeFilesState.value.dirtyFiles)) {
+                startService(mode)
+            }
+        }
+    }
+
     fun resetSelectedRuntimeFileToDefaults() {
         val selectedFile = _runtimeFilesState.value.selectedFile
         viewModelScope.launch {
@@ -203,14 +383,16 @@ class MainViewModel(
         }
     }
 
-    private fun startService() {
+    private fun startService(modeOverride: String? = null) {
         val intent = Intent(appContext, ZeroDpiService::class.java)
         startWhenConnected = true
+        startWhenConnectedModeOverride = modeOverride
         ContextCompat.startForegroundService(appContext, intent)
         bindService()
         service?.let {
             startWhenConnected = false
-            it.startZeroDpi()
+            startWhenConnectedModeOverride = null
+            it.startZeroDpi(modeOverride)
         }
     }
 

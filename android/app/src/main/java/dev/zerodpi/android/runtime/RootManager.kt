@@ -131,12 +131,20 @@ class SuRootManager(
         workingDirectory: File?,
     ): RootProcessLaunchResult =
         withContext(Dispatchers.IO) {
-            val shell = shellCommand(command)
+            val shell = buildString {
+                if (workingDirectory != null) {
+                    append("cd ")
+                    append(shellArg(workingDirectory.absolutePath))
+                    append(" && ")
+                }
+                append("exec ")
+                append(shellCommand(command))
+            }
             val suCommand = listOf("su", "-c", shell)
             val process = try {
                 executor.start(
                     command = suCommand,
-                    workingDirectory = workingDirectory,
+                    workingDirectory = null,
                     redirectErrorStream = true,
                 )
             } catch (error: IOException) {
@@ -330,12 +338,13 @@ class SuRootManager(
         }
 
     private fun shellCommand(args: List<String>): String =
-        args.joinToString(" ") { arg ->
-            if (arg.matches(SAFE_SHELL_ARG)) {
-                arg
-            } else {
-                "'${arg.replace("'", "'\"'\"'")}'"
-            }
+        args.joinToString(" ") { arg -> shellArg(arg) }
+
+    private fun shellArg(arg: String): String =
+        if (arg.matches(SAFE_SHELL_ARG)) {
+            arg
+        } else {
+            "'${arg.replace("'", "'\"'\"'")}'"
         }
 
     private fun Process.pidOrNull(): Long? =

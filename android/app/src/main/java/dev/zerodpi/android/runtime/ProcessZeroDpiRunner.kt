@@ -1,6 +1,8 @@
 package dev.zerodpi.android.runtime
 
 import android.content.Context
+import android.os.Process as AndroidProcess
+import android.system.OsConstants
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -41,6 +43,8 @@ class ProcessZeroDpiRunner internal constructor(
     private val events = MutableSharedFlow<ZeroDpiRunnerEvent>(extraBufferCapacity = 128)
     private var process: Process? = null
     private var rootProcessPid: Long? = null
+    @Volatile
+    private var nativeProcessPid: Long? = null
     private var runningAsRoot: Boolean = false
     private var outputJob: Job? = null
     private var waitJob: Job? = null
@@ -62,6 +66,7 @@ class ProcessZeroDpiRunner internal constructor(
 
         events.emit(ZeroDpiRunnerEvent.Starting)
         exitEmitted.set(false)
+        nativeProcessPid = null
         val command = mutableListOf(
             executable.absolutePath,
             "--config",
@@ -107,6 +112,9 @@ class ProcessZeroDpiRunner internal constructor(
         outputJob = scope.launch(Dispatchers.IO) {
             launchedProcess.inputStream.bufferedReader().useLines { lines ->
                 lines.forEach { line ->
+                    RuntimeEventLineParser.startupPid(line)?.let { pid ->
+                        nativeProcessPid = pid
+                    }
                     events.emit(RuntimeEventLineParser.parse(line) ?: ZeroDpiRunnerEvent.Log(line))
                 }
             }
@@ -116,6 +124,7 @@ class ProcessZeroDpiRunner internal constructor(
             val exitCode = launchedProcess.waitFor()
             process = null
             rootProcessPid = null
+            nativeProcessPid = null
             runningAsRoot = false
             emitExited(exitCode)
         }
@@ -127,10 +136,17 @@ class ProcessZeroDpiRunner internal constructor(
             return
         }
 
-        stopRootProcessIfNeeded()
-        current.destroy()
-        val stopped = withContext(Dispatchers.IO) {
+        if (!sendSigterm(current)) {
+            current.destroy()
+        }
+        var stopped = withContext(Dispatchers.IO) {
             current.waitFor(5, TimeUnit.SECONDS)
+        }
+        if (!stopped) {
+            stopRootProcessIfNeeded()
+            stopped = withContext(Dispatchers.IO) {
+                current.waitFor(2, TimeUnit.SECONDS)
+            }
         }
         if (!stopped) {
             events.emit(ZeroDpiRunnerEvent.StopTimedOut)
@@ -146,8 +162,8 @@ class ProcessZeroDpiRunner internal constructor(
             return
         }
 
-        stopRootProcessIfNeeded()
         current.destroyForcibly()
+        stopRootProcessIfNeeded()
         withContext(Dispatchers.IO) {
             current.waitFor(2, TimeUnit.SECONDS)
         }
@@ -162,11 +178,12 @@ class ProcessZeroDpiRunner internal constructor(
         waitJob = null
         process = null
         rootProcessPid = null
+        nativeProcessPid = null
         runningAsRoot = false
     }
 
     private suspend fun stopRootProcessIfNeeded() {
-        val pid = rootProcessPid
+        val pid = nativeProcessPid ?: rootProcessPid
         if (!runningAsRoot || pid == null) {
             return
         }
@@ -181,6 +198,22 @@ class ProcessZeroDpiRunner internal constructor(
             events.emit(ZeroDpiRunnerEvent.Exited(exitCode))
         }
     }
+
+    private fun sendSigterm(process: Process): Boolean {
+        val pid = nativeProcessPid ?: process.pidOrNull() ?: return false
+        if (pid < Int.MIN_VALUE.toLong() || pid > Int.MAX_VALUE.toLong()) {
+            return false
+        }
+        return runCatching {
+            AndroidProcess.sendSignal(pid.toInt(), OsConstants.SIGTERM)
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun Process.pidOrNull(): Long? =
+        runCatching {
+            Process::class.java.getMethod("pid").invoke(this) as? Long
+        }.getOrNull()
 }
 
 private object SystemZeroDpiProcessLauncher : ZeroDpiProcessLauncher {

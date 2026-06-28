@@ -7,6 +7,18 @@ import org.junit.Test
 
 class RuntimeEventLineParserTest {
     @Test
+    fun extractsStartupPidForProcessStop() {
+        assertEquals(
+            1234L,
+            RuntimeEventLineParser.startupPid(
+                """{"event":"startup","contract_version":1,"version":"0.1.0","pid":1234}""",
+            ),
+        )
+        assertNull(RuntimeEventLineParser.startupPid("""{"event":"config_loaded","pid":1234}"""))
+        assertNull(RuntimeEventLineParser.startupPid("plain stderr log line"))
+    }
+
+    @Test
     fun parsesConfigLoadedEvent() {
         val event = RuntimeEventLineParser.parse(
             """

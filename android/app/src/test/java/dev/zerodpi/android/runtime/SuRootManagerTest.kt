@@ -44,6 +44,35 @@ class SuRootManagerTest {
     }
 
     @Test
+    fun runAsRootExecsCommandAfterChangingToWorkingDirectory() = runBlocking {
+        val executor = FakeRootProcessExecutor(FakeResponse(exitCode = 0))
+        val manager = SuRootManager(executor)
+        val workingDirectory = File("/data/user/0/dev.zerodpi.android/files/zero dpi")
+
+        val result = manager.runAsRoot(
+            command = listOf(
+                "/data/app/libzerodpi_exec.so",
+                "--config",
+                "/data/user/0/dev.zerodpi.android/files/zerodpi/config with 'quote'.toml",
+            ),
+            workingDirectory = workingDirectory,
+        )
+
+        assertTrue(result is RootProcessLaunchResult.Started)
+        assertEquals(
+            listOf(
+                "su",
+                "-c",
+                "cd '${workingDirectory.absolutePath}' && " +
+                    "exec /data/app/libzerodpi_exec.so --config " +
+                    "'/data/user/0/dev.zerodpi.android/files/zerodpi/config with '\"'\"'quote'\"'\"'.toml'",
+            ),
+            executor.commands.single(),
+        )
+        assertEquals(listOf<File?>(null), executor.workingDirectories)
+    }
+
+    @Test
     fun runDiagnosticsReportsFirewallAndNfqueueChecks() = runBlocking {
         val executor = FakeRootProcessExecutor(
             FakeResponse(stdout = "0\n", exitCode = 0),
@@ -93,6 +122,7 @@ class SuRootManagerTest {
     ) : RootProcessExecutor {
         private val responses = ArrayDeque(responses.toList())
         val commands = mutableListOf<List<String>>()
+        val workingDirectories = mutableListOf<File?>()
 
         override fun start(
             command: List<String>,
@@ -100,6 +130,7 @@ class SuRootManagerTest {
             redirectErrorStream: Boolean,
         ): Process {
             commands += command
+            workingDirectories += workingDirectory
             val response = responses.removeFirstOrNull()
                 ?: error("No fake response for command $command")
             return FakeProcess(response, redirectErrorStream)

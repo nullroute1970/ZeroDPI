@@ -27,9 +27,24 @@ android {
         compose = true
     }
 
+    buildTypes {
+        debug {
+            buildConfigField("boolean", "ZERODPI_ALLOW_FAKE_RUNNER", "true")
+        }
+        release {
+            buildConfigField("boolean", "ZERODPI_ALLOW_FAKE_RUNNER", "false")
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 
     sourceSets {

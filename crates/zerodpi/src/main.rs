@@ -149,17 +149,18 @@ fn main() -> Result<()> {
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install ring CryptoProvider"))?;
 
+    let args = Args::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_writer(TuiAwareStderr)
-        .with_ansi(true)
+        .with_ansi(!args.json_events)
         .with_level(true)
         .with_target(false)
         .init();
 
-    let args = Args::parse();
     let events = RuntimeEventEmitter::new(args.json_events);
     events.emit(RuntimeEvent::Startup {
         contract_version: CONTRACT_VERSION,

@@ -83,6 +83,14 @@ impl PacketInterceptor for NfqInterceptor {
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
                 }
+                Err(e) if is_stale_nfq_recv_error(&e) => {
+                    if shutdown.is_requested() {
+                        info!(error = %e, "NFQUEUE recv reported stale state after shutdown");
+                        return Ok(());
+                    }
+                    debug!(error = %e, "NFQUEUE recv reported stale state; continuing");
+                    continue;
+                }
                 Err(e) => {
                     return Err(e).context("NFQUEUE recv");
                 }
@@ -136,6 +144,10 @@ impl PacketInterceptor for NfqInterceptor {
             }
         }
     }
+}
+
+fn is_stale_nfq_recv_error(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::NotFound
 }
 
 /// Parsed offsets inside the captured IPv4+TCP buffer.
@@ -542,6 +554,24 @@ fn strings(items: &[&str]) -> Vec<String> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn nfqueue_recv_not_found_is_treated_as_stale_state() {
+        let error = std::io::Error::from(ErrorKind::NotFound);
+        assert!(is_stale_nfq_recv_error(&error));
+    }
+
+    #[test]
+    fn nfqueue_recv_other_errors_remain_fatal() {
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::ConnectionReset,
+        ] {
+            let error = std::io::Error::from(kind);
+            assert!(!is_stale_nfq_recv_error(&error));
+        }
+    }
 
     fn make_view() -> PacketView<'static> {
         PacketView {

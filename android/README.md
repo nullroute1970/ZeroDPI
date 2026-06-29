@@ -55,6 +55,11 @@ ZERODPI_RELEASE_KEY_PASSWORD=...
 Use debug builds for local rooted-device smoke tests when no release key is
 configured.
 
+If release signing is not configured, Gradle emits a
+`zerodpi-android-<runtime>-release-unsigned.apk` artifact. That file is only for
+manual signing and `adb install` will reject it with
+`INSTALL_PARSE_FAILED_NO_CERTIFICATES`.
+
 The APK is copied to:
 
 ```text

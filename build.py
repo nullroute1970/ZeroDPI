@@ -130,6 +130,11 @@ ANDROID_APP_RUNTIME_CHOICES = ("rootless", "full", "both")
 ANDROID_APP_BUILD_TYPES = ("debug", "release")
 ANDROID_GRADLE_FALLBACK_VERSION = "9.5.0"
 ANDROID_GRADLE_INCOMPATIBLE_MIN_VERSION = (9, 6)
+ANDROID_GRADLE_BUILD_ARGS = (
+    "-Pkotlin.compiler.execution.strategy=in-process",
+    "--no-daemon",
+    "--rerun-tasks",
+)
 REPO_ROOT = Path(__file__).resolve().parent
 ANDROID_PROJECT_DIR = REPO_ROOT / "android"
 ANDROID_APP_MODULE_DIR = ANDROID_PROJECT_DIR / "app"
@@ -1408,38 +1413,34 @@ def android_gradle_task(build_type: str) -> str:
     return f":app:assemble{build_type.capitalize()}"
 
 
+def is_unsigned_android_apk(apk: Path) -> bool:
+    return apk.name.endswith("-unsigned.apk")
+
+
+def android_packaged_apk_name(runtime: str, build_type: str, apk: Path) -> str:
+    suffix = (
+        "-unsigned"
+        if build_type == "release" and is_unsigned_android_apk(apk)
+        else ""
+    )
+    return f"zerodpi-android-{runtime}-{build_type}{suffix}.apk"
+
+
 def find_android_apk(build_type: str) -> Path:
     output_dir = ANDROID_APP_MODULE_DIR / "build" / "outputs" / "apk" / build_type
-    exact_apk = output_dir / f"app-{build_type}.apk"
-    if exact_apk.is_file():
-        return exact_apk
-
-    unsigned_apk = output_dir / f"app-{build_type}-unsigned.apk"
-    if build_type == "release" and unsigned_apk.is_file():
-        die(
-            "Gradle produced an unsigned release APK. Configure release signing with "
-            "ZERODPI_RELEASE_STORE_FILE, ZERODPI_RELEASE_STORE_PASSWORD, "
-            "ZERODPI_RELEASE_KEY_ALIAS, and optionally ZERODPI_RELEASE_KEY_PASSWORD, "
-            "or build --android-app-build-type debug for local device testing."
-        )
-
-    for name in (f"app-{build_type}-unsigned.apk",):
-        apk = output_dir / name
-        if apk.is_file():
-            return apk
-
     apks = sorted(
-        output_dir.glob("*.apk"),
+        output_dir.glob(f"app-{build_type}*.apk"),
         key=lambda apk: apk.stat().st_mtime,
         reverse=True,
     )
     if not apks:
-        die(f"Expected Android APK not found under: {output_dir}")
-    if build_type == "release" and "unsigned" in apks[0].name:
-        die(
-            "Gradle produced only unsigned release APKs. Configure release signing "
-            "or use --android-app-build-type debug for local device testing."
+        apks = sorted(
+            output_dir.glob("*.apk"),
+            key=lambda apk: apk.stat().st_mtime,
+            reverse=True,
         )
+    if not apks:
+        die(f"Expected Android APK not found under: {output_dir}")
     return apks[0]
 
 
@@ -1459,15 +1460,21 @@ def build_android_app_apk(
             str(ANDROID_PROJECT_DIR),
             f"-PzerodpiRuntimeDir={dist_dir}",
             android_gradle_task(build_type),
-            "--no-daemon",
-            "--rerun-tasks",
+            *ANDROID_GRADLE_BUILD_ARGS,
         ],
         env=android_gradle_env(ndk_path),
     )
 
     apk = find_android_apk(build_type)
-    packaged_apk = dist_dir / f"zerodpi-android-{runtime}-{build_type}.apk"
+    packaged_apk = dist_dir / android_packaged_apk_name(runtime, build_type, apk)
     copy_required_file(apk, packaged_apk)
+    if build_type == "release" and is_unsigned_android_apk(apk):
+        print(
+            "WARNING: Gradle produced an unsigned release APK. It was copied for "
+            "manual signing; configure ZERODPI_RELEASE_STORE_FILE, "
+            "ZERODPI_RELEASE_STORE_PASSWORD, ZERODPI_RELEASE_KEY_ALIAS, and "
+            "optionally ZERODPI_RELEASE_KEY_PASSWORD for a signed release APK."
+        )
     print(f"Android APK copied to: {packaged_apk}")
     return packaged_apk
 

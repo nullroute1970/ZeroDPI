@@ -41,6 +41,20 @@ python build.py --platform android --android-app-runtime full
 python build.py --platform android --android-app-abi x86_64 --android-app-build-type debug
 ```
 
+Release builds require signing. Provide these Gradle properties or environment
+variables before building `--android-app-build-type release`:
+
+```text
+ZERODPI_RELEASE_STORE_FILE=/path/to/keystore.jks
+ZERODPI_RELEASE_STORE_PASSWORD=...
+ZERODPI_RELEASE_KEY_ALIAS=...
+ZERODPI_RELEASE_KEY_PASSWORD=...
+```
+
+`ZERODPI_RELEASE_KEY_PASSWORD` is optional when it matches the store password.
+Use debug builds for local rooted-device smoke tests when no release key is
+configured.
+
 The APK is copied to:
 
 ```text

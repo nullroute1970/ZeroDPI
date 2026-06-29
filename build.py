@@ -991,6 +991,16 @@ def copy_android_app_runtime_templates(dist_dir: Path) -> None:
         copy_required_file(REPO_ROOT / filename, assets_dir / filename)
 
 
+def reset_android_app_runtime_inputs(dist_dir: Path) -> None:
+    for dirname in ("assets", "bin", "jniLibs"):
+        shutil.rmtree(dist_dir / dirname, ignore_errors=True)
+    for apk in dist_dir.glob("zerodpi-android-*.apk"):
+        apk.unlink()
+    manifest = dist_dir / "zerodpi-runtime-manifest.json"
+    if manifest.exists():
+        manifest.unlink()
+
+
 def write_android_app_manifest(
     dist_dir: Path,
     runtime: str,
@@ -1400,7 +1410,20 @@ def android_gradle_task(build_type: str) -> str:
 
 def find_android_apk(build_type: str) -> Path:
     output_dir = ANDROID_APP_MODULE_DIR / "build" / "outputs" / "apk" / build_type
-    for name in (f"app-{build_type}.apk", f"app-{build_type}-unsigned.apk"):
+    exact_apk = output_dir / f"app-{build_type}.apk"
+    if exact_apk.is_file():
+        return exact_apk
+
+    unsigned_apk = output_dir / f"app-{build_type}-unsigned.apk"
+    if build_type == "release" and unsigned_apk.is_file():
+        die(
+            "Gradle produced an unsigned release APK. Configure release signing with "
+            "ZERODPI_RELEASE_STORE_FILE, ZERODPI_RELEASE_STORE_PASSWORD, "
+            "ZERODPI_RELEASE_KEY_ALIAS, and optionally ZERODPI_RELEASE_KEY_PASSWORD, "
+            "or build --android-app-build-type debug for local device testing."
+        )
+
+    for name in (f"app-{build_type}-unsigned.apk",):
         apk = output_dir / name
         if apk.is_file():
             return apk
@@ -1412,6 +1435,11 @@ def find_android_apk(build_type: str) -> Path:
     )
     if not apks:
         die(f"Expected Android APK not found under: {output_dir}")
+    if build_type == "release" and "unsigned" in apks[0].name:
+        die(
+            "Gradle produced only unsigned release APKs. Configure release signing "
+            "or use --android-app-build-type debug for local device testing."
+        )
     return apks[0]
 
 
@@ -1508,6 +1536,7 @@ def build_android_app_runtime(
     for runtime in runtimes:
         dist_dir = REPO_ROOT / "dist" / "android-app" / runtime
         dist_dir.mkdir(parents=True, exist_ok=True)
+        reset_android_app_runtime_inputs(dist_dir)
         copy_android_app_runtime_templates(dist_dir)
 
         entries = [

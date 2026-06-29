@@ -8,6 +8,16 @@ plugins {
 
 val zeroDpiRuntimeDir = providers.gradleProperty("zerodpiRuntimeDir")
     .map { file(it) }
+fun stringPropertyOrEnv(name: String) =
+    providers.gradleProperty(name).orElse(providers.environmentVariable(name))
+
+val releaseStoreFile = stringPropertyOrEnv("ZERODPI_RELEASE_STORE_FILE")
+val releaseStorePassword = stringPropertyOrEnv("ZERODPI_RELEASE_STORE_PASSWORD")
+val releaseKeyAlias = stringPropertyOrEnv("ZERODPI_RELEASE_KEY_ALIAS")
+val releaseKeyPassword = stringPropertyOrEnv("ZERODPI_RELEASE_KEY_PASSWORD")
+val hasReleaseSigning = releaseStoreFile.isPresent &&
+    releaseStorePassword.isPresent &&
+    releaseKeyAlias.isPresent
 
 android {
     namespace = "dev.zerodpi.android"
@@ -27,12 +37,26 @@ android {
         compose = true
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("zerodpiRelease") {
+                storeFile = file(releaseStoreFile.get())
+                storePassword = releaseStorePassword.get()
+                keyAlias = releaseKeyAlias.get()
+                keyPassword = releaseKeyPassword.orElse(releaseStorePassword).get()
+            }
+        }
+    }
+
     buildTypes {
         debug {
             buildConfigField("boolean", "ZERODPI_ALLOW_FAKE_RUNNER", "true")
         }
         release {
             buildConfigField("boolean", "ZERODPI_ALLOW_FAKE_RUNNER", "false")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("zerodpiRelease")
+            }
         }
     }
 

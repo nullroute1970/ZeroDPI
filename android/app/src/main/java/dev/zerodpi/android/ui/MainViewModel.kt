@@ -287,12 +287,12 @@ class MainViewModel(
         _runtimeFilesState.update { it.copy(selectedFile = kind) }
     }
 
-    fun updateRuntimeFileText(text: String) {
+    fun updateRuntimeFileText(kind: RuntimeFileKind, text: String) {
         _runtimeFilesState.update { current ->
             current
-                .withText(current.selectedFile, text)
+                .withText(kind, text)
                 .copy(
-                    dirtyFiles = current.dirtyFiles + current.selectedFile,
+                    dirtyFiles = current.dirtyFiles + kind,
                     statusMessage = "Unsaved edits.",
                     errorMessage = null,
                 )
@@ -317,8 +317,12 @@ class MainViewModel(
     }
 
     fun saveSelectedRuntimeFile() {
+        saveRuntimeFile(_runtimeFilesState.value.selectedFile)
+    }
+
+    fun saveRuntimeFile(kind: RuntimeFileKind) {
         viewModelScope.launch {
-            saveRuntimeFiles(setOf(_runtimeFilesState.value.selectedFile))
+            saveRuntimeFiles(setOf(kind))
         }
     }
 
@@ -409,21 +413,24 @@ class MainViewModel(
     }
 
     fun resetSelectedRuntimeFileToDefaults() {
-        val selectedFile = _runtimeFilesState.value.selectedFile
+        resetRuntimeFileToDefaults(_runtimeFilesState.value.selectedFile)
+    }
+
+    fun resetRuntimeFileToDefaults(kind: RuntimeFileKind) {
         viewModelScope.launch {
             _runtimeFilesState.update {
                 it.copy(isSaving = true, statusMessage = null, errorMessage = null)
             }
             runCatching {
-                runtimeStorage.resetToDefaults(selectedFile)
+                runtimeStorage.resetToDefaults(kind)
             }.onSuccess { defaultText ->
                 _runtimeFilesState.update { current ->
                     current
-                        .withText(selectedFile, defaultText)
+                        .withText(kind, defaultText)
                         .copy(
-                            dirtyFiles = current.dirtyFiles - selectedFile,
+                            dirtyFiles = current.dirtyFiles - kind,
                             isSaving = false,
-                            statusMessage = "Reset ${selectedFile.fileName} to defaults.",
+                            statusMessage = "Reset ${kind.fileName} to defaults.",
                             errorMessage = null,
                         )
                 }
@@ -431,7 +438,7 @@ class MainViewModel(
                 _runtimeFilesState.update {
                     it.copy(
                         isSaving = false,
-                        errorMessage = error.message ?: "Failed to reset ${selectedFile.fileName}.",
+                        errorMessage = error.message ?: "Failed to reset ${kind.fileName}.",
                     )
                 }
             }

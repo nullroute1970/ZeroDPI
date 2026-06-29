@@ -1,5 +1,6 @@
 package dev.zerodpi.android.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,12 +27,14 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -60,10 +63,12 @@ fun DashboardScreen(
     onStop: () -> Unit,
     onForceStop: () -> Unit,
     onRuntimeFileSelected: (RuntimeFileKind) -> Unit,
-    onRuntimeFileTextChanged: (String) -> Unit,
+    onRuntimeFileTextChanged: (RuntimeFileKind, String) -> Unit,
     onConfigFieldChanged: (String, String) -> Unit,
-    onSaveRuntimeFile: () -> Unit,
-    onResetRuntimeFile: () -> Unit,
+    onSaveConfig: () -> Unit,
+    onResetConfig: () -> Unit,
+    onSaveRuntimeFile: (RuntimeFileKind) -> Unit,
+    onResetRuntimeFile: (RuntimeFileKind) -> Unit,
     onImportRuntimeFile: (RuntimeFileKind) -> Unit,
     onExportRuntimeFile: (RuntimeFileKind) -> Unit,
     onShareRuntimeFile: (RuntimeFileKind) -> Unit,
@@ -73,62 +78,128 @@ fun DashboardScreen(
     onExportSupportBundle: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var page by rememberSaveable { mutableStateOf(DashboardPage.Home) }
+
+    BackHandler(enabled = page == DashboardPage.Settings) {
+        page = DashboardPage.Home
+    }
+
     Scaffold(
         modifier = modifier,
-        topBar = { ZeroDpiTopBar() },
+        topBar = {
+            ZeroDpiTopBar(
+                page = page,
+                onNavigateHome = { page = DashboardPage.Home },
+                onNavigateSettings = { page = DashboardPage.Settings },
+            )
+        },
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .padding(padding)
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            StatusPanel(
-                state = state,
-                canStart = runtimeFilesState.canStart &&
-                    !runtimeFilesState.isLoading &&
-                    !runtimeFilesState.isSaving,
-                onStart = onStart,
-                onStop = onStop,
-                onForceStop = onForceStop,
-            )
-            ConfigSettingsPanel(
-                editorState = runtimeFilesState.configEditor,
-                enabled = !runtimeFilesState.isLoading && !runtimeFilesState.isSaving,
-                onConfigFieldChanged = onConfigFieldChanged,
-                onRunRootDiagnostics = onRunRootDiagnostics,
-            )
-            RuntimeFilesPanel(
-                state = runtimeFilesState,
-                onRuntimeFileSelected = onRuntimeFileSelected,
-                onRuntimeFileTextChanged = onRuntimeFileTextChanged,
-                onSaveRuntimeFile = onSaveRuntimeFile,
-                onResetRuntimeFile = onResetRuntimeFile,
-                onImportRuntimeFile = onImportRuntimeFile,
-                onExportRuntimeFile = onExportRuntimeFile,
-                onShareRuntimeFile = onShareRuntimeFile,
-                onRunTestScan = onRunTestScan,
-            )
-            RuntimeDetails(state = state)
-            DiagnosticsPanel(
-                serviceState = state,
-                runtimeFilesState = runtimeFilesState,
-                diagnosticsState = diagnosticsState,
-                onRefreshDiagnostics = onRefreshDiagnostics,
-                onExportSupportBundle = onExportSupportBundle,
-            )
-            LogsPanel(logs = state.recentLogs)
+        when (page) {
+            DashboardPage.Home -> {
+                Column(
+                    modifier = Modifier
+                        .padding(padding)
+                        .fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    StatusPanel(
+                        state = state,
+                        canStart = runtimeFilesState.canStart &&
+                            !runtimeFilesState.isLoading &&
+                            !runtimeFilesState.isSaving,
+                        onStart = onStart,
+                        onStop = onStop,
+                        onForceStop = onForceStop,
+                    )
+                    RuntimeFilesPanel(
+                        title = "Runtime lists",
+                        fileKinds = listOf(RuntimeFileKind.SniList, RuntimeFileKind.IpList),
+                        state = runtimeFilesState,
+                        onRuntimeFileSelected = onRuntimeFileSelected,
+                        onRuntimeFileTextChanged = onRuntimeFileTextChanged,
+                        onSaveRuntimeFile = onSaveRuntimeFile,
+                        onResetRuntimeFile = onResetRuntimeFile,
+                        onImportRuntimeFile = onImportRuntimeFile,
+                        onExportRuntimeFile = onExportRuntimeFile,
+                        onShareRuntimeFile = onShareRuntimeFile,
+                        onRunTestScan = onRunTestScan,
+                    )
+                    RuntimeDetails(state = state)
+                    DiagnosticsPanel(
+                        serviceState = state,
+                        runtimeFilesState = runtimeFilesState,
+                        diagnosticsState = diagnosticsState,
+                        onRefreshDiagnostics = onRefreshDiagnostics,
+                        onExportSupportBundle = onExportSupportBundle,
+                    )
+                    LogsPanel(logs = state.recentLogs)
+                }
+            }
+
+            DashboardPage.Settings -> {
+                Column(
+                    modifier = Modifier
+                        .padding(padding)
+                        .fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    ConfigSettingsPanel(
+                        editorState = runtimeFilesState.configEditor,
+                        enabled = !runtimeFilesState.isLoading && !runtimeFilesState.isSaving,
+                        isSaving = runtimeFilesState.isSaving,
+                        hasUnsavedConfig = RuntimeFileKind.Config in runtimeFilesState.dirtyFiles,
+                        statusMessage = runtimeFilesState.statusMessage,
+                        errorMessage = runtimeFilesState.errorMessage,
+                        onConfigFieldChanged = onConfigFieldChanged,
+                        onSaveConfig = onSaveConfig,
+                        onResetConfig = onResetConfig,
+                        onRunRootDiagnostics = onRunRootDiagnostics,
+                    )
+                }
+            }
         }
     }
 }
 
+private enum class DashboardPage {
+    Home,
+    Settings,
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ZeroDpiTopBar() {
+private fun ZeroDpiTopBar(
+    page: DashboardPage,
+    onNavigateHome: () -> Unit,
+    onNavigateSettings: () -> Unit,
+) {
     TopAppBar(
-        title = { Text("ZeroDPI") },
+        title = {
+            Text(
+                when (page) {
+                    DashboardPage.Home -> "ZeroDPI"
+                    DashboardPage.Settings -> "Settings"
+                },
+            )
+        },
+        navigationIcon = {
+            if (page == DashboardPage.Settings) {
+                TextButton(onClick = onNavigateHome) {
+                    Text("Back")
+                }
+            }
+        },
+        actions = {
+            if (page == DashboardPage.Home) {
+                TextButton(onClick = onNavigateSettings) {
+                    Text("Settings")
+                }
+            }
+        },
         colors = TopAppBarDefaults.topAppBarColors(
             containerColor = MaterialTheme.colorScheme.surface,
         ),
@@ -202,7 +273,13 @@ private fun StatusPanel(
 private fun ConfigSettingsPanel(
     editorState: ConfigEditorState,
     enabled: Boolean,
+    isSaving: Boolean,
+    hasUnsavedConfig: Boolean,
+    statusMessage: String?,
+    errorMessage: String?,
     onConfigFieldChanged: (String, String) -> Unit,
+    onSaveConfig: () -> Unit,
+    onResetConfig: () -> Unit,
     onRunRootDiagnostics: () -> Unit,
 ) {
     Surface(
@@ -239,8 +316,37 @@ private fun ConfigSettingsPanel(
             OutlinedButton(
                 onClick = onRunRootDiagnostics,
                 enabled = enabled,
+                modifier = Modifier.fillMaxWidth(),
             ) {
                 Text("Run root diagnostics")
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Button(
+                    onClick = onSaveConfig,
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text(if (isSaving) "Saving" else "Save")
+                }
+                OutlinedButton(
+                    onClick = onResetConfig,
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("Reset")
+                }
+            }
+            if (hasUnsavedConfig) {
+                Text("Unsaved config changes.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            statusMessage?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            errorMessage?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.error)
             }
             if (editorState.issues.isEmpty()) {
                 Text("Config validation passed.", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -485,18 +591,26 @@ private fun keyboardTypeFor(type: ConfigFieldType): KeyboardType =
 
 @Composable
 private fun RuntimeFilesPanel(
+    title: String,
+    fileKinds: List<RuntimeFileKind>,
     state: RuntimeFilesUiState,
     onRuntimeFileSelected: (RuntimeFileKind) -> Unit,
-    onRuntimeFileTextChanged: (String) -> Unit,
-    onSaveRuntimeFile: () -> Unit,
-    onResetRuntimeFile: () -> Unit,
+    onRuntimeFileTextChanged: (RuntimeFileKind, String) -> Unit,
+    onSaveRuntimeFile: (RuntimeFileKind) -> Unit,
+    onResetRuntimeFile: (RuntimeFileKind) -> Unit,
     onImportRuntimeFile: (RuntimeFileKind) -> Unit,
     onExportRuntimeFile: (RuntimeFileKind) -> Unit,
     onShareRuntimeFile: (RuntimeFileKind) -> Unit,
     onRunTestScan: (RuntimeFileKind) -> Unit,
 ) {
-    val selectedListValidation = state.selectedListValidation
-    val selectedFileCanRunTestScan = state.selectedFile != RuntimeFileKind.Config
+    val selectedFile = if (state.selectedFile in fileKinds) {
+        state.selectedFile
+    } else {
+        fileKinds.first()
+    }
+    val selectedText = state.textFor(selectedFile)
+    val selectedListValidation = state.validationFor(selectedFile)
+    val selectedFileCanRunTestScan = selectedFile != RuntimeFileKind.Config
     val actionsEnabled = !state.isLoading && !state.isSaving
 
     Surface(
@@ -508,7 +622,7 @@ private fun RuntimeFilesPanel(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Text("Runtime files", fontWeight = FontWeight.SemiBold)
+            Text(title, fontWeight = FontWeight.SemiBold)
             if (state.runtimeDir.isNotBlank()) {
                 Text(
                     text = state.runtimeDir,
@@ -517,33 +631,44 @@ private fun RuntimeFilesPanel(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                RuntimeFileKind.entries.forEach { kind ->
+            if (fileKinds.size > 1) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    fileKinds.forEach { kind ->
+                        val label = if (kind in state.dirtyFiles) {
+                            "${kind.title} *"
+                        } else {
+                            kind.title
+                        }
+                        if (kind == selectedFile) {
+                            Button(
+                                onClick = { onRuntimeFileSelected(kind) },
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text(label)
+                            }
+                        } else {
+                            OutlinedButton(
+                                onClick = { onRuntimeFileSelected(kind) },
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text(label)
+                            }
+                        }
+                    }
+                }
+            } else {
+                fileKinds.firstOrNull()?.let { kind ->
                     val label = if (kind in state.dirtyFiles) {
                         "${kind.title} *"
                     } else {
                         kind.title
                     }
-                    if (kind == state.selectedFile) {
-                        Button(
-                            onClick = { onRuntimeFileSelected(kind) },
-                            modifier = Modifier.weight(1f),
-                        ) {
-                            Text(label)
-                        }
-                    } else {
-                        OutlinedButton(
-                            onClick = { onRuntimeFileSelected(kind) },
-                            modifier = Modifier.weight(1f),
-                        ) {
-                            Text(label)
-                        }
-                    }
+                    Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
             selectedListValidation?.let { validation ->
                 RuntimeListValidationSummary(
-                    kind = state.selectedFile,
+                    kind = selectedFile,
                     validation = validation,
                 )
             }
@@ -551,14 +676,14 @@ private fun RuntimeFilesPanel(
                 Text("Loading runtime files.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
                 OutlinedTextField(
-                    value = state.selectedText,
-                    onValueChange = onRuntimeFileTextChanged,
+                    value = selectedText,
+                    onValueChange = { onRuntimeFileTextChanged(selectedFile, it) },
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 220.dp, max = 360.dp),
                     enabled = !state.isSaving,
                     isError = selectedListValidation?.issues?.isNotEmpty() == true,
-                    label = { Text(state.selectedFile.fileName) },
+                    label = { Text(selectedFile.fileName) },
                     textStyle = MaterialTheme.typography.bodySmall.copy(
                         fontFamily = FontFamily.Monospace,
                     ),
@@ -568,13 +693,13 @@ private fun RuntimeFilesPanel(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
-                    onClick = onSaveRuntimeFile,
+                    onClick = { onSaveRuntimeFile(selectedFile) },
                     enabled = actionsEnabled,
                 ) {
                     Text(if (state.isSaving) "Saving" else "Save")
                 }
                 OutlinedButton(
-                    onClick = onResetRuntimeFile,
+                    onClick = { onResetRuntimeFile(selectedFile) },
                     enabled = actionsEnabled,
                 ) {
                     Text("Reset to defaults")
@@ -582,21 +707,21 @@ private fun RuntimeFilesPanel(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
-                    onClick = { onImportRuntimeFile(state.selectedFile) },
+                    onClick = { onImportRuntimeFile(selectedFile) },
                     enabled = actionsEnabled,
                     modifier = Modifier.weight(1f),
                 ) {
                     Text("Import")
                 }
                 OutlinedButton(
-                    onClick = { onExportRuntimeFile(state.selectedFile) },
+                    onClick = { onExportRuntimeFile(selectedFile) },
                     enabled = actionsEnabled,
                     modifier = Modifier.weight(1f),
                 ) {
                     Text("Export")
                 }
                 OutlinedButton(
-                    onClick = { onShareRuntimeFile(state.selectedFile) },
+                    onClick = { onShareRuntimeFile(selectedFile) },
                     enabled = actionsEnabled,
                     modifier = Modifier.weight(1f),
                 ) {
@@ -605,14 +730,14 @@ private fun RuntimeFilesPanel(
             }
             if (selectedFileCanRunTestScan) {
                 Button(
-                    onClick = { onRunTestScan(state.selectedFile) },
+                    onClick = { onRunTestScan(selectedFile) },
                     enabled = actionsEnabled &&
                         state.configEditor.canStart &&
                         selectedListValidation?.isValid == true,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(
-                        when (state.selectedFile) {
+                        when (selectedFile) {
                             RuntimeFileKind.SniList -> "Run SNI test scan"
                             RuntimeFileKind.IpList -> "Run IP test scan"
                             RuntimeFileKind.Config -> "Run test scan"

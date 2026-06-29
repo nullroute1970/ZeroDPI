@@ -1470,10 +1470,14 @@ def build_android_app_apk(
     copy_required_file(apk, packaged_apk)
     if build_type == "release" and is_unsigned_android_apk(apk):
         print(
-            "WARNING: Gradle produced an unsigned release APK. It was copied for "
-            "manual signing; configure ZERODPI_RELEASE_STORE_FILE, "
+            "WARNING: Gradle produced an unsigned release APK. Android will "
+            f"reject {packaged_apk.name} with "
+            "INSTALL_PARSE_FAILED_NO_CERTIFICATES if you try to install it. "
+            "For adb install, rebuild with --android-app-build-type debug, or "
+            "configure ZERODPI_RELEASE_STORE_FILE, "
             "ZERODPI_RELEASE_STORE_PASSWORD, ZERODPI_RELEASE_KEY_ALIAS, and "
-            "optionally ZERODPI_RELEASE_KEY_PASSWORD for a signed release APK."
+            "optionally ZERODPI_RELEASE_KEY_PASSWORD before building a signed "
+            "release APK."
         )
     print(f"Android APK copied to: {packaged_apk}")
     return packaged_apk

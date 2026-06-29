@@ -1177,6 +1177,10 @@ python build.py --platform android --android-app-build-type release
 The default Android app build creates the first-release public ABIs
 `arm64-v8a` and `armeabi-v7a` under `dist/android-app/rootless/`. Use
 `--android-app-abi debug` to also build `x86_64` for emulator work.
+Use debug builds for local `adb install` smoke tests unless release signing is
+configured. An unsigned release artifact such as
+`zerodpi-android-full-release-unsigned.apk` is only for manual signing and
+Android will reject it with `INSTALL_PARSE_FAILED_NO_CERTIFICATES`.
 
 Runtime variants:
 

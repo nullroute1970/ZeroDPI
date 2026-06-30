@@ -119,7 +119,9 @@ class ProfileModelsTest {
         assertFailsWithIllegalArgument { ProfilePaths.profileDirectory(profilesDir, "../escape") }
         assertFailsWithIllegalArgument { ProfilePaths.profileDirectory(profilesDir, "nested/profile") }
         assertFailsWithIllegalArgument { ProfilePaths.childFile(profileDir, "../config.toml") }
-        assertFailsWithIllegalArgument { ProfilePaths.childFile(profileDir, "/tmp/config.toml") }
+        assertFailsWithIllegalArgument {
+            ProfilePaths.childFile(profileDir, temporaryFolder.newFile("absolute-config.toml").absolutePath)
+        }
     }
 
     @Test

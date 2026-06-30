@@ -402,35 +402,35 @@ Acceptance criteria:
 - [x] Dirty local edits require confirmation before remote overwrite.
 - [x] Failed manual update does not destroy local files or editor text.
 
-## Phase 9: Add Automatic Updates
+## Phase 9: Add Automatic Updates (Completed)
 
 Steps:
 
-- Add AndroidX WorkManager dependency.
-- Create `ProfileAutoUpdateWorker`.
-- Schedule periodic work only when at least one profile has auto update enabled.
-- Use constraints:
-  - network connected,
-  - battery not low if practical.
-- Worker behavior:
-  - load profile index,
-  - find profiles due for update,
-  - skip profiles with incomplete URLs,
-  - skip or defer if ZeroDPI is running,
-  - call the same `ProfileUpdateManager` used by manual updates,
-  - write per-profile status.
-- On app launch/resume, read latest profile status from disk and refresh UI.
-- If the active profile was auto-updated while the app UI was not visible,
+- [x] Add AndroidX WorkManager dependency.
+- [x] Create `ProfileAutoUpdateWorker`.
+- [x] Schedule periodic work only when at least one profile has auto update enabled.
+- [x] Use constraints:
+  - [x] network connected,
+  - [x] battery not low if practical.
+- [x] Worker behavior:
+  - [x] load profile index,
+  - [x] find profiles due for update,
+  - [x] skip profiles with incomplete URLs,
+  - [x] skip or defer if ZeroDPI is running,
+  - [x] call the same `ProfileUpdateManager` used by manual updates,
+  - [x] write per-profile status.
+- [x] On app launch/resume, read latest profile status from disk and refresh UI.
+- [x] If the active profile was auto-updated while the app UI was not visible,
   reload active editor text on next foreground.
-- If auto update fails, do not notify loudly in the first implementation; show
+- [x] If auto update fails, do not notify loudly in the first implementation; show
   status in the profile panel. Add notifications later only if users need them.
 
 Acceptance criteria:
 
-- Auto update uses the same all-or-nothing apply path as manual update.
-- Auto update never modifies files while ZeroDPI is actively running.
-- Users can disable auto update per profile.
-- Auto update status is visible per profile.
+- [x] Auto update uses the same all-or-nothing apply path as manual update.
+- [x] Auto update never modifies files while ZeroDPI is actively running.
+- [x] Users can disable auto update per profile.
+- [x] Auto update status is visible per profile.
 
 ## Phase 10: Service And Running-State Integration
 
@@ -477,7 +477,7 @@ Android unit tests:
 - Remote update success overwrites all three files.
 - Remote update failure overwrites no files.
 - Dirty flags clear after successful remote update.
-- Auto update due-profile selection.
+- [x] Auto update due-profile selection.
 - Support bundle redacts remote URL query strings.
 
 Android instrumented tests:

@@ -22,6 +22,7 @@ data class ProfileUpdateResult(
 class ProfileUpdateManager(
     private val profileRepository: ProfileRepository,
     private val remoteClient: ProfileRemoteClient = HttpUrlConnectionProfileRemoteClient(),
+    private val beforeApply: suspend () -> Unit = {},
 ) {
     suspend fun updateProfile(
         profileId: String,
@@ -80,6 +81,7 @@ class ProfileUpdateManager(
 
         val successMessage = "Updated profile from remote."
         val applyResult = runCatching {
+            beforeApply()
             profileRepository.applyRemoteUpdate(
                 profileId = profileId,
                 remote = remoteSettings,

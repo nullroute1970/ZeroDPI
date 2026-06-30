@@ -103,6 +103,24 @@ class ProfileRepositoryInstrumentedTest {
     }
 
     @Test
+    fun deletingLastProfileIsRejectedAndKeepsDefaultProfile() = runBlocking {
+        val repository = repository()
+        repository.loadIndex()
+
+        try {
+            repository.deleteProfile(ZeroDpiProfile.DEFAULT_PROFILE_ID)
+            fail("Expected deleting the last profile to fail.")
+        } catch (expected: IllegalArgumentException) {
+            assertTrue(expected.message.orEmpty().contains("Cannot delete the last profile"))
+        }
+
+        val index = repository.loadIndex()
+        assertEquals(ZeroDpiProfile.DEFAULT_PROFILE_ID, index.activeProfileId)
+        assertEquals(listOf(ZeroDpiProfile.DEFAULT_PROFILE_NAME), index.profiles.map { it.name })
+        assertTrue(repository.activeFilePaths().profileDir.isDirectory)
+    }
+
+    @Test
     fun corruptedIndexReportsRecoverableErrorAndKeepsProfileFiles() = runBlocking {
         val repository = repository()
         repository.loadIndex()

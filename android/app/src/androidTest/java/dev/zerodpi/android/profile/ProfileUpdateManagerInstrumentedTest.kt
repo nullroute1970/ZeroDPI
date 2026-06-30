@@ -9,10 +9,13 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import java.nio.charset.StandardCharsets
 
 @RunWith(AndroidJUnit4::class)
@@ -130,6 +133,64 @@ class ProfileUpdateManagerInstrumentedTest {
         assertTrue(status.message.startsWith("sni_list.txt validation failed"))
     }
 
+    @Test
+    fun applyGuardFailureOverwritesNoProfileFilesAndRecordsAutomaticStatus() = runBlocking {
+        val repository = repository(clock = sequenceClock(1000L, 2000L))
+        repository.loadIndex()
+        val paths = repository.activeFilePaths()
+        val oldFiles = profileFileTexts(paths)
+        val remote = remoteSettings()
+        val remoteFiles = ProfileUpdateFileContents(
+            configText = assetText(RuntimeFileKind.Config),
+            sniListText = "remote.example.com\n",
+            ipListText = "203.0.113.10\n",
+        )
+        val manager = ProfileUpdateManager(
+            profileRepository = repository,
+            remoteClient = fakeClient(remote = remote, files = remoteFiles),
+            beforeApply = {
+                error("Automatic update skipped because ZeroDPI started running.")
+            },
+        )
+
+        val result = manager.updateProfile(
+            profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID,
+            mode = ProfileUpdateMode.Automatic,
+            remote = remote,
+        )
+        val status = result.index.profiles.single().remote.lastUpdateStatus!!
+
+        assertFalse(result.successful)
+        assertEquals(oldFiles, profileFileTexts(paths))
+        assertFalse(status.successful)
+        assertEquals(ProfileUpdateMode.Automatic, status.mode)
+        assertTrue(status.message.contains("ZeroDPI started running"))
+    }
+
+    @Test
+    fun manualUpdateFromRealHttpsUrlsOverwritesProfileFiles() = runBlocking {
+        val remote = githubRawRemoteSettings()
+        assumeTrue("GitHub raw HTTPS runtime assets are not reachable.", remoteUrlsReachable(remote))
+        val repository = repository(clock = sequenceClock(1000L, 2000L))
+        repository.loadIndex()
+        val manager = ProfileUpdateManager(profileRepository = repository)
+
+        val result = manager.updateProfile(
+            profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID,
+            mode = ProfileUpdateMode.Manual,
+            remote = remote,
+        )
+        val paths = repository.activeFilePaths()
+        val status = result.index.profiles.single().remote.lastUpdateStatus!!
+
+        assertTrue(result.message, result.successful)
+        assertTrue(paths.configFile.readText(StandardCharsets.UTF_8).contains("MODE"))
+        assertTrue(paths.sniListFile.readText(StandardCharsets.UTF_8).isNotBlank())
+        assertTrue(paths.ipListFile.readText(StandardCharsets.UTF_8).isNotBlank())
+        assertTrue(status.successful)
+        assertEquals(ProfileUpdateMode.Manual, status.mode)
+    }
+
     private fun repository(clock: () -> Long): ProfileRepository =
         ProfileRepository(
             context = context,
@@ -181,6 +242,32 @@ class ProfileUpdateManagerInstrumentedTest {
             sniListUrl = "https://example.com/zerodpi/sni_list.txt",
             ipListUrl = "https://example.com/zerodpi/ip_list.txt",
         )
+
+    private fun githubRawRemoteSettings(): ProfileRemoteSettings {
+        val baseUrl = "https://raw.githubusercontent.com/nullroute1970/ZeroDPI/master/" +
+            "android/app/src/main/assets/zerodpi"
+        return ProfileRemoteSettings(
+            configUrl = "$baseUrl/config.toml",
+            sniListUrl = "$baseUrl/sni_list.txt",
+            ipListUrl = "$baseUrl/ip_list.txt",
+        )
+    }
+
+    private fun remoteUrlsReachable(remote: ProfileRemoteSettings): Boolean =
+        listOf(remote.configUrl, remote.sniListUrl, remote.ipListUrl).all { url ->
+            runCatching {
+                val connection = URL(url).openConnection() as HttpURLConnection
+                try {
+                    connection.instanceFollowRedirects = false
+                    connection.connectTimeout = 5_000
+                    connection.readTimeout = 5_000
+                    connection.requestMethod = "HEAD"
+                    connection.responseCode in 200..299
+                } finally {
+                    connection.disconnect()
+                }
+            }.getOrDefault(false)
+        }
 
     private fun profileFileTexts(paths: ProfileFilePaths): Map<RuntimeFileKind, String> =
         RuntimeFileKind.entries.associateWith { kind ->

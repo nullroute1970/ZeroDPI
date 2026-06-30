@@ -462,45 +462,45 @@ Acceptance criteria:
 - [x] Background auto update cannot race with service startup.
 - [x] Logs and support bundles identify which profile was used.
 
-## Phase 11: Update Tests
+## Phase 11: Update Tests (Completed)
 
 Android unit tests:
 
-- Profile JSON read/write round trip.
-- Default profile creation on fresh install.
-- Legacy single-profile migration preserves current config and lists.
-- Create, rename, duplicate, delete, and select profile.
-- Cannot delete the last profile.
-- RuntimeStorage reads/writes only the selected profile.
-- Relative config paths resolve inside selected profile directory.
-- Remote URL validation.
-- Remote update success overwrites all three files.
-- Remote update failure overwrites no files.
-- Dirty flags clear after successful remote update.
+- [x] Profile JSON read/write round trip.
+- [x] Default profile creation on fresh install.
+- [x] Legacy single-profile migration preserves current config and lists.
+- [x] Create, rename, duplicate, delete, and select profile.
+- [x] Cannot delete the last profile.
+- [x] RuntimeStorage reads/writes only the selected profile.
+- [x] Relative config paths resolve inside selected profile directory.
+- [x] Remote URL validation.
+- [x] Remote update success overwrites all three files.
+- [x] Remote update failure overwrites no files.
+- [x] Dirty flags clear after successful remote update.
 - [x] Auto update due-profile selection.
-- Support bundle redacts remote URL query strings.
+- [x] Support bundle redacts remote URL query strings.
 
 Android instrumented tests:
 
-- Save profile A, switch to profile B, verify profile A content remains.
-- Save and reopen app with multiple profiles.
-- Manual update reloads editor content.
-- Unsaved edit profile-switch confirmation works.
-- Start flow passes selected profile to fake runner.
+- [x] Save profile A, switch to profile B, verify profile A content remains.
+- [x] Save and reopen app with multiple profiles.
+- [x] Manual update reloads editor content.
+- [x] Unsaved edit profile-switch confirmation works.
+- [x] Start flow passes selected profile to fake runner.
 
 Device tests:
 
-- Manual update from real HTTPS URLs.
-- Auto update while app is backgrounded.
-- Auto update is deferred while ZeroDPI is running.
-- Rootless start still works after switching profiles.
-- Root-required start still requests root only when required by the selected
+- [x] Manual update from real HTTPS URLs.
+- [x] Auto update while app is backgrounded.
+- [x] Auto update is deferred while ZeroDPI is running.
+- [x] Rootless start still works after switching profiles.
+- [x] Root-required start still requests root only when required by the selected
   profile config.
 
 Acceptance criteria:
 
-- Existing Android tests still pass.
-- New tests cover migration, overwrite semantics, and profile isolation.
+- [x] Existing Android tests still pass.
+- [x] New tests cover migration, overwrite semantics, and profile isolation.
 
 ## Phase 12: Documentation
 

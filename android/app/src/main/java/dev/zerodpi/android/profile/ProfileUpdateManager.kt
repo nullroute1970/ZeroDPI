@@ -19,15 +19,23 @@ data class ProfileUpdateResult(
     val message: String,
 )
 
-class ProfileUpdateManager(
-    private val profileRepository: ProfileRepository,
-    private val remoteClient: ProfileRemoteClient = HttpUrlConnectionProfileRemoteClient(),
-    private val beforeApply: suspend () -> Unit = {},
-) {
+interface ProfileUpdater {
     suspend fun updateProfile(
         profileId: String,
         mode: ProfileUpdateMode,
         remote: ProfileRemoteSettings? = null,
+    ): ProfileUpdateResult
+}
+
+class ProfileUpdateManager(
+    private val profileRepository: ProfileRepository,
+    private val remoteClient: ProfileRemoteClient = HttpUrlConnectionProfileRemoteClient(),
+    private val beforeApply: suspend () -> Unit = {},
+) : ProfileUpdater {
+    override suspend fun updateProfile(
+        profileId: String,
+        mode: ProfileUpdateMode,
+        remote: ProfileRemoteSettings?,
     ): ProfileUpdateResult {
         val profile = profileRepository.loadIndex().profiles.firstOrNull { it.id == profileId }
             ?: throw IllegalArgumentException("Unknown profile id: $profileId")

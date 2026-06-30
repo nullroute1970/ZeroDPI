@@ -7,6 +7,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.rule.ServiceTestRule
 import dev.zerodpi.android.config.ZeroDpiConfigToml
+import dev.zerodpi.android.profile.ProfileRepository
 import dev.zerodpi.android.profile.ZeroDpiProfile
 import dev.zerodpi.android.storage.RuntimeFileKind
 import dev.zerodpi.android.storage.RuntimeStorage
@@ -65,6 +66,27 @@ class ZeroDpiServiceInstrumentedTest {
         assertEquals(0, stopped.connectionCount)
     }
 
+    @Test
+    fun startUsesExplicitProfileAndLogsProfileMetadata() {
+        configureWorkProfile()
+        val service = bindZeroDpiService()
+
+        service.startZeroDpi(profileId = WORK_PROFILE_ID)
+
+        val running = service.waitForState {
+            it.status == RuntimeStatus.Running && it.listener == "127.0.0.1:45555"
+        }
+        assertTrue(running.recentLogs.any { it.contains("profile \"Work\" (id: work)") })
+        assertTrue(
+            running.recentLogs.any {
+                it.contains("Profile runtime directory:") && it.contains("profiles") && it.contains("work")
+            },
+        )
+
+        service.stopZeroDpi()
+        service.waitForState { it.status == RuntimeStatus.Stopped && it.lastExitCode == 0 }
+    }
+
     private fun configureRootlessRunningMode() = runBlocking {
         val storage = RuntimeStorage(context)
         val rootlessConfig = storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText
@@ -72,6 +94,22 @@ class ZeroDpiServiceInstrumentedTest {
             .replaceField("BYPASS_METHOD", "tls_frag")
             .replaceField("LISTEN_PORT", "44444")
         storage.save(ZeroDpiProfile.DEFAULT_PROFILE_ID, RuntimeFileKind.Config, rootlessConfig)
+    }
+
+    private fun configureWorkProfile() = runBlocking {
+        val repository = ProfileRepository(
+            context = context,
+            idGenerator = { WORK_PROFILE_ID },
+        )
+        repository.loadIndex()
+        repository.createProfile("Work")
+
+        val storage = RuntimeStorage(context)
+        val rootlessConfig = storage.readAll(WORK_PROFILE_ID).configText
+            .replaceField("MODE", "sni_spoof")
+            .replaceField("BYPASS_METHOD", "tls_frag")
+            .replaceField("LISTEN_PORT", "45555")
+        storage.save(WORK_PROFILE_ID, RuntimeFileKind.Config, rootlessConfig)
     }
 
     private fun bindZeroDpiService(): ZeroDpiService {
@@ -102,5 +140,9 @@ class ZeroDpiServiceInstrumentedTest {
 
     private fun clearRuntimeDir() {
         File(context.filesDir, "zerodpi").deleteRecursively()
+    }
+
+    private companion object {
+        private const val WORK_PROFILE_ID = "work"
     }
 }

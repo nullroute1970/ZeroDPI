@@ -432,35 +432,35 @@ Acceptance criteria:
 - [x] Users can disable auto update per profile.
 - [x] Auto update status is visible per profile.
 
-## Phase 10: Service And Running-State Integration
+## Phase 10: Service And Running-State Integration (Completed)
 
 Steps:
 
-- Pass the active profile id from `MainViewModel.startService()` to
+- [x] Pass the active profile id from `MainViewModel.startService()` to
   `ZeroDpiService.startZeroDpi(profileId, modeOverride)`, or make the service
   read a stable active profile snapshot before prepare.
-- Prefer passing the profile id explicitly so the service starts exactly the
+- [x] Prefer passing the profile id explicitly so the service starts exactly the
   profile selected in the UI.
-- Update `ZeroDpiService` logs:
-  - log active profile name/id,
-  - log profile runtime directory.
-- Add a lightweight running marker if the auto-update worker cannot reliably
+- [x] Update `ZeroDpiService` logs:
+  - [x] log active profile name/id,
+  - [x] log profile runtime directory.
+- [x] Add a lightweight running marker if the auto-update worker cannot reliably
   observe service state:
-  - create marker on runtime start,
-  - remove marker on graceful or failed stop,
-  - treat stale marker as non-running only after a conservative timeout and no
+  - [x] create marker on runtime start,
+  - [x] remove marker on graceful or failed stop,
+  - [x] treat stale marker as non-running only after a conservative timeout and no
     foreground service is active.
-- Keep profile switch/update blocked while runtime status is active:
-  - `Starting`,
-  - `Scanning`,
-  - `Running`,
-  - `Stopping`.
+- [x] Keep profile switch/update blocked while runtime status is active:
+  - [x] `Starting`,
+  - [x] `Scanning`,
+  - [x] `Running`,
+  - [x] `Stopping`.
 
 Acceptance criteria:
 
-- Start uses the profile the user selected.
-- Background auto update cannot race with service startup.
-- Logs and support bundles identify which profile was used.
+- [x] Start uses the profile the user selected.
+- [x] Background auto update cannot race with service startup.
+- [x] Logs and support bundles identify which profile was used.
 
 ## Phase 11: Update Tests
 

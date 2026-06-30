@@ -26,6 +26,7 @@ import dev.zerodpi.android.profile.ProfileUpdateResult
 import dev.zerodpi.android.profile.ProfileValidationResult
 import dev.zerodpi.android.profile.ZeroDpiProfile
 import dev.zerodpi.android.service.RuntimeStatus
+import dev.zerodpi.android.service.ZeroDpiRuntimeStateStore
 import dev.zerodpi.android.service.ZeroDpiService
 import dev.zerodpi.android.service.ZeroDpiServiceState
 import dev.zerodpi.android.storage.RuntimeFileKind
@@ -853,6 +854,7 @@ class MainViewModel(
         startWhenConnected = true
         startWhenConnectedProfileId = profileId
         startWhenConnectedModeOverride = modeOverride
+        ZeroDpiRuntimeStateStore.markRuntimeActive(appContext, profileId = profileId)
         ContextCompat.startForegroundService(appContext, intent)
         bindService()
         service?.let {

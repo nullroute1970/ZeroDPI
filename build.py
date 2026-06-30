@@ -5,7 +5,6 @@ build.py - Build ZeroDPI for the current platform, Windows, Linux, Termux, or An
 Usage:
     python build.py [--platform linux|windows|termux|android|android-app|all]
                    [--windivert-version <ver>] [--toolchain <toolchain>]
-                   [--msys2-path <path>]
                    [--termux-arch all|armv7|armv8|<arch>] [--android-ndk <path>]
 
 What it does
@@ -63,9 +62,6 @@ WINDIVERT_REQUIRED_FILES = ("WinDivert.dll", "WinDivert.lib", "WinDivert64.sys")
 WINDIVERT_RELEASE_URL = "https://github.com/basil00/WinDivert/releases/download/v{version}/WinDivert-{version}-A.zip"
 # On Windows this project targets the MSVC toolchain by default.
 WINDOWS_DEFAULT_TOOLCHAIN = "stable-x86_64-pc-windows-msvc"
-# Default MSYS2 installation path; its mingw64/bin is prepended to PATH when
-# building with a GNU toolchain so that gcc, dlltool, ld, etc. are reachable.
-WINDOWS_DEFAULT_MSYS2_PATH = r"C:\msys64"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
 LINUX_CROSS_TARGETS = [
     "x86_64-unknown-linux-gnu",
@@ -192,20 +188,6 @@ def confirm_or_die(prompt: str) -> None:
         answer = "n"
     if answer not in ("", "y", "yes"):
         die("Aborted by user.")
-
-
-def msys2_pacman_install(msys2_path: str, packages: list[str]) -> None:
-    """Install packages via MSYS2 pacman inside the MSYS2 environment."""
-    bash = Path(msys2_path) / "usr" / "bin" / "bash.exe"
-    if not bash.is_file():
-        die(
-            f"MSYS2 bash not found at {bash}.\n"
-            "Install MSYS2 from https://www.msys2.org/ or verify --msys2-path."
-        )
-    pkg_str = " ".join(packages)
-    print(f"\nInstalling MSYS2 packages: {pkg_str}")
-    env = {**os.environ, "MSYSTEM": "MINGW64", "CHERE_INVOKING": "1"}
-    run([str(bash), "--login", "-c", f"pacman -S --noconfirm {pkg_str}"], env=env)
 
 
 def android_ndk_download_host_tag() -> str:
@@ -370,16 +352,11 @@ def ensure_rustup_targets(targets: list[str]) -> None:
             run(["rustup", "target", "add", target])
 
 
-def _find_zig_path(msys2_path: str | None) -> Path | None:
-    """Locate the zig binary, searching PATH and MSYS2 directories."""
+def _find_zig_path() -> Path | None:
+    """Locate the zig binary on PATH."""
     which = shutil.which("zig")
     if which:
         return Path(which)
-    if platform.system() == "Windows" and msys2_path:
-        for sub in ("clang64", "mingw64", "ucrt64"):
-            candidate = Path(msys2_path) / sub / "bin" / "zig.exe"
-            if candidate.is_file():
-                return candidate
     return None
 
 
@@ -477,23 +454,21 @@ exit /b !EC!
     return wrapper_path
 
 
-def build_linux_cross_zigbuild(targets: list[str], msys2_path: str | None = None) -> None:
+def build_linux_cross_zigbuild(targets: list[str]) -> None:
     """Cross-compile ZeroDPI for Linux using cargo-zigbuild.
 
     Builds the requested Linux targets from any host platform (Windows,
     macOS, etc.). Requires 'zig' and 'cargo-zigbuild' to be installed.
-    On Windows, ``msys2_path`` is searched for the zig binary when it is
-    not already on PATH.
     """
     label = targets[0] if len(targets) == 1 else f"{len(targets)} targets"
     print(f"=== Cross-compiling ZeroDPI for Linux ({label}) via cargo-zigbuild ===")
 
-    zig_path = _find_zig_path(msys2_path)
+    zig_path = _find_zig_path()
     if zig_path is None:
         print(
             "Zig compiler not found.\n"
-            "  Install it via MSYS2: pacman -S mingw-w64-clang-x86_64-zig\n"
-            "  Or download from https://ziglang.org/download/"
+            "  Install Zig and ensure it is on PATH.\n"
+            "  Download from https://ziglang.org/download/"
         )
         die("Zig not found. Aborting.")
 
@@ -531,7 +506,7 @@ def build_linux_cross_zigbuild(targets: list[str], msys2_path: str | None = None
 
     extra_env: dict = {
         "CARGO_TERM_COLOR": "always",
-        "PATH": f"{zig_path.parent};{os.environ.get('PATH', '')}",
+        "PATH": f"{zig_path.parent}{os.pathsep}{os.environ.get('PATH', '')}",
     }
 
     if ar_wrapper is not None:
@@ -656,7 +631,7 @@ def validate_local_windivert(dest_dir: Path, expected_version: str) -> None:
     print(f"\nUsing local WinDivert ({version}): {dest_dir}")
 
 
-def build_windows(windivert_version: str, toolchain: str, msys2_path: str) -> None:
+def build_windows(windivert_version: str, toolchain: str) -> None:
     print("=== Building ZeroDPI for Windows ===")
 
     windivert_dir = REPO_ROOT / "windivert"
@@ -669,16 +644,10 @@ def build_windows(windivert_version: str, toolchain: str, msys2_path: str) -> No
         cargo_cmd.append(f"+{toolchain}")
     cargo_cmd += ["build", "--workspace", "--release"]
 
-    # When using the GNU toolchain, prepend the MSYS2 mingw64 bin directory to
-    # PATH so that rustc can locate dlltool, ld, and other GNU binutils by name.
     extra_env: dict = {
         "CARGO_TERM_COLOR": "always",
         "WINDIVERT_PATH": str(windivert_dir),
     }
-    if msys2_path and toolchain and "gnu" in toolchain:
-        mingw_bin = Path(msys2_path) / "mingw64" / "bin"
-        msys_bin  = Path(msys2_path) / "usr" / "bin"
-        extra_env["PATH"] = f"{mingw_bin};{msys_bin};{os.environ.get('PATH', '')}"
 
     run(cargo_cmd, env=extra_env)
 
@@ -1566,7 +1535,6 @@ def build_android_app_runtime(
 def build_all(
     windivert_version: str,
     toolchain: str,
-    msys2_path: str,
     termux_arch: str,
     android_ndk: str | None,
     android_api: int,
@@ -1584,7 +1552,7 @@ def build_all(
     # 1. Windows
     print("\n\n")
     try:
-        build_windows(windivert_version, toolchain, msys2_path)
+        build_windows(windivert_version, toolchain)
     except SystemExit as e:
         print(f"\n[SKIP] Windows build skipped: {e}")
         exit_code = exit_code or 1
@@ -1592,7 +1560,7 @@ def build_all(
     # 2. Linux (cross-compile via cargo-zigbuild)
     print("\n\n")
     try:
-        build_linux_cross_zigbuild(linux_targets, msys2_path)
+        build_linux_cross_zigbuild(linux_targets)
     except SystemExit as e:
         print(f"\n[SKIP] Linux build skipped: {e}")
         exit_code = exit_code or 1
@@ -1684,7 +1652,6 @@ def run_interactive() -> None:
     # Initialize all potential variables with defaults
     windivert_version = WINDIVERT_DEFAULT_VERSION
     toolchain = WINDOWS_DEFAULT_TOOLCHAIN
-    msys2_path = WINDOWS_DEFAULT_MSYS2_PATH
     linux_target = DEFAULT_LINUX_TARGET
     termux_arch = TERMUX_DEFAULT_ARCH
     android_ndk = None
@@ -1704,15 +1671,12 @@ def run_interactive() -> None:
                 linux_target = prompt_input("Enter custom Linux target triple (e.g. x86_64-unknown-linux-gnu):")
             else:
                 linux_target = target_sel
-
-            msys2_path = prompt_input("MSYS2 path for Zig compiler (if not on PATH):", WINDOWS_DEFAULT_MSYS2_PATH)
         else:
             print("\nYou are building natively on Linux. No extra cross-compilation variables needed.")
 
     elif selected_platform == "windows":
         windivert_version = prompt_input("WinDivert version to download/verify:", WINDIVERT_DEFAULT_VERSION)
         toolchain = prompt_input("Rust toolchain to use (press Enter for default, or empty for workspace default):", WINDOWS_DEFAULT_TOOLCHAIN)
-        msys2_path = prompt_input("MSYS2 install path (required for GNU toolchain dlltool/ld):", WINDOWS_DEFAULT_MSYS2_PATH)
 
     elif selected_platform == "termux":
         arch_choices = list(TERMUX_ARCH_CHOICES) + ["Custom"]
@@ -1787,7 +1751,6 @@ def run_interactive() -> None:
     elif selected_platform == "all":
         windivert_version = prompt_input("WinDivert version to download/verify (Windows only):", WINDIVERT_DEFAULT_VERSION)
         toolchain = prompt_input("Rust toolchain to use for Windows target (press Enter for default):", WINDOWS_DEFAULT_TOOLCHAIN)
-        msys2_path = prompt_input("MSYS2 install path (required for Windows GNU toolchain and Linux Zig cross-compiler):", WINDOWS_DEFAULT_MSYS2_PATH)
 
         target_choices = [DEFAULT_LINUX_TARGET] + [t for t in LINUX_CROSS_TARGETS if t != DEFAULT_LINUX_TARGET] + ["all", "Custom"]
         target_sel = prompt_choice("Select Linux targets to cross-compile:", target_choices, DEFAULT_LINUX_TARGET)
@@ -1832,10 +1795,8 @@ def run_interactive() -> None:
     if selected_platform in ("windows", "all"):
         print(f"WinDivert Version:     {windivert_version}")
         print(f"Windows Toolchain:     {toolchain or 'Workspace Default'}")
-        print(f"MSYS2 Path:            {msys2_path}")
     if selected_platform == "linux" and platform.system() == "Windows":
         print(f"Linux Target:          {linux_target}")
-        print(f"MSYS2 Path (for Zig):  {msys2_path}")
     if selected_platform == "all":
         print(f"Linux targets:         {linux_target}")
     if selected_platform in ("termux", "all"):
@@ -1864,11 +1825,11 @@ def run_interactive() -> None:
     if selected_platform == "linux":
         if platform.system() == "Windows":
             targets = resolve_linux_targets(linux_target)
-            build_linux_cross_zigbuild(targets, msys2_path)
+            build_linux_cross_zigbuild(targets)
         else:
             build_linux()
     elif selected_platform == "windows":
-        build_windows(windivert_version, toolchain, msys2_path)
+        build_windows(windivert_version, toolchain)
     elif selected_platform == "termux":
         build_termux(termux_arch, android_ndk, android_api)
     elif selected_platform in ("android", "android-app"):
@@ -1884,7 +1845,6 @@ def run_interactive() -> None:
         build_all(
             windivert_version,
             toolchain,
-            msys2_path,
             termux_arch,
             android_ndk,
             android_api,
@@ -1926,17 +1886,6 @@ def main() -> None:
             f"Rust toolchain to use for the cargo build (Windows only, "
             f"default: {WINDOWS_DEFAULT_TOOLCHAIN}). "
             "Pass an empty string to use the workspace default toolchain."
-        ),
-    )
-    parser.add_argument(
-        "--msys2-path",
-        default=WINDOWS_DEFAULT_MSYS2_PATH,
-        metavar="PATH",
-        help=(
-            f"Path to the MSYS2 installation (Windows + GNU toolchain only, "
-            f"default: {WINDOWS_DEFAULT_MSYS2_PATH}). "
-            "Its mingw64/bin is prepended to PATH so that dlltool and ld are "
-            "reachable by the Rust GNU toolchain."
         ),
     )
     parser.add_argument(
@@ -2026,11 +1975,11 @@ def main() -> None:
     if selected_platform == "linux":
         if platform.system() == "Windows":
             targets = resolve_linux_targets(args.linux_target)
-            build_linux_cross_zigbuild(targets, args.msys2_path)
+            build_linux_cross_zigbuild(targets)
         else:
             build_linux()
     elif selected_platform == "windows":
-        build_windows(args.windivert_version, args.toolchain, args.msys2_path)
+        build_windows(args.windivert_version, args.toolchain)
     elif selected_platform == "termux":
         build_termux(args.termux_arch, args.android_ndk, args.android_api)
     elif selected_platform in ("android", "android-app"):
@@ -2046,7 +1995,6 @@ def main() -> None:
         build_all(
             args.windivert_version,
             args.toolchain,
-            args.msys2_path,
             args.termux_arch,
             args.android_ndk,
             args.android_api,

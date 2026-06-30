@@ -103,7 +103,11 @@ fun DashboardScreen(
         !runtimeFilesState.isLoading &&
         !runtimeFilesState.isSaving &&
         !profileState.isProfileLoading &&
-        !profileState.isProfileSwitching
+        !profileState.isProfileSwitching &&
+        !profileState.isRemoteUpdating
+    val runtimeFileActionsEnabled = !runtimeFilesState.isLoading &&
+        !runtimeFilesState.isSaving &&
+        !profileState.isRemoteUpdating
 
     BackHandler(enabled = page == DashboardPage.Settings) {
         page = DashboardPage.Home
@@ -144,7 +148,8 @@ fun DashboardScreen(
                         state = state,
                         canStart = runtimeFilesState.canStart &&
                             !runtimeFilesState.isLoading &&
-                            !runtimeFilesState.isSaving,
+                            !runtimeFilesState.isSaving &&
+                            !profileState.isRemoteUpdating,
                         onStart = onStart,
                         onStop = onStop,
                         onForceStop = onForceStop,
@@ -153,6 +158,7 @@ fun DashboardScreen(
                         title = "Runtime lists",
                         fileKinds = listOf(RuntimeFileKind.SniList, RuntimeFileKind.IpList),
                         state = runtimeFilesState,
+                        actionsEnabled = runtimeFileActionsEnabled,
                         onRuntimeFileSelected = onRuntimeFileSelected,
                         onRuntimeFileTextChanged = onRuntimeFileTextChanged,
                         onSaveRuntimeFile = onSaveRuntimeFile,
@@ -206,7 +212,7 @@ fun DashboardScreen(
                     )
                     ConfigSettingsPanel(
                         editorState = runtimeFilesState.configEditor,
-                        enabled = !runtimeFilesState.isLoading && !runtimeFilesState.isSaving,
+                        enabled = runtimeFileActionsEnabled,
                         isSaving = runtimeFilesState.isSaving,
                         hasUnsavedConfig = RuntimeFileKind.Config in runtimeFilesState.dirtyFiles,
                         statusMessage = runtimeFilesState.statusMessage,
@@ -376,6 +382,7 @@ private fun ProfileManagementPanel(
     val activeProfile = profileState.activeProfile
     val canDelete = actionsEnabled && profileState.profiles.size > 1
     val storageStatus = when {
+        profileState.isRemoteUpdating -> "Updating"
         profileState.isProfileSwitching -> "Switching"
         profileState.isProfileLoading -> "Loading"
         runtimeFilesState.runtimeDir.isBlank() -> "Pending"
@@ -525,7 +532,9 @@ private fun RemoteUpdatePanel(
     var showManualUpdateDialog by remember { mutableStateOf(false) }
     val remote = profileState.profileRemoteSettings
     val remoteValidation = remote.validate()
-    val updateEnabled = actionsEnabled && !profileState.isRemoteUpdating
+    val updateValidation = remote.validateForUpdate()
+    val remoteFieldsEnabled = !profileState.isProfileLoading && !profileState.isRemoteUpdating
+    val updateEnabled = actionsEnabled && updateValidation.isValid
     val dirtyFiles = runtimeFilesState.dirtyFiles
     var intervalText by remember(remote.autoUpdateIntervalHours) {
         mutableStateOf(remote.autoUpdateIntervalHours.toString())
@@ -544,19 +553,19 @@ private fun RemoteUpdatePanel(
             RemoteUrlField(
                 label = "config.toml URL",
                 value = remote.configUrl,
-                enabled = !profileState.isProfileLoading,
+                enabled = remoteFieldsEnabled,
                 onValueChange = onConfigUrlChanged,
             )
             RemoteUrlField(
                 label = "sni_list.txt URL",
                 value = remote.sniListUrl,
-                enabled = !profileState.isProfileLoading,
+                enabled = remoteFieldsEnabled,
                 onValueChange = onSniListUrlChanged,
             )
             RemoteUrlField(
                 label = "ip_list.txt URL",
                 value = remote.ipListUrl,
-                enabled = !profileState.isProfileLoading,
+                enabled = remoteFieldsEnabled,
                 onValueChange = onIpListUrlChanged,
             )
             Row(
@@ -580,7 +589,7 @@ private fun RemoteUpdatePanel(
                 Switch(
                     checked = remote.autoUpdateEnabled,
                     onCheckedChange = onAutoUpdateChanged,
-                    enabled = !profileState.isProfileLoading,
+                    enabled = remoteFieldsEnabled,
                 )
             }
             OutlinedTextField(
@@ -590,7 +599,7 @@ private fun RemoteUpdatePanel(
                     value.toIntOrNull()?.let(onIntervalHoursChanged)
                 },
                 modifier = Modifier.fillMaxWidth(),
-                enabled = !profileState.isProfileLoading,
+                enabled = remoteFieldsEnabled,
                 singleLine = true,
                 label = { Text("Automatic update interval hours") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -620,6 +629,20 @@ private fun RemoteUpdatePanel(
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(if (profileState.isRemoteUpdating) "Updating" else "Update now")
+            }
+            if (profileState.isRemoteUpdating) {
+                Text(
+                    text = "Downloading, validating, and applying remote files.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            if (remoteValidation.isValid && !updateValidation.isValid) {
+                Text(
+                    text = "Configure all three valid URLs before running a manual update.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
             remoteValidation.errors.forEach { issue ->
                 Text(
@@ -1185,6 +1208,7 @@ private fun RuntimeFilesPanel(
     title: String,
     fileKinds: List<RuntimeFileKind>,
     state: RuntimeFilesUiState,
+    actionsEnabled: Boolean,
     onRuntimeFileSelected: (RuntimeFileKind) -> Unit,
     onRuntimeFileTextChanged: (RuntimeFileKind, String) -> Unit,
     onSaveRuntimeFile: (RuntimeFileKind) -> Unit,
@@ -1202,7 +1226,7 @@ private fun RuntimeFilesPanel(
     val selectedText = state.textFor(selectedFile)
     val selectedListValidation = state.validationFor(selectedFile)
     val selectedFileCanRunTestScan = selectedFile != RuntimeFileKind.Config
-    val actionsEnabled = !state.isLoading && !state.isSaving
+    val fileActionsEnabled = actionsEnabled && !state.isLoading && !state.isSaving
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -1272,7 +1296,7 @@ private fun RuntimeFilesPanel(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 220.dp, max = 360.dp),
-                    enabled = !state.isSaving,
+                    enabled = fileActionsEnabled,
                     isError = selectedListValidation?.issues?.isNotEmpty() == true,
                     label = { Text(selectedFile.fileName) },
                     textStyle = MaterialTheme.typography.bodySmall.copy(
@@ -1285,13 +1309,13 @@ private fun RuntimeFilesPanel(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
                     onClick = { onSaveRuntimeFile(selectedFile) },
-                    enabled = actionsEnabled,
+                    enabled = fileActionsEnabled,
                 ) {
                     Text(if (state.isSaving) "Saving" else "Save")
                 }
                 OutlinedButton(
                     onClick = { onResetRuntimeFile(selectedFile) },
-                    enabled = actionsEnabled,
+                    enabled = fileActionsEnabled,
                 ) {
                     Text("Reset to defaults")
                 }
@@ -1299,21 +1323,21 @@ private fun RuntimeFilesPanel(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
                     onClick = { onImportRuntimeFile(selectedFile) },
-                    enabled = actionsEnabled,
+                    enabled = fileActionsEnabled,
                     modifier = Modifier.weight(1f),
                 ) {
                     Text("Import")
                 }
                 OutlinedButton(
                     onClick = { onExportRuntimeFile(selectedFile) },
-                    enabled = actionsEnabled,
+                    enabled = fileActionsEnabled,
                     modifier = Modifier.weight(1f),
                 ) {
                     Text("Export")
                 }
                 OutlinedButton(
                     onClick = { onShareRuntimeFile(selectedFile) },
-                    enabled = actionsEnabled,
+                    enabled = fileActionsEnabled,
                     modifier = Modifier.weight(1f),
                 ) {
                     Text("Share")
@@ -1322,7 +1346,7 @@ private fun RuntimeFilesPanel(
             if (selectedFileCanRunTestScan) {
                 Button(
                     onClick = { onRunTestScan(selectedFile) },
-                    enabled = actionsEnabled &&
+                    enabled = fileActionsEnabled &&
                         state.configEditor.canStart &&
                         selectedListValidation?.isValid == true,
                     modifier = Modifier.fillMaxWidth(),

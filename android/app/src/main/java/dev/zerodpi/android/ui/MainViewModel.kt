@@ -205,6 +205,10 @@ class MainViewModel(
 
     fun start() {
         viewModelScope.launch {
+            if (!ensureRemoteUpdateInactive("starting ZeroDPI")) {
+                return@launch
+            }
+
             val validation = ZeroDpiConfigToml.analyze(_runtimeFilesState.value.configText)
             if (!validation.canStart) {
                 _runtimeFilesState.update {
@@ -407,6 +411,10 @@ class MainViewModel(
         }
 
         viewModelScope.launch {
+            if (!ensureRemoteUpdateInactive("running test scans")) {
+                return@launch
+            }
+
             val snapshot = _runtimeFilesState.value
             val scanConfigText = ZeroDpiConfigToml.replaceOrAppendField(
                 text = snapshot.configText,
@@ -459,6 +467,10 @@ class MainViewModel(
 
     fun resetRuntimeFileToDefaults(kind: RuntimeFileKind) {
         viewModelScope.launch {
+            if (!ensureRemoteUpdateInactive("resetting profile files")) {
+                return@launch
+            }
+
             _runtimeFilesState.update {
                 it.copy(isSaving = true, statusMessage = null, errorMessage = null)
             }
@@ -491,6 +503,9 @@ class MainViewModel(
 
     fun createProfileFromDefaults(name: String) {
         viewModelScope.launch {
+            if (!ensureRemoteUpdateInactive("creating profiles")) {
+                return@launch
+            }
             if (!ensureRuntimeInactive("creating profiles")) {
                 return@launch
             }
@@ -507,6 +522,9 @@ class MainViewModel(
 
     fun duplicateActiveProfile(name: String) {
         viewModelScope.launch {
+            if (!ensureRemoteUpdateInactive("duplicating profiles")) {
+                return@launch
+            }
             if (!ensureRuntimeInactive("duplicating profiles")) {
                 return@launch
             }
@@ -527,6 +545,9 @@ class MainViewModel(
 
     fun renameProfile(profileId: String, name: String) {
         viewModelScope.launch {
+            if (!ensureRemoteUpdateInactive("renaming profiles")) {
+                return@launch
+            }
             if (!ensureRuntimeInactive("renaming profiles")) {
                 return@launch
             }
@@ -543,6 +564,9 @@ class MainViewModel(
 
     fun deleteProfile(profileId: String) {
         viewModelScope.launch {
+            if (!ensureRemoteUpdateInactive("deleting profiles")) {
+                return@launch
+            }
             if (!ensureRuntimeInactive("deleting profiles")) {
                 return@launch
             }
@@ -573,6 +597,9 @@ class MainViewModel(
 
     fun selectProfile(profileId: String) {
         viewModelScope.launch {
+            if (!ensureRemoteUpdateInactive("switching profiles")) {
+                return@launch
+            }
             if (profileId == _runtimeFilesState.value.activeProfileId) {
                 _profileState.update {
                     it.copy(
@@ -603,6 +630,10 @@ class MainViewModel(
 
     fun saveAndSelectProfile(profileId: String? = null) {
         viewModelScope.launch {
+            if (!ensureRemoteUpdateInactive("switching profiles")) {
+                return@launch
+            }
+
             val targetProfileId = profileId ?: _profileState.value.pendingSwitchProfileId
             if (targetProfileId == null) {
                 setProfileError("No pending profile switch.")
@@ -622,6 +653,10 @@ class MainViewModel(
 
     fun discardAndSelectProfile(profileId: String? = null) {
         viewModelScope.launch {
+            if (!ensureRemoteUpdateInactive("switching profiles")) {
+                return@launch
+            }
+
             val targetProfileId = profileId ?: _profileState.value.pendingSwitchProfileId
             if (targetProfileId == null) {
                 setProfileError("No pending profile switch.")
@@ -677,6 +712,10 @@ class MainViewModel(
     }
 
     fun updateActiveProfileRemoteSettings(remote: ProfileRemoteSettings) {
+        if (!ensureRemoteUpdateInactive("changing remote settings")) {
+            return
+        }
+
         val activeProfileId = _profileState.value.activeProfileId
         val validation = remote.validate()
         remoteSettingsSaveJob?.cancel()
@@ -726,9 +765,25 @@ class MainViewModel(
 
     fun updateActiveProfileFromRemote(confirmDiscardUnsavedEdits: Boolean = false) {
         viewModelScope.launch {
+            if (!ensureRemoteUpdateInactive("starting another remote update")) {
+                return@launch
+            }
             if (!ensureRuntimeInactive("updating profiles from remote")) {
                 return@launch
             }
+
+            val profileId = _profileState.value.activeProfileId
+            val remoteSettings = _profileState.value.profileRemoteSettings
+            val remoteValidation = remoteSettings.validateForUpdate()
+            if (!remoteValidation.isValid) {
+                setProfileError(
+                    remoteValidation.validationMessage(
+                        fallbackMessage = "Configure all three valid remote URLs before updating.",
+                    ),
+                )
+                return@launch
+            }
+
             if (_runtimeFilesState.value.dirtyFiles.isNotEmpty() && !confirmDiscardUnsavedEdits) {
                 setProfileError("Remote update overwrites local edits. Confirm before discarding unsaved edits.")
                 return@launch
@@ -736,8 +791,6 @@ class MainViewModel(
 
             remoteSettingsSaveJob?.cancel()
             remoteSettingsSaveJob = null
-            val profileId = _profileState.value.activeProfileId
-            val remoteSettings = _profileState.value.profileRemoteSettings
             _profileState.update {
                 it.copy(isRemoteUpdating = true, statusMessage = null, lastProfileError = null)
             }
@@ -964,6 +1017,20 @@ class MainViewModel(
         return false
     }
 
+    private fun ensureRemoteUpdateInactive(action: String): Boolean {
+        if (!_profileState.value.isRemoteUpdating) {
+            return true
+        }
+        val message = "Wait for the remote update to finish before $action."
+        _profileState.update {
+            it.copy(statusMessage = null, lastProfileError = message)
+        }
+        _runtimeFilesState.update {
+            it.copy(statusMessage = null, errorMessage = message)
+        }
+        return false
+    }
+
     private fun isRuntimeActive(): Boolean =
         when (_uiState.value.status) {
             RuntimeStatus.Starting,
@@ -1032,6 +1099,9 @@ class MainViewModel(
     private suspend fun saveRuntimeFiles(filesToSave: Set<RuntimeFileKind>): Boolean {
         if (filesToSave.isEmpty()) {
             return true
+        }
+        if (!ensureRemoteUpdateInactive("saving profile files")) {
+            return false
         }
 
         val snapshot = _runtimeFilesState.value

@@ -13,6 +13,7 @@ import androidx.core.app.NotificationCompat
 import dev.zerodpi.android.BuildConfig
 import dev.zerodpi.android.R
 import dev.zerodpi.android.config.ZeroDpiConfigToml
+import dev.zerodpi.android.profile.ProfileRepository
 import dev.zerodpi.android.profile.ZeroDpiProfile
 import dev.zerodpi.android.runtime.FakeZeroDpiRunner
 import dev.zerodpi.android.runtime.ProcessZeroDpiRunner
@@ -80,6 +81,7 @@ class ZeroDpiService : Service() {
     private lateinit var runner: ZeroDpiRunner
     private lateinit var rootManager: RootManager
     private lateinit var runtimeStorage: RuntimeStorage
+    private lateinit var profileRepository: ProfileRepository
     private val activeConnections = mutableSetOf<Int>()
     private val activeRelayBytes = mutableMapOf<Int, Long>()
     private val sessionLogLines = ArrayDeque<String>()
@@ -87,8 +89,11 @@ class ZeroDpiService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        ZeroDpiRuntimeStateStore.markRuntimeInactive(this)
+        if (!ZeroDpiRuntimeStateStore.isRuntimeActive(this)) {
+            ZeroDpiRuntimeStateStore.markRuntimeInactive(this)
+        }
         runtimeStorage = RuntimeStorage(this)
+        profileRepository = ProfileRepository(this)
         rootManager = SuRootManager()
         runner = createRunner()
         scope.launch {
@@ -130,7 +135,7 @@ class ZeroDpiService : Service() {
         profileId: String = ZeroDpiProfile.DEFAULT_PROFILE_ID,
         modeOverride: String? = null,
     ) {
-        ZeroDpiRuntimeStateStore.markRuntimeActive(this)
+        ZeroDpiRuntimeStateStore.markRuntimeActive(this, profileId = profileId)
         ensureForeground()
         scope.launch {
             if (state.value.status in activeStatuses) {
@@ -150,6 +155,9 @@ class ZeroDpiService : Service() {
                 finishForegroundRun()
                 return@launch
             }
+            val profileName = runCatching {
+                profileRepository.loadIndex().profiles.firstOrNull { profile -> profile.id == profileId }?.name
+            }.getOrNull()
             val editorState = ZeroDpiConfigToml.analyze(runConfig.configText)
             val mode = runConfig.modeOverride ?: editorState.valueFor("MODE").ifBlank { "unknown" }
             val listenHost = editorState.valueFor("LISTEN_HOST").ifBlank { "127.0.0.1" }
@@ -175,7 +183,8 @@ class ZeroDpiService : Service() {
                 )
             }
             sessionLogLines.clear()
-            appendLog("Runtime storage ready for profile $profileId at ${runConfig.files.runtimeDir.absolutePath}.")
+            appendLog("Starting ZeroDPI with profile ${profileDescription(profileId, profileName)}.")
+            appendLog("Profile runtime directory: ${runConfig.files.runtimeDir.absolutePath}.")
             modeOverride?.let { modeName ->
                 appendLog("Running temporary $modeName test scan config.")
             }
@@ -508,6 +517,16 @@ class ZeroDpiService : Service() {
             !ip.isNullOrBlank() -> ip
             else -> "None"
         }
+
+    private fun profileDescription(profileId: String, profileName: String?): String =
+        if (profileName.isNullOrBlank()) {
+            "id $profileId"
+        } else {
+            "\"${profileName.sanitizeForLog()}\" (id: $profileId)"
+        }
+
+    private fun String.sanitizeForLog(): String =
+        replace('\r', ' ').replace('\n', ' ')
 
     private fun ensureForeground() {
         createNotificationChannel()

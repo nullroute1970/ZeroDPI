@@ -135,6 +135,78 @@ class ProfileRepository(
             }
         }
 
+    suspend fun recordRemoteUpdateFailure(
+        profileId: String,
+        mode: ProfileUpdateMode,
+        message: String,
+        remote: ProfileRemoteSettings? = null,
+    ): ProfileIndex =
+        withContext(Dispatchers.IO) {
+            synchronized(repositoryLock) {
+                val current = loadIndexLocked()
+                val existing = current.requireProfile(profileId)
+                val remoteForStatus = remote ?: existing.remote
+                remoteForStatus.validate().requireValid("Profile remote settings")
+                writeIndexLocked(
+                    current.withUpdatedProfile(
+                        existing.withRemoteUpdateStatus(
+                            remote = remoteForStatus,
+                            mode = mode,
+                            successful = false,
+                            message = message,
+                            completedAtEpochMs = clock(),
+                        ),
+                    ),
+                )
+            }
+        }
+
+    suspend fun applyRemoteUpdate(
+        profileId: String,
+        remote: ProfileRemoteSettings,
+        files: ProfileUpdateFileContents,
+        mode: ProfileUpdateMode,
+        message: String,
+    ): ProfileIndex =
+        withContext(Dispatchers.IO) {
+            synchronized(repositoryLock) {
+                remote.validateForUpdate().requireValid("Profile remote settings")
+                val current = loadIndexLocked()
+                val existing = current.requireProfile(profileId)
+                val paths = filePathsForKnownProfileLocked(current, profileId)
+                val updatedProfile = existing.withRemoteUpdateStatus(
+                    remote = remote,
+                    mode = mode,
+                    successful = true,
+                    message = message,
+                    completedAtEpochMs = clock(),
+                )
+                val next = current.withUpdatedProfile(updatedProfile)
+                val rollbackFiles = createRollbackFilesLocked(paths)
+
+                try {
+                    writeProfileFilesLocked(paths = paths, files = files)
+                    writeIndexLocked(next)
+                } catch (error: Exception) {
+                    try {
+                        restoreRollbackFilesLocked(rollbackFiles)
+                    } catch (restoreError: Exception) {
+                        restoreError.addSuppressed(error)
+                        throw ProfileRepositoryException(
+                            "Failed to apply remote update and restore previous profile files.",
+                            restoreError,
+                        )
+                    }
+                    throw ProfileRepositoryException(
+                        "Failed to apply remote update; previous profile files were restored.",
+                        error,
+                    )
+                } finally {
+                    cleanupRollbackFilesLocked(rollbackFiles)
+                }
+            }
+        }
+
     suspend fun duplicateProfile(
         sourceProfileId: String,
         name: String,
@@ -240,6 +312,63 @@ class ProfileRepository(
         return validIndex
     }
 
+    private fun writeProfileFilesLocked(
+        paths: ProfileFilePaths,
+        files: ProfileUpdateFileContents,
+    ) {
+        RuntimeFileOps.atomicWrite(
+            target = paths.configFile,
+            content = files.configText,
+            backup = RuntimeFileOps.backupFor(paths.configFile),
+        )
+        RuntimeFileOps.atomicWrite(
+            target = paths.sniListFile,
+            content = files.sniListText,
+            backup = RuntimeFileOps.backupFor(paths.sniListFile),
+        )
+        RuntimeFileOps.atomicWrite(
+            target = paths.ipListFile,
+            content = files.ipListText,
+            backup = RuntimeFileOps.backupFor(paths.ipListFile),
+        )
+    }
+
+    private fun createRollbackFilesLocked(paths: ProfileFilePaths): List<ProfileFileRollback> =
+        RuntimeFileKind.entries.map { kind ->
+            val target = paths.fileFor(kind)
+            val rollback = File(
+                target.parentFile ?: error("Runtime target has no parent: ${target.absolutePath}"),
+                ".${target.name}.${System.nanoTime()}.rollback",
+            )
+            val existed = target.exists()
+            if (existed) {
+                RuntimeFileOps.copyFileAtomic(source = target, target = rollback)
+            }
+            ProfileFileRollback(target = target, rollback = rollback, existed = existed)
+        }
+
+    private fun restoreRollbackFilesLocked(rollbackFiles: List<ProfileFileRollback>) {
+        rollbackFiles.forEach { rollbackFile ->
+            if (rollbackFile.existed) {
+                RuntimeFileOps.copyFileAtomic(
+                    source = rollbackFile.rollback,
+                    target = rollbackFile.target,
+                )
+            } else if (rollbackFile.target.exists() && !rollbackFile.target.delete()) {
+                error("Failed to remove new profile file: ${rollbackFile.target.absolutePath}")
+            }
+        }
+        rollbackFiles.firstOrNull()?.target?.parentFile?.let(RuntimeFileOps::fsyncDirectory)
+    }
+
+    private fun cleanupRollbackFilesLocked(rollbackFiles: List<ProfileFileRollback>) {
+        rollbackFiles.forEach { rollbackFile ->
+            if (rollbackFile.rollback.exists()) {
+                rollbackFile.rollback.delete()
+            }
+        }
+    }
+
     private fun ensureProfileStorageLocked(index: ProfileIndex) {
         index.profiles.forEach { profile ->
             seedProfileFilesFromAssetsLocked(filePathsFor(profile.id))
@@ -340,6 +469,40 @@ class ProfileRepository(
             ?: throw IllegalArgumentException("Unknown profile id: $profileId")
     }
 
+    private fun ProfileIndex.withUpdatedProfile(profile: ZeroDpiProfile): ProfileIndex =
+        copy(
+            profiles = profiles.map { existing ->
+                if (existing.id == profile.id) profile else existing
+            },
+        ).requireValid()
+
+    private fun ZeroDpiProfile.withRemoteUpdateStatus(
+        remote: ProfileRemoteSettings,
+        mode: ProfileUpdateMode,
+        successful: Boolean,
+        message: String,
+        completedAtEpochMs: Long,
+    ): ZeroDpiProfile {
+        val updatedRemote = remote.copy(
+            lastUpdateAttemptEpochMs = completedAtEpochMs,
+            lastSuccessfulUpdateEpochMs = if (successful) {
+                completedAtEpochMs
+            } else {
+                remote.lastSuccessfulUpdateEpochMs
+            },
+            lastUpdateStatus = ProfileUpdateStatus(
+                mode = mode,
+                successful = successful,
+                message = message,
+                completedAtEpochMs = completedAtEpochMs,
+            ),
+        )
+        return copy(
+            remote = updatedRemote,
+            updatedAtEpochMs = maxOf(createdAtEpochMs, updatedAtEpochMs, completedAtEpochMs),
+        )
+    }
+
     private fun generateProfileId(existingIds: Set<String>): String {
         repeat(MAX_ID_GENERATION_ATTEMPTS) {
             val candidate = idGenerator()
@@ -354,4 +517,10 @@ class ProfileRepository(
         private const val MAX_ID_GENERATION_ATTEMPTS = 20
         private val repositoryLock = Any()
     }
+
+    private data class ProfileFileRollback(
+        val target: File,
+        val rollback: File,
+        val existed: Boolean,
+    )
 }

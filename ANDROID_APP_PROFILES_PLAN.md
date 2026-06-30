@@ -336,43 +336,43 @@ Acceptance criteria:
 - [x] Very large responses cannot exhaust app memory.
 - [x] Tests can exercise update behavior without real network access.
 
-## Phase 7: Apply Remote Updates All-Or-Nothing
+## Phase 7: Apply Remote Updates All-Or-Nothing (Completed)
 
 Steps:
 
-- Add `ProfileUpdateManager` that coordinates:
-  - URL validation,
-  - download all three files,
-  - config analysis,
-  - SNI list validation,
-  - IP list validation,
-  - atomic apply.
+- [x] Add `ProfileUpdateManager` that coordinates:
+  - [x] URL validation,
+  - [x] download all three files,
+  - [x] config analysis,
+  - [x] SNI list validation,
+  - [x] IP list validation,
+  - [x] atomic apply.
 - Recommended validation before apply:
-  - `ZeroDpiConfigToml.analyze(remoteConfig).issues` must be empty,
-  - `RuntimeListValidator.validate(SniList, remoteSniList, mode)` must pass for
+  - [x] `ZeroDpiConfigToml.analyze(remoteConfig).issues` must be empty,
+  - [x] `RuntimeListValidator.validate(SniList, remoteSniList, mode)` must pass for
     relevant modes,
-  - `RuntimeListValidator.validate(IpList, remoteIpList, mode)` must pass for
+  - [x] `RuntimeListValidator.validate(IpList, remoteIpList, mode)` must pass for
     relevant modes,
-  - at minimum, reject clearly invalid SNI/IP list syntax even if the selected
+  - [x] at minimum, reject clearly invalid SNI/IP list syntax even if the selected
     mode does not currently use that list.
 - Apply update in this order:
-  1. download into memory or temp files,
-  2. validate all three contents,
-  3. acquire the profile write lock,
-  4. write all three files atomically with backups,
-  5. update profile metadata timestamps/status,
-  6. reload UI state if the updated profile is active.
-- If any step fails, leave the previous local files in place and record
+  1. [x] download into memory or temp files,
+  2. [x] validate all three contents,
+  3. [x] acquire the profile write lock,
+  4. [x] write all three files atomically with backups,
+  5. [x] update profile metadata timestamps/status,
+  6. [x] reload UI state if the updated profile is active.
+- [x] If any step fails, leave the previous local files in place and record
   `lastUpdateStatus`.
-- If update succeeds, clear dirty flags for those three files because local UI
+- [x] If update succeeds, clear dirty flags for those three files because local UI
   state now matches disk.
 
 Acceptance criteria:
 
-- A successful update overwrites all three local profile files.
-- A failed or partial update overwrites none of them.
-- After update, users can immediately edit and save local changes again.
-- A later successful update overwrites those local changes.
+- [x] A successful update overwrites all three local profile files.
+- [x] A failed or partial update overwrites none of them.
+- [x] After update, users can immediately edit and save local changes again.
+- [x] A later successful update overwrites those local changes.
 
 ## Phase 8: Add Manual Update Flow
 

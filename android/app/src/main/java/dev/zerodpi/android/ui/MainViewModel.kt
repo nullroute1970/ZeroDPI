@@ -19,6 +19,9 @@ import dev.zerodpi.android.list.RuntimeListValidator
 import dev.zerodpi.android.profile.ProfileIndex
 import dev.zerodpi.android.profile.ProfileRemoteSettings
 import dev.zerodpi.android.profile.ProfileRepository
+import dev.zerodpi.android.profile.ProfileUpdateManager
+import dev.zerodpi.android.profile.ProfileUpdateMode
+import dev.zerodpi.android.profile.ProfileUpdateResult
 import dev.zerodpi.android.profile.ProfileValidationResult
 import dev.zerodpi.android.profile.ZeroDpiProfile
 import dev.zerodpi.android.service.RuntimeStatus
@@ -147,6 +150,7 @@ class MainViewModel(
     private val appContext = application.applicationContext
     private val profileRepository = ProfileRepository(appContext)
     private val runtimeStorage = RuntimeStorage(appContext)
+    private val profileUpdateManager = ProfileUpdateManager(profileRepository)
     private val diagnosticsProvider = AndroidDiagnosticsProvider(appContext)
     private val _uiState = MutableStateFlow(ZeroDpiServiceState())
     val uiState: StateFlow<ZeroDpiServiceState> = _uiState.asStateFlow()
@@ -730,16 +734,31 @@ class MainViewModel(
                 return@launch
             }
 
-            val validation = _profileState.value.profileRemoteSettings.validateForUpdate()
-            if (!validation.isValid) {
-                setProfileError(validation.validationMessage("Configure all three valid remote URLs before updating."))
-                return@launch
-            }
-
+            remoteSettingsSaveJob?.cancel()
+            remoteSettingsSaveJob = null
+            val profileId = _profileState.value.activeProfileId
+            val remoteSettings = _profileState.value.profileRemoteSettings
             _profileState.update {
                 it.copy(isRemoteUpdating = true, statusMessage = null, lastProfileError = null)
             }
-            setProfileError("Remote update needs the download client and update manager from later phases.")
+            runCatching {
+                profileUpdateManager.updateProfile(
+                    profileId = profileId,
+                    mode = ProfileUpdateMode.Manual,
+                    remote = remoteSettings,
+                )
+            }.onSuccess { result ->
+                if (result.successful) {
+                    loadActiveRuntimeFiles(
+                        profileIndex = result.index,
+                        statusMessage = result.message,
+                    )
+                } else {
+                    applyRemoteUpdateFailure(result)
+                }
+            }.onFailure { error ->
+                reportProfileError(error, "Failed to update profile from remote.")
+            }
         }
     }
 
@@ -900,6 +919,27 @@ class MainViewModel(
                 statusMessage = statusMessage,
                 errorMessage = null,
             )
+        }
+    }
+
+    private fun applyRemoteUpdateFailure(result: ProfileUpdateResult) {
+        val activeProfile = activeProfileFrom(result.index)
+        val currentRemote = _profileState.value.profileRemoteSettings
+        val keepUnsavedRemote = !currentRemote.validate().isValid
+        _profileState.value = _profileState.value.copy(
+            profiles = result.index.profiles,
+            activeProfileId = activeProfile.id,
+            activeProfileName = activeProfile.name,
+            profileRemoteSettings = if (keepUnsavedRemote) currentRemote else activeProfile.remote,
+            hasUnsavedProfileRemoteSettings = keepUnsavedRemote,
+            isProfileLoading = false,
+            isProfileSwitching = false,
+            isRemoteUpdating = false,
+            statusMessage = null,
+            lastProfileError = result.message,
+        )
+        _runtimeFilesState.update {
+            it.copy(statusMessage = null, errorMessage = result.message)
         }
     }
 

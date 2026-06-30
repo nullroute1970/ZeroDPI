@@ -1,8 +1,6 @@
 package dev.zerodpi.android.storage
 
 import android.content.Context
-import android.system.Os
-import android.system.OsConstants
 import dev.zerodpi.android.config.ZeroDpiConfigToml
 import dev.zerodpi.android.diagnostics.DeviceDiagnostics
 import kotlinx.coroutines.Dispatchers
@@ -68,14 +66,14 @@ class RuntimeStorage(context: Context) {
     private val lock = Any()
     private var activeLogFile: File? = null
 
-    private val runtimeDir = File(appContext.filesDir, RUNTIME_DIR_NAME)
+    private val runtimeDir = File(appContext.filesDir, RuntimeStorageLayout.RUNTIME_DIR_NAME)
     private val files = RuntimeStorageFiles(
         runtimeDir = runtimeDir,
         configFile = File(runtimeDir, RuntimeFileKind.Config.fileName),
         sniListFile = File(runtimeDir, RuntimeFileKind.SniList.fileName),
         ipListFile = File(runtimeDir, RuntimeFileKind.IpList.fileName),
-        logsDir = File(runtimeDir, LOGS_DIR_NAME),
-        scanResultsDir = File(runtimeDir, SCAN_RESULTS_DIR_NAME),
+        logsDir = File(runtimeDir, RuntimeStorageLayout.LOGS_DIR_NAME),
+        scanResultsDir = File(runtimeDir, RuntimeStorageLayout.SCAN_RESULTS_DIR_NAME),
     )
 
     suspend fun ensureInitialized(): RuntimeStorageFiles =
@@ -98,7 +96,7 @@ class RuntimeStorage(context: Context) {
         withContext(Dispatchers.IO) {
             val currentFiles = ensureInitializedBlocking()
             val target = currentFiles.fileFor(kind)
-            atomicWrite(target = target, content = content, backup = backupFor(target))
+            RuntimeFileOps.atomicWrite(target = target, content = content, backup = RuntimeFileOps.backupFor(target))
         }
     }
 
@@ -109,20 +107,20 @@ class RuntimeStorage(context: Context) {
     ) {
         withContext(Dispatchers.IO) {
             val currentFiles = ensureInitializedBlocking()
-            atomicWrite(
+            RuntimeFileOps.atomicWrite(
                 target = currentFiles.configFile,
                 content = configText,
-                backup = backupFor(currentFiles.configFile),
+                backup = RuntimeFileOps.backupFor(currentFiles.configFile),
             )
-            atomicWrite(
+            RuntimeFileOps.atomicWrite(
                 target = currentFiles.sniListFile,
                 content = sniListText,
-                backup = backupFor(currentFiles.sniListFile),
+                backup = RuntimeFileOps.backupFor(currentFiles.sniListFile),
             )
-            atomicWrite(
+            RuntimeFileOps.atomicWrite(
                 target = currentFiles.ipListFile,
                 content = ipListText,
-                backup = backupFor(currentFiles.ipListFile),
+                backup = RuntimeFileOps.backupFor(currentFiles.ipListFile),
             )
         }
     }
@@ -132,7 +130,7 @@ class RuntimeStorage(context: Context) {
             val currentFiles = ensureInitializedBlocking()
             val content = defaultContentFor(kind)
             val target = currentFiles.fileFor(kind)
-            atomicWrite(target = target, content = content, backup = backupFor(target))
+            RuntimeFileOps.atomicWrite(target = target, content = content, backup = RuntimeFileOps.backupFor(target))
             content
         }
 
@@ -147,7 +145,7 @@ class RuntimeStorage(context: Context) {
             val currentFiles = ensureInitializedBlocking()
             val configText = currentFiles.configFile.readText(StandardCharsets.UTF_8)
             val resolvedPaths = resolveConfigPaths(configText)
-            resolvedPaths.scanOutput?.parentFile?.mkdirsOrThrow()
+            resolvedPaths.scanOutput?.parentFile?.let(RuntimeFileOps::ensureDirectory)
             resolvedPaths
         }
 
@@ -164,12 +162,12 @@ class RuntimeStorage(context: Context) {
             } ?: storedConfigText
             val runConfigFile = modeOverride?.let { mode ->
                 File(currentFiles.runtimeDir, ".${mode}_config.toml").also { target ->
-                    atomicWrite(target = target, content = runConfigText, backup = null)
+                    RuntimeFileOps.atomicWrite(target = target, content = runConfigText, backup = null)
                 }
             } ?: currentFiles.configFile
 
             val resolvedPaths = resolveConfigPaths(runConfigText)
-            resolvedPaths.scanOutput?.parentFile?.mkdirsOrThrow()
+            resolvedPaths.scanOutput?.parentFile?.let(RuntimeFileOps::ensureDirectory)
 
             RuntimeRunConfig(
                 files = currentFiles,
@@ -183,7 +181,7 @@ class RuntimeStorage(context: Context) {
         withContext(Dispatchers.IO) {
             synchronized(lock) {
                 val currentFiles = ensureInitializedBlocking()
-                currentFiles.logsDir.mkdirsOrThrow()
+                RuntimeFileOps.ensureDirectory(currentFiles.logsDir)
                 activeLogFile = File(
                     currentFiles.logsDir,
                     "${timestampForFile()}_${label.sanitizeFileName()}.log",
@@ -251,13 +249,13 @@ class RuntimeStorage(context: Context) {
 
     private fun ensureInitializedBlocking(): RuntimeStorageFiles =
         synchronized(lock) {
-            runtimeDir.mkdirsOrThrow()
-            files.logsDir.mkdirsOrThrow()
-            files.scanResultsDir.mkdirsOrThrow()
+            RuntimeFileOps.ensureDirectory(runtimeDir)
+            RuntimeFileOps.ensureDirectory(files.logsDir)
+            RuntimeFileOps.ensureDirectory(files.scanResultsDir)
 
-            restorePrimaryFromBackupIfMissing(files.configFile)
-            restorePrimaryFromBackupIfMissing(files.sniListFile)
-            restorePrimaryFromBackupIfMissing(files.ipListFile)
+            RuntimeFileOps.restorePrimaryFromBackupIfMissing(files.configFile)
+            RuntimeFileOps.restorePrimaryFromBackupIfMissing(files.sniListFile)
+            RuntimeFileOps.restorePrimaryFromBackupIfMissing(files.ipListFile)
 
             seedIfMissing(files.configFile, RuntimeFileKind.Config)
             seedIfMissing(files.sniListFile, RuntimeFileKind.SniList)
@@ -270,28 +268,14 @@ class RuntimeStorage(context: Context) {
         if (target.exists()) {
             return
         }
-        atomicWrite(target = target, content = defaultContentFor(kind), backup = null)
-    }
-
-    private fun restorePrimaryFromBackupIfMissing(target: File) {
-        if (target.exists()) {
-            return
-        }
-        val backup = backupFor(target)
-        if (backup.isFile) {
-            copyFileAtomic(source = backup, target = target)
-        }
-    }
-
-    private fun backupFor(target: File): File {
-        val parent = target.parentFile ?: error("Runtime target has no parent: ${target.absolutePath}")
-        return File(parent, "${target.name}.bak")
+        RuntimeFileOps.atomicWrite(target = target, content = defaultContentFor(kind), backup = null)
     }
 
     private fun defaultContentFor(kind: RuntimeFileKind): String =
-        appContext.assets.open("$ASSET_DIR/${kind.fileName}").use { input ->
-            input.bufferedReader(StandardCharsets.UTF_8).readText()
-        }
+        RuntimeFileOps.readAssetText(
+            context = appContext,
+            assetPath = "${RuntimeStorageLayout.ASSET_DIR}/${kind.fileName}",
+        )
 
     private fun resolveRuntimePath(value: String): File {
         val raw = File(value)
@@ -308,71 +292,6 @@ class RuntimeStorage(context: Context) {
         return encoded
             .replace("\\\"", "\"")
             .replace("\\\\", "\\")
-    }
-
-    private fun atomicWrite(target: File, content: String, backup: File?) {
-        val parent = target.parentFile ?: error("Runtime target has no parent: ${target.absolutePath}")
-        parent.mkdirsOrThrow()
-
-        val temp = tempFileFor(target)
-        try {
-            FileOutputStream(temp).use { output ->
-                output.write(content.toByteArray(StandardCharsets.UTF_8))
-                output.fd.sync()
-            }
-
-            if (target.isFile && backup != null) {
-                copyFileAtomic(source = target, target = backup)
-            }
-
-            renameReplacing(source = temp, target = target)
-            fsyncDirectory(parent)
-        } finally {
-            if (temp.exists()) {
-                temp.delete()
-            }
-        }
-    }
-
-    private fun copyFileAtomic(source: File, target: File) {
-        val parent = target.parentFile ?: error("Runtime target has no parent: ${target.absolutePath}")
-        parent.mkdirsOrThrow()
-
-        val temp = tempFileFor(target)
-        try {
-            FileInputStream(source).use { input ->
-                FileOutputStream(temp).use { output ->
-                    input.copyTo(output)
-                    output.fd.sync()
-                }
-            }
-            renameReplacing(source = temp, target = target)
-            fsyncDirectory(parent)
-        } finally {
-            if (temp.exists()) {
-                temp.delete()
-            }
-        }
-    }
-
-    private fun renameReplacing(source: File, target: File) {
-        Os.rename(source.absolutePath, target.absolutePath)
-    }
-
-    private fun fsyncDirectory(directory: File) {
-        runCatching {
-            val fd = Os.open(directory.absolutePath, OsConstants.O_RDONLY, 0)
-            try {
-                Os.fsync(fd)
-            } finally {
-                Os.close(fd)
-            }
-        }
-    }
-
-    private fun tempFileFor(target: File): File {
-        val parent = target.parentFile ?: error("Runtime target has no parent: ${target.absolutePath}")
-        return File(parent, ".${target.name}.${System.nanoTime()}.tmp")
     }
 
     private fun recentLogFiles(logsDir: File): List<File> =
@@ -415,17 +334,7 @@ class RuntimeStorage(context: Context) {
     private fun String.sanitizeFileName(): String =
         replace(Regex("""[^A-Za-z0-9_.-]"""), "_").ifBlank { "session" }
 
-    private fun File.mkdirsOrThrow() {
-        if (!isDirectory && !mkdirs()) {
-            error("Failed to create directory: $absolutePath")
-        }
-    }
-
     private companion object {
-        private const val RUNTIME_DIR_NAME = "zerodpi"
-        private const val LOGS_DIR_NAME = "logs"
-        private const val SCAN_RESULTS_DIR_NAME = "scan_results"
-        private const val ASSET_DIR = "zerodpi"
         private const val MAX_RETAINED_LOG_FILES = 8
         private const val MAX_LOG_FILES_IN_BUNDLE = 4
     }

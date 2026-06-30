@@ -23,6 +23,7 @@ import dev.zerodpi.android.profile.ProfileRepository
 import dev.zerodpi.android.profile.ProfileUpdateManager
 import dev.zerodpi.android.profile.ProfileUpdateMode
 import dev.zerodpi.android.profile.ProfileUpdateResult
+import dev.zerodpi.android.profile.ProfileUpdater
 import dev.zerodpi.android.profile.ProfileValidationResult
 import dev.zerodpi.android.profile.ZeroDpiProfile
 import dev.zerodpi.android.service.RuntimeStatus
@@ -148,11 +149,21 @@ data class DiagnosticsUiState(
 
 class MainViewModel(
     application: Application,
+    private val profileRepository: ProfileRepository = ProfileRepository(application.applicationContext),
+    private val runtimeStorage: RuntimeStorage = RuntimeStorage(application.applicationContext),
+    private val profileUpdateManager: ProfileUpdater = ProfileUpdateManager(profileRepository),
+    private val autoUpdateReconciler: suspend (Context, ProfileIndex) -> Unit = { context, index ->
+        ProfileAutoUpdateScheduler.reconcile(context, index)
+    },
+    private val bindServiceOnInit: Boolean = true,
 ) : AndroidViewModel(application) {
+    constructor(application: Application) : this(
+        application = application,
+        profileRepository = ProfileRepository(application.applicationContext),
+        runtimeStorage = RuntimeStorage(application.applicationContext),
+    )
+
     private val appContext = application.applicationContext
-    private val profileRepository = ProfileRepository(appContext)
-    private val runtimeStorage = RuntimeStorage(appContext)
-    private val profileUpdateManager = ProfileUpdateManager(profileRepository)
     private val diagnosticsProvider = AndroidDiagnosticsProvider(appContext)
     private val _uiState = MutableStateFlow(ZeroDpiServiceState())
     val uiState: StateFlow<ZeroDpiServiceState> = _uiState.asStateFlow()
@@ -201,7 +212,9 @@ class MainViewModel(
     }
 
     init {
-        bindService()
+        if (bindServiceOnInit) {
+            bindService()
+        }
         loadRuntimeFiles()
     }
 
@@ -1036,7 +1049,7 @@ class MainViewModel(
     private fun reconcileAutoUpdateWork(index: ProfileIndex) {
         viewModelScope.launch {
             runCatching {
-                ProfileAutoUpdateScheduler.reconcile(appContext, index)
+                autoUpdateReconciler(appContext, index)
             }.onFailure { error ->
                 _profileState.update {
                     it.copy(

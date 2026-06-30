@@ -87,6 +87,38 @@ class ZeroDpiServiceInstrumentedTest {
         service.waitForState { it.status == RuntimeStatus.Stopped && it.lastExitCode == 0 }
     }
 
+    @Test
+    fun selectedProfileConfigControlsWhetherRootIsRequested() {
+        configureRootlessRunningMode()
+        configureRootRequiredWorkProfile()
+        val service = bindZeroDpiService()
+
+        service.startZeroDpi(profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID)
+
+        val rootlessRunning = service.waitForState {
+            it.status == RuntimeStatus.Running && it.listener == "127.0.0.1:44444"
+        }
+        assertEquals(RootStatus.NotNeeded, rootlessRunning.rootStatus)
+
+        service.stopZeroDpi()
+        service.waitForState { it.status == RuntimeStatus.Stopped && it.lastExitCode == 0 }
+
+        service.startZeroDpi(profileId = WORK_PROFILE_ID)
+
+        val rootRequiredResult = service.waitForState(timeoutMs = 20_000) {
+            (it.status == RuntimeStatus.Failed && it.rootStatus != RootStatus.NotNeeded) ||
+                (it.status == RuntimeStatus.Running && it.rootStatus == RootStatus.Granted)
+        }
+        assertTrue(rootRequiredResult.rootStatus != RootStatus.NotNeeded)
+        assertEquals("sni_spoof", rootRequiredResult.mode)
+        assertEquals("wrong_seq", rootRequiredResult.bypassMethod)
+
+        if (rootRequiredResult.status == RuntimeStatus.Running) {
+            service.stopZeroDpi()
+            service.waitForState { it.status == RuntimeStatus.Stopped && it.lastExitCode == 0 }
+        }
+    }
+
     private fun configureRootlessRunningMode() = runBlocking {
         val storage = RuntimeStorage(context)
         val rootlessConfig = storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText
@@ -110,6 +142,22 @@ class ZeroDpiServiceInstrumentedTest {
             .replaceField("BYPASS_METHOD", "tls_frag")
             .replaceField("LISTEN_PORT", "45555")
         storage.save(WORK_PROFILE_ID, RuntimeFileKind.Config, rootlessConfig)
+    }
+
+    private fun configureRootRequiredWorkProfile() = runBlocking {
+        val repository = ProfileRepository(
+            context = context,
+            idGenerator = { WORK_PROFILE_ID },
+        )
+        repository.loadIndex()
+        repository.createProfile("Work")
+
+        val storage = RuntimeStorage(context)
+        val rootRequiredConfig = storage.readAll(WORK_PROFILE_ID).configText
+            .replaceField("MODE", "sni_spoof")
+            .replaceField("BYPASS_METHOD", "wrong_seq")
+            .replaceField("LISTEN_PORT", "45666")
+        storage.save(WORK_PROFILE_ID, RuntimeFileKind.Config, rootRequiredConfig)
     }
 
     private fun bindZeroDpiService(): ZeroDpiService {

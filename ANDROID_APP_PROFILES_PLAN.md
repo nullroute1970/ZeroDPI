@@ -261,45 +261,45 @@ Acceptance criteria:
 - [x] Dirty local edits are not lost without an explicit user action, except when
   the user explicitly runs a remote update.
 
-## Phase 5: Build Profile UI
+## Phase 5: Build Profile UI (Completed)
 
 Steps:
 
-- Add an active profile selector near the top of the dashboard/top bar:
-  - show current profile name,
-  - open profile menu,
-  - switch profiles in one or two taps.
-- Add a profile management panel on the Settings page:
-  - create,
-  - duplicate,
-  - rename,
-  - delete,
-  - show profile storage status.
-- Add a remote update panel per active profile:
-  - `config.toml` URL input,
-  - `sni_list.txt` URL input,
-  - `ip_list.txt` URL input,
-  - auto update toggle,
-  - interval selector,
-  - "Update now" action,
-  - last attempt,
-  - last success,
-  - last error.
-- Keep existing config settings and list editors below the active profile
+- [x] Add an active profile selector near the top of the dashboard/top bar:
+  - [x] show current profile name,
+  - [x] open profile menu,
+  - [x] switch profiles in one or two taps.
+- [x] Add a profile management panel on the Settings page:
+  - [x] create,
+  - [x] duplicate,
+  - [x] rename,
+  - [x] delete,
+  - [x] show profile storage status.
+- [x] Add a remote update panel per active profile:
+  - [x] `config.toml` URL input,
+  - [x] `sni_list.txt` URL input,
+  - [x] `ip_list.txt` URL input,
+  - [x] auto update toggle,
+  - [x] interval selector,
+  - [x] "Update now" action,
+  - [x] last attempt,
+  - [x] last success,
+  - [x] last error.
+- [x] Keep existing config settings and list editors below the active profile
   controls. They should continue editing local files for the active profile.
-- Show clear overwrite copy before manual update:
-  - remote update replaces local `config.toml`, `sni_list.txt`, and
+- [x] Show clear overwrite copy before manual update:
+  - [x] remote update replaces local `config.toml`, `sni_list.txt`, and
     `ip_list.txt` for this profile.
-- Show a smaller persistent warning when auto update is enabled and local files
+- [x] Show a smaller persistent warning when auto update is enabled and local files
   are dirty:
-  - local edits can be overwritten by the next successful auto update.
+  - [x] local edits can be overwritten by the next successful auto update.
 
 Acceptance criteria:
 
-- Users can create and switch profiles without visiting file import/export.
-- Users can edit all three files per profile.
-- Users can configure three separate remote URLs per profile.
-- Users understand that remote update overwrites local profile files.
+- [x] Users can create and switch profiles without visiting file import/export.
+- [x] Users can edit all three files per profile.
+- [x] Users can configure three separate remote URLs per profile.
+- [x] Users understand that remote update overwrites local profile files.
 
 ## Phase 6: Implement Remote Download Client
 

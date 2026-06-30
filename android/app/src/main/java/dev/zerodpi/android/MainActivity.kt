@@ -61,15 +61,31 @@ class MainActivity : ComponentActivity() {
         setContent {
             val state by viewModel.uiState.collectAsState()
             val runtimeFilesState by viewModel.runtimeFilesState.collectAsState()
+            val profileState by viewModel.profileState.collectAsState()
             val diagnosticsState by viewModel.diagnosticsState.collectAsState()
             ZeroDpiTheme {
                 DashboardScreen(
                     state = state,
                     runtimeFilesState = runtimeFilesState,
+                    profileState = profileState,
                     diagnosticsState = diagnosticsState,
                     onStart = viewModel::start,
                     onStop = viewModel::stop,
                     onForceStop = viewModel::forceStop,
+                    onCreateProfile = viewModel::createProfileFromDefaults,
+                    onDuplicateActiveProfile = viewModel::duplicateActiveProfile,
+                    onRenameProfile = viewModel::renameProfile,
+                    onDeleteProfile = viewModel::deleteProfile,
+                    onSelectProfile = viewModel::selectProfile,
+                    onSaveAndSelectProfile = viewModel::saveAndSelectProfile,
+                    onDiscardAndSelectProfile = viewModel::discardAndSelectProfile,
+                    onCancelProfileSwitch = viewModel::cancelProfileSwitch,
+                    onProfileRemoteConfigUrlChanged = viewModel::updateActiveProfileRemoteConfigUrl,
+                    onProfileRemoteSniListUrlChanged = viewModel::updateActiveProfileRemoteSniListUrl,
+                    onProfileRemoteIpListUrlChanged = viewModel::updateActiveProfileRemoteIpListUrl,
+                    onProfileAutoUpdateChanged = viewModel::toggleActiveProfileAutoUpdate,
+                    onProfileAutoUpdateIntervalChanged = viewModel::updateActiveProfileAutoUpdateIntervalHours,
+                    onRunManualProfileUpdate = viewModel::updateActiveProfileFromRemote,
                     onRuntimeFileSelected = viewModel::selectRuntimeFile,
                     onRuntimeFileTextChanged = viewModel::updateRuntimeFileText,
                     onConfigFieldChanged = viewModel::updateConfigField,

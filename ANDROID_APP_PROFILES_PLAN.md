@@ -301,40 +301,40 @@ Acceptance criteria:
 - [x] Users can configure three separate remote URLs per profile.
 - [x] Users understand that remote update overwrites local profile files.
 
-## Phase 6: Implement Remote Download Client
+## Phase 6: Implement Remote Download Client (Completed)
 
 Steps:
 
-- Add `ProfileRemoteClient` with a small interface so tests can use fakes.
-- Use `HttpURLConnection` first unless another HTTP client is already added for
+- [x] Add `ProfileRemoteClient` with a small interface so tests can use fakes.
+- [x] Use `HttpURLConnection` first unless another HTTP client is already added for
   a separate reason.
-- Configure network behavior:
-  - run only on `Dispatchers.IO`,
-  - connect/read timeouts,
-  - follow redirects only for `http` to `http` or `https` to `https` unless
+- [x] Configure network behavior:
+  - [x] run only on `Dispatchers.IO`,
+  - [x] connect/read timeouts,
+  - [x] follow redirects only for `http` to `http` or `https` to `https` unless
     explicitly allowed later,
-  - reject unsupported schemes,
-  - reject empty responses for required files,
-  - enforce max download sizes.
-- Recommended size limits:
-  - `config.toml`: 512 KiB,
-  - `sni_list.txt`: 5 MiB,
-  - `ip_list.txt`: 5 MiB.
-- Return a structured result per file:
-  - status code,
-  - final URL,
-  - content text,
-  - response headers,
-  - error message.
-- Optionally store `ETag` and `Last-Modified` per URL later. Do not make this
+  - [x] reject unsupported schemes,
+  - [x] reject empty responses for required files,
+  - [x] enforce max download sizes.
+- [x] Recommended size limits:
+  - [x] `config.toml`: 512 KiB,
+  - [x] `sni_list.txt`: 5 MiB,
+  - [x] `ip_list.txt`: 5 MiB.
+- [x] Return a structured result per file:
+  - [x] status code,
+  - [x] final URL,
+  - [x] content text,
+  - [x] response headers,
+  - [x] error message.
+- [x] Optionally store `ETag` and `Last-Modified` per URL later. Do not make this
   required for the first implementation.
 
 Acceptance criteria:
 
-- Remote downloads happen off the main thread.
-- Failed downloads produce actionable errors.
-- Very large responses cannot exhaust app memory.
-- Tests can exercise update behavior without real network access.
+- [x] Remote downloads happen off the main thread.
+- [x] Failed downloads produce actionable errors.
+- [x] Very large responses cannot exhaust app memory.
+- [x] Tests can exercise update behavior without real network access.
 
 ## Phase 7: Apply Remote Updates All-Or-Nothing
 

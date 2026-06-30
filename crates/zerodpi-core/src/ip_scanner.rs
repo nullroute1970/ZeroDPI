@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::ser::SerializeStruct;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, trace};
@@ -549,60 +549,6 @@ fn make_tls_connector() -> tokio_rustls::TlsConnector {
     tokio_rustls::TlsConnector::from(Arc::new(tls_config))
 }
 
-async fn measure_upload<S>(
-    stream: &mut S,
-    host: &str,
-    upload_path: &str,
-    upload_bytes: usize,
-    timeout: Duration,
-) -> Option<f64>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let req = format!(
-        "POST {upload_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: zerodpi-scanner/0.1\r\nContent-Type: application/octet-stream\r\nContent-Length: {upload_bytes}\r\n\r\n"
-    );
-
-    if !matches!(
-        tokio::time::timeout(timeout, stream.write_all(req.as_bytes())).await,
-        Ok(Ok(()))
-    ) {
-        return None;
-    }
-
-    let result = tokio::time::timeout(timeout, async {
-        let chunk = vec![0u8; upload_bytes.min(16 * 1024)];
-        let start = Instant::now();
-        let mut remaining = upload_bytes;
-        while remaining > 0 {
-            let n = remaining.min(chunk.len());
-            stream.write_all(&chunk[..n]).await?;
-            remaining -= n;
-        }
-        stream.flush().await?;
-        Ok::<Duration, std::io::Error>(start.elapsed())
-    })
-    .await;
-
-    let elapsed = match result {
-        Ok(Ok(elapsed)) => elapsed.as_secs_f64(),
-        _ => return None,
-    };
-
-    let mut response = [0u8; 1024];
-    if let Ok(Ok(n)) = tokio::time::timeout(timeout, stream.read(&mut response)).await {
-        if let Ok(text) = std::str::from_utf8(&response[..n]) {
-            let _ = parse_http_status(text);
-        }
-    }
-
-    if elapsed > 0.0 {
-        Some(upload_bytes as f64 / elapsed)
-    } else {
-        None
-    }
-}
-
 async fn probe_ip_upload(
     ip: IpAddr,
     sni: &str,
@@ -621,7 +567,7 @@ async fn probe_ip_upload(
         .ok()?
         .ok()?;
 
-    measure_upload(
+    crate::scanner_http::measure_upload(
         &mut stream,
         sni,
         &config.SCAN_UPLOAD_PATH,

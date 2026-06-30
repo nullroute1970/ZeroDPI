@@ -19,5 +19,6 @@ pub mod methods;
 pub mod net;
 pub mod proxy;
 pub mod proxy_tester;
+mod scanner_http;
 pub mod sni_scanner;
 pub mod tls_template;

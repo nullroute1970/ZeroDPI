@@ -502,30 +502,30 @@ Acceptance criteria:
 - [x] Existing Android tests still pass.
 - [x] New tests cover migration, overwrite semantics, and profile isolation.
 
-## Phase 12: Documentation
+## Phase 12: Documentation (Completed)
 
 Update Android documentation with:
 
-- what profiles are,
-- how to create, duplicate, rename, delete, and switch profiles,
-- how local edits work,
-- how remote overwrite works,
-- how to configure the three remote URLs,
-- how manual update differs from auto update,
-- why updates may be deferred while ZeroDPI is running,
-- warning that URL query strings can contain secrets.
+- [x] what profiles are,
+- [x] how to create, duplicate, rename, delete, and switch profiles,
+- [x] how local edits work,
+- [x] how remote overwrite works,
+- [x] how to configure the three remote URLs,
+- [x] how manual update differs from auto update,
+- [x] why updates may be deferred while ZeroDPI is running,
+- [x] warning that URL query strings can contain secrets.
 
 Update support/troubleshooting docs with:
 
-- how to inspect last remote update status,
-- common HTTP failures,
-- invalid remote config/list failures,
-- how to recover by disabling auto update or resetting a profile to defaults.
+- [x] how to inspect last remote update status,
+- [x] common HTTP failures,
+- [x] invalid remote config/list failures,
+- [x] how to recover by disabling auto update or resetting a profile to defaults.
 
 Acceptance criteria:
 
-- Users can understand the overwrite behavior before enabling remote update.
-- Troubleshooting docs explain why an update did not apply.
+- [x] Users can understand the overwrite behavior before enabling remote update.
+- [x] Troubleshooting docs explain why an update did not apply.
 
 ## Suggested Implementation Order
 

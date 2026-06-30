@@ -79,3 +79,106 @@ adb shell am start -n dev.zerodpi.android/.MainActivity
 After pressing Start, the session log should show `Loaded ... config` and
 `Listening on ...`. It should not show `Using fake ZeroDPI runner` when the APK
 was built through `build.py` with native runtime artifacts.
+
+## Profiles
+
+The Android app keeps runtime files in app-private profiles. Each profile has
+its own editable `config.toml`, `sni_list.txt`, `ip_list.txt`, remote update
+settings, and last update status. Starting ZeroDPI uses only the active profile.
+Relative config paths such as `SNI_LIST = "sni_list.txt"` resolve inside the
+active profile directory.
+
+Fresh installs create one `Default` profile. Upgrades migrate the previous
+single app-private runtime file set into `Default`.
+
+On the Home page, the `Active profile` panel shows the current profile. Tap
+`Switch` to select another profile. If the current profile has unsaved edits,
+choose `Save`, `Discard`, or `Cancel` before the app switches.
+
+Tap `Manage profiles` or open Settings to use the `Profiles` panel:
+
+- `Create` adds a profile from the packaged default files.
+- `Duplicate` copies the active profile's files and remote settings.
+- `Rename` changes the active profile name.
+- `Delete` removes the active profile's local config and list files. The last
+  profile cannot be deleted.
+
+Stop ZeroDPI before switching, deleting, or remotely updating profiles. The app
+disables those actions while ZeroDPI is starting, scanning, running, or
+stopping so the running process keeps using a stable file set.
+
+## Local Edits
+
+The Settings config fields and Home runtime list editors always edit the active
+profile. `Save` writes only that profile's file. `Reset to defaults` replaces
+only the selected file in the active profile. Import, export, share, and test
+scan actions also use the active profile.
+
+Local edits remain local until you save, discard, reset, delete the profile, or
+apply a successful remote update. Switching profiles reloads text from the new
+active profile, so edits in profile A do not mutate profile B.
+
+## Remote Profile Updates
+
+Each profile can fetch a complete replacement file set from remote URLs. Open
+Settings and use the `Remote update` panel:
+
+- `config.toml URL` points to the replacement config.
+- `sni_list.txt URL` points to the replacement SNI list.
+- `ip_list.txt URL` points to the replacement IP list.
+- `Automatic update` enables background updates for this profile.
+- `Automatic update interval hours` controls how often this profile becomes due
+  for automatic update. The scheduler enforces a minimum interval of 1 hour.
+- `Update now` runs a manual update.
+
+All three URLs are required before a manual or automatic update can run. URLs
+must be absolute `http://` or `https://` URLs. Prefer HTTPS. HTTP is accepted
+but shown with a warning because it is not encrypted.
+
+Remote update is all-or-nothing. The app downloads all three files, validates
+`config.toml`, validates both lists, and then atomically replaces the profile's
+local files. If any download, validation, or apply step fails, the previous
+local files remain in place.
+
+Manual update is user-triggered with `Update now`. If the active profile has
+unsaved edits, the confirmation dialog warns that those edits will be
+discarded. After a successful manual update, the editor reloads the remote
+contents and you can edit locally again.
+
+Automatic update is background WorkManager work. It uses the same validation
+and all-or-nothing apply path as manual update, requires network connectivity,
+and is deferred when Android reports low battery. If ZeroDPI is running when an
+automatic update is due, the app records a skipped update instead of changing
+files underneath the active runtime.
+
+Remote updates overwrite local files after each successful update. A local edit
+made after an update remains until the next successful manual or automatic
+remote update for that profile.
+
+Remote URLs can contain credentials or access tokens in query strings. Treat
+the full URL as secret. Support bundles redact URL query strings, but
+screenshots and copied profile metadata may not.
+
+## Profile Update Troubleshooting
+
+The `Remote update` panel shows `Last attempt`, `Last success`, `Last update`,
+and the latest status message for the active profile. For support, use
+Diagnostics -> `Export bundle`; the bundle includes profile id/name, sanitized
+remote URLs, auto update settings, and last remote update status.
+
+Common failures:
+
+| Message or Symptom | What to Check |
+|--------------------|---------------|
+| `Configure all three valid URLs before updating.` | Fill `config.toml URL`, `sni_list.txt URL`, and `ip_list.txt URL`. A partial URL set is rejected. |
+| `Remote URL must be an absolute http or https URL.` | Use a full URL with scheme and host, for example `https://example.com/zerodpi/config.toml`. |
+| `HTTP <status> while downloading ...` | Check the remote server, path, authentication token, and whether the URL requires redirects or cookies. |
+| Redirect errors | The app rejects missing redirect locations, unsupported redirect schemes, too many redirects, and redirects that change between HTTP and HTTPS. Use the final direct file URL when possible. |
+| Empty or too-large response | The remote file must be non-empty. `config.toml` is limited to 512 KiB; each list is limited to 5 MiB. |
+| `config.toml validation failed ...` | Fix the remote config. It must parse and pass the Android config validator before any profile file is overwritten. |
+| `sni_list.txt validation failed ...` or `ip_list.txt validation failed ...` | Fix the remote list syntax. SNI lists use one hostname per line; IP lists use IP addresses or CIDR ranges. |
+| Automatic update skipped because ZeroDPI is running | Stop ZeroDPI and run `Update now`, or wait for the next automatic interval after the runtime stops. |
+
+To recover from a bad remote source, disable `Automatic update`, fix or clear
+the URL fields, then edit the active profile locally or use `Reset to defaults`
+on the affected config/list file.

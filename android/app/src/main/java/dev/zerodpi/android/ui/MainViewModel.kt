@@ -16,6 +16,7 @@ import dev.zerodpi.android.diagnostics.DeviceDiagnostics
 import dev.zerodpi.android.list.RuntimeListIssue
 import dev.zerodpi.android.list.RuntimeListValidation
 import dev.zerodpi.android.list.RuntimeListValidator
+import dev.zerodpi.android.profile.ProfileAutoUpdateScheduler
 import dev.zerodpi.android.profile.ProfileIndex
 import dev.zerodpi.android.profile.ProfileRemoteSettings
 import dev.zerodpi.android.profile.ProfileRepository
@@ -288,6 +289,37 @@ class MainViewModel(
     fun refreshDiagnostics() {
         viewModelScope.launch {
             refreshDiagnosticsSnapshot()
+        }
+    }
+
+    fun refreshProfilesFromDiskOnForeground() {
+        viewModelScope.launch {
+            val profileSnapshot = _profileState.value
+            val runtimeSnapshot = _runtimeFilesState.value
+            if (
+                profileSnapshot.isProfileLoading ||
+                profileSnapshot.isRemoteUpdating ||
+                runtimeSnapshot.isLoading
+            ) {
+                return@launch
+            }
+
+            val index = runCatching {
+                profileRepository.loadIndex()
+            }.getOrElse { error ->
+                reportProfileError(error, "Failed to refresh profile status.")
+                return@launch
+            }
+            reconcileAutoUpdateWork(index)
+
+            if (runtimeSnapshot.dirtyFiles.isEmpty() && !profileSnapshot.hasUnsavedProfileRemoteSettings) {
+                loadActiveRuntimeFiles(
+                    profileIndex = index,
+                    statusMessage = "Runtime files refreshed.",
+                )
+            } else if (!profileSnapshot.hasUnsavedProfileRemoteSettings) {
+                applyProfileIndex(index, statusMessage = "Profile status refreshed.")
+            }
         }
     }
 
@@ -893,6 +925,7 @@ class MainViewModel(
                     statusMessage = statusMessage,
                 )
                 refreshDiagnostics()
+                reconcileAutoUpdateWork(index)
                 true
             },
             onFailure = { error ->
@@ -973,6 +1006,7 @@ class MainViewModel(
                 errorMessage = null,
             )
         }
+        reconcileAutoUpdateWork(index)
     }
 
     private fun applyRemoteUpdateFailure(result: ProfileUpdateResult) {
@@ -993,6 +1027,22 @@ class MainViewModel(
         )
         _runtimeFilesState.update {
             it.copy(statusMessage = null, errorMessage = result.message)
+        }
+        reconcileAutoUpdateWork(result.index)
+    }
+
+    private fun reconcileAutoUpdateWork(index: ProfileIndex) {
+        viewModelScope.launch {
+            runCatching {
+                ProfileAutoUpdateScheduler.reconcile(appContext, index)
+            }.onFailure { error ->
+                _profileState.update {
+                    it.copy(
+                        statusMessage = null,
+                        lastProfileError = error.message ?: "Failed to schedule automatic updates.",
+                    )
+                }
+            }
         }
     }
 

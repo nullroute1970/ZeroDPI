@@ -87,6 +87,7 @@ class ZeroDpiService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        ZeroDpiRuntimeStateStore.markRuntimeInactive(this)
         runtimeStorage = RuntimeStorage(this)
         rootManager = SuRootManager()
         runner = createRunner()
@@ -117,6 +118,7 @@ class ZeroDpiService : Service() {
                 logScope.coroutineContext[Job]?.children?.toList()?.joinAll()
             }
         }
+        ZeroDpiRuntimeStateStore.markRuntimeInactive(this)
         logScope.cancel()
         scope.cancel()
         super.onDestroy()
@@ -128,6 +130,7 @@ class ZeroDpiService : Service() {
         profileId: String = ZeroDpiProfile.DEFAULT_PROFILE_ID,
         modeOverride: String? = null,
     ) {
+        ZeroDpiRuntimeStateStore.markRuntimeActive(this)
         ensureForeground()
         scope.launch {
             if (state.value.status in activeStatuses) {
@@ -242,6 +245,7 @@ class ZeroDpiService : Service() {
     }
 
     fun stopZeroDpi() {
+        ZeroDpiRuntimeStateStore.markRuntimeActive(this)
         state.update { it.copy(status = RuntimeStatus.Stopping, forceStopAvailable = false) }
         scope.launch {
             runner.stop()
@@ -249,6 +253,7 @@ class ZeroDpiService : Service() {
     }
 
     fun forceStopZeroDpi() {
+        ZeroDpiRuntimeStateStore.markRuntimeActive(this)
         state.update { it.copy(status = RuntimeStatus.Stopping, forceStopAvailable = false) }
         scope.launch {
             runner.forceStop()
@@ -519,6 +524,7 @@ class ZeroDpiService : Service() {
     }
 
     private fun finishForegroundRun() {
+        ZeroDpiRuntimeStateStore.markRuntimeInactive(this)
         stopForegroundCompat()
         stopSelf()
     }

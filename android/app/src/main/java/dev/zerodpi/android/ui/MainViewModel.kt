@@ -16,6 +16,8 @@ import dev.zerodpi.android.diagnostics.DeviceDiagnostics
 import dev.zerodpi.android.list.RuntimeListIssue
 import dev.zerodpi.android.list.RuntimeListValidation
 import dev.zerodpi.android.list.RuntimeListValidator
+import dev.zerodpi.android.profile.ProfileRepository
+import dev.zerodpi.android.profile.ZeroDpiProfile
 import dev.zerodpi.android.service.RuntimeStatus
 import dev.zerodpi.android.service.ZeroDpiService
 import dev.zerodpi.android.service.ZeroDpiServiceState
@@ -31,6 +33,8 @@ import java.io.OutputStream
 
 data class RuntimeFilesUiState(
     val selectedFile: RuntimeFileKind = RuntimeFileKind.Config,
+    val activeProfileId: String = ZeroDpiProfile.DEFAULT_PROFILE_ID,
+    val activeProfileName: String = ZeroDpiProfile.DEFAULT_PROFILE_NAME,
     val runtimeDir: String = "",
     val configText: String = "",
     val sniListText: String = "",
@@ -116,6 +120,7 @@ class MainViewModel(
     application: Application,
 ) : AndroidViewModel(application) {
     private val appContext = application.applicationContext
+    private val profileRepository = ProfileRepository(appContext)
     private val runtimeStorage = RuntimeStorage(appContext)
     private val diagnosticsProvider = AndroidDiagnosticsProvider(appContext)
     private val _uiState = MutableStateFlow(ZeroDpiServiceState())
@@ -129,6 +134,7 @@ class MainViewModel(
     private var serviceStateJob: Job? = null
     private var isBound = false
     private var startWhenConnected = false
+    private var startWhenConnectedProfileId: String? = null
     private var startWhenConnectedModeOverride: String? = null
 
     private val connection = object : ServiceConnection {
@@ -143,9 +149,11 @@ class MainViewModel(
             }
             if (startWhenConnected) {
                 startWhenConnected = false
+                val profileId = startWhenConnectedProfileId ?: ZeroDpiProfile.DEFAULT_PROFILE_ID
                 val modeOverride = startWhenConnectedModeOverride
+                startWhenConnectedProfileId = null
                 startWhenConnectedModeOverride = null
-                service?.startZeroDpi(modeOverride)
+                service?.startZeroDpi(profileId = profileId, modeOverride = modeOverride)
             }
         }
 
@@ -256,6 +264,7 @@ class MainViewModel(
             configText = _runtimeFilesState.value.configText,
         )
         runtimeStorage.exportSupportBundle(
+            profileId = _runtimeFilesState.value.activeProfileId,
             output = output,
             diagnostics = diagnostics,
             includePrivateLists = includePrivateLists,
@@ -422,7 +431,10 @@ class MainViewModel(
                 it.copy(isSaving = true, statusMessage = null, errorMessage = null)
             }
             runCatching {
-                runtimeStorage.resetToDefaults(kind)
+                runtimeStorage.resetToDefaults(
+                    profileId = _runtimeFilesState.value.activeProfileId,
+                    kind = kind,
+                )
             }.onSuccess { defaultText ->
                 _runtimeFilesState.update { current ->
                     current
@@ -446,15 +458,18 @@ class MainViewModel(
     }
 
     private fun startService(modeOverride: String? = null) {
+        val profileId = _runtimeFilesState.value.activeProfileId
         val intent = Intent(appContext, ZeroDpiService::class.java)
         startWhenConnected = true
+        startWhenConnectedProfileId = profileId
         startWhenConnectedModeOverride = modeOverride
         ContextCompat.startForegroundService(appContext, intent)
         bindService()
         service?.let {
             startWhenConnected = false
+            startWhenConnectedProfileId = null
             startWhenConnectedModeOverride = null
-            it.startZeroDpi(modeOverride)
+            it.startZeroDpi(profileId = profileId, modeOverride = modeOverride)
         }
     }
 
@@ -472,9 +487,14 @@ class MainViewModel(
                 it.copy(isLoading = true, errorMessage = null)
             }
             runCatching {
-                runtimeStorage.readAll()
-            }.onSuccess { contents ->
+                val index = profileRepository.loadIndex()
+                val activeProfile = index.profiles.first { it.id == index.activeProfileId }
+                val contents = runtimeStorage.readAll(activeProfile.id)
+                activeProfile to contents
+            }.onSuccess { (activeProfile, contents) ->
                 _runtimeFilesState.value = RuntimeFilesUiState(
+                    activeProfileId = activeProfile.id,
+                    activeProfileName = activeProfile.name,
                     runtimeDir = contents.files.runtimeDir.absolutePath,
                     configText = contents.configText,
                     sniListText = contents.sniListText,
@@ -536,7 +556,11 @@ class MainViewModel(
 
         return runCatching {
             filesToSave.forEach { kind ->
-                runtimeStorage.save(kind, snapshot.textFor(kind))
+                runtimeStorage.save(
+                    profileId = snapshot.activeProfileId,
+                    kind = kind,
+                    content = snapshot.textFor(kind),
+                )
             }
         }.fold(
             onSuccess = {

@@ -16,7 +16,10 @@ import dev.zerodpi.android.diagnostics.DeviceDiagnostics
 import dev.zerodpi.android.list.RuntimeListIssue
 import dev.zerodpi.android.list.RuntimeListValidation
 import dev.zerodpi.android.list.RuntimeListValidator
+import dev.zerodpi.android.profile.ProfileIndex
+import dev.zerodpi.android.profile.ProfileRemoteSettings
 import dev.zerodpi.android.profile.ProfileRepository
+import dev.zerodpi.android.profile.ProfileValidationResult
 import dev.zerodpi.android.profile.ZeroDpiProfile
 import dev.zerodpi.android.service.RuntimeStatus
 import dev.zerodpi.android.service.ZeroDpiService
@@ -109,6 +112,28 @@ data class RuntimeFilesUiState(
     }
 }
 
+data class ProfileUiState(
+    val profiles: List<ZeroDpiProfile> = listOf(ZeroDpiProfile.default()),
+    val activeProfileId: String = ZeroDpiProfile.DEFAULT_PROFILE_ID,
+    val activeProfileName: String = ZeroDpiProfile.DEFAULT_PROFILE_NAME,
+    val profileRemoteSettings: ProfileRemoteSettings = ProfileRemoteSettings(),
+    val hasUnsavedProfileRemoteSettings: Boolean = false,
+    val pendingSwitchProfileId: String? = null,
+    val isProfileLoading: Boolean = true,
+    val isProfileSwitching: Boolean = false,
+    val isRemoteUpdating: Boolean = false,
+    val statusMessage: String? = null,
+    val lastProfileError: String? = null,
+) {
+    val activeProfile: ZeroDpiProfile?
+        get() = profiles.firstOrNull { it.id == activeProfileId }
+
+    val pendingSwitchProfile: ZeroDpiProfile?
+        get() = pendingSwitchProfileId?.let { targetId ->
+            profiles.firstOrNull { it.id == targetId }
+        }
+}
+
 data class DiagnosticsUiState(
     val diagnostics: DeviceDiagnostics = DeviceDiagnostics.Empty,
     val isRefreshing: Boolean = false,
@@ -127,6 +152,8 @@ class MainViewModel(
     val uiState: StateFlow<ZeroDpiServiceState> = _uiState.asStateFlow()
     private val _runtimeFilesState = MutableStateFlow(RuntimeFilesUiState())
     val runtimeFilesState: StateFlow<RuntimeFilesUiState> = _runtimeFilesState.asStateFlow()
+    private val _profileState = MutableStateFlow(ProfileUiState())
+    val profileState: StateFlow<ProfileUiState> = _profileState.asStateFlow()
     private val _diagnosticsState = MutableStateFlow(DiagnosticsUiState())
     val diagnosticsState: StateFlow<DiagnosticsUiState> = _diagnosticsState.asStateFlow()
 
@@ -136,6 +163,7 @@ class MainViewModel(
     private var startWhenConnected = false
     private var startWhenConnectedProfileId: String? = null
     private var startWhenConnectedModeOverride: String? = null
+    private var remoteSettingsSaveJob: Job? = null
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -457,6 +485,264 @@ class MainViewModel(
         }
     }
 
+    fun createProfileFromDefaults(name: String) {
+        viewModelScope.launch {
+            if (!ensureRuntimeInactive("creating profiles")) {
+                return@launch
+            }
+            setProfileLoading()
+            runCatching {
+                profileRepository.createProfile(name.trim())
+            }.onSuccess { index ->
+                applyProfileIndex(index, statusMessage = "Created profile \"${name.trim()}\".")
+            }.onFailure { error ->
+                reportProfileError(error, "Failed to create profile.")
+            }
+        }
+    }
+
+    fun duplicateActiveProfile(name: String) {
+        viewModelScope.launch {
+            if (!ensureRuntimeInactive("duplicating profiles")) {
+                return@launch
+            }
+            setProfileLoading()
+            val sourceProfileId = _runtimeFilesState.value.activeProfileId
+            runCatching {
+                profileRepository.duplicateProfile(
+                    sourceProfileId = sourceProfileId,
+                    name = name.trim(),
+                )
+            }.onSuccess { index ->
+                applyProfileIndex(index, statusMessage = "Duplicated active profile.")
+            }.onFailure { error ->
+                reportProfileError(error, "Failed to duplicate active profile.")
+            }
+        }
+    }
+
+    fun renameProfile(profileId: String, name: String) {
+        viewModelScope.launch {
+            if (!ensureRuntimeInactive("renaming profiles")) {
+                return@launch
+            }
+            setProfileLoading()
+            runCatching {
+                profileRepository.renameProfile(profileId = profileId, name = name.trim())
+            }.onSuccess { index ->
+                applyProfileIndex(index, statusMessage = "Renamed profile.")
+            }.onFailure { error ->
+                reportProfileError(error, "Failed to rename profile.")
+            }
+        }
+    }
+
+    fun deleteProfile(profileId: String) {
+        viewModelScope.launch {
+            if (!ensureRuntimeInactive("deleting profiles")) {
+                return@launch
+            }
+            val snapshot = _runtimeFilesState.value
+            if (profileId == snapshot.activeProfileId && snapshot.dirtyFiles.isNotEmpty()) {
+                setProfileError("Save or discard unsaved edits before deleting the active profile.")
+                return@launch
+            }
+
+            setProfileLoading()
+            runCatching {
+                profileRepository.deleteProfile(profileId)
+            }.onSuccess { index ->
+                if (index.activeProfileId == snapshot.activeProfileId) {
+                    applyProfileIndex(index, statusMessage = "Deleted profile.")
+                } else {
+                    loadActiveRuntimeFiles(
+                        profileIndex = index,
+                        isSwitching = true,
+                        statusMessage = "Deleted profile and switched active profile.",
+                    )
+                }
+            }.onFailure { error ->
+                reportProfileError(error, "Failed to delete profile.")
+            }
+        }
+    }
+
+    fun selectProfile(profileId: String) {
+        viewModelScope.launch {
+            if (profileId == _runtimeFilesState.value.activeProfileId) {
+                _profileState.update {
+                    it.copy(
+                        pendingSwitchProfileId = null,
+                        statusMessage = "Profile already selected.",
+                        lastProfileError = null,
+                    )
+                }
+                return@launch
+            }
+            if (!ensureRuntimeInactive("switching profiles")) {
+                return@launch
+            }
+            if (_runtimeFilesState.value.dirtyFiles.isNotEmpty()) {
+                _profileState.update {
+                    it.copy(
+                        pendingSwitchProfileId = profileId,
+                        statusMessage = null,
+                        lastProfileError = "Save or discard unsaved edits before switching profiles.",
+                    )
+                }
+                return@launch
+            }
+
+            switchToProfile(profileId, statusMessage = "Switched profile.")
+        }
+    }
+
+    fun saveAndSelectProfile(profileId: String? = null) {
+        viewModelScope.launch {
+            val targetProfileId = profileId ?: _profileState.value.pendingSwitchProfileId
+            if (targetProfileId == null) {
+                setProfileError("No pending profile switch.")
+                return@launch
+            }
+            if (!ensureRuntimeInactive("switching profiles")) {
+                return@launch
+            }
+
+            val dirtyFiles = _runtimeFilesState.value.dirtyFiles
+            if (dirtyFiles.isNotEmpty() && !saveRuntimeFiles(dirtyFiles)) {
+                return@launch
+            }
+            switchToProfile(targetProfileId, statusMessage = "Saved edits and switched profile.")
+        }
+    }
+
+    fun discardAndSelectProfile(profileId: String? = null) {
+        viewModelScope.launch {
+            val targetProfileId = profileId ?: _profileState.value.pendingSwitchProfileId
+            if (targetProfileId == null) {
+                setProfileError("No pending profile switch.")
+                return@launch
+            }
+            if (!ensureRuntimeInactive("switching profiles")) {
+                return@launch
+            }
+
+            switchToProfile(targetProfileId, statusMessage = "Discarded edits and switched profile.")
+        }
+    }
+
+    fun cancelProfileSwitch() {
+        _profileState.update {
+            it.copy(
+                pendingSwitchProfileId = null,
+                isProfileSwitching = false,
+                statusMessage = "Profile switch canceled.",
+                lastProfileError = null,
+            )
+        }
+    }
+
+    fun updateActiveProfileRemoteConfigUrl(configUrl: String) {
+        updateActiveProfileRemoteSettings(
+            _profileState.value.profileRemoteSettings.copy(configUrl = configUrl),
+        )
+    }
+
+    fun updateActiveProfileRemoteSniListUrl(sniListUrl: String) {
+        updateActiveProfileRemoteSettings(
+            _profileState.value.profileRemoteSettings.copy(sniListUrl = sniListUrl),
+        )
+    }
+
+    fun updateActiveProfileRemoteIpListUrl(ipListUrl: String) {
+        updateActiveProfileRemoteSettings(
+            _profileState.value.profileRemoteSettings.copy(ipListUrl = ipListUrl),
+        )
+    }
+
+    fun toggleActiveProfileAutoUpdate(enabled: Boolean) {
+        updateActiveProfileRemoteSettings(
+            _profileState.value.profileRemoteSettings.copy(autoUpdateEnabled = enabled),
+        )
+    }
+
+    fun updateActiveProfileAutoUpdateIntervalHours(intervalHours: Int) {
+        updateActiveProfileRemoteSettings(
+            _profileState.value.profileRemoteSettings.copy(autoUpdateIntervalHours = intervalHours),
+        )
+    }
+
+    fun updateActiveProfileRemoteSettings(remote: ProfileRemoteSettings) {
+        val activeProfileId = _profileState.value.activeProfileId
+        val validation = remote.validate()
+        remoteSettingsSaveJob?.cancel()
+        _profileState.update {
+            it.copy(
+                profileRemoteSettings = remote,
+                hasUnsavedProfileRemoteSettings = true,
+                statusMessage = if (validation.isValid) {
+                    "Saving profile remote settings."
+                } else {
+                    null
+                },
+                lastProfileError = if (validation.isValid) null else validation.validationMessage(),
+            )
+        }
+        if (!validation.isValid) {
+            return
+        }
+
+        remoteSettingsSaveJob = viewModelScope.launch {
+            runCatching {
+                profileRepository.updateRemoteSettings(
+                    profileId = activeProfileId,
+                    remote = remote,
+                )
+            }.onSuccess { index ->
+                if (_runtimeFilesState.value.activeProfileId == activeProfileId) {
+                    applyProfileIndex(index, statusMessage = "Saved profile remote settings.")
+                } else {
+                    _profileState.update {
+                        it.copy(
+                            isProfileLoading = false,
+                            statusMessage = "Saved profile remote settings.",
+                            lastProfileError = null,
+                        )
+                    }
+                }
+            }.onFailure { error ->
+                reportProfileError(error, "Failed to save profile remote settings.")
+            }
+        }
+    }
+
+    fun runManualRemoteUpdate(confirmDiscardUnsavedEdits: Boolean = false) {
+        updateActiveProfileFromRemote(confirmDiscardUnsavedEdits)
+    }
+
+    fun updateActiveProfileFromRemote(confirmDiscardUnsavedEdits: Boolean = false) {
+        viewModelScope.launch {
+            if (!ensureRuntimeInactive("updating profiles from remote")) {
+                return@launch
+            }
+            if (_runtimeFilesState.value.dirtyFiles.isNotEmpty() && !confirmDiscardUnsavedEdits) {
+                setProfileError("Remote update overwrites local edits. Confirm before discarding unsaved edits.")
+                return@launch
+            }
+
+            val validation = _profileState.value.profileRemoteSettings.validateForUpdate()
+            if (!validation.isValid) {
+                setProfileError(validation.validationMessage("Configure all three valid remote URLs before updating."))
+                return@launch
+            }
+
+            _profileState.update {
+                it.copy(isRemoteUpdating = true, statusMessage = null, lastProfileError = null)
+            }
+            setProfileError("Remote update needs the download client and update manager from later phases.")
+        }
+    }
+
     private fun startService(modeOverride: String? = null) {
         val profileId = _runtimeFilesState.value.activeProfileId
         val intent = Intent(appContext, ZeroDpiService::class.java)
@@ -483,16 +769,47 @@ class MainViewModel(
 
     private fun loadRuntimeFiles() {
         viewModelScope.launch {
-            _runtimeFilesState.update {
-                it.copy(isLoading = true, errorMessage = null)
-            }
-            runCatching {
-                val index = profileRepository.loadIndex()
-                val activeProfile = index.profiles.first { it.id == index.activeProfileId }
-                val contents = runtimeStorage.readAll(activeProfile.id)
-                activeProfile to contents
-            }.onSuccess { (activeProfile, contents) ->
+            loadActiveRuntimeFiles(statusMessage = "Runtime files loaded.")
+        }
+    }
+
+    private suspend fun loadActiveRuntimeFiles(
+        profileIndex: ProfileIndex? = null,
+        isSwitching: Boolean = false,
+        statusMessage: String,
+    ): Boolean {
+        val selectedFile = _runtimeFilesState.value.selectedFile
+        _runtimeFilesState.update {
+            it.copy(isLoading = true, errorMessage = null)
+        }
+        _profileState.update {
+            it.copy(
+                isProfileLoading = true,
+                isProfileSwitching = isSwitching,
+                statusMessage = null,
+                lastProfileError = null,
+            )
+        }
+
+        return runCatching {
+            val index = profileIndex ?: profileRepository.loadIndex()
+            val activeProfile = activeProfileFrom(index)
+            val contents = runtimeStorage.readAll(activeProfile.id)
+            Triple(index, activeProfile, contents)
+        }.fold(
+            onSuccess = { (index, activeProfile, contents) ->
+                _profileState.value = ProfileUiState(
+                    profiles = index.profiles,
+                    activeProfileId = activeProfile.id,
+                    activeProfileName = activeProfile.name,
+                    profileRemoteSettings = activeProfile.remote,
+                    isProfileLoading = false,
+                    isProfileSwitching = false,
+                    statusMessage = statusMessage,
+                    lastProfileError = null,
+                )
                 _runtimeFilesState.value = RuntimeFilesUiState(
+                    selectedFile = selectedFile,
                     activeProfileId = activeProfile.id,
                     activeProfileName = activeProfile.name,
                     runtimeDir = contents.files.runtimeDir.absolutePath,
@@ -501,20 +818,148 @@ class MainViewModel(
                     ipListText = contents.ipListText,
                     configEditor = ZeroDpiConfigToml.analyze(contents.configText),
                     isLoading = false,
-                    statusMessage = "Runtime files loaded.",
+                    statusMessage = statusMessage,
                 )
                 refreshDiagnostics()
-            }.onFailure { error ->
+                true
+            },
+            onFailure = { error ->
+                val message = error.message ?: "Failed to load runtime files."
+                _profileState.update {
+                    it.copy(
+                        isProfileLoading = false,
+                        isProfileSwitching = false,
+                        lastProfileError = message,
+                    )
+                }
                 _runtimeFilesState.update {
                     it.copy(
                         isLoading = false,
-                        errorMessage = error.message ?: "Failed to load runtime files.",
+                        errorMessage = message,
                     )
                 }
                 refreshDiagnostics()
-            }
+                false
+            },
+        )
+    }
+
+    private suspend fun switchToProfile(
+        profileId: String,
+        statusMessage: String,
+    ): Boolean {
+        remoteSettingsSaveJob?.cancel()
+        remoteSettingsSaveJob = null
+        _profileState.update {
+            it.copy(
+                isProfileLoading = true,
+                isProfileSwitching = true,
+                statusMessage = null,
+                lastProfileError = null,
+            )
+        }
+        return runCatching {
+            profileRepository.selectProfile(profileId)
+        }.fold(
+            onSuccess = { index ->
+                loadActiveRuntimeFiles(
+                    profileIndex = index,
+                    isSwitching = true,
+                    statusMessage = statusMessage,
+                )
+            },
+            onFailure = { error ->
+                reportProfileError(error, "Failed to switch profile.")
+                false
+            },
+        )
+    }
+
+    private fun applyProfileIndex(
+        index: ProfileIndex,
+        statusMessage: String,
+    ) {
+        val activeProfile = activeProfileFrom(index)
+        _profileState.value = _profileState.value.copy(
+            profiles = index.profiles,
+            activeProfileId = activeProfile.id,
+            activeProfileName = activeProfile.name,
+            profileRemoteSettings = activeProfile.remote,
+            hasUnsavedProfileRemoteSettings = false,
+            pendingSwitchProfileId = null,
+            isProfileLoading = false,
+            isProfileSwitching = false,
+            isRemoteUpdating = false,
+            statusMessage = statusMessage,
+            lastProfileError = null,
+        )
+        _runtimeFilesState.update {
+            it.copy(
+                activeProfileId = activeProfile.id,
+                activeProfileName = activeProfile.name,
+                statusMessage = statusMessage,
+                errorMessage = null,
+            )
         }
     }
+
+    private fun activeProfileFrom(index: ProfileIndex): ZeroDpiProfile =
+        index.profiles.first { it.id == index.activeProfileId }
+
+    private fun setProfileLoading() {
+        _profileState.update {
+            it.copy(
+                isProfileLoading = true,
+                statusMessage = null,
+                lastProfileError = null,
+            )
+        }
+    }
+
+    private fun ensureRuntimeInactive(action: String): Boolean {
+        if (!isRuntimeActive()) {
+            return true
+        }
+        setProfileError("Stop ZeroDPI before $action.")
+        return false
+    }
+
+    private fun isRuntimeActive(): Boolean =
+        when (_uiState.value.status) {
+            RuntimeStatus.Starting,
+            RuntimeStatus.Scanning,
+            RuntimeStatus.Running,
+            RuntimeStatus.Stopping,
+            -> true
+
+            RuntimeStatus.Stopped,
+            RuntimeStatus.Failed,
+            -> false
+        }
+
+    private fun reportProfileError(error: Throwable, fallbackMessage: String) {
+        setProfileError(error.message ?: fallbackMessage)
+    }
+
+    private fun setProfileError(message: String) {
+        _profileState.update {
+            it.copy(
+                isProfileLoading = false,
+                isProfileSwitching = false,
+                isRemoteUpdating = false,
+                statusMessage = null,
+                lastProfileError = message,
+            )
+        }
+        _runtimeFilesState.update {
+            it.copy(statusMessage = null, errorMessage = message)
+        }
+    }
+
+    private fun ProfileValidationResult.validationMessage(
+        fallbackMessage: String = "Profile validation failed.",
+    ): String =
+        errors.joinToString("; ") { it.message }.ifBlank { fallbackMessage }
 
     private suspend fun refreshDiagnosticsSnapshot() {
         _diagnosticsState.update {
@@ -587,6 +1032,7 @@ class MainViewModel(
 
     override fun onCleared() {
         serviceStateJob?.cancel()
+        remoteSettingsSaveJob?.cancel()
         if (isBound) {
             runCatching {
                 appContext.unbindService(connection)

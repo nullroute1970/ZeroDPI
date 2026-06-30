@@ -129,136 +129,136 @@ confirmed before final UI polish:
   ZeroDPI is running, then let the user update manually after stop.
 - Delete policy: recommended default is do not allow deleting the last profile.
 
-## Phase 1: Add Profile Domain Model
+## Phase 1: Add Profile Domain Model (Completed)
 
 Steps:
 
-- Add Android profile model classes, likely under a new package:
+- [x] Add Android profile model classes, likely under a new package:
   `dev.zerodpi.android.profile`.
-- Define:
-  - `ZeroDpiProfile`
-  - `ProfileRemoteSettings`
-  - `ProfileIndex`
-  - `ProfileUpdateStatus`
-  - `ProfileUpdateMode` for manual vs automatic update reporting.
-- Add profile name validation:
-  - non-empty,
-  - trimmed,
-  - reasonable max length such as 64 characters,
-  - duplicate names allowed only if the UI can distinguish them; otherwise
+- [x] Define:
+  - [x] `ZeroDpiProfile`
+  - [x] `ProfileRemoteSettings`
+  - [x] `ProfileIndex`
+  - [x] `ProfileUpdateStatus`
+  - [x] `ProfileUpdateMode` for manual vs automatic update reporting.
+- [x] Add profile name validation:
+  - [x] non-empty,
+  - [x] trimmed,
+  - [x] reasonable max length such as 64 characters,
+  - [x] duplicate names allowed only if the UI can distinguish them; otherwise
     reject duplicates.
-- Add remote URL validation:
-  - blank means not configured,
-  - configured profile update requires all three URLs,
-  - accept only valid absolute `http` or `https` URLs,
-  - warn on `http`.
-- Add unit tests for model validation and JSON round trips.
+- [x] Add remote URL validation:
+  - [x] blank means not configured,
+  - [x] configured profile update requires all three URLs,
+  - [x] accept only valid absolute `http` or `https` URLs,
+  - [x] warn on `http`.
+- [x] Add unit tests for model validation and JSON round trips.
 
 Acceptance criteria:
 
-- Profiles can be represented without touching existing runtime behavior.
-- Profile metadata can be serialized and deserialized.
-- Invalid ids or paths cannot escape the profile directory.
+- [x] Profiles can be represented without touching existing runtime behavior.
+- [x] Profile metadata can be serialized and deserialized.
+- [x] Invalid ids or paths cannot escape the profile directory.
 
-## Phase 2: Add Profile Repository And Migration
+## Phase 2: Add Profile Repository And Migration (Completed)
 
 Steps:
 
-- Add `ProfileRepository` responsible for:
-  - loading `profiles/index.json`,
-  - creating the default profile when no index exists,
-  - creating, renaming, duplicating, deleting, and selecting profiles,
-  - reading and writing profile metadata atomically,
-  - returning file paths for a profile id.
-- Add migration from the current single-profile layout:
-  - if `profiles/index.json` is missing, create a `Default` profile,
-  - if legacy `files/zerodpi/config.toml`, `sni_list.txt`, or `ip_list.txt`
+- [x] Add `ProfileRepository` responsible for:
+  - [x] loading `profiles/index.json`,
+  - [x] creating the default profile when no index exists,
+  - [x] creating, renaming, duplicating, deleting, and selecting profiles,
+  - [x] reading and writing profile metadata atomically,
+  - [x] returning file paths for a profile id.
+- [x] Add migration from the current single-profile layout:
+  - [x] if `profiles/index.json` is missing, create a `Default` profile,
+  - [x] if legacy `files/zerodpi/config.toml`, `sni_list.txt`, or `ip_list.txt`
     exist, copy them into the default profile,
-  - otherwise seed default files from packaged assets,
-  - leave legacy files untouched after a successful copy for one release, or
+  - [x] otherwise seed default files from packaged assets,
+  - [x] leave legacy files untouched after a successful copy for one release, or
     move them into a `legacy_backup/` directory after explicit testing.
-- Refactor reusable file helpers out of `RuntimeStorage` if needed:
-  - atomic write,
-  - backup path creation,
-  - asset seeding,
-  - directory fsync.
-- Add repository-level locking so UI saves, service startup, and remote updates
+- [x] Refactor reusable file helpers out of `RuntimeStorage` if needed:
+  - [x] atomic write,
+  - [x] backup path creation,
+  - [x] asset seeding,
+  - [x] directory fsync.
+- [x] Add repository-level locking so UI saves, service startup, and remote updates
   do not write the same profile concurrently.
 
 Acceptance criteria:
 
-- Existing Android users keep their current config/lists after upgrading.
-- Fresh installs get one default profile.
-- Profile metadata and files survive app restart.
-- A corrupted `index.json` produces a recoverable error and does not delete
+- [x] Existing Android users keep their current config/lists after upgrading.
+- [x] Fresh installs get one default profile.
+- [x] Profile metadata and files survive app restart.
+- [x] A corrupted `index.json` produces a recoverable error and does not delete
   profile files.
 
-## Phase 3: Make RuntimeStorage Profile-Aware
+## Phase 3: Make RuntimeStorage Profile-Aware (Completed)
 
 Steps:
 
-- Change `RuntimeStorage` APIs to accept a profile id or active profile handle:
-  - `readAll(profileId)`
-  - `save(profileId, kind, content)`
-  - `saveAll(profileId, configText, sniListText, ipListText)`
-  - `resetToDefaults(profileId, kind)`
-  - `prepareRunConfig(profileId, modeOverride)`
-  - `prepareConfiguredDirectories(profileId)`
-  - `exportSupportBundle(profileId, ...)`
-- Update `RuntimeStorageFiles` so `runtimeDir` points at the selected profile
+- [x] Change `RuntimeStorage` APIs to accept a profile id or active profile handle:
+  - [x] `readAll(profileId)`
+  - [x] `save(profileId, kind, content)`
+  - [x] `saveAll(profileId, configText, sniListText, ipListText)`
+  - [x] `resetToDefaults(profileId, kind)`
+  - [x] `prepareRunConfig(profileId, modeOverride)`
+  - [x] `prepareConfiguredDirectories(profileId)`
+  - [x] `exportSupportBundle(profileId, ...)`
+- [x] Update `RuntimeStorageFiles` so `runtimeDir` points at the selected profile
   directory.
-- Ensure relative config paths such as `SNI_LIST = "sni_list.txt"` resolve
+- [x] Ensure relative config paths such as `SNI_LIST = "sni_list.txt"` resolve
   inside the selected profile directory.
-- Keep temporary mode override configs inside the selected profile directory.
-- Include profile name/id in support bundle metadata, but redact remote URL query
+- [x] Keep temporary mode override configs inside the selected profile directory.
+- [x] Include profile name/id in support bundle metadata, but redact remote URL query
   strings because they may contain tokens.
 
 Acceptance criteria:
 
-- Starting ZeroDPI uses the selected profile's `config.toml`.
-- SNI/IP relative paths resolve to the selected profile's files.
-- Resetting defaults affects only the selected profile.
-- Support bundles do not silently leak secret-bearing remote URLs.
+- [x] Starting ZeroDPI uses the selected profile's `config.toml`.
+- [x] SNI/IP relative paths resolve to the selected profile's files.
+- [x] Resetting defaults affects only the selected profile.
+- [x] Support bundles do not silently leak secret-bearing remote URLs.
 
-## Phase 4: Add Profile State To MainViewModel
+## Phase 4: Add Profile State To MainViewModel (Completed)
 
 Steps:
 
-- Add a UI state model for profile list and active profile:
-  - `profiles`
-  - `activeProfileId`
-  - `activeProfileName`
-  - `profileRemoteSettings`
-  - `isProfileLoading`
-  - `isProfileSwitching`
-  - `isRemoteUpdating`
-  - `lastProfileError`
-- Update `loadRuntimeFiles()` to load the active profile from
+- [x] Add a UI state model for profile list and active profile:
+  - [x] `profiles`
+  - [x] `activeProfileId`
+  - [x] `activeProfileName`
+  - [x] `profileRemoteSettings`
+  - [x] `isProfileLoading`
+  - [x] `isProfileSwitching`
+  - [x] `isRemoteUpdating`
+  - [x] `lastProfileError`
+- [x] Update `loadRuntimeFiles()` to load the active profile from
   `ProfileRepository`, then read that profile through `RuntimeStorage`.
-- Update all existing save/reset/import/export/test-scan paths to pass the
+- [x] Update all existing save/reset/import/export/test-scan paths to pass the
   active profile id.
-- Add actions:
-  - create profile from defaults,
-  - duplicate active profile,
-  - rename profile,
-  - delete profile,
-  - select profile,
-  - update remote URL fields,
-  - toggle auto update,
-  - run manual remote update.
-- Handle unsaved edits on profile switch:
-  - if `dirtyFiles` is empty, switch immediately,
-  - if dirty, require user choice: save, discard, or cancel.
-- Disable profile switching and remote updates while ZeroDPI is running for the
+- [x] Add actions:
+  - [x] create profile from defaults,
+  - [x] duplicate active profile,
+  - [x] rename profile,
+  - [x] delete profile,
+  - [x] select profile,
+  - [x] update remote URL fields,
+  - [x] toggle auto update,
+  - [x] run manual remote update.
+- [x] Handle unsaved edits on profile switch:
+  - [x] if `dirtyFiles` is empty, switch immediately,
+  - [x] if dirty, require user choice: save, discard, or cancel.
+- [x] Disable profile switching and remote updates while ZeroDPI is running for the
   first implementation. Offer "Stop first" messaging rather than changing files
   under an active process.
 
 Acceptance criteria:
 
-- The UI state always points to exactly one active profile.
-- Editing one profile does not mutate another profile.
-- Profile switching reloads config and lists from the selected profile.
-- Dirty local edits are not lost without an explicit user action, except when
+- [x] The UI state always points to exactly one active profile.
+- [x] Editing one profile does not mutate another profile.
+- [x] Profile switching reloads config and lists from the selected profile.
+- [x] Dirty local edits are not lost without an explicit user action, except when
   the user explicitly runs a remote update.
 
 ## Phase 5: Build Profile UI

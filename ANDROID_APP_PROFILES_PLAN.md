@@ -378,29 +378,29 @@ Acceptance criteria:
 
 Steps:
 
-- Add `MainViewModel.updateActiveProfileFromRemote()`.
-- Before manual update:
-  - verify all three URLs are configured,
-  - if local files are dirty, show a confirmation dialog that update discards
+- [x] Add `MainViewModel.updateActiveProfileFromRemote()`.
+- [x] Before manual update:
+  - [x] verify all three URLs are configured,
+  - [x] if local files are dirty, show a confirmation dialog that update discards
     unsaved local edits,
-  - block if ZeroDPI is running.
-- During update:
-  - disable profile switching and file save actions for that profile,
-  - show progress state,
-  - keep existing editor text visible until update succeeds.
-- On success:
-  - reload active profile text,
-  - re-run config/list validation,
-  - show timestamp and success status.
-- On failure:
-  - keep existing editor text and dirty state,
-  - show the failed file and reason.
+  - [x] block if ZeroDPI is running.
+- [x] During update:
+  - [x] disable profile switching and file save actions for that profile,
+  - [x] show progress state,
+  - [x] keep existing editor text visible until update succeeds.
+- [x] On success:
+  - [x] reload active profile text,
+  - [x] re-run config/list validation,
+  - [x] show timestamp and success status.
+- [x] On failure:
+  - [x] keep existing editor text and dirty state,
+  - [x] show the failed file and reason.
 
 Acceptance criteria:
 
-- Manual update is user-triggered and predictable.
-- Dirty local edits require confirmation before remote overwrite.
-- Failed manual update does not destroy local files or editor text.
+- [x] Manual update is user-triggered and predictable.
+- [x] Dirty local edits require confirmation before remote overwrite.
+- [x] Failed manual update does not destroy local files or editor text.
 
 ## Phase 9: Add Automatic Updates
 

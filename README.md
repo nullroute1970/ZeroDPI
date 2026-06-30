@@ -1264,6 +1264,9 @@ Unit tests cover:
 | A fixed `SELECTED_SNI` stopped working | Clear `SELECTED_SNI`, run `sni_scan`, and select a fresh candidate. DNS and CDN edge routing can change. |
 | Linux rules remain after a forced kill | Restart ZeroDPI cleanly if possible, or inspect/remove matching `iptables`/`nft` rules manually. Normal shutdown removes temporary rules. |
 | Another device cannot connect to ZeroDPI | Use `LISTEN_HOST = "0.0.0.0"`, open the host firewall for `LISTEN_PORT`, and make sure the other device dials the ZeroDPI machine's LAN IP. |
+| Android app remote update is unavailable | In Settings -> `Remote update`, configure all three absolute `http://` or `https://` URLs. Stop ZeroDPI first; profile switching and remote updates are blocked while the runtime is active. |
+| Android app remote update fails | Check Settings -> `Remote update` for `Last attempt`, `Last success`, `Last update`, and the message below them. HTTP errors, DNS/TLS failures, unsupported redirects, empty responses, and size-limit failures leave local profile files unchanged. |
+| Android app remote update downloads but does not apply | The downloaded `config.toml`, `sni_list.txt`, or `ip_list.txt` failed validation. Fix the remote source, or disable automatic update and reset/edit the affected active-profile file locally. |
 
 Use `RUST_LOG=debug` when collecting detailed diagnostics:
 
@@ -1286,6 +1289,10 @@ sudo journalctl -u zerodpi.service -f
 sudo journalctl -u zerodpi.service --since "10 minutes ago"
 ```
 
+For native Android app profile issues, export Diagnostics -> `Export bundle`.
+The bundle includes the active profile id/name, redacted remote URL query
+strings, auto update settings, and last remote update status.
+
 ---
 
 ## 🔐 Security & Privacy Checklist
@@ -1293,6 +1300,7 @@ sudo journalctl -u zerodpi.service --since "10 minutes ago"
 - Do not publish real VPN endpoints, private SNI lists, proxy credentials, or machine-specific paths.
 - Treat screenshots as publishable artifacts only after removing visible private details and embedded metadata.
 - Keep `config.toml`, `sni_list.txt`, and `ip_list.txt` out of public commits if they contain operational infrastructure.
+- Treat Android profile remote URLs as secrets when they include query tokens or embedded credentials. Support bundles redact query strings, but screenshots and copied settings may not.
 - Prefer `LISTEN_HOST = "127.0.0.1"` unless another device must connect to ZeroDPI.
 - Review logs before sharing them. Logs can include local ports, selected candidates, timing, and failure reasons.
 - Use scan-only modes before production changes so you can validate candidates without running the relay.

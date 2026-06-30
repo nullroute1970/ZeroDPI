@@ -11,9 +11,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -50,18 +51,37 @@ import dev.zerodpi.android.config.ConfigSection
 import dev.zerodpi.android.config.ConfigValidationIssue
 import dev.zerodpi.android.config.ZeroDpiConfigSchema
 import dev.zerodpi.android.list.RuntimeListValidation
+import dev.zerodpi.android.profile.ZeroDpiProfile
 import dev.zerodpi.android.service.RuntimeStatus
 import dev.zerodpi.android.service.ZeroDpiServiceState
 import dev.zerodpi.android.storage.RuntimeFileKind
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @Composable
 fun DashboardScreen(
     state: ZeroDpiServiceState,
     runtimeFilesState: RuntimeFilesUiState,
+    profileState: ProfileUiState,
     diagnosticsState: DiagnosticsUiState,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onForceStop: () -> Unit,
+    onCreateProfile: (String) -> Unit,
+    onDuplicateActiveProfile: (String) -> Unit,
+    onRenameProfile: (String, String) -> Unit,
+    onDeleteProfile: (String) -> Unit,
+    onSelectProfile: (String) -> Unit,
+    onSaveAndSelectProfile: (String?) -> Unit,
+    onDiscardAndSelectProfile: (String?) -> Unit,
+    onCancelProfileSwitch: () -> Unit,
+    onProfileRemoteConfigUrlChanged: (String) -> Unit,
+    onProfileRemoteSniListUrlChanged: (String) -> Unit,
+    onProfileRemoteIpListUrlChanged: (String) -> Unit,
+    onProfileAutoUpdateChanged: (Boolean) -> Unit,
+    onProfileAutoUpdateIntervalChanged: (Int) -> Unit,
+    onRunManualProfileUpdate: (Boolean) -> Unit,
     onRuntimeFileSelected: (RuntimeFileKind) -> Unit,
     onRuntimeFileTextChanged: (RuntimeFileKind, String) -> Unit,
     onConfigFieldChanged: (String, String) -> Unit,
@@ -79,6 +99,11 @@ fun DashboardScreen(
     modifier: Modifier = Modifier,
 ) {
     var page by rememberSaveable { mutableStateOf(DashboardPage.Home) }
+    val profileActionsEnabled = canChangeProfiles(state.status) &&
+        !runtimeFilesState.isLoading &&
+        !runtimeFilesState.isSaving &&
+        !profileState.isProfileLoading &&
+        !profileState.isProfileSwitching
 
     BackHandler(enabled = page == DashboardPage.Settings) {
         page = DashboardPage.Home
@@ -104,6 +129,17 @@ fun DashboardScreen(
                         .padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
+                    ActiveProfileSelectorPanel(
+                        serviceStatus = state.status,
+                        profileState = profileState,
+                        runtimeFilesState = runtimeFilesState,
+                        actionsEnabled = profileActionsEnabled,
+                        onManageProfiles = { page = DashboardPage.Settings },
+                        onSelectProfile = onSelectProfile,
+                        onSaveAndSelectProfile = onSaveAndSelectProfile,
+                        onDiscardAndSelectProfile = onDiscardAndSelectProfile,
+                        onCancelProfileSwitch = onCancelProfileSwitch,
+                    )
                     StatusPanel(
                         state = state,
                         canStart = runtimeFilesState.canStart &&
@@ -147,6 +183,27 @@ fun DashboardScreen(
                         .padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
+                    ProfileManagementPanel(
+                        profileState = profileState,
+                        runtimeFilesState = runtimeFilesState,
+                        actionsEnabled = profileActionsEnabled,
+                        onCreateProfile = onCreateProfile,
+                        onDuplicateActiveProfile = onDuplicateActiveProfile,
+                        onRenameProfile = onRenameProfile,
+                        onDeleteProfile = onDeleteProfile,
+                    )
+                    RemoteUpdatePanel(
+                        serviceStatus = state.status,
+                        profileState = profileState,
+                        runtimeFilesState = runtimeFilesState,
+                        actionsEnabled = profileActionsEnabled,
+                        onConfigUrlChanged = onProfileRemoteConfigUrlChanged,
+                        onSniListUrlChanged = onProfileRemoteSniListUrlChanged,
+                        onIpListUrlChanged = onProfileRemoteIpListUrlChanged,
+                        onAutoUpdateChanged = onProfileAutoUpdateChanged,
+                        onIntervalHoursChanged = onProfileAutoUpdateIntervalChanged,
+                        onRunManualUpdate = onRunManualProfileUpdate,
+                    )
                     ConfigSettingsPanel(
                         editorState = runtimeFilesState.configEditor,
                         enabled = !runtimeFilesState.isLoading && !runtimeFilesState.isSaving,
@@ -168,6 +225,540 @@ fun DashboardScreen(
 private enum class DashboardPage {
     Home,
     Settings,
+}
+
+@Composable
+private fun ActiveProfileSelectorPanel(
+    serviceStatus: RuntimeStatus,
+    profileState: ProfileUiState,
+    runtimeFilesState: RuntimeFilesUiState,
+    actionsEnabled: Boolean,
+    onManageProfiles: () -> Unit,
+    onSelectProfile: (String) -> Unit,
+    onSaveAndSelectProfile: (String?) -> Unit,
+    onDiscardAndSelectProfile: (String?) -> Unit,
+    onCancelProfileSwitch: () -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val pendingProfile = profileState.pendingSwitchProfile
+    val dirtyFiles = runtimeFilesState.dirtyFiles
+    val canOpenMenu = actionsEnabled && profileState.profiles.isNotEmpty()
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        tonalElevation = 1.dp,
+        shape = MaterialTheme.shapes.medium,
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(end = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Text("Active profile", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        text = profileState.activeProfileName,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    if (dirtyFiles.isNotEmpty()) {
+                        Text(
+                            text = "Unsaved: ${dirtyFiles.joinToString { it.fileName }}",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+                Box {
+                    Button(
+                        onClick = { expanded = true },
+                        enabled = canOpenMenu,
+                    ) {
+                        Text(if (profileState.isProfileSwitching) "Switching" else "Switch")
+                    }
+                    DropdownMenu(
+                        expanded = expanded,
+                        onDismissRequest = { expanded = false },
+                    ) {
+                        profileState.profiles.forEach { profile ->
+                            DropdownMenuItem(
+                                text = {
+                                    Column {
+                                        Text(profile.name)
+                                        Text(
+                                            text = profile.id,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            style = MaterialTheme.typography.bodySmall,
+                                        )
+                                    }
+                                },
+                                onClick = {
+                                    expanded = false
+                                    onSelectProfile(profile.id)
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+            OutlinedButton(
+                onClick = onManageProfiles,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Manage profiles")
+            }
+            if (!canChangeProfiles(serviceStatus)) {
+                Text(
+                    text = "Stop ZeroDPI before switching profiles.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            pendingProfile?.let { target ->
+                Text(
+                    text = "Switch to ${target.name} with unsaved edits?",
+                    color = MaterialTheme.colorScheme.error,
+                    fontWeight = FontWeight.Medium,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = { onSaveAndSelectProfile(target.id) },
+                        enabled = actionsEnabled,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text("Save")
+                    }
+                    OutlinedButton(
+                        onClick = { onDiscardAndSelectProfile(target.id) },
+                        enabled = actionsEnabled,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text("Discard")
+                    }
+                    TextButton(onClick = onCancelProfileSwitch) {
+                        Text("Cancel")
+                    }
+                }
+            }
+            profileState.statusMessage?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            profileState.lastProfileError?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.error)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProfileManagementPanel(
+    profileState: ProfileUiState,
+    runtimeFilesState: RuntimeFilesUiState,
+    actionsEnabled: Boolean,
+    onCreateProfile: (String) -> Unit,
+    onDuplicateActiveProfile: (String) -> Unit,
+    onRenameProfile: (String, String) -> Unit,
+    onDeleteProfile: (String) -> Unit,
+) {
+    var showCreateDialog by remember { mutableStateOf(false) }
+    var showDuplicateDialog by remember { mutableStateOf(false) }
+    var showRenameDialog by remember { mutableStateOf(false) }
+    var showDeleteDialog by remember { mutableStateOf(false) }
+    val activeProfile = profileState.activeProfile
+    val canDelete = actionsEnabled && profileState.profiles.size > 1
+    val storageStatus = when {
+        profileState.isProfileSwitching -> "Switching"
+        profileState.isProfileLoading -> "Loading"
+        runtimeFilesState.runtimeDir.isBlank() -> "Pending"
+        else -> "Ready"
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        tonalElevation = 1.dp,
+        shape = MaterialTheme.shapes.medium,
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text("Profiles", fontWeight = FontWeight.SemiBold)
+            DetailRow("Active", profileState.activeProfileName)
+            DetailRow("Profile id", profileState.activeProfileId)
+            DetailRow("Profiles", profileState.profiles.size.toString())
+            DetailRow("Storage", storageStatus)
+            if (runtimeFilesState.runtimeDir.isNotBlank()) {
+                Text(
+                    text = runtimeFilesState.runtimeDir,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = { showCreateDialog = true },
+                    enabled = actionsEnabled,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("Create")
+                }
+                OutlinedButton(
+                    onClick = { showDuplicateDialog = true },
+                    enabled = actionsEnabled,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("Duplicate")
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = { showRenameDialog = true },
+                    enabled = actionsEnabled,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("Rename")
+                }
+                OutlinedButton(
+                    onClick = { showDeleteDialog = true },
+                    enabled = canDelete,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("Delete")
+                }
+            }
+            if (profileState.profiles.size <= 1) {
+                Text(
+                    text = "The last profile cannot be deleted.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+    }
+
+    if (showCreateDialog) {
+        ProfileNameDialog(
+            title = "Create profile",
+            initialName = uniqueProfileName("New profile", profileState.profiles),
+            confirmLabel = "Create",
+            onDismiss = { showCreateDialog = false },
+            onConfirm = { name ->
+                showCreateDialog = false
+                onCreateProfile(name)
+            },
+        )
+    }
+    if (showDuplicateDialog) {
+        ProfileNameDialog(
+            title = "Duplicate profile",
+            initialName = uniqueProfileName("${profileState.activeProfileName} copy", profileState.profiles),
+            confirmLabel = "Duplicate",
+            onDismiss = { showDuplicateDialog = false },
+            onConfirm = { name ->
+                showDuplicateDialog = false
+                onDuplicateActiveProfile(name)
+            },
+        )
+    }
+    if (showRenameDialog && activeProfile != null) {
+        ProfileNameDialog(
+            title = "Rename profile",
+            initialName = activeProfile.name,
+            confirmLabel = "Rename",
+            onDismiss = { showRenameDialog = false },
+            onConfirm = { name ->
+                showRenameDialog = false
+                onRenameProfile(activeProfile.id, name)
+            },
+        )
+    }
+    if (showDeleteDialog && activeProfile != null) {
+        AlertDialog(
+            onDismissRequest = { showDeleteDialog = false },
+            title = { Text("Delete profile") },
+            text = {
+                Text("Delete ${activeProfile.name}? This removes that profile's local config and list files.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showDeleteDialog = false
+                        onDeleteProfile(activeProfile.id)
+                    },
+                    enabled = canDelete,
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteDialog = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun RemoteUpdatePanel(
+    serviceStatus: RuntimeStatus,
+    profileState: ProfileUiState,
+    runtimeFilesState: RuntimeFilesUiState,
+    actionsEnabled: Boolean,
+    onConfigUrlChanged: (String) -> Unit,
+    onSniListUrlChanged: (String) -> Unit,
+    onIpListUrlChanged: (String) -> Unit,
+    onAutoUpdateChanged: (Boolean) -> Unit,
+    onIntervalHoursChanged: (Int) -> Unit,
+    onRunManualUpdate: (Boolean) -> Unit,
+) {
+    var showManualUpdateDialog by remember { mutableStateOf(false) }
+    val remote = profileState.profileRemoteSettings
+    val remoteValidation = remote.validate()
+    val updateEnabled = actionsEnabled && !profileState.isRemoteUpdating
+    val dirtyFiles = runtimeFilesState.dirtyFiles
+    var intervalText by remember(remote.autoUpdateIntervalHours) {
+        mutableStateOf(remote.autoUpdateIntervalHours.toString())
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        tonalElevation = 1.dp,
+        shape = MaterialTheme.shapes.medium,
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text("Remote update", fontWeight = FontWeight.SemiBold)
+            RemoteUrlField(
+                label = "config.toml URL",
+                value = remote.configUrl,
+                enabled = !profileState.isProfileLoading,
+                onValueChange = onConfigUrlChanged,
+            )
+            RemoteUrlField(
+                label = "sni_list.txt URL",
+                value = remote.sniListUrl,
+                enabled = !profileState.isProfileLoading,
+                onValueChange = onSniListUrlChanged,
+            )
+            RemoteUrlField(
+                label = "ip_list.txt URL",
+                value = remote.ipListUrl,
+                enabled = !profileState.isProfileLoading,
+                onValueChange = onIpListUrlChanged,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(end = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Text("Automatic update", fontWeight = FontWeight.Medium)
+                    Text(
+                        text = "Remote files overwrite local edits after a successful update.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(
+                    checked = remote.autoUpdateEnabled,
+                    onCheckedChange = onAutoUpdateChanged,
+                    enabled = !profileState.isProfileLoading,
+                )
+            }
+            OutlinedTextField(
+                value = intervalText,
+                onValueChange = { value ->
+                    intervalText = value
+                    value.toIntOrNull()?.let(onIntervalHoursChanged)
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !profileState.isProfileLoading,
+                singleLine = true,
+                label = { Text("Automatic update interval hours") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            )
+            Text(
+                text = "Remote update replaces local config.toml, sni_list.txt, and ip_list.txt for this profile.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if (remote.autoUpdateEnabled && dirtyFiles.isNotEmpty()) {
+                Text(
+                    text = "Unsaved local edits can be overwritten by the next successful auto update.",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            if (!canChangeProfiles(serviceStatus)) {
+                Text(
+                    text = "Stop ZeroDPI before updating from remote.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Button(
+                onClick = { showManualUpdateDialog = true },
+                enabled = updateEnabled,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(if (profileState.isRemoteUpdating) "Updating" else "Update now")
+            }
+            remoteValidation.errors.forEach { issue ->
+                Text(
+                    text = issue.message,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            remoteValidation.warnings.forEach { issue ->
+                Text(
+                    text = issue.message,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            DetailRow("Last attempt", formatEpochMs(remote.lastUpdateAttemptEpochMs))
+            DetailRow("Last success", formatEpochMs(remote.lastSuccessfulUpdateEpochMs))
+            remote.lastUpdateStatus?.let { status ->
+                DetailRow("Last update", if (status.successful) "Success" else "Failed")
+                if (status.message.isNotBlank()) {
+                    Text(
+                        text = status.message,
+                        color = if (status.successful) {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        } else {
+                            MaterialTheme.colorScheme.error
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+            profileState.lastProfileError?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.error)
+            }
+        }
+    }
+
+    if (showManualUpdateDialog) {
+        AlertDialog(
+            onDismissRequest = { showManualUpdateDialog = false },
+            title = { Text("Update profile files") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Remote update replaces local config.toml, sni_list.txt, and ip_list.txt for this profile.")
+                    if (dirtyFiles.isNotEmpty()) {
+                        Text(
+                            text = "Unsaved local edits will be discarded.",
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showManualUpdateDialog = false
+                        onRunManualUpdate(dirtyFiles.isNotEmpty())
+                    },
+                    enabled = updateEnabled,
+                ) {
+                    Text("Update")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showManualUpdateDialog = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun RemoteUrlField(
+    label: String,
+    value: String,
+    enabled: Boolean,
+    onValueChange: (String) -> Unit,
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = Modifier.fillMaxWidth(),
+        enabled = enabled,
+        singleLine = true,
+        label = { Text(label) },
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+    )
+}
+
+@Composable
+private fun ProfileNameDialog(
+    title: String,
+    initialName: String,
+    confirmLabel: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var name by remember(initialName) { mutableStateOf(initialName) }
+    val trimmedName = name.trim()
+    val nameValidation = ZeroDpiProfile.validateName(trimmedName)
+    val canConfirm = nameValidation.isValid
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("Profile name") },
+                    isError = !canConfirm,
+                )
+                nameValidation.errors.forEach { issue ->
+                    Text(
+                        text = issue.message,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onConfirm(trimmedName) },
+                enabled = canConfirm,
+            ) {
+                Text(confirmLabel)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        },
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -955,6 +1546,51 @@ private fun LogsPanel(logs: List<String>) {
             }
         }
     }
+}
+
+private fun canChangeProfiles(status: RuntimeStatus): Boolean =
+    when (status) {
+        RuntimeStatus.Starting,
+        RuntimeStatus.Scanning,
+        RuntimeStatus.Running,
+        RuntimeStatus.Stopping,
+        -> false
+
+        RuntimeStatus.Stopped,
+        RuntimeStatus.Failed,
+        -> true
+    }
+
+private fun uniqueProfileName(
+    baseName: String,
+    profiles: List<ZeroDpiProfile>,
+): String {
+    val existingNames = profiles.mapTo(mutableSetOf()) { it.name.trim().lowercase(Locale.US) }
+    val normalizedBase = baseName
+        .trim()
+        .ifBlank { "Profile" }
+        .take(ZeroDpiProfile.MAX_NAME_LENGTH)
+    if (normalizedBase.lowercase(Locale.US) !in existingNames) {
+        return normalizedBase
+    }
+    var index = 2
+    while (true) {
+        val suffix = " $index"
+        val candidate = normalizedBase
+            .take(ZeroDpiProfile.MAX_NAME_LENGTH - suffix.length)
+            .trimEnd() + suffix
+        if (candidate.trim().lowercase(Locale.US) !in existingNames) {
+            return candidate
+        }
+        index += 1
+    }
+}
+
+private fun formatEpochMs(epochMs: Long?): String {
+    if (epochMs == null) {
+        return "Never"
+    }
+    return SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(epochMs))
 }
 
 private const val MAX_VISIBLE_VALIDATION_ERRORS = 6

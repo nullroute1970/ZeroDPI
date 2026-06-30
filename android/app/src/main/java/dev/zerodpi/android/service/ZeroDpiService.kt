@@ -13,6 +13,7 @@ import androidx.core.app.NotificationCompat
 import dev.zerodpi.android.BuildConfig
 import dev.zerodpi.android.R
 import dev.zerodpi.android.config.ZeroDpiConfigToml
+import dev.zerodpi.android.profile.ZeroDpiProfile
 import dev.zerodpi.android.runtime.FakeZeroDpiRunner
 import dev.zerodpi.android.runtime.ProcessZeroDpiRunner
 import dev.zerodpi.android.runtime.RootAccessState
@@ -123,7 +124,10 @@ class ZeroDpiService : Service() {
 
     fun state(): StateFlow<ZeroDpiServiceState> = state.asStateFlow()
 
-    fun startZeroDpi(modeOverride: String? = null) {
+    fun startZeroDpi(
+        profileId: String = ZeroDpiProfile.DEFAULT_PROFILE_ID,
+        modeOverride: String? = null,
+    ) {
         ensureForeground()
         scope.launch {
             if (state.value.status in activeStatuses) {
@@ -135,7 +139,7 @@ class ZeroDpiService : Service() {
             }
 
             val runConfig = runCatching {
-                runtimeStorage.prepareRunConfig(modeOverride)
+                runtimeStorage.prepareRunConfig(profileId = profileId, modeOverride = modeOverride)
             }.getOrElse { error ->
                 val message = error.message ?: "Failed to prepare runtime storage."
                 appendLog(message)
@@ -168,7 +172,7 @@ class ZeroDpiService : Service() {
                 )
             }
             sessionLogLines.clear()
-            appendLog("Runtime storage ready at ${runConfig.files.runtimeDir.absolutePath}.")
+            appendLog("Runtime storage ready for profile $profileId at ${runConfig.files.runtimeDir.absolutePath}.")
             modeOverride?.let { modeName ->
                 appendLog("Running temporary $modeName test scan config.")
             }

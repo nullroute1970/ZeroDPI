@@ -7,6 +7,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.rule.ServiceTestRule
 import dev.zerodpi.android.config.ZeroDpiConfigToml
+import dev.zerodpi.android.profile.ZeroDpiProfile
 import dev.zerodpi.android.storage.RuntimeFileKind
 import dev.zerodpi.android.storage.RuntimeStorage
 import kotlinx.coroutines.runBlocking
@@ -66,11 +67,11 @@ class ZeroDpiServiceInstrumentedTest {
 
     private fun configureRootlessRunningMode() = runBlocking {
         val storage = RuntimeStorage(context)
-        val rootlessConfig = storage.readAll().configText
+        val rootlessConfig = storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText
             .replaceField("MODE", "sni_spoof")
             .replaceField("BYPASS_METHOD", "tls_frag")
             .replaceField("LISTEN_PORT", "44444")
-        storage.save(RuntimeFileKind.Config, rootlessConfig)
+        storage.save(ZeroDpiProfile.DEFAULT_PROFILE_ID, RuntimeFileKind.Config, rootlessConfig)
     }
 
     private fun bindZeroDpiService(): ZeroDpiService {

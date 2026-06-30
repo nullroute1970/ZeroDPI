@@ -1,5 +1,7 @@
 package dev.zerodpi.android.storage
 
+import dev.zerodpi.android.profile.ProfileRemoteSettings
+import dev.zerodpi.android.profile.ZeroDpiProfile
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -39,5 +41,29 @@ class SupportBundleSanitizerTest {
             SupportBundleSanitizer.noticeText(includePrivateLists = true)
                 .contains("explicitly included"),
         )
+    }
+
+    @Test
+    fun profileMetadataRedactsRemoteUrlQueryStrings() {
+        val metadata = SupportBundleSanitizer.profileMetadata(
+            ZeroDpiProfile(
+                id = "default",
+                name = "Default",
+                createdAtEpochMs = 0,
+                updatedAtEpochMs = 0,
+                remote = ProfileRemoteSettings(
+                    configUrl = "https://example.com/config.toml?token=config-secret",
+                    sniListUrl = "https://example.com/sni.txt?token=sni-secret",
+                    ipListUrl = "https://example.com/ip.txt",
+                ),
+            ),
+        )
+
+        assertTrue(metadata.contains("Profile id: default"))
+        assertTrue(metadata.contains("https://example.com/config.toml?<redacted>"))
+        assertTrue(metadata.contains("https://example.com/sni.txt?<redacted>"))
+        assertTrue(metadata.contains("https://example.com/ip.txt"))
+        assertFalse(metadata.contains("config-secret"))
+        assertFalse(metadata.contains("sni-secret"))
     }
 }

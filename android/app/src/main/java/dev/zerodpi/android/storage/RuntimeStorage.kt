@@ -3,6 +3,9 @@ package dev.zerodpi.android.storage
 import android.content.Context
 import dev.zerodpi.android.config.ZeroDpiConfigToml
 import dev.zerodpi.android.diagnostics.DeviceDiagnostics
+import dev.zerodpi.android.profile.ProfileFilePaths
+import dev.zerodpi.android.profile.ProfileRepository
+import dev.zerodpi.android.profile.ZeroDpiProfile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -63,27 +66,21 @@ data class ResolvedRuntimeConfigPaths(
 
 class RuntimeStorage(context: Context) {
     private val appContext = context.applicationContext
+    private val profileRepository = ProfileRepository(appContext)
     private val lock = Any()
     private var activeLogFile: File? = null
 
-    private val runtimeDir = File(appContext.filesDir, RuntimeStorageLayout.RUNTIME_DIR_NAME)
-    private val files = RuntimeStorageFiles(
-        runtimeDir = runtimeDir,
-        configFile = File(runtimeDir, RuntimeFileKind.Config.fileName),
-        sniListFile = File(runtimeDir, RuntimeFileKind.SniList.fileName),
-        ipListFile = File(runtimeDir, RuntimeFileKind.IpList.fileName),
-        logsDir = File(runtimeDir, RuntimeStorageLayout.LOGS_DIR_NAME),
-        scanResultsDir = File(runtimeDir, RuntimeStorageLayout.SCAN_RESULTS_DIR_NAME),
-    )
+    private val rootRuntimeDir = File(appContext.filesDir, RuntimeStorageLayout.RUNTIME_DIR_NAME)
+    private val logsDir = File(rootRuntimeDir, RuntimeStorageLayout.LOGS_DIR_NAME)
 
-    suspend fun ensureInitialized(): RuntimeStorageFiles =
+    suspend fun ensureInitialized(profileId: String): RuntimeStorageFiles =
         withContext(Dispatchers.IO) {
-            ensureInitializedBlocking()
+            ensureInitializedForProfile(profileId)
         }
 
-    suspend fun readAll(): RuntimeFileContents =
+    suspend fun readAll(profileId: String): RuntimeFileContents =
         withContext(Dispatchers.IO) {
-            val currentFiles = ensureInitializedBlocking()
+            val currentFiles = ensureInitializedForProfile(profileId)
             RuntimeFileContents(
                 files = currentFiles,
                 configText = currentFiles.configFile.readText(StandardCharsets.UTF_8),
@@ -92,21 +89,22 @@ class RuntimeStorage(context: Context) {
             )
         }
 
-    suspend fun save(kind: RuntimeFileKind, content: String) {
+    suspend fun save(profileId: String, kind: RuntimeFileKind, content: String) {
         withContext(Dispatchers.IO) {
-            val currentFiles = ensureInitializedBlocking()
+            val currentFiles = ensureInitializedForProfile(profileId)
             val target = currentFiles.fileFor(kind)
             RuntimeFileOps.atomicWrite(target = target, content = content, backup = RuntimeFileOps.backupFor(target))
         }
     }
 
     suspend fun saveAll(
+        profileId: String,
         configText: String,
         sniListText: String,
         ipListText: String,
     ) {
         withContext(Dispatchers.IO) {
-            val currentFiles = ensureInitializedBlocking()
+            val currentFiles = ensureInitializedForProfile(profileId)
             RuntimeFileOps.atomicWrite(
                 target = currentFiles.configFile,
                 content = configText,
@@ -125,33 +123,36 @@ class RuntimeStorage(context: Context) {
         }
     }
 
-    suspend fun resetToDefaults(kind: RuntimeFileKind): String =
+    suspend fun resetToDefaults(profileId: String, kind: RuntimeFileKind): String =
         withContext(Dispatchers.IO) {
-            val currentFiles = ensureInitializedBlocking()
+            val currentFiles = ensureInitializedForProfile(profileId)
             val content = defaultContentFor(kind)
             val target = currentFiles.fileFor(kind)
             RuntimeFileOps.atomicWrite(target = target, content = content, backup = RuntimeFileOps.backupFor(target))
             content
         }
 
-    suspend fun resolveConfigPaths(): ResolvedRuntimeConfigPaths =
+    suspend fun resolveConfigPaths(profileId: String): ResolvedRuntimeConfigPaths =
         withContext(Dispatchers.IO) {
-            val currentFiles = ensureInitializedBlocking()
-            resolveConfigPaths(currentFiles.configFile.readText(StandardCharsets.UTF_8))
+            val currentFiles = ensureInitializedForProfile(profileId)
+            resolveConfigPaths(
+                configText = currentFiles.configFile.readText(StandardCharsets.UTF_8),
+                runtimeDir = currentFiles.runtimeDir,
+            )
         }
 
-    suspend fun prepareConfiguredDirectories(): ResolvedRuntimeConfigPaths =
+    suspend fun prepareConfiguredDirectories(profileId: String): ResolvedRuntimeConfigPaths =
         withContext(Dispatchers.IO) {
-            val currentFiles = ensureInitializedBlocking()
+            val currentFiles = ensureInitializedForProfile(profileId)
             val configText = currentFiles.configFile.readText(StandardCharsets.UTF_8)
-            val resolvedPaths = resolveConfigPaths(configText)
+            val resolvedPaths = resolveConfigPaths(configText, currentFiles.runtimeDir)
             resolvedPaths.scanOutput?.parentFile?.let(RuntimeFileOps::ensureDirectory)
             resolvedPaths
         }
 
-    suspend fun prepareRunConfig(modeOverride: String? = null): RuntimeRunConfig =
+    suspend fun prepareRunConfig(profileId: String, modeOverride: String? = null): RuntimeRunConfig =
         withContext(Dispatchers.IO) {
-            val currentFiles = ensureInitializedBlocking()
+            val currentFiles = ensureInitializedForProfile(profileId)
             val storedConfigText = currentFiles.configFile.readText(StandardCharsets.UTF_8)
             val runConfigText = modeOverride?.let { mode ->
                 ZeroDpiConfigToml.replaceOrAppendField(
@@ -166,7 +167,7 @@ class RuntimeStorage(context: Context) {
                 }
             } ?: currentFiles.configFile
 
-            val resolvedPaths = resolveConfigPaths(runConfigText)
+            val resolvedPaths = resolveConfigPaths(runConfigText, currentFiles.runtimeDir)
             resolvedPaths.scanOutput?.parentFile?.let(RuntimeFileOps::ensureDirectory)
 
             RuntimeRunConfig(
@@ -180,13 +181,12 @@ class RuntimeStorage(context: Context) {
     suspend fun startNewLogSession(label: String): File =
         withContext(Dispatchers.IO) {
             synchronized(lock) {
-                val currentFiles = ensureInitializedBlocking()
-                RuntimeFileOps.ensureDirectory(currentFiles.logsDir)
+                ensureLogStorageBlocking()
                 activeLogFile = File(
-                    currentFiles.logsDir,
+                    logsDir,
                     "${timestampForFile()}_${label.sanitizeFileName()}.log",
                 )
-                pruneLogFiles(currentFiles.logsDir)
+                pruneLogFiles(logsDir)
                 activeLogFile ?: error("Failed to create log session.")
             }
         }
@@ -194,10 +194,10 @@ class RuntimeStorage(context: Context) {
     suspend fun appendLogLine(message: String) {
         withContext(Dispatchers.IO) {
             synchronized(lock) {
-                val currentFiles = ensureInitializedBlocking()
-                val target = activeLogFile ?: File(currentFiles.logsDir, "${timestampForFile()}_session.log").also {
+                ensureLogStorageBlocking()
+                val target = activeLogFile ?: File(logsDir, "${timestampForFile()}_session.log").also {
                     activeLogFile = it
-                    pruneLogFiles(currentFiles.logsDir)
+                    pruneLogFiles(logsDir)
                 }
                 FileOutputStream(target, true).use { output ->
                     output.write("${timestampForLog()} $message\n".toByteArray(StandardCharsets.UTF_8))
@@ -207,16 +207,19 @@ class RuntimeStorage(context: Context) {
     }
 
     suspend fun exportSupportBundle(
+        profileId: String,
         output: OutputStream,
         diagnostics: DeviceDiagnostics,
         includePrivateLists: Boolean,
     ) {
         withContext(Dispatchers.IO) {
-            val currentFiles = ensureInitializedBlocking()
+            val currentFiles = ensureInitializedForProfile(profileId)
+            val profile = profileFor(profileId)
             val configText = currentFiles.configFile.readText(StandardCharsets.UTF_8)
             ZipOutputStream(output).use { zip ->
                 zip.addText("README.txt", SupportBundleSanitizer.noticeText(includePrivateLists))
                 zip.addText("diagnostics.txt", diagnostics.asText())
+                zip.addText("profile.txt", SupportBundleSanitizer.profileMetadata(profile))
                 zip.addText("config.redacted.toml", SupportBundleSanitizer.sanitizedConfig(configText))
                 recentLogFiles(currentFiles.logsDir).forEach { logFile ->
                     zip.addFile("logs/${logFile.name}", logFile)
@@ -234,22 +237,27 @@ class RuntimeStorage(context: Context) {
         }
     }
 
-    fun resolveConfigPaths(configText: String): ResolvedRuntimeConfigPaths =
+    fun resolveConfigPaths(configText: String, runtimeDir: File): ResolvedRuntimeConfigPaths =
         ResolvedRuntimeConfigPaths(
             sniList = resolveRuntimePath(
                 readTomlString(configText, "SNI_LIST") ?: RuntimeFileKind.SniList.fileName,
+                runtimeDir,
             ),
             ipList = resolveRuntimePath(
                 readTomlString(configText, "IP_LIST") ?: RuntimeFileKind.IpList.fileName,
+                runtimeDir,
             ),
             scanOutput = readTomlString(configText, "SCAN_OUTPUT")
                 ?.takeIf { it.isNotBlank() }
-                ?.let(::resolveRuntimePath),
+                ?.let { resolveRuntimePath(it, runtimeDir) },
         )
 
-    private fun ensureInitializedBlocking(): RuntimeStorageFiles =
-        synchronized(lock) {
-            RuntimeFileOps.ensureDirectory(runtimeDir)
+    private suspend fun ensureInitializedForProfile(profileId: String): RuntimeStorageFiles {
+        val profilePaths = profileRepository.filePaths(profileId)
+        return synchronized(lock) {
+            val files = runtimeFilesFor(profilePaths)
+            RuntimeFileOps.ensureDirectory(rootRuntimeDir)
+            RuntimeFileOps.ensureDirectory(files.runtimeDir)
             RuntimeFileOps.ensureDirectory(files.logsDir)
             RuntimeFileOps.ensureDirectory(files.scanResultsDir)
 
@@ -263,6 +271,28 @@ class RuntimeStorage(context: Context) {
 
             files
         }
+    }
+
+    private fun ensureLogStorageBlocking() {
+        RuntimeFileOps.ensureDirectory(rootRuntimeDir)
+        RuntimeFileOps.ensureDirectory(logsDir)
+    }
+
+    private suspend fun profileFor(profileId: String): ZeroDpiProfile {
+        val index = profileRepository.loadIndex()
+        return index.profiles.firstOrNull { it.id == profileId }
+            ?: throw IllegalArgumentException("Unknown profile id: $profileId")
+    }
+
+    private fun runtimeFilesFor(paths: ProfileFilePaths): RuntimeStorageFiles =
+        RuntimeStorageFiles(
+            runtimeDir = paths.profileDir,
+            configFile = paths.configFile,
+            sniListFile = paths.sniListFile,
+            ipListFile = paths.ipListFile,
+            logsDir = logsDir,
+            scanResultsDir = paths.scanResultsDir,
+        )
 
     private fun seedIfMissing(target: File, kind: RuntimeFileKind) {
         if (target.exists()) {
@@ -277,7 +307,7 @@ class RuntimeStorage(context: Context) {
             assetPath = "${RuntimeStorageLayout.ASSET_DIR}/${kind.fileName}",
         )
 
-    private fun resolveRuntimePath(value: String): File {
+    private fun resolveRuntimePath(value: String, runtimeDir: File): File {
         val raw = File(value)
         return if (raw.isAbsolute) {
             raw

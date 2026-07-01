@@ -14,6 +14,7 @@ import dev.zerodpi.android.profile.ProfileRepository
 import dev.zerodpi.android.profile.ProfileUpdateFileContents
 import dev.zerodpi.android.profile.ProfileUpdateManager
 import dev.zerodpi.android.profile.ZeroDpiProfile
+import dev.zerodpi.android.service.RootStatus
 import dev.zerodpi.android.storage.RuntimeFileKind
 import dev.zerodpi.android.storage.RuntimeStorage
 import kotlinx.coroutines.runBlocking
@@ -43,6 +44,35 @@ class MainViewModelInstrumentedTest {
     @After
     fun tearDown() {
         clearRuntimeDir()
+    }
+
+    @Test
+    fun stoppedDashboardSummaryFollowsLoadedConfig() = runBlocking {
+        val viewModel = viewModel()
+        viewModel.waitUntilLoaded()
+
+        val state = viewModel.uiState.value
+
+        assertEquals(RootStatus.Needed, state.rootStatus)
+        assertEquals("sni_spoof", state.mode)
+        assertEquals("wrong_seq", state.bypassMethod)
+        assertEquals("127.0.0.1:44444", state.listener)
+    }
+
+    @Test
+    fun stoppedDashboardSummaryFollowsConfigEdits() = runBlocking {
+        val viewModel = viewModel()
+        viewModel.waitUntilLoaded()
+
+        viewModel.updateConfigField("BYPASS_METHOD", "tls_frag")
+        viewModel.updateConfigField("LISTEN_PORT", "1080")
+
+        val state = viewModel.uiState.value
+
+        assertEquals(RootStatus.NotNeeded, state.rootStatus)
+        assertEquals("sni_spoof", state.mode)
+        assertEquals("tls_frag", state.bypassMethod)
+        assertEquals("127.0.0.1:1080", state.listener)
     }
 
     @Test

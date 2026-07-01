@@ -38,8 +38,8 @@ Android app runtime:
   4. Runs the Android Gradle project and copies the APK into the same dist dir.
   5. The default rootless runtime disables NFQUEUE packet interception so the
      first APK runtime can ship without external netfilter dependencies.
-  6. Release APK builds use the existing signing key and properties under
-     /home/mahmood/Drive/Projects/ZeroDPI; build.py never generates keys.
+  6. Release APK builds use the existing signing key and local properties
+     directory for the host OS; build.py never generates keys.
 """
 
 import argparse
@@ -133,7 +133,11 @@ ANDROID_GRADLE_BUILD_ARGS = (
     "--no-daemon",
     "--rerun-tasks",
 )
-ANDROID_RELEASE_SIGNING_DIR = Path("/home/mahmood/Drive/Projects/ZeroDPI")
+ANDROID_RELEASE_SIGNING_DIR = (
+    Path(r"C:\Drive\Projects\ZeroDPI")
+    if platform.system() == "Windows"
+    else Path("/home/mahmood/Drive/Projects/ZeroDPI")
+)
 ANDROID_RELEASE_SIGNING_PROPERTIES = (
     ANDROID_RELEASE_SIGNING_DIR / "zerodpi-release-signing.properties"
 )
@@ -1367,10 +1371,23 @@ def read_android_release_signing_properties(path: Path) -> dict[str, str]:
     return properties
 
 
-def android_release_signing_value(name: str, properties: dict[str, str]) -> str | None:
+def android_platform_property_suffix() -> str:
+    return platform.system().upper().replace("-", "_")
+
+
+def android_release_signing_value(
+    name: str,
+    properties: dict[str, str],
+    platform_specific: bool = False,
+) -> str | None:
     value = os.environ.get(name)
     if value:
         return value
+    if platform_specific:
+        platform_name = f"{name}_{android_platform_property_suffix()}"
+        value = os.environ.get(platform_name) or properties.get(platform_name)
+        if value:
+            return value
     value = properties.get(name)
     return value if value else None
 
@@ -1388,7 +1405,11 @@ def android_release_signing_env() -> dict:
     properties_path = android_release_signing_properties_path()
     properties = read_android_release_signing_properties(properties_path)
     store_file = resolve_android_release_store_file(
-        android_release_signing_value("ZERODPI_RELEASE_STORE_FILE", properties),
+        android_release_signing_value(
+            "ZERODPI_RELEASE_STORE_FILE",
+            properties,
+            platform_specific=True,
+        ),
         properties_path,
     )
     store_password = android_release_signing_value(

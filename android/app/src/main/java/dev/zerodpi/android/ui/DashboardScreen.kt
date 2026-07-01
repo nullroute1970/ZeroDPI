@@ -4,6 +4,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -109,7 +110,7 @@ fun DashboardScreen(
         !runtimeFilesState.isSaving &&
         !profileState.isRemoteUpdating
 
-    BackHandler(enabled = page == DashboardPage.Settings) {
+    BackHandler(enabled = page != DashboardPage.Home) {
         page = DashboardPage.Home
     }
 
@@ -120,6 +121,14 @@ fun DashboardScreen(
                 page = page,
                 onNavigateHome = { page = DashboardPage.Home },
                 onNavigateSettings = { page = DashboardPage.Settings },
+                onNavigateSniList = {
+                    onRuntimeFileSelected(RuntimeFileKind.SniList)
+                    page = DashboardPage.SniList
+                },
+                onNavigateIpList = {
+                    onRuntimeFileSelected(RuntimeFileKind.IpList)
+                    page = DashboardPage.IpList
+                },
             )
         },
     ) { padding ->
@@ -153,20 +162,6 @@ fun DashboardScreen(
                         onStart = onStart,
                         onStop = onStop,
                         onForceStop = onForceStop,
-                    )
-                    RuntimeFilesPanel(
-                        title = "Runtime lists",
-                        fileKinds = listOf(RuntimeFileKind.SniList, RuntimeFileKind.IpList),
-                        state = runtimeFilesState,
-                        actionsEnabled = runtimeFileActionsEnabled,
-                        onRuntimeFileSelected = onRuntimeFileSelected,
-                        onRuntimeFileTextChanged = onRuntimeFileTextChanged,
-                        onSaveRuntimeFile = onSaveRuntimeFile,
-                        onResetRuntimeFile = onResetRuntimeFile,
-                        onImportRuntimeFile = onImportRuntimeFile,
-                        onExportRuntimeFile = onExportRuntimeFile,
-                        onShareRuntimeFile = onShareRuntimeFile,
-                        onRunTestScan = onRunTestScan,
                     )
                     RuntimeDetails(state = state)
                     DiagnosticsPanel(
@@ -224,13 +219,92 @@ fun DashboardScreen(
                     )
                 }
             }
+
+            DashboardPage.SniList -> {
+                RuntimeListPage(
+                    padding = padding,
+                    title = "SNI list",
+                    fileKind = RuntimeFileKind.SniList,
+                    runtimeFilesState = runtimeFilesState,
+                    actionsEnabled = runtimeFileActionsEnabled,
+                    onRuntimeFileSelected = onRuntimeFileSelected,
+                    onRuntimeFileTextChanged = onRuntimeFileTextChanged,
+                    onSaveRuntimeFile = onSaveRuntimeFile,
+                    onResetRuntimeFile = onResetRuntimeFile,
+                    onImportRuntimeFile = onImportRuntimeFile,
+                    onExportRuntimeFile = onExportRuntimeFile,
+                    onShareRuntimeFile = onShareRuntimeFile,
+                    onRunTestScan = onRunTestScan,
+                )
+            }
+
+            DashboardPage.IpList -> {
+                RuntimeListPage(
+                    padding = padding,
+                    title = "IP list",
+                    fileKind = RuntimeFileKind.IpList,
+                    runtimeFilesState = runtimeFilesState,
+                    actionsEnabled = runtimeFileActionsEnabled,
+                    onRuntimeFileSelected = onRuntimeFileSelected,
+                    onRuntimeFileTextChanged = onRuntimeFileTextChanged,
+                    onSaveRuntimeFile = onSaveRuntimeFile,
+                    onResetRuntimeFile = onResetRuntimeFile,
+                    onImportRuntimeFile = onImportRuntimeFile,
+                    onExportRuntimeFile = onExportRuntimeFile,
+                    onShareRuntimeFile = onShareRuntimeFile,
+                    onRunTestScan = onRunTestScan,
+                )
+            }
         }
     }
 }
 
-private enum class DashboardPage {
-    Home,
-    Settings,
+private enum class DashboardPage(val title: String) {
+    Home("ZeroDPI"),
+    Settings("Settings"),
+    SniList("SNI list"),
+    IpList("IP list"),
+}
+
+@Composable
+private fun RuntimeListPage(
+    padding: PaddingValues,
+    title: String,
+    fileKind: RuntimeFileKind,
+    runtimeFilesState: RuntimeFilesUiState,
+    actionsEnabled: Boolean,
+    onRuntimeFileSelected: (RuntimeFileKind) -> Unit,
+    onRuntimeFileTextChanged: (RuntimeFileKind, String) -> Unit,
+    onSaveRuntimeFile: (RuntimeFileKind) -> Unit,
+    onResetRuntimeFile: (RuntimeFileKind) -> Unit,
+    onImportRuntimeFile: (RuntimeFileKind) -> Unit,
+    onExportRuntimeFile: (RuntimeFileKind) -> Unit,
+    onShareRuntimeFile: (RuntimeFileKind) -> Unit,
+    onRunTestScan: (RuntimeFileKind) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .padding(padding)
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        RuntimeFilesPanel(
+            title = title,
+            fileKinds = listOf(fileKind),
+            state = runtimeFilesState,
+            actionsEnabled = actionsEnabled,
+            onRuntimeFileSelected = onRuntimeFileSelected,
+            onRuntimeFileTextChanged = onRuntimeFileTextChanged,
+            onSaveRuntimeFile = onSaveRuntimeFile,
+            onResetRuntimeFile = onResetRuntimeFile,
+            onImportRuntimeFile = onImportRuntimeFile,
+            onExportRuntimeFile = onExportRuntimeFile,
+            onShareRuntimeFile = onShareRuntimeFile,
+            onRunTestScan = onRunTestScan,
+        )
+    }
 }
 
 @Composable
@@ -790,27 +864,52 @@ private fun ZeroDpiTopBar(
     page: DashboardPage,
     onNavigateHome: () -> Unit,
     onNavigateSettings: () -> Unit,
+    onNavigateSniList: () -> Unit,
+    onNavigateIpList: () -> Unit,
 ) {
+    var menuExpanded by remember { mutableStateOf(false) }
+
     TopAppBar(
         title = {
-            Text(
-                when (page) {
-                    DashboardPage.Home -> "ZeroDPI"
-                    DashboardPage.Settings -> "Settings"
-                },
-            )
+            Text(page.title)
         },
         navigationIcon = {
-            if (page == DashboardPage.Settings) {
+            if (page != DashboardPage.Home) {
                 TextButton(onClick = onNavigateHome) {
                     Text("Back")
                 }
             }
         },
         actions = {
-            if (page == DashboardPage.Home) {
-                TextButton(onClick = onNavigateSettings) {
-                    Text("Settings")
+            Box {
+                TextButton(onClick = { menuExpanded = true }) {
+                    Text("\u2630 Menu")
+                }
+                DropdownMenu(
+                    expanded = menuExpanded,
+                    onDismissRequest = { menuExpanded = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Settings") },
+                        onClick = {
+                            menuExpanded = false
+                            onNavigateSettings()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("SNI list") },
+                        onClick = {
+                            menuExpanded = false
+                            onNavigateSniList()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("IP list") },
+                        onClick = {
+                            menuExpanded = false
+                            onNavigateIpList()
+                        },
+                    )
                 }
             }
         },

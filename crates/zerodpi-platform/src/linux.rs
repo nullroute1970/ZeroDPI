@@ -316,7 +316,9 @@ impl IptablesGuard {
     fn install(filter: &FilterSpec) -> Result<Self> {
         let rules = iptables_rules(filter);
         for rule in &rules {
-            run_iptables("-A", rule).context("install iptables rule")?;
+            // Android devices commonly have pre-existing terminal rules in
+            // INPUT/OUTPUT. Insert first so NFQUEUE sees matching packets.
+            run_iptables("-I", rule).context("install iptables rule")?;
         }
         info!("iptables rules installed");
         Ok(Self { rules })

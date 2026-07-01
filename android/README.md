@@ -45,13 +45,15 @@ Release builds require signing. `build.py` reads the local signing properties
 from:
 
 ```text
-/home/mahmood/Drive/Projects/ZeroDPI/zerodpi-release-signing.properties
+Windows: C:\Drive\Projects\ZeroDPI\zerodpi-release-signing.properties
+Linux: /home/mahmood/Drive/Projects/ZeroDPI/zerodpi-release-signing.properties
 ```
 
 That file points at the existing release keystore:
 
 ```text
-/home/mahmood/Drive/Projects/ZeroDPI/zerodpi-release.jks
+Windows: C:\Drive\Projects\ZeroDPI\zerodpi-release.jks
+Linux: /home/mahmood/Drive/Projects/ZeroDPI/zerodpi-release.jks
 ```
 
 You can override the local file with `ZERODPI_RELEASE_SIGNING_PROPERTIES`, or
@@ -59,12 +61,14 @@ provide these Gradle properties or environment variables before building
 `--android-app-build-type release`:
 
 ```text
-ZERODPI_RELEASE_STORE_FILE=/path/to/keystore.jks
+ZERODPI_RELEASE_STORE_FILE_WINDOWS=C:\Drive\Projects\ZeroDPI\zerodpi-release.jks
+ZERODPI_RELEASE_STORE_FILE_LINUX=/home/mahmood/Drive/Projects/ZeroDPI/zerodpi-release.jks
 ZERODPI_RELEASE_STORE_PASSWORD=...
 ZERODPI_RELEASE_KEY_ALIAS=...
 ZERODPI_RELEASE_KEY_PASSWORD=...
 ```
 
+`ZERODPI_RELEASE_STORE_FILE` is still supported as a single-path fallback.
 `ZERODPI_RELEASE_KEY_PASSWORD` is optional when it matches the store password.
 Use debug builds for local rooted-device smoke tests when no release key is
 configured.

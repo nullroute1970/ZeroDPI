@@ -508,11 +508,12 @@ def build_linux_cross_zigbuild(targets: list[str]) -> None:
         capture_output=True, text=True,
     )
     if zb.returncode != 0:
-        print(
-            "cargo-zigbuild is not installed.\n"
-            "  Install it with: cargo install --locked cargo-zigbuild"
-        )
-        die("cargo-zigbuild not found. Aborting.")
+        print("cargo-zigbuild is not installed.")
+        answer = input("Install it now with: cargo install --locked cargo-zigbuild [Y/n]: ").strip().lower()
+        if answer in ("", "y", "yes"):
+            run(["cargo", "install", "--locked", "cargo-zigbuild"])
+        else:
+            die("cargo-zigbuild is required for cross-compiling. Aborting.")
 
     ensure_rustup_targets(targets)
 

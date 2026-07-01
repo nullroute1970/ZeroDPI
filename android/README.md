@@ -41,8 +41,22 @@ python build.py --platform android --android-app-runtime full
 python build.py --platform android --android-app-abi x86_64 --android-app-build-type debug
 ```
 
-Release builds require signing. Provide these Gradle properties or environment
-variables before building `--android-app-build-type release`:
+Release builds require signing. `build.py` reads the local signing properties
+from:
+
+```text
+/home/mahmood/Drive/Projects/ZeroDPI/zerodpi-release-signing.properties
+```
+
+That file points at the existing release keystore:
+
+```text
+/home/mahmood/Drive/Projects/ZeroDPI/zerodpi-release.jks
+```
+
+You can override the local file with `ZERODPI_RELEASE_SIGNING_PROPERTIES`, or
+provide these Gradle properties or environment variables before building
+`--android-app-build-type release`:
 
 ```text
 ZERODPI_RELEASE_STORE_FILE=/path/to/keystore.jks
@@ -55,10 +69,9 @@ ZERODPI_RELEASE_KEY_PASSWORD=...
 Use debug builds for local rooted-device smoke tests when no release key is
 configured.
 
-If release signing is not configured, Gradle emits a
-`zerodpi-android-<runtime>-release-unsigned.apk` artifact. That file is only for
-manual signing and `adb install` will reject it with
-`INSTALL_PARSE_FAILED_NO_CERTIFICATES`.
+If release signing is not configured, `build.py` stops before running Gradle
+instead of copying an unsigned release APK. The script does not generate or
+rotate signing keys.
 
 The APK is copied to:
 

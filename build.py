@@ -38,6 +38,8 @@ Android app runtime:
   4. Runs the Android Gradle project and copies the APK into the same dist dir.
   5. The default rootless runtime disables NFQUEUE packet interception so the
      first APK runtime can ship without external netfilter dependencies.
+  6. Release APK builds use the existing signing key and properties under
+     /home/mahmood/Drive/Projects/ZeroDPI; build.py never generates keys.
 """
 
 import argparse
@@ -131,6 +133,12 @@ ANDROID_GRADLE_BUILD_ARGS = (
     "--no-daemon",
     "--rerun-tasks",
 )
+ANDROID_RELEASE_SIGNING_DIR = Path("/home/mahmood/Drive/Projects/ZeroDPI")
+ANDROID_RELEASE_SIGNING_PROPERTIES = (
+    ANDROID_RELEASE_SIGNING_DIR / "zerodpi-release-signing.properties"
+)
+ANDROID_RELEASE_STORE_FILE = ANDROID_RELEASE_SIGNING_DIR / "zerodpi-release.jks"
+ANDROID_RELEASE_KEY_ALIAS = "zerodpi-release"
 REPO_ROOT = Path(__file__).resolve().parent
 ANDROID_PROJECT_DIR = REPO_ROOT / "android"
 ANDROID_APP_MODULE_DIR = ANDROID_PROJECT_DIR / "app"
@@ -1335,6 +1343,96 @@ def android_gradle_env(ndk_path: Path | None) -> dict:
     return env
 
 
+def android_release_signing_properties_path() -> Path:
+    raw_path = os.environ.get("ZERODPI_RELEASE_SIGNING_PROPERTIES")
+    if raw_path:
+        return Path(raw_path).expanduser()
+    return ANDROID_RELEASE_SIGNING_PROPERTIES
+
+
+def read_android_release_signing_properties(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+
+    properties: dict[str, str] = {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for line_number, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            die(f"Invalid Android release signing property at {path}:{line_number}")
+        key, value = line.split("=", 1)
+        properties[key.strip()] = value.strip()
+    return properties
+
+
+def android_release_signing_value(name: str, properties: dict[str, str]) -> str | None:
+    value = os.environ.get(name)
+    if value:
+        return value
+    value = properties.get(name)
+    return value if value else None
+
+
+def resolve_android_release_store_file(raw_path: str | None, properties_path: Path) -> Path:
+    if raw_path:
+        store_file = Path(raw_path).expanduser()
+        if not store_file.is_absolute():
+            store_file = properties_path.parent / store_file
+        return store_file
+    return ANDROID_RELEASE_STORE_FILE
+
+
+def android_release_signing_env() -> dict:
+    properties_path = android_release_signing_properties_path()
+    properties = read_android_release_signing_properties(properties_path)
+    store_file = resolve_android_release_store_file(
+        android_release_signing_value("ZERODPI_RELEASE_STORE_FILE", properties),
+        properties_path,
+    )
+    store_password = android_release_signing_value(
+        "ZERODPI_RELEASE_STORE_PASSWORD",
+        properties,
+    )
+    key_alias = (
+        android_release_signing_value("ZERODPI_RELEASE_KEY_ALIAS", properties)
+        or ANDROID_RELEASE_KEY_ALIAS
+    )
+    key_password = (
+        android_release_signing_value("ZERODPI_RELEASE_KEY_PASSWORD", properties)
+        or store_password
+    )
+
+    errors: list[str] = []
+    if not store_file.is_file():
+        errors.append(f"missing keystore: {store_file}")
+    if not store_password:
+        errors.append("missing ZERODPI_RELEASE_STORE_PASSWORD")
+    if not key_alias:
+        errors.append("missing ZERODPI_RELEASE_KEY_ALIAS")
+
+    if errors:
+        die(
+            "Android release signing is required for release APK builds, but "
+            "the signing setup is incomplete:\n  - "
+            + "\n  - ".join(errors)
+            + f"\nExpected local signing properties at: {properties_path}\n"
+            "Create the keystore/properties before building; build.py does not "
+            "generate signing keys."
+        )
+
+    print(f"Android release signing key: {store_file}")
+    env = {
+        "ZERODPI_RELEASE_STORE_FILE": str(store_file),
+        "ZERODPI_RELEASE_STORE_PASSWORD": store_password,
+        "ZERODPI_RELEASE_KEY_ALIAS": key_alias,
+    }
+    if key_password:
+        env["ZERODPI_RELEASE_KEY_PASSWORD"] = key_password
+    return env
+
+
 def resolve_gradle_command(android_gradle: str | None) -> list[str]:
     if not ANDROID_PROJECT_DIR.is_dir():
         die(f"Android project directory not found: {ANDROID_PROJECT_DIR}")
@@ -1422,6 +1520,9 @@ def build_android_app_apk(
 ) -> Path:
     print(f"\n--- Building Android APK ({runtime}, {build_type}) ---")
     gradle_cmd = resolve_gradle_command(android_gradle)
+    gradle_env = android_gradle_env(ndk_path)
+    if build_type == "release":
+        gradle_env.update(android_release_signing_env())
     run(
         [
             *gradle_cmd,
@@ -1431,7 +1532,7 @@ def build_android_app_apk(
             android_gradle_task(build_type),
             *ANDROID_GRADLE_BUILD_ARGS,
         ],
-        env=android_gradle_env(ndk_path),
+        env=gradle_env,
     )
 
     apk = find_android_apk(build_type)

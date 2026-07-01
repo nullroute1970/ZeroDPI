@@ -59,10 +59,10 @@ enum class RootStatus(val label: String) {
 
 data class ZeroDpiServiceState(
     val status: RuntimeStatus = RuntimeStatus.Stopped,
-    val rootStatus: RootStatus = RootStatus.NotNeeded,
+    val rootStatus: RootStatus = RootStatus.Needed,
     val mode: String = "sni_spoof",
-    val bypassMethod: String = "tls_frag",
-    val listener: String = "127.0.0.1:1080",
+    val bypassMethod: String = "wrong_seq",
+    val listener: String = "127.0.0.1:44444",
     val activeTarget: String = "None",
     val activeTargetScore: Int? = null,
     val connectionCount: Int = 0,

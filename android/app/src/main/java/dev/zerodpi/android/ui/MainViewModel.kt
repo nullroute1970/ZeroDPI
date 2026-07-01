@@ -26,6 +26,7 @@ import dev.zerodpi.android.profile.ProfileUpdateResult
 import dev.zerodpi.android.profile.ProfileUpdater
 import dev.zerodpi.android.profile.ProfileValidationResult
 import dev.zerodpi.android.profile.ZeroDpiProfile
+import dev.zerodpi.android.service.RootStatus
 import dev.zerodpi.android.service.RuntimeStatus
 import dev.zerodpi.android.service.ZeroDpiRuntimeStateStore
 import dev.zerodpi.android.service.ZeroDpiService
@@ -190,6 +191,7 @@ class MainViewModel(
             serviceStateJob = viewModelScope.launch {
                 service?.state()?.collect { state ->
                     _uiState.value = state
+                    syncIdleRuntimeStateFromConfig()
                 }
             }
             if (startWhenConnected) {
@@ -208,6 +210,7 @@ class MainViewModel(
             service = null
             isBound = false
             _uiState.value = _uiState.value.copy(status = RuntimeStatus.Stopped)
+            syncIdleRuntimeStateFromConfig()
         }
     }
 
@@ -388,6 +391,9 @@ class MainViewModel(
                     errorMessage = null,
                 )
         }
+        if (kind == RuntimeFileKind.Config) {
+            syncIdleRuntimeStateFromConfig()
+        }
     }
 
     fun updateConfigField(fieldName: String, value: String) {
@@ -405,6 +411,7 @@ class MainViewModel(
                     errorMessage = null,
                 )
         }
+        syncIdleRuntimeStateFromConfig()
     }
 
     fun saveSelectedRuntimeFile() {
@@ -427,6 +434,9 @@ class MainViewModel(
                     statusMessage = "Imported ${kind.fileName}. Review and save the file.",
                     errorMessage = null,
                 )
+        }
+        if (kind == RuntimeFileKind.Config) {
+            syncIdleRuntimeStateFromConfig()
         }
     }
 
@@ -535,6 +545,9 @@ class MainViewModel(
                             statusMessage = "Reset ${kind.fileName} to defaults.",
                             errorMessage = null,
                         )
+                }
+                if (kind == RuntimeFileKind.Config) {
+                    syncIdleRuntimeStateFromConfig()
                 }
             }.onFailure { error ->
                 _runtimeFilesState.update {
@@ -917,6 +930,7 @@ class MainViewModel(
             Triple(index, activeProfile, contents)
         }.fold(
             onSuccess = { (index, activeProfile, contents) ->
+                val configEditor = ZeroDpiConfigToml.analyze(contents.configText)
                 _profileState.value = ProfileUiState(
                     profiles = index.profiles,
                     activeProfileId = activeProfile.id,
@@ -935,10 +949,11 @@ class MainViewModel(
                     configText = contents.configText,
                     sniListText = contents.sniListText,
                     ipListText = contents.ipListText,
-                    configEditor = ZeroDpiConfigToml.analyze(contents.configText),
+                    configEditor = configEditor,
                     isLoading = false,
                     statusMessage = statusMessage,
                 )
+                syncIdleRuntimeStateFromConfig(configEditor)
                 refreshDiagnostics()
                 reconcileAutoUpdateWork(index)
                 true
@@ -1108,6 +1123,32 @@ class MainViewModel(
             RuntimeStatus.Failed,
             -> false
         }
+
+    private fun syncIdleRuntimeStateFromConfig(
+        configEditor: ConfigEditorState = _runtimeFilesState.value.configEditor,
+    ) {
+        _uiState.update { current ->
+            if (current.status != RuntimeStatus.Stopped) {
+                return@update current
+            }
+
+            val mode = configEditor.valueFor("MODE").ifBlank { current.mode }
+            val bypassMethod = configEditor.valueFor("BYPASS_METHOD").ifBlank { current.bypassMethod }
+            val listenHost = configEditor.valueFor("LISTEN_HOST").ifBlank { "127.0.0.1" }
+            val listenPort = configEditor.valueFor("LISTEN_PORT").ifBlank { "44444" }
+
+            current.copy(
+                rootStatus = if (configEditor.rootRequirement.requiresRoot) {
+                    RootStatus.Needed
+                } else {
+                    RootStatus.NotNeeded
+                },
+                mode = mode,
+                bypassMethod = bypassMethod,
+                listener = "$listenHost:$listenPort",
+            )
+        }
+    }
 
     private fun reportProfileError(error: Throwable, fallbackMessage: String) {
         setProfileError(error.message ?: fallbackMessage)

@@ -22,6 +22,7 @@ target
 dist
 windivert
 __pycache__/
+.zig_ar_wrapper.bat
 
 # OpenCode skills
 .opencode/

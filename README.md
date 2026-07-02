@@ -358,7 +358,7 @@ Method behavior in more detail:
 - `wrong_seq_wrong_md5` sends one fake ClientHello with both the `wrong_seq` sequence rewrite and the `wrong_md5` TCP-MD5 option.
 - `wrong_timestamp` is ZeroDPI's snake_case name for sing-box's `wrong-timestamp` spoof behavior. It requires TCP timestamps on the intercepted flow and backdates `TSval` so PAWS rejects the forged segment.
 - `tls_record_frag` rewrites the real first TLS record into many smaller TLS records. The server should reassemble the TLS handshake normally.
-- `tls_frag` keeps the TLS bytes unchanged and writes selected client data in small TCP chunks from the proxy. It can fragment the first TLS ClientHello (`TLS_FRAG_PACKETS = "tlshello"`) or a 1-based range of client writes such as `"1-3"`.
+- `tls_frag` keeps the TLS bytes unchanged and writes selected client data in small TCP chunks from the proxy. It can fragment a 1-based range of client writes such as `TLS_FRAG_PACKETS = "1-3"` or the first TLS ClientHello with `TLS_FRAG_PACKETS = "tlshello"`.
 - The combo methods such as `wrong_seq_tls_frag` and `wrong_md5_tls_frag` first send a decoy ClientHello, then also fragment the real ClientHello path.
 
 If a method works but connection setup is slow, increase fragment sizes gradually (`TLS_FRAG_LENGTH`, `TLS_RECORD_FRAG_SIZE`) or try a higher-scoring SNI/IP. Very small fragments are aggressive and can add connection-start overhead.
@@ -376,7 +376,11 @@ MODE = "sni_spoof"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 44444
 SNI_LIST = "sni_list.txt"
-BYPASS_METHOD = "wrong_seq"
+BYPASS_METHOD = "wrong_seq_tls_frag"
+BYPASS_TIMEOUT_SECS = 20
+TLS_FRAG_PACKETS = "1-3"
+TLS_FRAG_LENGTH = "100-200"
+TLS_FRAG_INTERVAL_MS = "10-20"
 AUTO_SELECT = false
 ```
 
@@ -407,13 +411,13 @@ Use this when WinDivert/NFQUEUE is unavailable or you want TCP-level TLS Fragmen
 ```toml
 MODE = "sni_spoof"
 BYPASS_METHOD = "tls_frag"
-TLS_FRAG_PACKETS = "tlshello"
-TLS_FRAG_LENGTH = "1"
-TLS_FRAG_INTERVAL_MS = "0"
+TLS_FRAG_PACKETS = "1-3"
+TLS_FRAG_LENGTH = "100-200"
+TLS_FRAG_INTERVAL_MS = "10-20"
 TCP_SEG_NODELAY = true
 ```
 
-This still requires your VPN client to connect to ZeroDPI's local listener. The TLS layer stays intact; ZeroDPI only controls how the ClientHello bytes are written into TCP segments. Use `TLS_FRAG_PACKETS = "1-3"` to fragment the first through third client-to-upstream writes instead of only the first TLS record.
+This still requires your VPN client to connect to ZeroDPI's local listener. The TLS layer stays intact; ZeroDPI only controls how selected client-to-upstream writes are split into TCP segments. Set `TLS_FRAG_PACKETS = "tlshello"` to fragment only the first TLS record.
 
 ### Scan Only and Save Results
 
@@ -463,7 +467,11 @@ Use this after you have already run `sni_scan` and want deterministic startup wi
 ```toml
 MODE = "sni_spoof"
 SELECTED_SNI = "auth.vercel.com"
-BYPASS_METHOD = "wrong_seq"
+BYPASS_METHOD = "wrong_seq_tls_frag"
+BYPASS_TIMEOUT_SECS = 20
+TLS_FRAG_PACKETS = "1-3"
+TLS_FRAG_LENGTH = "100-200"
+TLS_FRAG_INTERVAL_MS = "10-20"
 AUTO_SELECT = true
 ```
 
@@ -568,8 +576,8 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `BYPASS_METHOD` | `string` | `"wrong_seq"` | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`, `wrong_ack`, `wrong_timestamp`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, or `tls_frag`; `ip_bypass_plus` allows only `tls_record_frag` or `tls_frag` |
-| `BYPASS_TIMEOUT_SECS` | `u64` | `2` | Time to wait for bypass setup before giving up |
+| `BYPASS_METHOD` | `string` | `"wrong_seq_tls_frag"` | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`, `wrong_ack`, `wrong_timestamp`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, or `tls_frag`; `ip_bypass_plus` allows only `tls_record_frag` or `tls_frag` |
+| `BYPASS_TIMEOUT_SECS` | `u64` | `20` | Time to wait for bypass setup before giving up |
 | `RELAY_MAX_LIFETIME_SECS` | `u64` | `0` | Rotate established relays after this many seconds (`0` = disabled/default) |
 | `NFQUEUE_NUM` | `u16` | `1` | (Linux) NFQUEUE queue number |
 | `LINUX_FIREWALL_BACKEND` | `string` | `"iptables"` | (Linux) Rule backend: `iptables` or `nftables` |
@@ -635,13 +643,13 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `TLS_FRAG_PACKETS` | `string` | `"tlshello"` | `"tlshello"` for first TLS record, or a 1-based client-write range like `"1-3"` |
-| `TLS_FRAG_LENGTH` | `Int32Range` | uses `TCP_SEG_SIZE` | Fragment chunk length in bytes; accepts `N` or `"A-B"` (≥ 1) |
-| `TLS_FRAG_INTERVAL_MS` | `Int32Range` | `0` | Delay between chunks in ms; accepts `N` or `"A-B"` (≥ 0) |
-| `TCP_SEG_SIZE` | `usize` | `1` | Legacy fixed-length fallback used when `TLS_FRAG_LENGTH` is omitted |
+| `TLS_FRAG_PACKETS` | `string` | `"1-3"` | A 1-based client-write range like `"1-3"`, or `"tlshello"` for the first TLS record |
+| `TLS_FRAG_LENGTH` | `Int32Range` | `"100-200"` | Fragment chunk length in bytes; accepts `N` or `"A-B"` (>= 1) |
+| `TLS_FRAG_INTERVAL_MS` | `Int32Range` | `"10-20"` | Delay between chunks in ms; accepts `N` or `"A-B"` (>= 0) |
+| `TCP_SEG_SIZE` | `usize` | `1` | Legacy fixed-length fallback for configs constructed without `TLS_FRAG_LENGTH` |
 | `TCP_SEG_NODELAY` | `bool` | `true` | Enable TCP_NODELAY to prevent Nagle coalescing |
 
-`TLS_FRAG_LENGTH` and `TLS_FRAG_INTERVAL_MS` use Xray-style range syntax: `5` means a fixed value, while `"1-5"` chooses a fresh random value in that inclusive range for each fragment chunk. With `TLS_FRAG_INTERVAL_MS = "0"`, ZeroDPI writes chunks back-to-back; actual TCP packet coalescing still depends on `TCP_SEG_NODELAY`, MSS/MTU, and the host TCP stack.
+`TLS_FRAG_LENGTH` and `TLS_FRAG_INTERVAL_MS` use Xray-style range syntax: `5` means a fixed value, while `"1-5"` chooses a fresh random value in that inclusive range for each fragment chunk. Set `TLS_FRAG_INTERVAL_MS = "0"` to write chunks back-to-back; actual TCP packet coalescing still depends on `TCP_SEG_NODELAY`, MSS/MTU, and the host TCP stack.
 
 `wrong_seq_tls_frag` uses both the `wrong_seq` and `tls_frag` parameter groups. `wrong_md5_tls_frag` uses the `wrong_md5` and `tls_frag` parameter groups.
 

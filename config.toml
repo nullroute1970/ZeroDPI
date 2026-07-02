@@ -139,7 +139,7 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #
 # Supported values:
 #
-#   "wrong_seq" (default)
+#   "wrong_seq"
 #     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
 #     then injects a fake TLS ClientHello on that packet with a deliberately
 #     old TCP sequence number.  DPI devices inspect the payload using the
@@ -199,7 +199,7 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     TLS records across fragment boundaries will fail to extract the SNI.  The
 #     upstream TLS server reassembles the fragments normally.
 #
-#   "wrong_seq_tls_frag"
+#   "wrong_seq_tls_frag" (default)
 #     Combines wrong_seq with TLS Fragment / TCP-level fragmentation for
 #     layered filtering.  First, it injects a fake wrong-sequence ClientHello
 #     on the handshake ACK.  Then it fragments configured real client data
@@ -228,7 +228,7 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 # "proxy_scan").  MODE = "ip_bypass_plus" supports only "tls_record_frag" or
 # "tls_frag" so the upstream VPN client's real SNI is preserved. The
 # "ip_bypass" and "ip_scan" modes do not use a bypass method.
-BYPASS_METHOD = "wrong_seq"
+BYPASS_METHOD = "wrong_seq_tls_frag"
 
 # Seconds the proxy waits for the intercept thread to confirm that the spoofed
 # packet was acknowledged and the bypass phase completed.
@@ -236,7 +236,7 @@ BYPASS_METHOD = "wrong_seq"
 # Increase this on very high-latency links or slow systems if otherwise valid
 # connections time out during startup.  Lower values fail faster when the
 # bypass cannot complete.  Must be at least 1.
-BYPASS_TIMEOUT_SECS = 2
+BYPASS_TIMEOUT_SECS = 20
 
 # Maximum lifetime (in seconds) for an established relay before ZeroDPI closes
 # it and lets the upstream VPN client reconnect. This is useful for protocols
@@ -487,8 +487,8 @@ TLS_RECORD_FRAG_BUMP_IP_IDENT = true
 #   "1-3"      — fragment the 1st through 3rd client-to-upstream data writes
 #                observed by ZeroDPI.
 #
-# Default: "tlshello".
-TLS_FRAG_PACKETS = "tlshello"
+# Default: "1-3".
+TLS_FRAG_PACKETS = "1-3"
 
 # Fragment length range in bytes.
 #
@@ -499,10 +499,10 @@ TLS_FRAG_PACKETS = "tlshello"
 #
 # A fresh value is chosen for each fragment chunk. Smaller values produce more
 # chunks and are harder for DPI to reassemble, at the cost of connection-start
-# overhead. If this field is omitted, ZeroDPI falls back to legacy TCP_SEG_SIZE.
+# overhead. If this field is omitted, ZeroDPI uses the default range below.
 #
-# Must be >= 1.  Default: unset (uses TCP_SEG_SIZE).
-TLS_FRAG_LENGTH = "1"
+# Must be >= 1.  Default: "100-200".
+TLS_FRAG_LENGTH = "100-200"
 
 # Delay between fragment chunks, in milliseconds.
 #
@@ -514,13 +514,14 @@ TLS_FRAG_LENGTH = "1"
 # A fresh value is chosen between each pair of chunks. ZeroDPI does not sleep
 # after the last chunk.
 #
-# Must be >= 0.  Default: 0.
-TLS_FRAG_INTERVAL_MS = "0"
+# Must be >= 0.  Default: "10-20".
+TLS_FRAG_INTERVAL_MS = "10-20"
 
 # Legacy fixed fragment length fallback.
 #
-# Existing configs can keep using TCP_SEG_SIZE. New configs should prefer
-# TLS_FRAG_LENGTH because it supports Xray-style ranges.
+# Existing configs that explicitly omit TLS_FRAG_LENGTH in code can keep using
+# TCP_SEG_SIZE. New configs should prefer TLS_FRAG_LENGTH because it supports
+# Xray-style ranges.
 #
 # Used only when TLS_FRAG_LENGTH is omitted. Must be >= 1. Default: 1.
 TCP_SEG_SIZE = 1

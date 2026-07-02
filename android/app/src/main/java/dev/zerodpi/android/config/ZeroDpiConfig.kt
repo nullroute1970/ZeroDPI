@@ -353,7 +353,7 @@ object ZeroDpiConfigSchema {
         field(
             name = "BYPASS_METHOD",
             type = ConfigFieldType.Enum,
-            defaultValue = "wrong_seq",
+            defaultValue = "wrong_seq_tls_frag",
             section = ConfigSection.BypassEngine,
             validationRule = "Must be one of the supported bypass method strings.",
             rootImpact = ConfigRootImpact.ControlsRootRequirement,
@@ -363,7 +363,7 @@ object ZeroDpiConfigSchema {
         field(
             name = "BYPASS_TIMEOUT_SECS",
             type = ConfigFieldType.UInt64,
-            defaultValue = "2",
+            defaultValue = "20",
             section = ConfigSection.BypassEngine,
             validationRule = "Must be greater than 0.",
             helpText = "Seconds to wait for bypass completion before failing a connection.",
@@ -587,7 +587,7 @@ object ZeroDpiConfigSchema {
         field(
             name = "TLS_FRAG_PACKETS",
             type = ConfigFieldType.PacketSelector,
-            defaultValue = "tlshello",
+            defaultValue = "1-3",
             section = ConfigSection.TlsFrag,
             validationRule = "tlshello, a 1-based index, or a 1-based range.",
             rootImpact = ConfigRootImpact.RootlessFragmentation,
@@ -596,7 +596,7 @@ object ZeroDpiConfigSchema {
         field(
             name = "TLS_FRAG_LENGTH",
             type = ConfigFieldType.IntegerRange,
-            defaultValue = "1",
+            defaultValue = "100-200",
             section = ConfigSection.TlsFrag,
             validationRule = "Integer or inclusive range with minimum at least 1.",
             rootImpact = ConfigRootImpact.RootlessFragmentation,
@@ -605,7 +605,7 @@ object ZeroDpiConfigSchema {
         field(
             name = "TLS_FRAG_INTERVAL_MS",
             type = ConfigFieldType.IntegerRange,
-            defaultValue = "0",
+            defaultValue = "10-20",
             section = ConfigSection.TlsFrag,
             validationRule = "Integer or inclusive range with minimum at least 0.",
             rootImpact = ConfigRootImpact.RootlessFragmentation,

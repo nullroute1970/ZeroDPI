@@ -174,7 +174,7 @@ pub struct Config {
     pub SELECTED_SNI: Option<String>,
 
     /// Bypass method to use.  Supported values:
-    /// - `"wrong_seq"` (default) — injects a fake TLS ClientHello with a
+    /// - `"wrong_seq"` — injects a fake TLS ClientHello with a
     ///   deliberately wrong TCP sequence number so DPI inspects the fake SNI
     ///   while the real server discards the out-of-window payload.
     /// - `"wrong_checksum"` — injects a fake TLS ClientHello with the normal
@@ -198,8 +198,9 @@ pub struct Config {
     ///   Splits the real ClientHello into multiple small TLS records so no
     ///   single record contains the full SNI. No fake packet is injected; the
     ///   server reassembles normally.
-    /// - `"wrong_seq_tls_frag"` — injects a `wrong_seq` fake ClientHello,
-    ///   then fragments configured real client data for downstream DPI layers.
+    /// - `"wrong_seq_tls_frag"` (default) — injects a `wrong_seq` fake
+    ///   ClientHello, then fragments configured real client data for
+    ///   downstream DPI layers.
     /// - `"wrong_md5_tls_frag"` — injects a `wrong_md5` fake ClientHello,
     ///   then fragments configured real client data for downstream DPI layers.
     /// - `"wrong_seq_tls_record_frag"` — injects a `wrong_seq` fake
@@ -393,7 +394,7 @@ pub struct Config {
     /// - `"N-M"` fragments the Nth through Mth client-to-upstream data writes
     ///   seen by ZeroDPI. Packet indexes are 1-based.
     ///
-    /// Default: `"tlshello"`.
+    /// Default: `"1-3"`.
     #[serde(default = "default_tls_frag_packets")]
     pub TLS_FRAG_PACKETS: String,
 
@@ -401,15 +402,16 @@ pub struct Config {
     /// fragmentation. Accepts either an integer (`1`) or an inclusive range
     /// string (`"1-5"`). A fresh value is sampled for every fragment chunk.
     ///
-    /// If unset, ZeroDPI falls back to the legacy `TCP_SEG_SIZE` value.
-    /// Must be `>= 1` when set.
-    #[serde(default)]
+    /// If this field is `None` in an in-memory config, ZeroDPI falls back to
+    /// the legacy `TCP_SEG_SIZE` value. Must be `>= 1` when set.
+    /// Default: `"100-200"`.
+    #[serde(default = "default_tls_frag_length")]
     pub TLS_FRAG_LENGTH: Option<Int32Range>,
 
     /// Xray-style interval range, in milliseconds, between TCP-level
     /// fragments. Accepts either an integer (`0`) or an inclusive range string
     /// (`"0-10"`). A fresh value is sampled between fragment chunks.
-    /// Must be `>= 0`. Default: `0`.
+    /// Must be `>= 0`. Default: `"10-20"`.
     #[serde(default = "default_tls_frag_interval_ms")]
     pub TLS_FRAG_INTERVAL_MS: Int32Range,
 
@@ -450,7 +452,7 @@ pub struct Config {
     /// How many seconds the proxy waits for the intercept thread to confirm
     /// that the spoofed packet was acknowledged before giving up on a
     /// connection.  Increase on very high-latency links.
-    /// Must be `>= 1`.  Default: `2`.
+    /// Must be `>= 1`.  Default: `20`.
     #[serde(default = "default_bypass_timeout")]
     pub BYPASS_TIMEOUT_SECS: u64,
 
@@ -623,7 +625,7 @@ fn default_scan_timeout() -> u64 {
     5
 }
 fn default_method() -> String {
-    "wrong_seq".into()
+    "wrong_seq_tls_frag".into()
 }
 fn default_queue_num() -> u16 {
     1
@@ -647,16 +649,19 @@ fn default_tls_frag_size() -> usize {
     1
 }
 fn default_tls_frag_packets() -> String {
-    "tlshello".into()
+    "1-3".into()
+}
+fn default_tls_frag_length() -> Option<Int32Range> {
+    Some(Int32Range { min: 100, max: 200 })
 }
 fn default_tls_frag_interval_ms() -> Int32Range {
-    Int32Range::exact(0)
+    Int32Range { min: 10, max: 20 }
 }
 fn default_tcp_seg_size() -> usize {
     1
 }
 fn default_bypass_timeout() -> u64 {
-    2
+    20
 }
 fn default_mode() -> String {
     "sni_spoof".into()
@@ -894,7 +899,7 @@ mod tests {
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.LISTEN_PORT, 40443);
-        assert_eq!(cfg.BYPASS_METHOD, "wrong_seq");
+        assert_eq!(cfg.BYPASS_METHOD, "wrong_seq_tls_frag");
         assert_eq!(cfg.NFQUEUE_NUM, 1);
         assert_eq!(cfg.LINUX_FIREWALL_BACKEND, "iptables");
         assert!(!cfg.AUTO_SELECT);
@@ -930,14 +935,17 @@ mod tests {
         assert!(cfg.TLS_RECORD_FRAG_SET_PSH);
         assert!(cfg.TLS_RECORD_FRAG_BUMP_IP_IDENT);
         // tls_frag defaults
-        assert_eq!(cfg.TLS_FRAG_PACKETS, "tlshello");
-        assert_eq!(cfg.TLS_FRAG_LENGTH, None);
-        assert_eq!(cfg.tls_frag_length_range().unwrap(), Int32Range::exact(1));
-        assert_eq!(cfg.TLS_FRAG_INTERVAL_MS, Int32Range::exact(0));
+        assert_eq!(cfg.TLS_FRAG_PACKETS, "1-3");
+        assert_eq!(cfg.TLS_FRAG_LENGTH, Some(Int32Range { min: 100, max: 200 }));
+        assert_eq!(
+            cfg.tls_frag_length_range().unwrap(),
+            Int32Range { min: 100, max: 200 }
+        );
+        assert_eq!(cfg.TLS_FRAG_INTERVAL_MS, Int32Range { min: 10, max: 20 });
         assert_eq!(cfg.TCP_SEG_SIZE, 1);
         assert!(cfg.TCP_SEG_NODELAY);
         // proxy timing defaults
-        assert_eq!(cfg.BYPASS_TIMEOUT_SECS, 2);
+        assert_eq!(cfg.BYPASS_TIMEOUT_SECS, 20);
         assert_eq!(cfg.RELAY_MAX_LIFETIME_SECS, 0);
     }
 
@@ -1709,9 +1717,15 @@ mod tests {
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.BYPASS_METHOD, "tls_frag");
-        assert_eq!(cfg.tls_frag_packets().unwrap(), TlsFragPackets::TlsHello);
-        assert_eq!(cfg.tls_frag_length_range().unwrap(), Int32Range::exact(1));
-        assert_eq!(cfg.TLS_FRAG_INTERVAL_MS, Int32Range::exact(0));
+        assert_eq!(
+            cfg.tls_frag_packets().unwrap(),
+            TlsFragPackets::WriteRange { start: 1, end: 3 }
+        );
+        assert_eq!(
+            cfg.tls_frag_length_range().unwrap(),
+            Int32Range { min: 100, max: 200 }
+        );
+        assert_eq!(cfg.TLS_FRAG_INTERVAL_MS, Int32Range { min: 10, max: 20 });
         assert_eq!(cfg.TCP_SEG_SIZE, 1);
         assert!(cfg.TCP_SEG_NODELAY);
     }
@@ -1727,8 +1741,11 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.TLS_FRAG_LENGTH, None);
-        assert_eq!(cfg.tls_frag_length_range().unwrap(), Int32Range::exact(16));
+        assert_eq!(cfg.TLS_FRAG_LENGTH, Some(Int32Range { min: 100, max: 200 }));
+        assert_eq!(
+            cfg.tls_frag_length_range().unwrap(),
+            Int32Range { min: 100, max: 200 }
+        );
         assert_eq!(cfg.TCP_SEG_SIZE, 16);
         assert!(!cfg.TCP_SEG_NODELAY);
     }

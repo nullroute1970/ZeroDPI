@@ -335,9 +335,9 @@ mod tests {
         )
         .unwrap();
         let m = TcpSegmentation::new(&cfg);
-        assert_eq!(m.packets, TlsFragPackets::TlsHello);
-        assert_eq!(m.length, Int32Range::exact(7));
-        assert_eq!(m.interval_ms, Int32Range::exact(0));
+        assert_eq!(m.packets, TlsFragPackets::WriteRange { start: 1, end: 3 });
+        assert_eq!(m.length, Int32Range { min: 100, max: 200 });
+        assert_eq!(m.interval_ms, Int32Range { min: 10, max: 20 });
         assert!(!m.nodelay);
     }
 

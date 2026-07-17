@@ -134,8 +134,16 @@ pub async fn run_proxy_tests(
             candidate.sni_score(),
         )));
         let flows = new_flow_table();
-        let probe =
-            run_socks5_probe(config.clone(), active_target, flows, interface_ip, timeout).await;
+        let flow_controller: Arc<dyn crate::flow::FlowController> =
+            Arc::new(crate::flow::LocalFlowController::new(flows));
+        let probe = run_socks5_probe(
+            config.clone(),
+            active_target,
+            flow_controller,
+            interface_ip,
+            timeout,
+        )
+        .await;
         let entry = build_entry(candidate, probe, &config);
         debug!("{}", entry.summary_line());
         if let Some(ref tx) = progress_tx {
@@ -186,8 +194,16 @@ where
 
     if config.BYPASS_METHOD == "tls_frag" {
         let flows = new_flow_table();
-        let probe_result =
-            run_socks5_probe(config.clone(), active_target, flows, interface_ip, timeout).await;
+        let flow_controller: Arc<dyn crate::flow::FlowController> =
+            Arc::new(crate::flow::LocalFlowController::new(flows));
+        let probe_result = run_socks5_probe(
+            config.clone(),
+            active_target,
+            flow_controller,
+            interface_ip,
+            timeout,
+        )
+        .await;
         return build_entry(candidate, probe_result, &config);
     }
 
@@ -208,6 +224,7 @@ where
         remote_port: CONNECT_PORT,
         queue_num: config.NFQUEUE_NUM,
         linux_firewall_backend: config.linux_firewall_backend(),
+        firewall_owner: None,
     };
 
     let interceptor = match interceptor_factory(filter) {
@@ -232,13 +249,51 @@ where
         });
 
     // Start the proxy listener on LISTEN_PORT.
-    let probe_result =
-        run_socks5_probe(config.clone(), active_target, flows, interface_ip, timeout).await;
+    let flow_controller: Arc<dyn crate::flow::FlowController> =
+        Arc::new(crate::flow::LocalFlowController::new(flows));
+    let probe_result = run_socks5_probe(
+        config.clone(),
+        active_target,
+        flow_controller,
+        interface_ip,
+        timeout,
+    )
+    .await;
 
     shutdown.request();
     let _ = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
 
     build_entry(candidate, probe_result, &config)
+}
+
+/// Test a candidate using an already-open interceptor controller. This is the
+/// Android privilege-separated path; the caller must configure/open the root
+/// helper before calling and close it after this future returns.
+pub async fn test_candidate_with_flow_controller(
+    candidate: &SniProbeEntry,
+    config: Arc<Config>,
+    interface_ip: Ipv4Addr,
+    flow_controller: Arc<dyn crate::flow::FlowController>,
+) -> ProxyTestEntry {
+    let timeout = Duration::from_secs(config.PROXY_TEST_TIMEOUT_SECS);
+    let active_target = Arc::new(std::sync::RwLock::new(ActiveSniTarget::new(
+        candidate.sni.clone(),
+        candidate.ip,
+        candidate.sni_score(),
+    )));
+    let probe_result = run_socks5_probe(
+        config.clone(),
+        active_target,
+        flow_controller,
+        interface_ip,
+        timeout,
+    )
+    .await;
+    build_entry(candidate, probe_result, &config)
+}
+
+pub fn failed_candidate_entry(candidate: &SniProbeEntry, sni_weight: f64) -> ProxyTestEntry {
+    failed_entry(candidate, sni_weight)
 }
 
 // ---------------------------------------------------------------------------
@@ -258,16 +313,15 @@ struct ProbeResult {
 async fn run_socks5_probe(
     config: Arc<Config>,
     active_target: Arc<std::sync::RwLock<ActiveSniTarget>>,
-    flows: crate::flow::FlowTable,
+    flow_controller: Arc<dyn crate::flow::FlowController>,
     interface_ip: Ipv4Addr,
     timeout: Duration,
 ) -> ProbeResult {
     // Spawn the proxy task.
     let cfg_clone = config.clone();
     let at_clone = active_target.clone();
-    let fl_clone = flows.clone();
     let proxy_task = tokio::spawn(async move {
-        let _ = run_proxy(cfg_clone, at_clone, interface_ip, fl_clone, None).await;
+        let _ = run_proxy(cfg_clone, at_clone, interface_ip, flow_controller, None).await;
     });
 
     // Give the listener a moment to bind before connecting.

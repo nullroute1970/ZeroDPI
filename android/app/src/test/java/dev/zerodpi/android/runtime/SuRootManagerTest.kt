@@ -44,18 +44,21 @@ class SuRootManagerTest {
     }
 
     @Test
-    fun runAsRootExecsCommandAfterChangingToWorkingDirectory() = runBlocking {
+    fun launchRootHelperBuildsOnlyTheTypedHelperCommand() = runBlocking {
         val executor = FakeRootProcessExecutor(FakeResponse(exitCode = 0))
         val manager = SuRootManager(executor)
         val workingDirectory = File("/data/user/0/dev.zerodpi.android/files/zero dpi")
 
-        val result = manager.runAsRoot(
-            command = listOf(
-                "/data/app/libzerodpi_exec.so",
-                "--config",
-                "/data/user/0/dev.zerodpi.android/files/zerodpi/config with 'quote'.toml",
+        val runtimeDirectory = File("/data/user/0/dev.zerodpi.android/files/helper session")
+        val result = manager.launchRootHelper(
+            RootHelperLaunchRequest(
+                executable = File("/data/app/libzerodpi_root_helper_exec.so"),
+                socketPath = File(runtimeDirectory, "control.sock"),
+                sessionFile = File(runtimeDirectory, "session.proof"),
+                expectedAppUid = 10123,
+                parentPid = 4321,
+                workingDirectory = workingDirectory,
             ),
-            workingDirectory = workingDirectory,
         )
 
         assertTrue(result is RootProcessLaunchResult.Started)
@@ -64,8 +67,9 @@ class SuRootManagerTest {
                 "su",
                 "-c",
                 "cd '${workingDirectory.absolutePath}' && " +
-                    "exec /data/app/libzerodpi_exec.so --config " +
-                    "'/data/user/0/dev.zerodpi.android/files/zerodpi/config with '\"'\"'quote'\"'\"'.toml'",
+                    "exec '${File("/data/app/libzerodpi_root_helper_exec.so").absolutePath}' --socket " +
+                    "'${File(runtimeDirectory, "control.sock").absolutePath}' --expected-uid 10123 " +
+                    "--session-file '${File(runtimeDirectory, "session.proof").absolutePath}' --parent-pid 4321",
             ),
             executor.commands.single(),
         )

@@ -36,6 +36,18 @@ class RuntimeEventLineParserTest {
     }
 
     @Test
+    fun parsesAuthenticatedHelperIdentity() {
+        val event = RuntimeEventLineParser.parse(
+            """{"event":"helper_authenticated","pid":1234,"uid":0,"protocol_major":1,"protocol_minor":0,"capabilities":["nfqueue"]}""",
+        )
+
+        assertTrue(event is ZeroDpiRunnerEvent.RootHelperAuthenticated)
+        val helper = event as ZeroDpiRunnerEvent.RootHelperAuthenticated
+        assertEquals(1234L, helper.pid)
+        assertEquals(0L, helper.uid)
+    }
+
+    @Test
     fun parsesRelayBytesFinalField() {
         val event = RuntimeEventLineParser.parse(
             """{"event":"relay_bytes","src_port":44300,"c2s_bytes":1200,"s2c_bytes":3400,"final":true}""",

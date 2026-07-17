@@ -24,6 +24,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+libc.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time", "signal"] }
 clap.workspace = true
 ratatui.workspace = true
@@ -32,4 +33,5 @@ crossterm.workspace = true
 rustls.workspace = true
 
 zerodpi-core = { path = "../zerodpi-core" }
+zerodpi-helper-protocol = { path = "../zerodpi-helper-protocol" }
 zerodpi-platform = { path = "../zerodpi-platform", default-features = false }

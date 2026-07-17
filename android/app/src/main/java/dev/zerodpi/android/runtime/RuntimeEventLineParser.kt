@@ -1,6 +1,19 @@
 package dev.zerodpi.android.runtime
 
 internal object RuntimeEventLineParser {
+    data class StartupIdentity(val pid: Long, val uid: Long)
+
+    fun startupIdentity(line: String): StartupIdentity? {
+        val json = line.trim()
+        if (!json.startsWith("{") || !json.endsWith("}") || stringValue(json, "event") != "startup") {
+            return null
+        }
+        return StartupIdentity(
+            pid = longValue(json, "pid") ?: return null,
+            uid = longValue(json, "uid") ?: return null,
+        )
+    }
+
     fun startupPid(line: String): Long? {
         val json = line.trim()
         if (!json.startsWith("{") || !json.endsWith("}")) {
@@ -21,7 +34,11 @@ internal object RuntimeEventLineParser {
 
         return when (stringValue(json, "event")) {
             "startup" -> ZeroDpiRunnerEvent.Log(
-                "ZeroDPI ${stringValue(json, "version").orEmpty()} started with pid ${longValue(json, "pid") ?: "unknown"}.",
+                "ZeroDPI ${stringValue(json, "version").orEmpty()} started with pid ${longValue(json, "pid") ?: "unknown"} and uid ${longValue(json, "uid") ?: "unknown"}.",
+            )
+            "helper_authenticated" -> ZeroDpiRunnerEvent.RootHelperAuthenticated(
+                pid = longValue(json, "pid") ?: 0,
+                uid = longValue(json, "uid") ?: 0,
             )
             "config_loaded" -> ZeroDpiRunnerEvent.ConfigLoaded(
                 mode = stringValue(json, "mode").orEmpty(),

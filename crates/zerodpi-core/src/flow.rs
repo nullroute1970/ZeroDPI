@@ -2,7 +2,9 @@
 //! backend. The flow table maps a 4-tuple to per-connection state and a
 //! signal channel used to wake the proxy task when the bypass is complete.
 
+use std::future::Future;
 use std::net::Ipv4Addr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -116,4 +118,50 @@ pub type FlowTable = Arc<DashMap<FlowKey, Arc<FlowEntry>>>;
 
 pub fn new_flow_table() -> FlowTable {
     Arc::new(DashMap::new())
+}
+
+/// Future returned while a flow controller makes a flow visible to the
+/// packet handler. Remote implementations complete this only after the helper
+/// acknowledges registration, preserving register-before-connect ordering.
+pub type FlowRegistrationFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<Arc<FlowEntry>>> + Send + 'a>>;
+
+/// Data-plane view of flow registration. Desktop builds use
+/// [`LocalFlowController`]; Android privilege separation supplies a remote
+/// implementation backed by the root-helper protocol.
+pub trait FlowController: Send + Sync {
+    fn register_flow(&self, key: FlowKey, fake_data: Vec<u8>) -> FlowRegistrationFuture<'_>;
+
+    /// Idempotently release a flow. Implementations must make this safe to
+    /// call from a cancellation/drop guard.
+    fn remove_flow(&self, key: FlowKey);
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalFlowController {
+    flows: FlowTable,
+}
+
+impl LocalFlowController {
+    pub fn new(flows: FlowTable) -> Self {
+        Self { flows }
+    }
+
+    pub fn flows(&self) -> FlowTable {
+        self.flows.clone()
+    }
+}
+
+impl FlowController for LocalFlowController {
+    fn register_flow(&self, key: FlowKey, fake_data: Vec<u8>) -> FlowRegistrationFuture<'_> {
+        Box::pin(async move {
+            let entry = FlowEntry::new(fake_data);
+            self.flows.insert(key, entry.clone());
+            Ok(entry)
+        })
+    }
+
+    fn remove_flow(&self, key: FlowKey) {
+        self.flows.remove(&key);
+    }
 }

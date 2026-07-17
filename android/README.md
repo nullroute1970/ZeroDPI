@@ -14,16 +14,20 @@ client at the local ZeroDPI listener from `config.toml`, usually
 - Rootless builds package the ZeroDPI CLI and run modes that do not need packet
   interception, such as `ip_bypass`, scan modes, and supported `tls_frag`
   workflows.
-- Full builds package the same app with root-capable runtime assets. Modes that
-  use Android/Linux packet interception request `su` and use the configured
-  firewall backend.
+- Full builds package an app-UID data plane plus a dedicated root helper.
+  Interception-based modes start only the helper through `su`; scanners,
+  listeners, upstream sockets, and relays remain owned by the Android app UID.
+  The app fails closed if helper authentication or setup fails and never
+  falls back to running the complete runtime as root.
 - Debug app builds may use `FakeZeroDpiRunner` when no native artifact is
   packaged, so UI and service tests can run from Gradle alone. Release builds
   fail loudly if the native artifact is missing.
 
-The native executable is packaged as `libzerodpi_exec.so` under
-`jniLibs/<abi>/` and is extracted to the app native library directory at
-install time.
+The data-plane executable is packaged as `libzerodpi_exec.so` under
+`jniLibs/<abi>/`. Full builds also package
+`libzerodpi_root_helper_exec.so`; rootless builds omit it. Both are extracted
+to the app native library directory at install time. The security boundary
+and protocol are documented in [PRIVILEGE_SEPARATION.md](PRIVILEGE_SEPARATION.md).
 
 ## Build
 
@@ -96,6 +100,12 @@ adb shell am start -n dev.zerodpi.android/.MainActivity
 After pressing Start, the session log should show `Loaded ... config` and
 `Listening on ...`. It should not show `Using fake ZeroDPI runner` when the APK
 was built through `build.py` with native runtime artifacts.
+
+For a root-required mode, the log must show the root helper at UID 0 and the
+data plane at the package UID. Exclude the ZeroDPI package—not UID 0—in the
+upstream VPN client's per-app settings. Android block-without-VPN/lockdown may
+intentionally block excluded applications; ZeroDPI cannot override that
+device or VPN policy.
 
 ## Profiles
 

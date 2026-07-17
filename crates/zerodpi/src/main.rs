@@ -12,6 +12,7 @@
 //!   6. If `RESCAN_INTERVAL_SECS > 0`, run the scanner again in the background
 //!      every that many seconds and switch new connections to better targets.
 
+mod helper_client;
 mod runtime_events;
 mod tui;
 
@@ -29,7 +30,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
 use zerodpi_core::config::Config;
-use zerodpi_core::flow::new_flow_table;
+use zerodpi_core::flow::{new_flow_table, FlowController, LocalFlowController};
 use zerodpi_core::handler::Handler;
 use zerodpi_core::interceptor::{FilterSpec, InterceptorShutdown, PacketInterceptor};
 use zerodpi_core::ip_scanner::{load_ip_list, scan_ip_list, IpProbeEntry, IpScanEvent};
@@ -39,10 +40,14 @@ use zerodpi_core::proxy::{
     run_ip_bypass_plus_proxy, run_ip_bypass_proxy, run_proxy, ActiveSniTarget, ProxyEvent,
     ProxyEventSender, RelayEndReason, CONNECT_PORT,
 };
-use zerodpi_core::proxy_tester::{test_candidate_full, ProxyTestEntry};
+use zerodpi_core::proxy_tester::{
+    failed_candidate_entry, test_candidate_full, test_candidate_with_flow_controller,
+    ProxyTestEntry,
+};
 use zerodpi_core::sni_scanner::{scan_sni_list, SniProbeEntry};
 use zerodpi_platform::{ensure_packet_interception_access, DefaultInterceptor};
 
+use helper_client::{interceptor_config, RemoteHelperClient};
 use runtime_events::{
     BypassStatus, RuntimeEvent, RuntimeEventEmitter, ScanKind, TargetKind, CONTRACT_VERSION,
 };
@@ -139,6 +144,28 @@ struct Args {
     /// Override `RELAY_MAX_LIFETIME_SECS` (`0` disables relay rotation).
     #[arg(long)]
     relay_max_lifetime: Option<u64>,
+
+    /// Android privilege separation: app-private Unix socket created by the root helper.
+    #[arg(
+        long,
+        requires = "root_helper_session_file",
+        requires = "expected_data_plane_uid"
+    )]
+    root_helper_socket: Option<PathBuf>,
+    /// Android privilege separation: app-private file containing the one-time session proof.
+    #[arg(
+        long,
+        requires = "root_helper_socket",
+        requires = "expected_data_plane_uid"
+    )]
+    root_helper_session_file: Option<PathBuf>,
+    /// Android package UID expected to own this data-plane process.
+    #[arg(
+        long,
+        requires = "root_helper_socket",
+        requires = "root_helper_session_file"
+    )]
+    expected_data_plane_uid: Option<u32>,
 }
 
 fn main() -> Result<()> {
@@ -166,6 +193,7 @@ fn main() -> Result<()> {
         contract_version: CONTRACT_VERSION,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         pid: std::process::id(),
+        uid: process_uid(),
     });
 
     let result = run(args, events.clone());
@@ -179,6 +207,11 @@ fn main() -> Result<()> {
 
 fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     let no_tui = args.no_tui || args.json_events;
+    let helper_bootstrap = (
+        args.root_helper_socket.clone(),
+        args.root_helper_session_file.clone(),
+        args.expected_data_plane_uid,
+    );
     if args.json_events && !args.no_tui {
         warn!("--json-events implies --no-tui");
     }
@@ -237,6 +270,17 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     }
     cfg.validate()?;
     let root_required = requires_packet_interception(&cfg);
+    let remote_helper = connect_external_helper(helper_bootstrap, root_required)?;
+    if let Some(helper) = remote_helper.as_ref() {
+        let (protocol_major, protocol_minor) = helper.protocol_version();
+        events.emit(RuntimeEvent::HelperAuthenticated {
+            pid: helper.helper_pid(),
+            uid: helper.helper_uid(),
+            protocol_major,
+            protocol_minor,
+            capabilities: helper.capabilities().to_vec(),
+        });
+    }
     events.emit(RuntimeEvent::ConfigLoaded {
         path: cfg_path.display().to_string(),
         mode: cfg.MODE.clone(),
@@ -247,7 +291,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         no_tui,
         root_required,
     });
-    if root_required {
+    if root_required && remote_helper.is_none() {
         if let Err(error) = ensure_packet_interception_access() {
             events.emit(RuntimeEvent::RootRequired {
                 mode: cfg.MODE.clone(),
@@ -275,7 +319,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return ip_bypass_plus_main(cfg_clone, cfg_path_clone, rt, no_tui, events);
+        return ip_bypass_plus_main(cfg_clone, cfg_path_clone, rt, no_tui, events, remote_helper);
     }
 
     // ---- branch: scan-only modes ----
@@ -302,7 +346,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return proxy_scan_main(cfg_clone, cfg_path_clone, rt, no_tui, events);
+        return proxy_scan_main(cfg_clone, cfg_path_clone, rt, no_tui, events, remote_helper);
     }
 
     // ---- resolve SNI list path relative to the config file ----
@@ -405,12 +449,31 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         .context("could not determine local interface IP for upstream")?;
     info!(%interface_ip, %connect_ip, sni = %selected.sni, "starting proxy");
 
-    let flows = new_flow_table();
-
-    let interceptor_runtime = if cfg.BYPASS_METHOD == "tls_frag" {
+    let (flow_controller, interceptor_runtime): (
+        Arc<dyn FlowController>,
+        Option<InterceptorRuntime>,
+    ) = if cfg.BYPASS_METHOD == "tls_frag" {
         info!("tls_frag selected; skipping packet interceptor");
-        None
+        let flows = new_flow_table();
+        (Arc::new(LocalFlowController::new(flows)), None)
+    } else if let Some(helper) = remote_helper {
+        let config = interceptor_config(&cfg, interface_ip, None, CONNECT_PORT);
+        rt.block_on(async {
+            helper.configure(config).await?;
+            helper.open().await
+        })
+        .context("prepare root helper interceptor")?;
+        info!(
+            helper_pid = helper.helper_pid(),
+            helper_uid = helper.helper_uid(),
+            "root helper interceptor ready"
+        );
+        (
+            Arc::new(helper.clone()),
+            Some(InterceptorRuntime::Remote(helper)),
+        )
     } else {
+        let flows = new_flow_table();
         let method_box = build_method(&cfg)
             .with_context(|| format!("unknown BYPASS_METHOD '{}'", cfg.BYPASS_METHOD))?;
         let method: Arc<dyn zerodpi_core::methods::BypassMethod> = Arc::from(method_box);
@@ -421,6 +484,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
             remote_port: CONNECT_PORT,
             queue_num: cfg.NFQUEUE_NUM,
             linux_firewall_backend: cfg.linux_firewall_backend(),
+            firewall_owner: None,
         };
         let interceptor = DefaultInterceptor::open(filter).context("open packet interceptor")?;
 
@@ -438,10 +502,13 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                 let _ = intercept_done_tx.send(result);
             })
             .context("spawn intercept thread")?;
-        Some(InterceptorRuntime {
-            shutdown,
-            done_rx: intercept_done_rx,
-        })
+        (
+            Arc::new(LocalFlowController::new(flows)),
+            Some(InterceptorRuntime::Local {
+                shutdown,
+                done_rx: intercept_done_rx,
+            }),
+        )
     };
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
@@ -477,7 +544,14 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     // thread is free to drive the ratatui dashboard.
     let dashboard_event_tx = Some(event_tx.clone());
     let proxy_handle = rt.spawn(async move {
-        run_proxy(cfg, active_target, interface_ip, flows, dashboard_event_tx).await
+        run_proxy(
+            cfg,
+            active_target,
+            interface_ip,
+            flow_controller,
+            dashboard_event_tx,
+        )
+        .await
     });
 
     if no_tui {
@@ -879,9 +953,63 @@ fn mode_requires_packet_interception(mode: &str, bypass_method: &str) -> bool {
     matches!(mode, "sni_spoof" | "proxy_scan" | "ip_bypass_plus") && bypass_method != "tls_frag"
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn process_uid() -> u32 {
+    0
+}
+
+fn connect_external_helper(
+    bootstrap: (Option<PathBuf>, Option<PathBuf>, Option<u32>),
+    root_required: bool,
+) -> Result<Option<RemoteHelperClient>> {
+    let (socket, session_file, expected_uid) = bootstrap;
+    match (socket, session_file, expected_uid) {
+        (None, None, None) => Ok(None),
+        (Some(socket), Some(session_file), Some(expected_uid)) => {
+            if !root_required {
+                anyhow::bail!("root helper bootstrap was supplied for a rootless mode");
+            }
+            verify_data_plane_uid(expected_uid)?;
+            let helper = RemoteHelperClient::connect(&socket, &session_file, expected_uid)
+                .context("authenticate root helper")?;
+            Ok(Some(helper))
+        }
+        _ => anyhow::bail!(
+            "--root-helper-socket, --root-helper-session-file, and --expected-data-plane-uid must be supplied together"
+        ),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn verify_data_plane_uid(expected_uid: u32) -> Result<()> {
+    let mut real = 0u32;
+    let mut effective = 0u32;
+    let mut saved = 0u32;
+    let result = unsafe { libc::getresuid(&mut real, &mut effective, &mut saved) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("read data-plane UID identity");
+    }
+    if real != expected_uid || effective != expected_uid || saved != expected_uid {
+        anyhow::bail!(
+            "data-plane UID verification failed: expected {expected_uid}, got real={real} effective={effective} saved={saved}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn verify_data_plane_uid(_expected_uid: u32) -> Result<()> {
+    anyhow::bail!("external root helper mode is only supported on Android/Linux")
+}
+
 fn root_required_message(cfg: &Config) -> String {
     format!(
-        "MODE = \"{}\" with BYPASS_METHOD = \"{}\" requires packet interception; on Android the app must start ZeroDPI through su/root. Rootless alternatives are MODE = \"ip_bypass\", scan-only modes, or BYPASS_METHOD = \"tls_frag\" where supported.",
+        "MODE = \"{}\" with BYPASS_METHOD = \"{}\" requires packet interception; on Android the app must start the packaged root helper while keeping the data plane under the app UID. Rootless alternatives are MODE = \"ip_bypass\", scan-only modes, or BYPASS_METHOD = \"tls_frag\" where supported.",
         cfg.MODE, cfg.BYPASS_METHOD
     )
 }
@@ -898,9 +1026,12 @@ fn rootless_alternatives() -> Vec<String> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const INTERCEPTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-struct InterceptorRuntime {
-    shutdown: InterceptorShutdown,
-    done_rx: oneshot::Receiver<anyhow::Result<()>>,
+enum InterceptorRuntime {
+    Local {
+        shutdown: InterceptorShutdown,
+        done_rx: oneshot::Receiver<anyhow::Result<()>>,
+    },
+    Remote(RemoteHelperClient),
 }
 
 async fn stop_interceptor(interceptor: Option<InterceptorRuntime>) -> anyhow::Result<()> {
@@ -908,9 +1039,17 @@ async fn stop_interceptor(interceptor: Option<InterceptorRuntime>) -> anyhow::Re
         return Ok(());
     };
 
-    interceptor.shutdown.request();
-    let mut report_rx = spawn_interceptor_report(interceptor.done_rx);
-    wait_for_interceptor_shutdown(&mut report_rx).await
+    match interceptor {
+        InterceptorRuntime::Local { shutdown, done_rx } => {
+            shutdown.request();
+            let mut report_rx = spawn_interceptor_report(done_rx);
+            wait_for_interceptor_shutdown(&mut report_rx).await
+        }
+        InterceptorRuntime::Remote(helper) => {
+            helper.close().await?;
+            helper.shutdown().await
+        }
+    }
 }
 
 async fn run_headless_proxy(
@@ -923,51 +1062,87 @@ async fn run_headless_proxy(
     let mut proxy_handle = proxy_handle;
     let event_log_handle = tokio::spawn(log_headless_proxy_events(event_rx, events.clone()));
 
-    if let Some(interceptor) = interceptor {
-        let shutdown = interceptor.shutdown.clone();
-        let mut intercept_report_rx = spawn_interceptor_report(interceptor.done_rx);
-        tokio::select! {
-            signal = shutdown_signal() => {
-                let reason = signal?;
-                proxy_handle.abort();
-                shutdown.request();
-                let result = wait_for_interceptor_shutdown(&mut intercept_report_rx).await;
-                if result.is_ok() {
-                    events.emit(RuntimeEvent::GracefulShutdown { reason });
+    match interceptor {
+        Some(InterceptorRuntime::Local { shutdown, done_rx }) => {
+            let mut intercept_report_rx = spawn_interceptor_report(done_rx);
+            tokio::select! {
+                signal = shutdown_signal() => {
+                    let reason = signal?;
+                    proxy_handle.abort();
+                    shutdown.request();
+                    let result = wait_for_interceptor_shutdown(&mut intercept_report_rx).await;
+                    if result.is_ok() {
+                        events.emit(RuntimeEvent::GracefulShutdown { reason });
+                    }
+                    event_log_handle.abort();
+                    result
                 }
-                event_log_handle.abort();
-                result
-            }
-            result = &mut proxy_handle => {
-                shutdown.request();
-                let proxy_result = result.context("proxy task panicked")?;
-                let stop_result = wait_for_interceptor_shutdown(&mut intercept_report_rx).await;
-                event_log_handle.abort();
-                proxy_result?;
-                stop_result
-            }
-            intercept_result = intercept_report_rx.recv() => {
-                proxy_handle.abort();
-                event_log_handle.abort();
-                match intercept_result {
-                    Some(Ok(())) => Err(anyhow::anyhow!("packet interceptor stopped unexpectedly")),
-                    Some(Err(e)) => Err(e.context("packet interceptor stopped")),
-                    None => Err(anyhow::anyhow!("packet interceptor thread stopped before reporting a result")),
+                result = &mut proxy_handle => {
+                    shutdown.request();
+                    let proxy_result = result.context("proxy task panicked")?;
+                    let stop_result = wait_for_interceptor_shutdown(&mut intercept_report_rx).await;
+                    event_log_handle.abort();
+                    proxy_result?;
+                    stop_result
+                }
+                intercept_result = intercept_report_rx.recv() => {
+                    proxy_handle.abort();
+                    event_log_handle.abort();
+                    match intercept_result {
+                        Some(Ok(())) => Err(anyhow::anyhow!("packet interceptor stopped unexpectedly")),
+                        Some(Err(e)) => Err(e.context("packet interceptor stopped")),
+                        None => Err(anyhow::anyhow!("packet interceptor thread stopped before reporting a result")),
+                    }
                 }
             }
         }
-    } else {
-        tokio::select! {
-            signal = shutdown_signal() => {
-                let reason = signal?;
-                events.emit(RuntimeEvent::GracefulShutdown { reason });
-                proxy_handle.abort();
-                event_log_handle.abort();
-                Ok(())
+        Some(InterceptorRuntime::Remote(helper)) => {
+            let disconnected = helper.wait_disconnected();
+            tokio::pin!(disconnected);
+            tokio::select! {
+                signal = shutdown_signal() => {
+                    let reason = signal?;
+                    proxy_handle.abort();
+                    let result = async {
+                        helper.close().await?;
+                        helper.shutdown().await
+                    }.await;
+                    if result.is_ok() {
+                        events.emit(RuntimeEvent::GracefulShutdown { reason });
+                    }
+                    event_log_handle.abort();
+                    result
+                }
+                result = &mut proxy_handle => {
+                    let proxy_result = result.context("proxy task panicked")?;
+                    let stop_result = async {
+                        helper.close().await?;
+                        helper.shutdown().await
+                    }.await;
+                    event_log_handle.abort();
+                    proxy_result?;
+                    stop_result
+                }
+                _ = &mut disconnected => {
+                    proxy_handle.abort();
+                    event_log_handle.abort();
+                    Err(anyhow::anyhow!("root helper disconnected while interception was active"))
+                }
             }
-            result = &mut proxy_handle => {
-                event_log_handle.abort();
-                result.context("proxy task panicked")?
+        }
+        None => {
+            tokio::select! {
+                signal = shutdown_signal() => {
+                    let reason = signal?;
+                    events.emit(RuntimeEvent::GracefulShutdown { reason });
+                    proxy_handle.abort();
+                    event_log_handle.abort();
+                    Ok(())
+                }
+                result = &mut proxy_handle => {
+                    event_log_handle.abort();
+                    result.context("proxy task panicked")?
+                }
             }
         }
     }
@@ -1326,6 +1501,7 @@ fn ip_bypass_plus_main(
     rt: tokio::runtime::Runtime,
     no_tui: bool,
     events: RuntimeEventEmitter,
+    remote_helper: Option<RemoteHelperClient>,
 ) -> Result<()> {
     let ip_list_path = {
         let raw = PathBuf::from(&cfg.IP_LIST);
@@ -1452,11 +1628,26 @@ fn ip_bypass_plus_main(
     );
 
     // ---- step 3: optional packet interceptor ----
-    let flows = new_flow_table();
-    let interceptor_runtime = if cfg.BYPASS_METHOD == "tls_frag" {
+    let (flow_controller, interceptor_runtime): (
+        Arc<dyn FlowController>,
+        Option<InterceptorRuntime>,
+    ) = if cfg.BYPASS_METHOD == "tls_frag" {
         info!("ip_bypass_plus: tls_frag selected; skipping packet interceptor");
-        None
+        let flows = new_flow_table();
+        (Arc::new(LocalFlowController::new(flows)), None)
+    } else if let Some(helper) = remote_helper {
+        let config = interceptor_config(&cfg, interface_ip, None, CONNECT_PORT);
+        rt.block_on(async {
+            helper.configure(config).await?;
+            helper.open().await
+        })
+        .context("prepare root helper interceptor")?;
+        (
+            Arc::new(helper.clone()),
+            Some(InterceptorRuntime::Remote(helper)),
+        )
     } else {
+        let flows = new_flow_table();
         let method_box = build_method(&cfg)
             .with_context(|| format!("unknown BYPASS_METHOD '{}'", cfg.BYPASS_METHOD))?;
         let method: Arc<dyn zerodpi_core::methods::BypassMethod> = Arc::from(method_box);
@@ -1467,6 +1658,7 @@ fn ip_bypass_plus_main(
             remote_port: CONNECT_PORT,
             queue_num: cfg.NFQUEUE_NUM,
             linux_firewall_backend: cfg.linux_firewall_backend(),
+            firewall_owner: None,
         };
         let interceptor = DefaultInterceptor::open(filter).context("open packet interceptor")?;
 
@@ -1484,10 +1676,13 @@ fn ip_bypass_plus_main(
                 let _ = intercept_done_tx.send(result);
             })
             .context("spawn intercept thread")?;
-        Some(InterceptorRuntime {
-            shutdown,
-            done_rx: intercept_done_rx,
-        })
+        (
+            Arc::new(LocalFlowController::new(flows)),
+            Some(InterceptorRuntime::Local {
+                shutdown,
+                done_rx: intercept_done_rx,
+            }),
+        )
     };
 
     // ---- step 4: run the proxy ----
@@ -1495,7 +1690,14 @@ fn ip_bypass_plus_main(
     let proxy_active = active_ip_arc.clone();
     let dashboard_event_tx = Some(event_tx.clone());
     let proxy_handle = rt.spawn(async move {
-        run_ip_bypass_plus_proxy(cfg, proxy_active, interface_ip, flows, dashboard_event_tx).await
+        run_ip_bypass_plus_proxy(
+            cfg,
+            proxy_active,
+            interface_ip,
+            flow_controller,
+            dashboard_event_tx,
+        )
+        .await
     });
 
     if no_tui {
@@ -1904,6 +2106,7 @@ fn proxy_scan_main(
     rt: tokio::runtime::Runtime,
     no_tui: bool,
     events: RuntimeEventEmitter,
+    remote_helper: Option<RemoteHelperClient>,
 ) -> Result<()> {
     // ---- resolve SNI list path ----
     let sni_list_path = {
@@ -2032,6 +2235,7 @@ fn proxy_scan_main(
     let (tx2, rx2) = mpsc::unbounded_channel::<ProxyTestEntry>();
     let cfg_for_phase2 = cfg.clone();
     let candidates_for_phase2 = candidates.clone();
+    let helper_for_phase2 = remote_helper;
     let total_proxy_tests = candidates.len();
 
     // Each candidate spins up an OS thread (WinDivert/NFQUEUE), so we run
@@ -2048,10 +2252,41 @@ fn proxy_scan_main(
                 let cfg_c = cfg_for_phase2.clone();
                 let tx_c = tx2.clone();
 
-                let entry = test_candidate_full(candidate, cfg_c, interface_ip, |filter| {
-                    DefaultInterceptor::open(filter)
-                })
-                .await;
+                let entry = if let Some(helper) = helper_for_phase2.as_ref() {
+                    let config = interceptor_config(
+                        &cfg_c,
+                        interface_ip,
+                        Some(candidate.ip),
+                        CONNECT_PORT,
+                    );
+                    let opened = async {
+                        helper.configure(config).await?;
+                        helper.open().await
+                    }
+                    .await;
+                    if let Err(error) = opened {
+                        warn!(%error, "proxy_scan: root helper failed to open for candidate");
+                        failed_candidate_entry(candidate, cfg_c.PROXY_TEST_SNI_WEIGHT)
+                    } else {
+                        let controller: Arc<dyn FlowController> = Arc::new(helper.clone());
+                        let entry = test_candidate_with_flow_controller(
+                            candidate,
+                            cfg_c.clone(),
+                            interface_ip,
+                            controller,
+                        )
+                        .await;
+                        if let Err(error) = helper.close().await {
+                            warn!(%error, "proxy_scan: root helper failed to close candidate interceptor");
+                        }
+                        entry
+                    }
+                } else {
+                    test_candidate_full(candidate, cfg_c, interface_ip, |filter| {
+                        DefaultInterceptor::open(filter)
+                    })
+                    .await
+                };
 
                 info!("{}", entry.summary_line());
                 let _ = tx_c.send(entry.clone());
@@ -2060,6 +2295,11 @@ fn proxy_scan_main(
                 // Small gap between candidates so the previous interceptor
                 // thread has time to exit before the next one opens.
                 tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if let Some(helper) = helper_for_phase2.as_ref() {
+                if let Err(error) = helper.shutdown().await {
+                    warn!(%error, "proxy_scan: root helper shutdown failed");
+                }
             }
             results
         })

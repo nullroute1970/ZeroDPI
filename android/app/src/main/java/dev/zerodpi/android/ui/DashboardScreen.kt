@@ -74,21 +74,16 @@ fun DashboardScreen(
     onRenameProfile: (String, String) -> Unit,
     onDeleteProfile: (String) -> Unit,
     onSelectProfile: (String) -> Unit,
-    onSaveAndSelectProfile: (String?) -> Unit,
-    onDiscardAndSelectProfile: (String?) -> Unit,
-    onCancelProfileSwitch: () -> Unit,
     onProfileRemoteConfigUrlChanged: (String) -> Unit,
     onProfileRemoteSniListUrlChanged: (String) -> Unit,
     onProfileRemoteIpListUrlChanged: (String) -> Unit,
     onProfileAutoUpdateChanged: (Boolean) -> Unit,
     onProfileAutoUpdateIntervalChanged: (Int) -> Unit,
-    onRunManualProfileUpdate: (Boolean) -> Unit,
+    onRunManualProfileUpdate: () -> Unit,
     onRuntimeFileSelected: (RuntimeFileKind) -> Unit,
     onRuntimeFileTextChanged: (RuntimeFileKind, String) -> Unit,
     onConfigFieldChanged: (String, String) -> Unit,
-    onSaveConfig: () -> Unit,
     onResetConfig: () -> Unit,
-    onSaveRuntimeFile: (RuntimeFileKind) -> Unit,
     onResetRuntimeFile: (RuntimeFileKind) -> Unit,
     onImportRuntimeFile: (RuntimeFileKind) -> Unit,
     onExportRuntimeFile: (RuntimeFileKind) -> Unit,
@@ -106,8 +101,7 @@ fun DashboardScreen(
         !profileState.isProfileLoading &&
         !profileState.isProfileSwitching &&
         !profileState.isRemoteUpdating
-    val runtimeFileActionsEnabled = !runtimeFilesState.isLoading &&
-        !runtimeFilesState.isSaving &&
+    val runtimeFileEditingEnabled = !runtimeFilesState.isLoading &&
         !profileState.isRemoteUpdating
 
     BackHandler(enabled = page != DashboardPage.Home) {
@@ -149,9 +143,6 @@ fun DashboardScreen(
                         actionsEnabled = profileActionsEnabled,
                         onManageProfiles = { page = DashboardPage.Settings },
                         onSelectProfile = onSelectProfile,
-                        onSaveAndSelectProfile = onSaveAndSelectProfile,
-                        onDiscardAndSelectProfile = onDiscardAndSelectProfile,
-                        onCancelProfileSwitch = onCancelProfileSwitch,
                     )
                     StatusPanel(
                         state = state,
@@ -207,13 +198,12 @@ fun DashboardScreen(
                     )
                     ConfigSettingsPanel(
                         editorState = runtimeFilesState.configEditor,
-                        enabled = runtimeFileActionsEnabled,
+                        enabled = runtimeFileEditingEnabled,
                         isSaving = runtimeFilesState.isSaving,
-                        hasUnsavedConfig = RuntimeFileKind.Config in runtimeFilesState.dirtyFiles,
+                        hasPendingConfigSave = RuntimeFileKind.Config in runtimeFilesState.dirtyFiles,
                         statusMessage = runtimeFilesState.statusMessage,
                         errorMessage = runtimeFilesState.errorMessage,
                         onConfigFieldChanged = onConfigFieldChanged,
-                        onSaveConfig = onSaveConfig,
                         onResetConfig = onResetConfig,
                         onRunRootDiagnostics = onRunRootDiagnostics,
                     )
@@ -226,10 +216,9 @@ fun DashboardScreen(
                     title = "SNI list",
                     fileKind = RuntimeFileKind.SniList,
                     runtimeFilesState = runtimeFilesState,
-                    actionsEnabled = runtimeFileActionsEnabled,
+                    actionsEnabled = runtimeFileEditingEnabled,
                     onRuntimeFileSelected = onRuntimeFileSelected,
                     onRuntimeFileTextChanged = onRuntimeFileTextChanged,
-                    onSaveRuntimeFile = onSaveRuntimeFile,
                     onResetRuntimeFile = onResetRuntimeFile,
                     onImportRuntimeFile = onImportRuntimeFile,
                     onExportRuntimeFile = onExportRuntimeFile,
@@ -244,10 +233,9 @@ fun DashboardScreen(
                     title = "IP list",
                     fileKind = RuntimeFileKind.IpList,
                     runtimeFilesState = runtimeFilesState,
-                    actionsEnabled = runtimeFileActionsEnabled,
+                    actionsEnabled = runtimeFileEditingEnabled,
                     onRuntimeFileSelected = onRuntimeFileSelected,
                     onRuntimeFileTextChanged = onRuntimeFileTextChanged,
-                    onSaveRuntimeFile = onSaveRuntimeFile,
                     onResetRuntimeFile = onResetRuntimeFile,
                     onImportRuntimeFile = onImportRuntimeFile,
                     onExportRuntimeFile = onExportRuntimeFile,
@@ -275,7 +263,6 @@ private fun RuntimeListPage(
     actionsEnabled: Boolean,
     onRuntimeFileSelected: (RuntimeFileKind) -> Unit,
     onRuntimeFileTextChanged: (RuntimeFileKind, String) -> Unit,
-    onSaveRuntimeFile: (RuntimeFileKind) -> Unit,
     onResetRuntimeFile: (RuntimeFileKind) -> Unit,
     onImportRuntimeFile: (RuntimeFileKind) -> Unit,
     onExportRuntimeFile: (RuntimeFileKind) -> Unit,
@@ -297,7 +284,6 @@ private fun RuntimeListPage(
             actionsEnabled = actionsEnabled,
             onRuntimeFileSelected = onRuntimeFileSelected,
             onRuntimeFileTextChanged = onRuntimeFileTextChanged,
-            onSaveRuntimeFile = onSaveRuntimeFile,
             onResetRuntimeFile = onResetRuntimeFile,
             onImportRuntimeFile = onImportRuntimeFile,
             onExportRuntimeFile = onExportRuntimeFile,
@@ -315,12 +301,8 @@ private fun ActiveProfileSelectorPanel(
     actionsEnabled: Boolean,
     onManageProfiles: () -> Unit,
     onSelectProfile: (String) -> Unit,
-    onSaveAndSelectProfile: (String?) -> Unit,
-    onDiscardAndSelectProfile: (String?) -> Unit,
-    onCancelProfileSwitch: () -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
-    val pendingProfile = profileState.pendingSwitchProfile
     val dirtyFiles = runtimeFilesState.dirtyFiles
     val canOpenMenu = actionsEnabled && profileState.profiles.isNotEmpty()
 
@@ -352,7 +334,7 @@ private fun ActiveProfileSelectorPanel(
                     )
                     if (dirtyFiles.isNotEmpty()) {
                         Text(
-                            text = "Unsaved: ${dirtyFiles.joinToString { it.fileName }}",
+                            text = "Saving automatically: ${dirtyFiles.joinToString { it.fileName }}",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodySmall,
                         )
@@ -402,32 +384,6 @@ private fun ActiveProfileSelectorPanel(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodySmall,
                 )
-            }
-            pendingProfile?.let { target ->
-                Text(
-                    text = "Switch to ${target.name} with unsaved edits?",
-                    color = MaterialTheme.colorScheme.error,
-                    fontWeight = FontWeight.Medium,
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = { onSaveAndSelectProfile(target.id) },
-                        enabled = actionsEnabled,
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text("Save")
-                    }
-                    OutlinedButton(
-                        onClick = { onDiscardAndSelectProfile(target.id) },
-                        enabled = actionsEnabled,
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text("Discard")
-                    }
-                    TextButton(onClick = onCancelProfileSwitch) {
-                        Text("Cancel")
-                    }
-                }
             }
             profileState.statusMessage?.let { message ->
                 Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -601,7 +557,7 @@ private fun RemoteUpdatePanel(
     onIpListUrlChanged: (String) -> Unit,
     onAutoUpdateChanged: (Boolean) -> Unit,
     onIntervalHoursChanged: (Int) -> Unit,
-    onRunManualUpdate: (Boolean) -> Unit,
+    onRunManualUpdate: () -> Unit,
 ) {
     var showManualUpdateDialog by remember { mutableStateOf(false) }
     val remote = profileState.profileRemoteSettings
@@ -685,8 +641,8 @@ private fun RemoteUpdatePanel(
             )
             if (remote.autoUpdateEnabled && dirtyFiles.isNotEmpty()) {
                 Text(
-                    text = "Unsaved local edits can be overwritten by the next successful auto update.",
-                    color = MaterialTheme.colorScheme.error,
+                    text = "Recent local changes are being saved automatically.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
@@ -763,8 +719,8 @@ private fun RemoteUpdatePanel(
                     Text("Remote update replaces local config.toml, sni_list.txt, and ip_list.txt for this profile.")
                     if (dirtyFiles.isNotEmpty()) {
                         Text(
-                            text = "Unsaved local edits will be discarded.",
-                            color = MaterialTheme.colorScheme.error,
+                            text = "Recent local changes will be saved before the update.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }
@@ -773,7 +729,7 @@ private fun RemoteUpdatePanel(
                 Button(
                     onClick = {
                         showManualUpdateDialog = false
-                        onRunManualUpdate(dirtyFiles.isNotEmpty())
+                        onRunManualUpdate()
                     },
                     enabled = updateEnabled,
                 ) {
@@ -987,11 +943,10 @@ private fun ConfigSettingsPanel(
     editorState: ConfigEditorState,
     enabled: Boolean,
     isSaving: Boolean,
-    hasUnsavedConfig: Boolean,
+    hasPendingConfigSave: Boolean,
     statusMessage: String?,
     errorMessage: String?,
     onConfigFieldChanged: (String, String) -> Unit,
-    onSaveConfig: () -> Unit,
     onResetConfig: () -> Unit,
     onRunRootDiagnostics: () -> Unit,
 ) {
@@ -1033,27 +988,15 @@ private fun ConfigSettingsPanel(
             ) {
                 Text("Run root diagnostics")
             }
-            Row(
+            OutlinedButton(
+                onClick = onResetConfig,
+                enabled = enabled && !isSaving,
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Button(
-                    onClick = onSaveConfig,
-                    enabled = enabled,
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Text(if (isSaving) "Saving" else "Save")
-                }
-                OutlinedButton(
-                    onClick = onResetConfig,
-                    enabled = enabled,
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Text("Reset")
-                }
+                Text("Reset")
             }
-            if (hasUnsavedConfig) {
-                Text("Unsaved config changes.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (hasPendingConfigSave) {
+                Text("Saving config changes automatically.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             statusMessage?.let { message ->
                 Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1310,7 +1253,6 @@ private fun RuntimeFilesPanel(
     actionsEnabled: Boolean,
     onRuntimeFileSelected: (RuntimeFileKind) -> Unit,
     onRuntimeFileTextChanged: (RuntimeFileKind, String) -> Unit,
-    onSaveRuntimeFile: (RuntimeFileKind) -> Unit,
     onResetRuntimeFile: (RuntimeFileKind) -> Unit,
     onImportRuntimeFile: (RuntimeFileKind) -> Unit,
     onExportRuntimeFile: (RuntimeFileKind) -> Unit,
@@ -1325,6 +1267,7 @@ private fun RuntimeFilesPanel(
     val selectedText = state.textFor(selectedFile)
     val selectedListValidation = state.validationFor(selectedFile)
     val selectedFileCanRunTestScan = selectedFile != RuntimeFileKind.Config
+    val editorEnabled = actionsEnabled && !state.isLoading
     val fileActionsEnabled = actionsEnabled && !state.isLoading && !state.isSaving
 
     Surface(
@@ -1395,7 +1338,7 @@ private fun RuntimeFilesPanel(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 220.dp, max = 360.dp),
-                    enabled = fileActionsEnabled,
+                    enabled = editorEnabled,
                     isError = selectedListValidation?.issues?.isNotEmpty() == true,
                     label = { Text(selectedFile.fileName) },
                     textStyle = MaterialTheme.typography.bodySmall.copy(
@@ -1405,19 +1348,12 @@ private fun RuntimeFilesPanel(
                     maxLines = 18,
                 )
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = { onSaveRuntimeFile(selectedFile) },
-                    enabled = fileActionsEnabled,
-                ) {
-                    Text(if (state.isSaving) "Saving" else "Save")
-                }
-                OutlinedButton(
-                    onClick = { onResetRuntimeFile(selectedFile) },
-                    enabled = fileActionsEnabled,
-                ) {
-                    Text("Reset to defaults")
-                }
+            OutlinedButton(
+                onClick = { onResetRuntimeFile(selectedFile) },
+                enabled = fileActionsEnabled,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Reset to defaults")
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(

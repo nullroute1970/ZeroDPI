@@ -34,11 +34,14 @@ import dev.zerodpi.android.service.ZeroDpiServiceState
 import dev.zerodpi.android.storage.RuntimeFileKind
 import dev.zerodpi.android.storage.RuntimeStorage
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.OutputStream
 
 data class RuntimeFilesUiState(
@@ -182,6 +185,8 @@ class MainViewModel(
     private var startWhenConnectedProfileId: String? = null
     private var startWhenConnectedModeOverride: String? = null
     private var remoteSettingsSaveJob: Job? = null
+    private var runtimeFilesAutoSaveJob: Job? = null
+    private val runtimeFilesSaveMutex = Mutex()
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -226,6 +231,8 @@ class MainViewModel(
             if (!ensureRemoteUpdateInactive("starting ZeroDPI")) {
                 return@launch
             }
+
+            cancelPendingRuntimeFilesAutoSave()
 
             val validation = ZeroDpiConfigToml.analyze(_runtimeFilesState.value.configText)
             if (!validation.canStart) {
@@ -387,13 +394,14 @@ class MainViewModel(
                 .withText(kind, text)
                 .copy(
                     dirtyFiles = current.dirtyFiles + kind,
-                    statusMessage = "Unsaved edits.",
+                    statusMessage = "Saving changes automatically.",
                     errorMessage = null,
                 )
         }
         if (kind == RuntimeFileKind.Config) {
             syncIdleRuntimeStateFromConfig()
         }
+        scheduleRuntimeFilesAutoSave()
     }
 
     fun updateConfigField(fieldName: String, value: String) {
@@ -407,11 +415,12 @@ class MainViewModel(
                 .withText(RuntimeFileKind.Config, updatedConfig)
                 .copy(
                     dirtyFiles = current.dirtyFiles + RuntimeFileKind.Config,
-                    statusMessage = "Unsaved config setting.",
+                    statusMessage = "Saving config changes automatically.",
                     errorMessage = null,
                 )
         }
         syncIdleRuntimeStateFromConfig()
+        scheduleRuntimeFilesAutoSave()
     }
 
     fun saveSelectedRuntimeFile() {
@@ -419,6 +428,7 @@ class MainViewModel(
     }
 
     fun saveRuntimeFile(kind: RuntimeFileKind) {
+        cancelPendingRuntimeFilesAutoSave()
         viewModelScope.launch {
             saveRuntimeFiles(setOf(kind))
         }
@@ -431,13 +441,14 @@ class MainViewModel(
                 .copy(
                     selectedFile = kind,
                     dirtyFiles = current.dirtyFiles + kind,
-                    statusMessage = "Imported ${kind.fileName}. Review and save the file.",
+                    statusMessage = "Imported ${kind.fileName}. Saving changes automatically.",
                     errorMessage = null,
                 )
         }
         if (kind == RuntimeFileKind.Config) {
             syncIdleRuntimeStateFromConfig()
         }
+        scheduleRuntimeFilesAutoSave()
     }
 
     fun reportRuntimeFileTransferResult(
@@ -511,7 +522,7 @@ class MainViewModel(
                 )
             }
 
-            if (saveRuntimeFiles(_runtimeFilesState.value.dirtyFiles)) {
+            if (flushPendingRuntimeFilesAutoSave()) {
                 startService(mode)
             }
         }
@@ -526,6 +537,7 @@ class MainViewModel(
             if (!ensureRemoteUpdateInactive("resetting profile files")) {
                 return@launch
             }
+            cancelPendingRuntimeFilesAutoSave()
 
             _runtimeFilesState.update {
                 it.copy(isSaving = true, statusMessage = null, errorMessage = null)
@@ -587,6 +599,9 @@ class MainViewModel(
             if (!ensureRuntimeInactive("duplicating profiles")) {
                 return@launch
             }
+            if (!flushPendingRuntimeFilesAutoSave()) {
+                return@launch
+            }
             setProfileLoading()
             val sourceProfileId = _runtimeFilesState.value.activeProfileId
             runCatching {
@@ -630,8 +645,7 @@ class MainViewModel(
                 return@launch
             }
             val snapshot = _runtimeFilesState.value
-            if (profileId == snapshot.activeProfileId && snapshot.dirtyFiles.isNotEmpty()) {
-                setProfileError("Save or discard unsaved edits before deleting the active profile.")
+            if (profileId == snapshot.activeProfileId && !flushPendingRuntimeFilesAutoSave()) {
                 return@launch
             }
 
@@ -672,18 +686,19 @@ class MainViewModel(
             if (!ensureRuntimeInactive("switching profiles")) {
                 return@launch
             }
-            if (_runtimeFilesState.value.dirtyFiles.isNotEmpty()) {
-                _profileState.update {
-                    it.copy(
-                        pendingSwitchProfileId = profileId,
-                        statusMessage = null,
-                        lastProfileError = "Save or discard unsaved edits before switching profiles.",
-                    )
-                }
+            val hadPendingChanges = _runtimeFilesState.value.dirtyFiles.isNotEmpty()
+            if (!flushPendingRuntimeFilesAutoSave()) {
                 return@launch
             }
 
-            switchToProfile(profileId, statusMessage = "Switched profile.")
+            switchToProfile(
+                profileId,
+                statusMessage = if (hadPendingChanges) {
+                    "Saved changes and switched profile."
+                } else {
+                    "Switched profile."
+                },
+            )
         }
     }
 
@@ -702,8 +717,7 @@ class MainViewModel(
                 return@launch
             }
 
-            val dirtyFiles = _runtimeFilesState.value.dirtyFiles
-            if (dirtyFiles.isNotEmpty() && !saveRuntimeFiles(dirtyFiles)) {
+            if (!flushPendingRuntimeFilesAutoSave()) {
                 return@launch
             }
             switchToProfile(targetProfileId, statusMessage = "Saved edits and switched profile.")
@@ -818,11 +832,11 @@ class MainViewModel(
         }
     }
 
-    fun runManualRemoteUpdate(confirmDiscardUnsavedEdits: Boolean = false) {
-        updateActiveProfileFromRemote(confirmDiscardUnsavedEdits)
+    fun runManualRemoteUpdate() {
+        updateActiveProfileFromRemote()
     }
 
-    fun updateActiveProfileFromRemote(confirmDiscardUnsavedEdits: Boolean = false) {
+    fun updateActiveProfileFromRemote() {
         viewModelScope.launch {
             if (!ensureRemoteUpdateInactive("starting another remote update")) {
                 return@launch
@@ -843,8 +857,7 @@ class MainViewModel(
                 return@launch
             }
 
-            if (_runtimeFilesState.value.dirtyFiles.isNotEmpty() && !confirmDiscardUnsavedEdits) {
-                setProfileError("Remote update overwrites local edits. Confirm before discarding unsaved edits.")
+            if (!flushPendingRuntimeFilesAutoSave()) {
                 return@launch
             }
 
@@ -983,6 +996,7 @@ class MainViewModel(
         profileId: String,
         statusMessage: String,
     ): Boolean {
+        cancelPendingRuntimeFilesAutoSave()
         remoteSettingsSaveJob?.cancel()
         remoteSettingsSaveJob = null
         _profileState.update {
@@ -1202,58 +1216,101 @@ class MainViewModel(
         }
     }
 
-    private suspend fun saveRuntimeFiles(filesToSave: Set<RuntimeFileKind>): Boolean {
-        if (filesToSave.isEmpty()) {
-            return true
+    private fun scheduleRuntimeFilesAutoSave() {
+        runtimeFilesAutoSaveJob?.cancel()
+        runtimeFilesAutoSaveJob = viewModelScope.launch {
+            delay(RUNTIME_FILES_AUTO_SAVE_DELAY_MS)
+            runtimeFilesAutoSaveJob = null
+            saveRuntimeFiles(_runtimeFilesState.value.dirtyFiles)
         }
-        if (!ensureRemoteUpdateInactive("saving profile files")) {
-            return false
-        }
+    }
 
-        val snapshot = _runtimeFilesState.value
-        _runtimeFilesState.update {
-            it.copy(isSaving = true, statusMessage = null, errorMessage = null)
-        }
+    private fun cancelPendingRuntimeFilesAutoSave() {
+        runtimeFilesAutoSaveJob?.cancel()
+        runtimeFilesAutoSaveJob = null
+    }
 
-        return runCatching {
-            filesToSave.forEach { kind ->
-                runtimeStorage.save(
-                    profileId = snapshot.activeProfileId,
-                    kind = kind,
-                    content = snapshot.textFor(kind),
+    private suspend fun flushPendingRuntimeFilesAutoSave(): Boolean {
+        cancelPendingRuntimeFilesAutoSave()
+        while (_runtimeFilesState.value.dirtyFiles.isNotEmpty()) {
+            if (!saveRuntimeFiles(_runtimeFilesState.value.dirtyFiles)) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private suspend fun saveRuntimeFiles(filesToSave: Set<RuntimeFileKind>): Boolean =
+        runtimeFilesSaveMutex.withLock {
+            if (filesToSave.isEmpty()) {
+                return@withLock true
+            }
+            if (!ensureRemoteUpdateInactive("saving profile files")) {
+                return@withLock false
+            }
+
+            val snapshot = _runtimeFilesState.value
+            _runtimeFilesState.update {
+                it.copy(
+                    isSaving = true,
+                    statusMessage = "Saving changes automatically.",
+                    errorMessage = null,
                 )
             }
-        }.fold(
-            onSuccess = {
-                _runtimeFilesState.update { current ->
-                    current.copy(
-                        dirtyFiles = current.dirtyFiles - filesToSave,
-                        isSaving = false,
-                        statusMessage = "Saved ${filesToSave.joinToString { it.fileName }}.",
+
+            runCatching {
+                filesToSave.forEach { kind ->
+                    runtimeStorage.save(
+                        profileId = snapshot.activeProfileId,
+                        kind = kind,
+                        content = snapshot.textFor(kind),
                     )
                 }
-                true
-            },
-            onFailure = { error ->
-                _runtimeFilesState.update {
-                    it.copy(
-                        isSaving = false,
-                        errorMessage = error.message ?: "Failed to save runtime files.",
-                    )
-                }
-                false
-            },
-        )
-    }
+            }.fold(
+                onSuccess = {
+                    _runtimeFilesState.update { current ->
+                        val unchangedFiles = filesToSave.filterTo(mutableSetOf()) { kind ->
+                            current.activeProfileId == snapshot.activeProfileId &&
+                                current.textFor(kind) == snapshot.textFor(kind)
+                        }
+                        current.copy(
+                            dirtyFiles = current.dirtyFiles - unchangedFiles,
+                            isSaving = false,
+                            statusMessage = if (unchangedFiles == filesToSave) {
+                                "Saved ${filesToSave.joinToString { it.fileName }} automatically."
+                            } else {
+                                "Saving latest changes automatically."
+                            },
+                        )
+                    }
+                    true
+                },
+                onFailure = { error ->
+                    _runtimeFilesState.update {
+                        it.copy(
+                            isSaving = false,
+                            statusMessage = null,
+                            errorMessage = error.message ?: "Failed to save runtime files automatically.",
+                        )
+                    }
+                    false
+                },
+            )
+        }
 
     override fun onCleared() {
         serviceStateJob?.cancel()
         remoteSettingsSaveJob?.cancel()
+        runtimeFilesAutoSaveJob?.cancel()
         if (isBound) {
             runCatching {
                 appContext.unbindService(connection)
             }
         }
         super.onCleared()
+    }
+
+    private companion object {
+        const val RUNTIME_FILES_AUTO_SAVE_DELAY_MS = 600L
     }
 }

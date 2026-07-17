@@ -76,7 +76,7 @@ class MainViewModelInstrumentedTest {
     }
 
     @Test
-    fun saveProfileASwitchToProfileBAndProfileAContentRemains() = runBlocking {
+    fun autoSaveProfileASwitchToProfileBAndProfileAContentRemains() = runBlocking {
         val repository = repository(generatedIds = listOf("profile-b"))
         val viewModel = viewModel(repository = repository)
         viewModel.waitUntilLoaded()
@@ -84,10 +84,9 @@ class MainViewModelInstrumentedTest {
             .replaceField("LISTEN_PORT", "41111")
 
         viewModel.updateRuntimeFileText(RuntimeFileKind.Config, profileAConfig)
-        viewModel.saveRuntimeFile(RuntimeFileKind.Config)
-        viewModel.waitUntil("config save") {
+        viewModel.waitUntil("automatic config save") {
             RuntimeFileKind.Config !in runtimeFilesState.value.dirtyFiles &&
-                runtimeFilesState.value.statusMessage?.contains("Saved config.toml") == true
+                runtimeFilesState.value.statusMessage?.contains("Saved config.toml automatically") == true
         }
         viewModel.createProfileFromDefaults("Profile B")
         viewModel.waitUntil("profile-b creation") {
@@ -109,7 +108,7 @@ class MainViewModelInstrumentedTest {
     }
 
     @Test
-    fun saveAndReopenAppWithMultipleProfiles() = runBlocking {
+    fun autoSaveAndReopenAppWithMultipleProfiles() = runBlocking {
         val repository = repository(generatedIds = listOf("profile-b"))
         val viewModel = viewModel(repository = repository)
         viewModel.waitUntilLoaded()
@@ -125,10 +124,9 @@ class MainViewModelInstrumentedTest {
                 !runtimeFilesState.value.isLoading
         }
         viewModel.updateRuntimeFileText(RuntimeFileKind.SniList, "persisted-profile-b.example\n")
-        viewModel.saveRuntimeFile(RuntimeFileKind.SniList)
-        viewModel.waitUntil("sni list save") {
+        viewModel.waitUntil("automatic sni list save") {
             RuntimeFileKind.SniList !in runtimeFilesState.value.dirtyFiles &&
-                runtimeFilesState.value.statusMessage?.contains("Saved sni_list.txt") == true
+                runtimeFilesState.value.statusMessage?.contains("Saved sni_list.txt automatically") == true
         }
 
         val reopened = viewModel(repository = repository())
@@ -170,7 +168,7 @@ class MainViewModelInstrumentedTest {
             RuntimeFileKind.SniList in runtimeFilesState.value.dirtyFiles
         }
 
-        viewModel.updateActiveProfileFromRemote(confirmDiscardUnsavedEdits = true)
+        viewModel.updateActiveProfileFromRemote()
         viewModel.waitUntil("manual remote update") {
             !profileState.value.isRemoteUpdating &&
                 runtimeFilesState.value.sniListText == remoteFiles.sniListText
@@ -186,7 +184,7 @@ class MainViewModelInstrumentedTest {
     }
 
     @Test
-    fun unsavedEditProfileSwitchConfirmationWorks() {
+    fun profileSwitchFlushesPendingAutoSave() = runBlocking {
         val repository = repository(generatedIds = listOf("profile-b"))
         val viewModel = viewModel(repository = repository)
         viewModel.waitUntilLoaded()
@@ -200,24 +198,15 @@ class MainViewModelInstrumentedTest {
             .replaceField("LISTEN_PORT", "49999")
         viewModel.updateRuntimeFileText(RuntimeFileKind.Config, dirtyConfig)
         viewModel.selectProfile("profile-b")
-        viewModel.waitUntil("pending profile switch") {
-            profileState.value.pendingSwitchProfileId == "profile-b"
-        }
-
-        assertEquals(ZeroDpiProfile.DEFAULT_PROFILE_ID, viewModel.runtimeFilesState.value.activeProfileId)
-        assertTrue(
-            viewModel.profileState.value.lastProfileError.orEmpty()
-                .contains("Save or discard unsaved edits"),
-        )
-
-        viewModel.discardAndSelectProfile()
-        viewModel.waitUntil("discarded profile switch") {
+        viewModel.waitUntil("automatically saved profile switch") {
             runtimeFilesState.value.activeProfileId == "profile-b" &&
                 runtimeFilesState.value.dirtyFiles.isEmpty() &&
                 !profileState.value.isProfileSwitching
         }
 
-        assertEquals("Discarded edits and switched profile.", viewModel.profileState.value.statusMessage)
+        val profileA = RuntimeStorage(context).readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID)
+        assertEquals("49999", ZeroDpiConfigToml.analyze(profileA.configText).valueFor("LISTEN_PORT"))
+        assertEquals("Saved changes and switched profile.", viewModel.profileState.value.statusMessage)
     }
 
     private fun viewModel(

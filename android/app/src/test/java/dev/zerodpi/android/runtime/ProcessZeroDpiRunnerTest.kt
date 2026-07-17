@@ -84,27 +84,43 @@ class ProcessZeroDpiRunnerTest {
     }
 
     @Test
-    fun rootStartDelegatesPackagedExecutableCommandToRootManager() = runBlocking {
+    fun rootStartLaunchesOnlyHelperAsRootAndDataPlaneNormally() = runBlocking {
         val executable = temporaryFolder.newFile("libzerodpi_exec.so")
+        val helperExecutable = temporaryFolder.newFile("libzerodpi_root_helper_exec.so")
         val workingDirectory = temporaryFolder.newFolder("runtime")
         val configFile = temporaryFolder.newFile("config.toml")
         val rootManager = FakeRootManager(
             launchProcess = FakeProcess(
-                stdout = """{"event":"listener_started","mode":"sni_spoof","listen_addr":"127.0.0.1:44444"}""",
+                stdout = "ZERODPI_HELPER_READY pid=1234 uid=0\n",
+            ),
+        )
+        val processLauncher = RecordingProcessLauncher(
+            FakeProcess(
+                stdout = """
+                    {"event":"startup","version":"0.1.0","pid":5678,"uid":10123}
+                    {"event":"helper_authenticated","pid":1234,"uid":0,"protocol_major":1,"protocol_minor":0,"capabilities":["nfqueue"]}
+                    {"event":"listener_started","mode":"sni_spoof","listen_addr":"127.0.0.1:44444"}
+                """.trimIndent(),
             ),
         )
         val runner = ProcessZeroDpiRunner(
             scope = this,
             rootManager = rootManager,
             executableProvider = { executable },
-            processLauncher = RecordingProcessLauncher(FakeProcess()),
+            processLauncher = processLauncher,
+            helperExecutableProvider = { helperExecutable },
+            appUidProvider = { 10123 },
+            appPidProvider = { 777 },
+            sessionProofProvider = { ByteArray(32) { 7 } },
+            fileModeSetter = { _, _ -> },
         )
 
         val events = collectRunnerEventsUntil(
             runner = runner,
             complete = { collected ->
-                collected.any { it is ZeroDpiRunnerEvent.ListenerStarted } &&
-                    collected.any { it is ZeroDpiRunnerEvent.Exited }
+                collected.any { it is ZeroDpiRunnerEvent.Failed } ||
+                    (collected.any { it is ZeroDpiRunnerEvent.ListenerStarted } &&
+                        collected.any { it is ZeroDpiRunnerEvent.Exited })
             },
         ) {
             runner.start(
@@ -116,20 +132,89 @@ class ProcessZeroDpiRunnerTest {
             )
         }
 
-        assertEquals(
-            listOf(
-                executable.absolutePath,
-                "--config",
-                configFile.absolutePath,
-                "--no-tui",
-                "--auto-select",
-                "--json-events",
-            ),
-            rootManager.launches.single().command,
-        )
+        assertTrue(events.toString(), events.none { it is ZeroDpiRunnerEvent.Failed })
+        assertEquals(helperExecutable, rootManager.launches.single().executable)
         assertEquals(workingDirectory, rootManager.launches.single().workingDirectory)
-        assertTrue(events.any { it is ZeroDpiRunnerEvent.Log && it.message.contains("through su") })
+        assertEquals(10123, rootManager.launches.single().expectedAppUid)
+        assertEquals(executable.absolutePath, processLauncher.commands.single().first())
+        assertTrue(processLauncher.commands.single().contains("--root-helper-socket"))
+        assertTrue(processLauncher.commands.single().contains("--expected-data-plane-uid"))
+        assertTrue(events.any { it is ZeroDpiRunnerEvent.RootHelperAuthenticated && it.uid == 0L })
+        assertTrue(events.any { it is ZeroDpiRunnerEvent.DataPlaneStarted && it.uid == 10123L })
         assertTrue(events.any { it is ZeroDpiRunnerEvent.ListenerStarted && it.listenAddress == "127.0.0.1:44444" })
+    }
+
+    @Test
+    fun helperFailureBeforeReadinessPreventsDataPlaneLaunch() = runBlocking {
+        val executable = temporaryFolder.newFile("libzerodpi_exec.so")
+        val helperExecutable = temporaryFolder.newFile("libzerodpi_root_helper_exec.so")
+        val workingDirectory = temporaryFolder.newFolder("failed-helper-runtime")
+        val configFile = temporaryFolder.newFile("failed-helper-config.toml")
+        val rootManager = FakeRootManager(launchProcess = FakeProcess(stdout = "helper failed\n", exitCode = 1))
+        val processLauncher = RecordingProcessLauncher(FakeProcess())
+        val runner = ProcessZeroDpiRunner(
+            scope = this,
+            rootManager = rootManager,
+            executableProvider = { executable },
+            processLauncher = processLauncher,
+            helperExecutableProvider = { helperExecutable },
+            appUidProvider = { 10123 },
+            appPidProvider = { 777 },
+            sessionProofProvider = { ByteArray(32) { 9 } },
+            fileModeSetter = { _, _ -> },
+        )
+
+        val events = collectRunnerEventsUntil(runner, { items -> items.any { it is ZeroDpiRunnerEvent.Failed } }) {
+            runner.start(
+                ZeroDpiRunRequest(
+                    configPath = configFile.absolutePath,
+                    workingDirectory = workingDirectory.absolutePath,
+                    useRoot = true,
+                ),
+            )
+        }
+
+        assertTrue(events.any { it is ZeroDpiRunnerEvent.Failed })
+        assertTrue(processLauncher.commands.isEmpty())
+    }
+
+    @Test
+    fun dataPlaneUidMismatchFailsClosed() = runBlocking {
+        val executable = temporaryFolder.newFile("libzerodpi_exec.so")
+        val helperExecutable = temporaryFolder.newFile("libzerodpi_root_helper_exec.so")
+        val workingDirectory = temporaryFolder.newFolder("uid-runtime")
+        val configFile = temporaryFolder.newFile("uid-config.toml")
+        val rootManager = FakeRootManager(
+            launchProcess = FakeProcess(stdout = "ZERODPI_HELPER_READY pid=1234 uid=0\n"),
+        )
+        val processLauncher = RecordingProcessLauncher(
+            FakeProcess(stdout = """{"event":"startup","version":"0.1.0","pid":5678,"uid":0}"""),
+        )
+        val runner = ProcessZeroDpiRunner(
+            scope = this,
+            rootManager = rootManager,
+            executableProvider = { executable },
+            processLauncher = processLauncher,
+            helperExecutableProvider = { helperExecutable },
+            appUidProvider = { 10123 },
+            appPidProvider = { 777 },
+            sessionProofProvider = { ByteArray(32) { 5 } },
+            fileModeSetter = { _, _ -> },
+        )
+
+        val events = collectRunnerEventsUntil(runner, { items -> items.any { it is ZeroDpiRunnerEvent.Failed } }) {
+            runner.start(
+                ZeroDpiRunRequest(
+                    configPath = configFile.absolutePath,
+                    workingDirectory = workingDirectory.absolutePath,
+                    useRoot = true,
+                ),
+            )
+        }
+
+        assertTrue(events.any {
+            it is ZeroDpiRunnerEvent.Failed && it.message.contains("UID verification failed")
+        })
     }
 
     private suspend fun collectRunnerEventsUntil(
@@ -170,15 +255,10 @@ class ProcessZeroDpiRunnerTest {
         }
     }
 
-    private data class RootLaunch(
-        val command: List<String>,
-        val workingDirectory: File?,
-    )
-
     private class FakeRootManager(
         private val launchProcess: Process = FakeProcess(),
     ) : RootManager {
-        val launches = mutableListOf<RootLaunch>()
+        val launches = mutableListOf<RootHelperLaunchRequest>()
 
         override suspend fun isRootAvailable(): RootAvailability =
             error("Root availability is not used by this test.")
@@ -186,12 +266,12 @@ class ProcessZeroDpiRunnerTest {
         override suspend fun requestRootFor(reason: String): RootAccessResult =
             error("Root request is not used by this test.")
 
-        override suspend fun runAsRoot(command: List<String>, workingDirectory: File?): RootProcessLaunchResult {
-            launches += RootLaunch(command, workingDirectory)
+        override suspend fun launchRootHelper(request: RootHelperLaunchRequest): RootProcessLaunchResult {
+            launches += request
             return RootProcessLaunchResult.Started(
                 process = launchProcess,
                 pid = 1234L,
-                command = listOf("su", "-c") + command,
+                command = listOf("su", "-c", request.executable.absolutePath),
             )
         }
 

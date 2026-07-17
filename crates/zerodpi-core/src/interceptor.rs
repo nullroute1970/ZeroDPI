@@ -136,6 +136,9 @@ pub struct FilterSpec {
     /// Linux firewall rule backend used to feed packets into NFQUEUE; ignored
     /// on non-Linux backends.
     pub linux_firewall_backend: LinuxFirewallBackend,
+    /// Optional internal ownership tag used for targeted crash recovery.
+    /// This is never accepted from the Android helper IPC protocol.
+    pub firewall_owner: Option<String>,
 }
 
 /// Linux firewall-rule manager used by the NFQUEUE backend.

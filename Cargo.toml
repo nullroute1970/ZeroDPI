@@ -1,8 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/zerodpi-helper-protocol",
     "crates/zerodpi-core",
     "crates/zerodpi-platform",
+    "crates/zerodpi-root-helper",
     "crates/zerodpi",
 ]
 
@@ -35,6 +37,7 @@ tokio-rustls = "0.26"
 webpki-roots = "0.26"
 ipnet = "2"
 tempfile = "3"
+libc = "0.2"
 
 [profile.release]
 lto = "thin"

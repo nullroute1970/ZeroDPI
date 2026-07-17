@@ -291,6 +291,21 @@ class ZeroDpiService : Service() {
                     )
                 }
             }
+            ZeroDpiRunnerEvent.RootHelperStarting -> {
+                appendLog("Starting privileged packet-interception helper.")
+            }
+            is ZeroDpiRunnerEvent.RootHelperAuthenticated -> {
+                appendLog("Root helper authenticated with pid ${event.pid} and uid ${event.uid}.")
+            }
+            is ZeroDpiRunnerEvent.DataPlaneStarted -> {
+                appendLog("Data plane started with pid ${event.pid} and app uid ${event.uid}.")
+            }
+            is ZeroDpiRunnerEvent.FirewallCleanup -> {
+                appendLog(
+                    if (event.completed) "Root-helper firewall cleanup completed."
+                    else "Root-helper firewall cleanup could not be confirmed.",
+                )
+            }
             is ZeroDpiRunnerEvent.ConfigLoaded -> {
                 state.update {
                     it.copy(

@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, TlsFragPackets};
-use crate::flow::{BypassOutcome, FlowEntry, FlowKey, FlowTable};
+use crate::flow::{BypassOutcome, FlowController, FlowEntry, FlowKey};
 use crate::methods::tcp_segmentation::{read_one_tls_record, write_fragmented, TcpSegmentation};
 use crate::tls_template::build_client_hello;
 
@@ -439,7 +439,7 @@ pub async fn run_proxy(
     cfg: Arc<Config>,
     active_target: SharedSniTarget,
     interface_ip: Ipv4Addr,
-    flows: FlowTable,
+    flow_controller: Arc<dyn FlowController>,
     event_tx: Option<ProxyEventSender>,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT)
@@ -485,7 +485,7 @@ pub async fn run_proxy(
         }
 
         let target = active_target.read().unwrap().clone();
-        let flows = flows.clone();
+        let flow_controller = flow_controller.clone();
         let event_tx = event_tx.clone();
         let connection_settings = ConnectionSettings::from_config(&cfg);
         let fake_client_hello = fresh_fake_client_hello(target.sni.as_bytes());
@@ -496,7 +496,7 @@ pub async fn run_proxy(
                     connect_ip: target.ip,
                     fake_client_hello,
                 },
-                flows,
+                flow_controller,
                 incoming,
                 peer,
                 event_tx,
@@ -512,7 +512,7 @@ pub async fn run_proxy(
 
 async fn handle_intercept_connection(
     target: InterceptConnectionTarget,
-    flows: FlowTable,
+    flow_controller: Arc<dyn FlowController>,
     mut incoming: TcpStream,
     peer: SocketAddr,
     event_tx: Option<ProxyEventSender>,
@@ -538,12 +538,16 @@ async fn handle_intercept_connection(
         dst_port: connect_port,
     };
 
-    let entry = FlowEntry::new(target.fake_client_hello);
-    flows.insert(key, entry.clone());
+    // A remote controller resolves this future only after the root helper has
+    // inserted the flow. The upstream connect below must never move above it.
+    let entry = flow_controller
+        .register_flow(key, target.fake_client_hello)
+        .await
+        .context("register intercepted flow")?;
 
     // Make sure we always remove the entry on this path's exit.
     let cleanup = scopeguard(|| {
-        flows.remove(&key);
+        flow_controller.remove_flow(key);
     });
 
     // Connect: while this is happening, the kernel emits SYN, receives SYN-ACK,
@@ -747,7 +751,7 @@ pub async fn run_ip_bypass_plus_proxy(
     cfg: Arc<Config>,
     active_ip: Arc<RwLock<IpAddr>>,
     interface_ip: Ipv4Addr,
-    flows: FlowTable,
+    flow_controller: Arc<dyn FlowController>,
     event_tx: Option<ProxyEventSender>,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT)
@@ -797,7 +801,7 @@ pub async fn run_ip_bypass_plus_proxy(
             continue;
         }
 
-        let flows = flows.clone();
+        let flow_controller = flow_controller.clone();
         let event_tx = event_tx.clone();
         let connection_settings = ConnectionSettings::from_config(&cfg);
         tokio::spawn(async move {
@@ -807,7 +811,7 @@ pub async fn run_ip_bypass_plus_proxy(
                     connect_ip,
                     fake_client_hello: Vec::new(),
                 },
-                flows,
+                flow_controller,
                 incoming,
                 peer,
                 event_tx,

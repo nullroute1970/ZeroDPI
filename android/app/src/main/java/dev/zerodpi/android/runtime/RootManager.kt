@@ -78,6 +78,15 @@ sealed interface RootProcessLaunchResult {
     ) : RootProcessLaunchResult
 }
 
+data class RootHelperLaunchRequest(
+    val executable: File,
+    val socketPath: File,
+    val sessionFile: File,
+    val expectedAppUid: Int,
+    val parentPid: Int,
+    val workingDirectory: File,
+)
+
 data class RootDiagnosticReport(
     val rootAccess: RootAccessResult,
     val checks: List<RootCommandResult>,
@@ -87,7 +96,7 @@ data class RootDiagnosticReport(
 interface RootManager {
     suspend fun isRootAvailable(): RootAvailability
     suspend fun requestRootFor(reason: String): RootAccessResult
-    suspend fun runAsRoot(command: List<String>, workingDirectory: File? = null): RootProcessLaunchResult
+    suspend fun launchRootHelper(request: RootHelperLaunchRequest): RootProcessLaunchResult
     suspend fun stopRootProcess(pid: Long): RootCommandResult
     suspend fun runDiagnostics(firewallBackend: String): RootDiagnosticReport
 }
@@ -126,17 +135,30 @@ class SuRootManager(
     override suspend fun requestRootFor(reason: String): RootAccessResult =
         checkRootFor(reason = reason, allowCachedGrant = true)
 
-    override suspend fun runAsRoot(
-        command: List<String>,
-        workingDirectory: File?,
-    ): RootProcessLaunchResult =
+    override suspend fun launchRootHelper(request: RootHelperLaunchRequest): RootProcessLaunchResult =
         withContext(Dispatchers.IO) {
+            require(request.executable.name == ROOT_HELPER_EXECUTABLE_NAME) {
+                "Refusing to launch an unexpected executable as the ZeroDPI root helper."
+            }
+            require(request.expectedAppUid > 0) { "Expected app UID must not be root." }
+            require(request.socketPath.parentFile == request.sessionFile.parentFile) {
+                "Helper socket and session proof must share one private directory."
+            }
+            val command = listOf(
+                request.executable.absolutePath,
+                "--socket",
+                request.socketPath.absolutePath,
+                "--expected-uid",
+                request.expectedAppUid.toString(),
+                "--session-file",
+                request.sessionFile.absolutePath,
+                "--parent-pid",
+                request.parentPid.toString(),
+            )
             val shell = buildString {
-                if (workingDirectory != null) {
-                    append("cd ")
-                    append(shellArg(workingDirectory.absolutePath))
-                    append(" && ")
-                }
+                append("cd ")
+                append(shellArg(request.workingDirectory.absolutePath))
+                append(" && ")
                 append("exec ")
                 append(shellCommand(command))
             }
@@ -353,6 +375,7 @@ class SuRootManager(
         }.getOrNull()
 
     private companion object {
+        const val ROOT_HELPER_EXECUTABLE_NAME = "libzerodpi_root_helper_exec.so"
         const val ROOT_TIMEOUT_SECONDS = 15L
         const val COMMAND_TIMEOUT_SECONDS = 5L
         val SAFE_SHELL_ARG = Regex("""^[A-Za-z0-9_./:=+-]+$""")

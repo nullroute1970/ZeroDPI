@@ -14,6 +14,10 @@ data class ZeroDpiRunRequest(
 
 sealed interface ZeroDpiRunnerEvent {
     data object Starting : ZeroDpiRunnerEvent
+    data object RootHelperStarting : ZeroDpiRunnerEvent
+    data class RootHelperAuthenticated(val pid: Long, val uid: Long) : ZeroDpiRunnerEvent
+    data class DataPlaneStarted(val pid: Long, val uid: Long) : ZeroDpiRunnerEvent
+    data class FirewallCleanup(val completed: Boolean) : ZeroDpiRunnerEvent
     data class ConfigLoaded(
         val mode: String,
         val bypassMethod: String,

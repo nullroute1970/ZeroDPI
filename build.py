@@ -1591,6 +1591,26 @@ def build_android_app_abi(
         cargo_cmd.append("--no-default-features")
     run(cargo_cmd, env=env)
 
+    helper_binary = None
+    if runtime == "full":
+        run(
+            [
+                "cargo",
+                "build",
+                "-p",
+                "zerodpi-root-helper",
+                "--release",
+                "--target",
+                rust_target,
+            ],
+            env=env,
+        )
+        helper_binary = (
+            REPO_ROOT / "target" / rust_target / "release" / "zerodpi-root-helper"
+        )
+        if not helper_binary.exists():
+            die(f"Expected root-helper binary not found: {helper_binary}")
+
     binary = REPO_ROOT / "target" / rust_target / "release" / "zerodpi"
     if not binary.exists():
         die(f"Expected binary not found: {binary}")
@@ -1607,12 +1627,28 @@ def build_android_app_abi(
     copy_required_file(binary, native_artifact)
     native_artifact.chmod(0o755)
 
-    return {
+    helper_artifact = None
+    if helper_binary is not None:
+        helper_artifact = jni_dir / "libzerodpi_root_helper_exec.so"
+        copy_required_file(helper_binary, helper_artifact)
+        helper_artifact.chmod(0o755)
+        if native_artifact.read_bytes() == helper_artifact.read_bytes():
+            die(
+                "Android data-plane and root-helper artifacts are unexpectedly identical: "
+                f"{native_artifact}"
+            )
+
+    entry = {
         "abi": abi,
         "rustTarget": rust_target,
         "standaloneExecutable": str(standalone_binary.relative_to(dist_dir)).replace("\\", "/"),
         "nativeLibraryArtifact": str(native_artifact.relative_to(dist_dir)).replace("\\", "/"),
     }
+    if helper_artifact is not None:
+        entry["rootHelperNativeLibraryArtifact"] = str(
+            helper_artifact.relative_to(dist_dir)
+        ).replace("\\", "/")
+    return entry
 
 
 def build_android_app_runtime(

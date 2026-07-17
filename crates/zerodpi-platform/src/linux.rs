@@ -9,6 +9,7 @@
 //! replacing payload" path used by the `wrong_seq` bypass.
 
 use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -293,6 +294,16 @@ enum FirewallGuard {
     Nftables { _guard: NftablesGuard },
 }
 
+/// Remove firewall state that is tagged as owned by a no-longer-running
+/// ZeroDPI root helper. A live helper owner is treated as a conflicting
+/// session and fails closed.
+pub fn recover_stale_firewall_state(backend: LinuxFirewallBackend) -> Result<usize> {
+    match backend {
+        LinuxFirewallBackend::Iptables => recover_stale_iptables_rules(),
+        LinuxFirewallBackend::Nftables => recover_stale_nftables_tables(),
+    }
+}
+
 impl FirewallGuard {
     fn install(filter: &FilterSpec) -> Result<Self> {
         match filter.linux_firewall_backend {
@@ -315,13 +326,22 @@ struct IptablesGuard {
 impl IptablesGuard {
     fn install(filter: &FilterSpec) -> Result<Self> {
         let rules = iptables_rules(filter);
-        for rule in &rules {
+        let mut installed: Vec<Vec<String>> = Vec::with_capacity(rules.len());
+        for rule in rules {
             // Android devices commonly have pre-existing terminal rules in
             // INPUT/OUTPUT. Insert first so NFQUEUE sees matching packets.
-            run_iptables("-I", rule).context("install iptables rule")?;
+            if let Err(error) = run_iptables("-I", &rule) {
+                for installed_rule in installed.iter().rev() {
+                    if let Err(cleanup_error) = run_iptables("-D", installed_rule) {
+                        warn!(error = %cleanup_error, "failed to roll back iptables rule");
+                    }
+                }
+                return Err(error).context("install iptables rule");
+            }
+            installed.push(rule);
         }
         info!("iptables rules installed");
-        Ok(Self { rules })
+        Ok(Self { rules: installed })
     }
 }
 
@@ -349,12 +369,62 @@ fn run_iptables(action: &str, rule_args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn recover_stale_iptables_rules() -> Result<usize> {
+    let mut removed = 0;
+    for chain in ["OUTPUT", "INPUT"] {
+        let output = Command::new("iptables")
+            .args(["-S", chain])
+            .output()
+            .with_context(|| format!("list iptables {chain} rules for stale recovery"))?;
+        if !output.status.success() {
+            anyhow::bail!("iptables -S {chain} failed: {}", output.status);
+        }
+        let rules = String::from_utf8(output.stdout).context("decode iptables rule listing")?;
+        for line in rules.lines() {
+            let Some((owner_pid, rule)) = parse_owned_iptables_rule(line) else {
+                continue;
+            };
+            if helper_owner_is_live(owner_pid) {
+                anyhow::bail!("another ZeroDPI root helper session is still active");
+            }
+            run_iptables("-D", &rule).context("remove stale ZeroDPI iptables rule")?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn parse_owned_iptables_rule(line: &str) -> Option<(u32, Vec<String>)> {
+    let tokens: Vec<&str> = line.split_ascii_whitespace().collect();
+    if tokens.len() < 8
+        || tokens.first().copied() != Some("-A")
+        || !matches!(tokens.get(1).copied(), Some("INPUT" | "OUTPUT"))
+        || !tokens.windows(2).any(|pair| pair == ["-j", "NFQUEUE"])
+    {
+        return None;
+    }
+    let comment = tokens
+        .windows(2)
+        .find(|pair| pair[0] == "--comment")?
+        .get(1)?
+        .trim_matches(['\'', '"']);
+    let owner_pid = comment.strip_prefix("zerodpi-")?.parse().ok()?;
+    let mut rule = Vec::with_capacity(tokens.len() - 1);
+    rule.push(tokens[1].to_owned());
+    rule.extend(
+        tokens[2..]
+            .iter()
+            .map(|token| token.trim_matches(['\'', '"']).to_owned()),
+    );
+    Some((owner_pid, rule))
+}
+
 fn iptables_rules(filter: &FilterSpec) -> Vec<Vec<String>> {
     let iface = filter.interface_ip.to_string();
     let port = filter.remote_port.to_string();
     let q = filter.queue_num.to_string();
 
-    match filter.remote_ip {
+    let mut rules = match filter.remote_ip {
         Some(remote_ip) => {
             let remote = remote_ip.to_string();
             vec![
@@ -422,7 +492,35 @@ fn iptables_rules(filter: &FilterSpec) -> Vec<Vec<String>> {
                 "--queue-bypass".into(),
             ],
         ],
+    };
+    if let Some(owner) = filter.firewall_owner.as_deref() {
+        assert!(
+            valid_firewall_owner(owner),
+            "invalid internal firewall owner tag"
+        );
+        for rule in &mut rules {
+            let jump = rule
+                .iter()
+                .position(|argument| argument == "-j")
+                .expect("NFQUEUE rule must contain a jump target");
+            rule.splice(
+                jump..jump,
+                [
+                    "-m".into(),
+                    "comment".into(),
+                    "--comment".into(),
+                    owner.into(),
+                ],
+            );
+        }
     }
+    rules
+}
+
+fn valid_firewall_owner(owner: &str) -> bool {
+    owner
+        .strip_prefix("zerodpi-")
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 // ---------------------- nftables rule management ----------------------
@@ -537,6 +635,66 @@ fn delete_nft_table(table_name: &str) -> Result<()> {
     run_nft(&strings(&["delete", "table", NFT_TABLE_FAMILY, table_name]))
 }
 
+fn recover_stale_nftables_tables() -> Result<usize> {
+    let output = Command::new("nft")
+        .args(["list", "tables"])
+        .output()
+        .context("list nftables tables for stale recovery")?;
+    if !output.status.success() {
+        anyhow::bail!("nft list tables failed: {}", output.status);
+    }
+    let listing = String::from_utf8(output.stdout).context("decode nftables table listing")?;
+    let mut removed = 0;
+    for line in listing.lines() {
+        let Some((owner_pid, table_name)) = parse_owned_nftables_table(line) else {
+            continue;
+        };
+        if helper_owner_is_live(owner_pid) {
+            anyhow::bail!("another ZeroDPI root helper session is still active");
+        }
+        delete_nft_table(table_name).context("remove stale ZeroDPI nftables table")?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn parse_owned_nftables_table(line: &str) -> Option<(u32, &str)> {
+    let mut tokens = line.split_ascii_whitespace();
+    if tokens.next()? != "table" || tokens.next()? != NFT_TABLE_FAMILY {
+        return None;
+    }
+    let table_name = tokens.next()?;
+    if tokens.next().is_some() {
+        return None;
+    }
+    let remainder = table_name.strip_prefix("zerodpi_")?;
+    let (pid, counter) = remainder.split_once('_')?;
+    if counter.is_empty() || !counter.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((pid.parse().ok()?, table_name))
+}
+
+fn helper_owner_is_live(pid: u32) -> bool {
+    // Recovery runs only while no interceptor is open. Matching state from a
+    // reused current PID is therefore stale, not a concurrent session.
+    if pid == std::process::id() {
+        return false;
+    }
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    if !proc_dir.exists() {
+        return false;
+    }
+    match std::fs::read(proc_dir.join("cmdline")) {
+        Ok(command_line) => {
+            let command = String::from_utf8_lossy(&command_line);
+            command.contains("zerodpi-root-helper") || command.contains("zerodpi_root_helper_exec")
+        }
+        // Be conservative if a platform security policy prevents inspection.
+        Err(_) => true,
+    }
+}
+
 fn run_nft(args: &[String]) -> Result<()> {
     let status = Command::new("nft")
         .args(args)
@@ -613,6 +771,7 @@ mod tests {
             remote_port: 443,
             queue_num: 7,
             linux_firewall_backend: LinuxFirewallBackend::Iptables,
+            firewall_owner: None,
         }
     }
 
@@ -655,6 +814,37 @@ mod tests {
                 "--queue-bypass",
             ])
         );
+    }
+
+    #[test]
+    fn owned_iptables_rule_is_tagged_and_recovery_parser_is_targeted() {
+        let mut filter = make_filter(None);
+        filter.firewall_owner = Some("zerodpi-1234".into());
+        let rules = iptables_rules(&filter);
+        assert!(rules.iter().all(|rule| rule
+            .windows(2)
+            .any(|pair| pair == ["--comment", "zerodpi-1234"])));
+
+        let parsed = parse_owned_iptables_rule(
+            "-A OUTPUT -p tcp -m comment --comment \"zerodpi-1234\" -j NFQUEUE --queue-num 7",
+        )
+        .unwrap();
+        assert_eq!(parsed.0, 1234);
+        assert_eq!(parsed.1.first().map(String::as_str), Some("OUTPUT"));
+        assert!(parse_owned_iptables_rule(
+            "-A OUTPUT -m comment --comment unrelated -j NFQUEUE --queue-num 7"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn nftables_recovery_parser_accepts_only_owned_table_shape() {
+        assert_eq!(
+            parse_owned_nftables_table("table inet zerodpi_1234_7"),
+            Some((1234, "zerodpi_1234_7"))
+        );
+        assert!(parse_owned_nftables_table("table ip zerodpi_1234_7").is_none());
+        assert!(parse_owned_nftables_table("table inet zerodpi_user_table").is_none());
     }
 
     #[test]

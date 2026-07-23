@@ -3,4 +3,113 @@
     <string name="zerodpi_notification_channel">ZeroDPI runtime</string>
     <string name="zerodpi_notification_title">ZeroDPI is running</string>
     <string name="zerodpi_notification_stop">Stop</string>
+
+    <string name="nav_home">Home</string>
+    <string name="nav_profiles">Profiles</string>
+    <string name="nav_configure">Configure</string>
+    <string name="nav_support">Support</string>
+    <string name="navigate_back">Go back</string>
+    <string name="show_more_actions">More actions</string>
+
+    <string name="action_start">Start ZeroDPI</string>
+    <string name="action_stop">Stop ZeroDPI</string>
+    <string name="action_force_stop">Force stop</string>
+    <string name="action_stopping">Stopping…</string>
+    <string name="action_create">Create</string>
+    <string name="action_duplicate">Duplicate</string>
+    <string name="action_rename">Rename</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_update">Update now</string>
+    <string name="action_refresh">Refresh</string>
+    <string name="action_export_bundle">Export bundle</string>
+    <string name="action_reset">Reset to defaults</string>
+    <string name="action_import">Import</string>
+    <string name="action_export">Export</string>
+    <string name="action_share">Share</string>
+    <string name="action_edit">Edit</string>
+    <string name="action_run_test_scan">Run test scan</string>
+    <string name="action_run_root_diagnostics">Run root diagnostics</string>
+
+    <string name="home_active_profile">Active profile</string>
+    <string name="home_status">Runtime status</string>
+    <string name="home_ready">Ready to start</string>
+    <string name="home_needs_attention">Needs attention</string>
+    <string name="home_runtime_summary">Runtime summary</string>
+    <string name="home_open_configure">Review configuration</string>
+    <string name="home_open_profiles">Manage profiles</string>
+    <string name="home_open_list">Fix list entries</string>
+    <string name="home_last_error">Last error</string>
+
+    <string name="profiles_title">Profiles</string>
+    <string name="profiles_description">Each profile has its own configuration and candidate lists.</string>
+    <string name="profiles_active">Active</string>
+    <string name="profiles_switching">Switching profile…</string>
+    <string name="profiles_stop_first">Stop ZeroDPI before switching or changing profiles.</string>
+    <string name="profiles_last_delete">The last profile cannot be deleted.</string>
+    <string name="profiles_remote_update">Remote update</string>
+    <string name="profiles_remote_description">Download and atomically replace all three files for the active profile.</string>
+    <string name="profiles_remote_warning">Remote updates overwrite local changes after a successful update.</string>
+    <string name="profiles_auto_update">Automatic updates</string>
+    <string name="profiles_update_interval">Update interval (hours)</string>
+    <string name="profiles_config_url">config.toml URL</string>
+    <string name="profiles_sni_url">sni_list.txt URL</string>
+    <string name="profiles_ip_url">ip_list.txt URL</string>
+    <string name="profiles_urls_required">Configure all three valid URLs before updating.</string>
+    <string name="profiles_updating">Downloading, validating, and applying files…</string>
+    <string name="profiles_delete_title">Delete profile?</string>
+    <string name="profiles_delete_message">Delete %1$s and its local configuration and lists? This cannot be undone.</string>
+
+    <string name="configure_title">Configure</string>
+    <string name="configure_basic">Basic</string>
+    <string name="configure_advanced">Advanced</string>
+    <string name="configure_basic_description">Common connection, mode, input, and DNS settings.</string>
+    <string name="configure_advanced_description">Scanner tuning and specialist bypass controls.</string>
+    <string name="configure_valid">Configuration is valid</string>
+    <string name="configure_errors">%1$d configuration errors</string>
+    <string name="configure_saving">Saving changes automatically…</string>
+    <string name="configure_lists">Candidate lists</string>
+    <string name="configure_entries">%1$d active entries</string>
+    <string name="configure_list_errors">%1$d invalid entries</string>
+    <string name="configure_reset_title">Reset configuration?</string>
+    <string name="configure_reset_message">Replace the active profile’s configuration with the packaged defaults?</string>
+    <string name="configure_required">Required</string>
+
+    <string name="support_diagnostics">Diagnostics</string>
+    <string name="support_runtime_details">Runtime details</string>
+    <string name="support_logs">Recent logs</string>
+    <string name="support_no_logs">No runtime logs yet.</string>
+    <string name="support_include_private">Include private lists</string>
+    <string name="support_include_private_description">Off by default so production SNI and IP lists are not exported accidentally.</string>
+
+    <string name="list_sni_title">SNI list</string>
+    <string name="list_ip_title">IP list</string>
+    <string name="list_sni_help">Enter one hostname per line. Blank lines and # comments are allowed.</string>
+    <string name="list_ip_help">Enter one IP address or CIDR range per line. Blank lines and # comments are allowed.</string>
+    <string name="list_valid">%1$d active entries are valid</string>
+    <string name="list_invalid">%1$d invalid entries</string>
+    <string name="list_saving">Saving changes automatically…</string>
+    <string name="list_loading">Loading list…</string>
+
+    <string name="status_stopped">Stopped</string>
+    <string name="status_starting">Starting…</string>
+    <string name="status_scanning">Scanning for a working target…</string>
+    <string name="status_running">Running</string>
+    <string name="status_stopping">Stopping…</string>
+    <string name="status_failed">Failed</string>
+
+    <string name="label_mode">Mode</string>
+    <string name="label_bypass_method">Bypass method</string>
+    <string name="label_listener">Listener</string>
+    <string name="label_active_target">Active target</string>
+    <string name="label_connections">Connections</string>
+    <string name="label_relay_bytes">Relayed bytes</string>
+    <string name="label_root">Root requirement</string>
+    <string name="label_app_version">App version</string>
+    <string name="label_zerodpi_version">ZeroDPI version</string>
+    <string name="label_abi">ABI</string>
+    <string name="label_android">Android</string>
+    <string name="label_firewall">Firewall backend</string>
+    <string name="label_last_exit">Last exit code</string>
+    <string name="label_storage_path">Storage path</string>
 </resources>

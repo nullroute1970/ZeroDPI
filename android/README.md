@@ -118,11 +118,12 @@ active profile directory.
 Fresh installs create one `Default` profile. Upgrades migrate the previous
 single app-private runtime file set into `Default`.
 
-On the Home page, the `Active profile` panel shows the current profile. Tap
-`Switch` to select another profile. If the current profile has unsaved edits,
-choose `Save`, `Discard`, or `Cancel` before the app switches.
+The Home destination shows the active profile beside runtime readiness and the
+primary Start/Stop action. Open Profiles to select another profile. If the
+current profile has unsaved edits, choose `Save`, `Discard`, or `Cancel` before
+the app switches.
 
-Tap `Manage profiles` or open Settings to use the `Profiles` panel:
+The Profiles destination provides:
 
 - `Create` adds a profile from the packaged default files.
 - `Duplicate` copies the active profile's files and remote settings.
@@ -136,8 +137,10 @@ stopping so the running process keeps using a stable file set.
 
 ## Local Edits
 
-The Settings config fields and Home runtime list editors always edit the active
-profile. `Save` writes only that profile's file. `Reset to defaults` replaces
+The Configure destination edits the active profile. Basic contains the common
+listener, mode, input, and DNS fields; Advanced contains scanner tuning and
+bypass controls. The SNI and IP summary cards open their dedicated list
+editors. `Save` writes only that profile's file. `Reset to defaults` replaces
 only the selected file in the active profile. Import, export, share, and test
 scan actions also use the active profile.
 
@@ -148,7 +151,7 @@ active profile, so edits in profile A do not mutate profile B.
 ## Remote Profile Updates
 
 Each profile can fetch a complete replacement file set from remote URLs. Open
-Settings and use the `Remote update` panel:
+Profiles and expand `Remote update`:
 
 - `config.toml URL` points to the replacement config.
 - `sni_list.txt URL` points to the replacement SNI list.
@@ -189,9 +192,9 @@ screenshots and copied profile metadata may not.
 ## Profile Update Troubleshooting
 
 The `Remote update` panel shows `Last attempt`, `Last success`, `Last update`,
-and the latest status message for the active profile. For support, use
-Diagnostics -> `Export bundle`; the bundle includes profile id/name, sanitized
-remote URLs, auto update settings, and last remote update status.
+and the latest status message for the active profile. For support, open Support
+and use `Export bundle`; the bundle includes profile id/name, sanitized remote
+URLs, auto update settings, and last remote update status.
 
 Common failures:
 

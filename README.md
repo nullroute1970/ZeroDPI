@@ -540,6 +540,24 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | `SNI_LIST` | `string` | `"sni_list.txt"` | Path to decoy SNI hostname file (one per line) |
 | `IP_LIST` | `string` | `"ip_list.txt"` | Path to IP list file (plain IPs or CIDR ranges) |
 
+### 🌐 DNS Resolution
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `CUSTOM_DNS_ENABLED` | `bool` | `false` | Resolve SNI hostnames only through `CUSTOM_DNS_SERVER` |
+| `CUSTOM_DNS_SERVER` | `string` | — | Plain DNS server as a literal IPv4/IPv6 address with an optional port (default port `53`) |
+
+System DNS remains the default. To use a custom resolver for `SNI_LIST` scans,
+background rescans, proxy scans, and `SELECTED_SNI`, configure:
+
+```toml
+CUSTOM_DNS_ENABLED = true
+CUSTOM_DNS_SERVER = "1.1.1.1"
+```
+
+Custom mode does not fall back to system DNS if the configured server fails.
+Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
+
 ### 🔍 Scan Behavior
 
 | Field | Type | Default | Description |

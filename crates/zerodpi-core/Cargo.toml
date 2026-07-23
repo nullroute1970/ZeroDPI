@@ -20,6 +20,7 @@ parking_lot.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
+hickory-resolver.workspace = true
 ipnet.workspace = true
 
 [dev-dependencies]

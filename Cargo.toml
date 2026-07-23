@@ -35,6 +35,7 @@ crossterm = "0.28"
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
+hickory-resolver = { version = "0.24.4", default-features = false, features = ["tokio-runtime"] }
 ipnet = "2"
 tempfile = "3"
 libc = "0.2"

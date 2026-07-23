@@ -77,6 +77,44 @@ class ZeroDpiConfigSchemaTest {
     }
 
     @Test
+    fun customDnsValidationMatchesRustConfiguration() {
+        val missingServer = ZeroDpiConfigToml.analyze(
+            """
+            LISTEN_HOST = "127.0.0.1"
+            LISTEN_PORT = 44444
+            CUSTOM_DNS_ENABLED = true
+            CUSTOM_DNS_SERVER = ""
+            """.trimIndent(),
+        )
+        assertFalse(missingServer.canStart)
+        assertTrue(missingServer.issues.any { it.fieldName == "CUSTOM_DNS_SERVER" })
+
+        for (server in listOf("1.1.1.1", "1.1.1.1:5353", "2606:4700:4700::1111", "[2606:4700:4700::1111]:5353")) {
+            val validServer = ZeroDpiConfigToml.analyze(
+                """
+                LISTEN_HOST = "127.0.0.1"
+                LISTEN_PORT = 44444
+                CUSTOM_DNS_ENABLED = true
+                CUSTOM_DNS_SERVER = "$server"
+                """.trimIndent(),
+            )
+            assertTrue("Unexpected issues for $server: ${validServer.issues}", validServer.canStart)
+        }
+
+        for (server in listOf("dns.example.com", "1.1.1.1:0", "[2606:4700:4700::1111]:0")) {
+            val invalidServer = ZeroDpiConfigToml.analyze(
+                """
+                LISTEN_HOST = "127.0.0.1"
+                LISTEN_PORT = 44444
+                CUSTOM_DNS_ENABLED = true
+                CUSTOM_DNS_SERVER = "$server"
+                """.trimIndent(),
+            )
+            assertFalse("Accepted invalid DNS server $server", invalidServer.canStart)
+        }
+    }
+
+    @Test
     fun tomlEditRoundTripPreservesTypesEscapesAndComments() {
         val original = """
             # User-edited runtime config.

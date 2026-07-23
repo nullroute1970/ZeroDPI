@@ -7,6 +7,7 @@ object SupportBundleSanitizer {
     private val redactedConfigFields = setOf(
         "SELECTED_SNI",
         "SELECTED_IP",
+        "CUSTOM_DNS_SERVER",
         "SNI_LIST",
         "IP_LIST",
         "SCAN_OUTPUT",

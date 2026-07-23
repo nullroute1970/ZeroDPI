@@ -30,6 +30,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
 use zerodpi_core::config::Config;
+use zerodpi_core::dns::DnsResolver;
 use zerodpi_core::flow::{new_flow_table, FlowController, LocalFlowController};
 use zerodpi_core::handler::Handler;
 use zerodpi_core::interceptor::{FilterSpec, InterceptorShutdown, PacketInterceptor};
@@ -269,6 +270,14 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         cfg.RELAY_MAX_LIFETIME_SECS = v;
     }
     cfg.validate()?;
+    if cfg.CUSTOM_DNS_ENABLED {
+        info!(
+            server = cfg.CUSTOM_DNS_SERVER.as_deref().unwrap_or_default(),
+            "custom DNS resolver enabled"
+        );
+    } else {
+        info!("system DNS resolver enabled");
+    }
     let root_required = requires_packet_interception(&cfg);
     let remote_helper = connect_external_helper(helper_bootstrap, root_required)?;
     if let Some(helper) = remote_helper.as_ref() {
@@ -374,7 +383,8 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         // Skip scanning; just resolve the forced SNI.
         info!(sni = %forced_sni, "SELECTED_SNI set — skipping scan");
         let sni = forced_sni.clone();
-        rt.block_on(async move { resolve_single_sni(&sni).await })
+        let resolver = DnsResolver::from_config(&cfg, scan_timeout)?;
+        rt.block_on(async move { resolve_single_sni(&sni, &resolver, scan_timeout).await })
             .with_context(|| format!("resolving SELECTED_SNI '{}'", forced_sni))?
     } else {
         info!(path = %sni_list_path.display(), "scanning SNI list");
@@ -588,16 +598,15 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
 
 /// Resolve `sni` to all IPv4 addresses and return a synthetic probe entry for
 /// each one (no TCP/TLS/HTTP checks are performed).
-async fn resolve_single_sni(sni: &str) -> anyhow::Result<Vec<SniProbeEntry>> {
-    let target = format!("{sni}:443");
-    let addrs: Vec<Ipv4Addr> = tokio::net::lookup_host(&target)
+async fn resolve_single_sni(
+    sni: &str,
+    resolver: &DnsResolver,
+    timeout: Duration,
+) -> anyhow::Result<Vec<SniProbeEntry>> {
+    let addrs = tokio::time::timeout(timeout, resolver.lookup_ipv4(sni))
         .await
-        .with_context(|| format!("DNS lookup for {sni}"))?
-        .filter_map(|sa| match sa.ip() {
-            IpAddr::V4(v4) => Some(v4),
-            IpAddr::V6(_) => None,
-        })
-        .collect();
+        .with_context(|| format!("DNS lookup for {sni} timed out"))?
+        .with_context(|| format!("DNS lookup for {sni}"))?;
 
     if addrs.is_empty() {
         anyhow::bail!("no IPv4 addresses found for {sni}");

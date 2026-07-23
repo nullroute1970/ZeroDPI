@@ -1,6 +1,7 @@
 //! ZeroDPI core: platform-independent logic.
 //!
 //! - [`config`]: load/validate `config.toml`.
+//! - [`dns`]: system and custom DNS resolution for SNI hostnames.
 //! - [`tls_template`]: byte-exact port of upstream's `ClientHelloMaker`.
 //! - [`flow`]: flow keys, per-connection state, the shared flow table.
 //! - [`interceptor`]: traits that platform packet-interception backends implement.
@@ -11,6 +12,7 @@
 //! - [`ip_scanner`]: 3-phase IP scanner (TCP→TLS→TTFB) used in `ip_bypass` mode.
 
 pub mod config;
+pub mod dns;
 pub mod flow;
 pub mod handler;
 pub mod interceptor;

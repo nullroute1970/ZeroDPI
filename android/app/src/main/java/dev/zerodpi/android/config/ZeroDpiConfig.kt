@@ -7,6 +7,7 @@ enum class ConfigSection(val title: String) {
     ProxyListener("Proxy listener"),
     OperatingMode("Operating mode"),
     InputFiles("Input files"),
+    DnsResolution("DNS resolution"),
     ScanBehavior("Scan behavior"),
     ScannerTuning("Scanner tuning"),
     Scoring("Scoring"),
@@ -205,6 +206,22 @@ object ZeroDpiConfigSchema {
             section = ConfigSection.InputFiles,
             validationRule = "Relative or absolute path.",
             helpText = "Path to candidate hostnames.",
+        ),
+        field(
+            name = "CUSTOM_DNS_ENABLED",
+            type = ConfigFieldType.Boolean,
+            defaultValue = "false",
+            section = ConfigSection.DnsResolution,
+            validationRule = "true or false.",
+            helpText = "Resolve SNI hostnames through a custom plain-DNS server.",
+        ),
+        field(
+            name = "CUSTOM_DNS_SERVER",
+            type = ConfigFieldType.OptionalText,
+            defaultValue = "",
+            section = ConfigSection.DnsResolution,
+            validationRule = "When enabled, a literal IPv4/IPv6 address with an optional non-zero port.",
+            helpText = "Custom DNS endpoint; omitted ports default to 53.",
         ),
         field(
             name = "IP_LIST",
@@ -991,6 +1008,17 @@ object ZeroDpiConfigToml {
             }
         }
 
+        if (
+            "CUSTOM_DNS_ENABLED" !in invalidFields &&
+            config.boolean("CUSTOM_DNS_ENABLED") &&
+            "CUSTOM_DNS_SERVER" !in invalidFields
+        ) {
+            requireField(
+                "CUSTOM_DNS_SERVER",
+                isValidCustomDnsServer(config.text("CUSTOM_DNS_SERVER")),
+                "CUSTOM_DNS_SERVER must be a literal IP address with an optional non-zero port.",
+            )
+        }
         whenValid("SCAN_TIMEOUT_SECS") {
             requireField("SCAN_TIMEOUT_SECS", config.integer("SCAN_TIMEOUT_SECS") > 0, "SCAN_TIMEOUT_SECS must be > 0.")
         }
@@ -1316,6 +1344,31 @@ object ZeroDpiConfigToml {
             }
             else -> null
         }
+
+    private fun isValidCustomDnsServer(rawValue: String): Boolean {
+        val value = rawValue.trim()
+        if (value.isEmpty()) return false
+
+        if (value.startsWith('[')) {
+            val closeBracket = value.indexOf(']')
+            if (closeBracket <= 1 || closeBracket == value.lastIndex) return false
+            val ip = value.substring(1, closeBracket)
+            val portText = value.substring(closeBracket + 1)
+            val port = portText.drop(1).toIntOrNull()
+            return portText.startsWith(':') &&
+                port != null &&
+                port in 1..65535 &&
+                parseIpKind(ip) == IpKind.Ipv6
+        }
+
+        if (parseIpKind(value) != null) return true
+
+        val colonIndex = value.lastIndexOf(':')
+        if (colonIndex <= 0 || value.indexOf(':') != colonIndex) return false
+        val ip = value.substring(0, colonIndex)
+        val port = value.substring(colonIndex + 1).toIntOrNull()
+        return parseIpKind(ip) == IpKind.Ipv4 && port != null && port in 1..65535
+    }
 
     private fun isValidIpv4(value: String): Boolean {
         val parts = value.split('.')

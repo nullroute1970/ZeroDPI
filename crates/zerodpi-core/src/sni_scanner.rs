@@ -28,7 +28,7 @@
 //! | Upload speed     | 7.5     | linear: 0→0, ≥2 000 KB/s→7.5 |
 //! | All phases bonus | 10      | all signals present |
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,6 +40,8 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
+
+use crate::dns::DnsResolver;
 
 /// All probe results for one (SNI, IP) combination.
 #[derive(Debug, Clone)]
@@ -204,6 +206,7 @@ pub async fn scan_sni_list(
     }
 
     let connector = Arc::new(make_tls_connector());
+    let resolver = Arc::new(DnsResolver::from_config(&config, timeout)?);
     let semaphore = Arc::new(Semaphore::new(config.SNI_MAX_CONCURRENT));
     let mut handles = Vec::new();
     for sni in hostnames {
@@ -211,8 +214,9 @@ pub async fn scan_sni_list(
         let tx = progress_tx.clone();
         let sem = semaphore.clone();
         let cfg = config.clone();
+        let resolver = resolver.clone();
         handles.push(tokio::spawn(async move {
-            probe_sni(sni, timeout, cfg, connector, tx, sem).await
+            probe_sni(sni, timeout, cfg, resolver, connector, tx, sem).await
         }));
     }
 
@@ -254,29 +258,24 @@ async fn probe_sni(
     sni: String,
     timeout: Duration,
     config: Arc<crate::config::Config>,
+    resolver: Arc<DnsResolver>,
     connector: Arc<TlsConnector>,
     progress_tx: Option<mpsc::UnboundedSender<SniProbeEntry>>,
     semaphore: Arc<Semaphore>,
 ) -> Vec<SniProbeEntry> {
-    let lookup_target = format!("{}:443", sni);
     // DNS resolution is covered by the same per-probe timeout.
-    let addrs: Vec<Ipv4Addr> =
-        match tokio::time::timeout(timeout, tokio::net::lookup_host(&lookup_target)).await {
-            Ok(Ok(iter)) => iter
-                .filter_map(|sa| match sa.ip() {
-                    IpAddr::V4(v4) => Some(v4),
-                    IpAddr::V6(_) => None,
-                })
-                .collect(),
-            Ok(Err(e)) => {
-                debug!(sni = %sni, error = %e, "DNS resolution failed");
-                return Vec::new();
-            }
-            Err(_) => {
-                debug!(sni = %sni, timeout = ?timeout, "DNS resolution timed out");
-                return Vec::new();
-            }
-        };
+    let addrs: Vec<Ipv4Addr> = match tokio::time::timeout(timeout, resolver.lookup_ipv4(&sni)).await
+    {
+        Ok(Ok(addrs)) => addrs,
+        Ok(Err(e)) => {
+            debug!(sni = %sni, error = %e, "DNS resolution failed");
+            return Vec::new();
+        }
+        Err(_) => {
+            debug!(sni = %sni, timeout = ?timeout, "DNS resolution timed out");
+            return Vec::new();
+        }
+    };
 
     let mut tasks = Vec::new();
     for ip in addrs {

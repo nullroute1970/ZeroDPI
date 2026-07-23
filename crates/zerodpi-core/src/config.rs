@@ -144,6 +144,17 @@ pub struct Config {
     #[serde(default = "default_sni_list")]
     pub SNI_LIST: String,
 
+    /// Whether SNI hostnames should be resolved through `CUSTOM_DNS_SERVER`
+    /// instead of the operating system resolver. Default: `false`.
+    #[serde(default)]
+    pub CUSTOM_DNS_ENABLED: bool,
+
+    /// Plain DNS server used when `CUSTOM_DNS_ENABLED` is true.
+    /// Accepts a literal IPv4 or IPv6 address with an optional port; when the
+    /// port is omitted, port 53 is used.
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub CUSTOM_DNS_SERVER: Option<String>,
+
     /// Per-probe timeout in seconds.
     /// Each (SNI, IP) combination is given this many seconds to complete all
     /// checks (DNS, TCP connect, TLS handshake, HTTP request).
@@ -748,6 +759,12 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.CUSTOM_DNS_ENABLED {
+            let server = self.CUSTOM_DNS_SERVER.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("CUSTOM_DNS_SERVER is required when CUSTOM_DNS_ENABLED is true")
+            })?;
+            crate::dns::parse_custom_dns_server(server)?;
+        }
         if self.SCAN_TIMEOUT_SECS == 0 {
             anyhow::bail!("SCAN_TIMEOUT_SECS must be > 0");
         }
@@ -1876,5 +1893,62 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn custom_dns_defaults_to_system_resolver() {
+        let cfg: Config = toml::from_str(
+            r#"
+            LISTEN_HOST = "127.0.0.1"
+            LISTEN_PORT = 44444
+            "#,
+        )
+        .unwrap();
+
+        assert!(!cfg.CUSTOM_DNS_ENABLED);
+        assert_eq!(cfg.CUSTOM_DNS_SERVER, None);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_enabled_custom_dns_server() {
+        for server in [
+            "1.1.1.1",
+            "1.1.1.1:5353",
+            "2606:4700:4700::1111",
+            "[2606:4700:4700::1111]:5353",
+        ] {
+            let toml_str = format!(
+                r#"
+                LISTEN_HOST = "127.0.0.1"
+                LISTEN_PORT = 44444
+                CUSTOM_DNS_ENABLED = true
+                CUSTOM_DNS_SERVER = "{server}"
+                "#
+            );
+            let cfg: Config = toml::from_str(&toml_str).unwrap();
+            assert!(cfg.validate().is_ok(), "rejected {server}");
+        }
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_enabled_custom_dns_server() {
+        for server_line in [
+            "",
+            "CUSTOM_DNS_SERVER = \"\"",
+            "CUSTOM_DNS_SERVER = \"dns.example.com\"",
+            "CUSTOM_DNS_SERVER = \"1.1.1.1:0\"",
+        ] {
+            let toml_str = format!(
+                r#"
+                LISTEN_HOST = "127.0.0.1"
+                LISTEN_PORT = 44444
+                CUSTOM_DNS_ENABLED = true
+                {server_line}
+                "#
+            );
+            let cfg: Config = toml::from_str(&toml_str).unwrap();
+            assert!(cfg.validate().is_err(), "accepted {server_line:?}");
+        }
     }
 }

@@ -232,7 +232,9 @@ jobs:
             android/app/*.gradle.kts
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ""
 
       - name: Configure Android release keystore path
         shell: bash

@@ -6,10 +6,12 @@ import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTextInput
 import dev.zerodpi.android.service.RuntimeStatus
 import dev.zerodpi.android.service.ZeroDpiServiceState
 import dev.zerodpi.android.ui.theme.ZeroDpiTheme
 import org.junit.Rule
+import org.junit.Assert.assertEquals
 import org.junit.Test
 
 @Suppress("DEPRECATION")
@@ -28,6 +30,17 @@ class DashboardScreenTest {
         composeRule.onNodeWithTag("screen_configure").assertIsDisplayed()
         composeRule.onNodeWithTag("nav_logs").performClick()
         composeRule.onNodeWithTag("screen_logs").assertIsDisplayed()
+    }
+
+    @Test
+    fun primaryDestinationsDoNotShowARepeatedTopBar() {
+        composeRule.setContent { TestDashboard() }
+
+        composeRule.onNodeWithTag("contextual_top_bar").assertDoesNotExist()
+        listOf("profiles", "configure", "logs", "home").forEach { destination ->
+            composeRule.onNodeWithTag("nav_$destination").performClick()
+            composeRule.onNodeWithTag("contextual_top_bar").assertDoesNotExist()
+        }
     }
 
     @Test
@@ -71,6 +84,41 @@ class DashboardScreenTest {
     }
 
     @Test
+    fun logsCanSearchFilterPauseAndConfirmClear() {
+        var clearCalls = 0
+        composeRule.setContent {
+            TestDashboard(
+                serviceState = ZeroDpiServiceState(
+                    status = RuntimeStatus.Running,
+                    recentLogs = listOf(
+                        "relay connected",
+                        "WARNING: DNS retry",
+                        "fatal runner error",
+                    ),
+                ),
+                onClearLogs = { clearCalls += 1 },
+            )
+        }
+
+        composeRule.onNodeWithTag("nav_logs").performClick()
+        composeRule.onNodeWithTag("logs_filter_error").performClick()
+        composeRule.onNodeWithText("fatal runner error").assertIsDisplayed()
+        composeRule.onNodeWithText("relay connected").assertDoesNotExist()
+
+        composeRule.onNodeWithTag("logs_search").performTextInput("missing")
+        composeRule.onNodeWithText("No log entries match the current search and level filter.")
+            .assertIsDisplayed()
+
+        composeRule.onNodeWithTag("logs_auto_scroll").performClick()
+        composeRule.onNodeWithText("Resume auto-scroll").assertIsDisplayed()
+
+        composeRule.onNodeWithTag("logs_clear").performClick()
+        composeRule.onNodeWithText("Delete all logs?").assertIsDisplayed()
+        composeRule.onNodeWithTag("logs_clear_confirm").performClick()
+        composeRule.runOnIdle { assertEquals(1, clearCalls) }
+    }
+
+    @Test
     fun configureSwitchesBetweenBasicAndAdvancedSections() {
         composeRule.setContent { TestDashboard() }
         composeRule.onNodeWithTag("nav_configure").performClick()
@@ -99,6 +147,8 @@ class DashboardScreenTest {
         composeRule.onAllNodesWithText("Edit")[0].performClick()
         composeRule.onNodeWithTag("screen_list_snilist").assertIsDisplayed()
         composeRule.onNodeWithTag("list_editor").assertIsDisplayed()
+        composeRule.onNodeWithTag("contextual_top_bar").assertIsDisplayed()
+        composeRule.onNodeWithTag("nav_configure").assertDoesNotExist()
     }
 }
 
@@ -108,6 +158,7 @@ private fun TestDashboard(
     runtimeFilesState: RuntimeFilesUiState = RuntimeFilesUiState(isLoading = false),
     profileState: ProfileUiState = ProfileUiState(isProfileLoading = false),
     diagnosticsState: DiagnosticsUiState = DiagnosticsUiState(),
+    onClearLogs: () -> Unit = {},
 ) {
     ZeroDpiTheme {
         DashboardScreen(
@@ -141,6 +192,7 @@ private fun TestDashboard(
             onRunRootDiagnostics = {},
             onRefreshDiagnostics = {},
             onExportSupportBundle = {},
+            onClearLogs = onClearLogs,
         )
     }
 }

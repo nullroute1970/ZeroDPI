@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.PlayArrow
@@ -76,23 +77,11 @@ internal fun HomeScreen(
             onForceStop = onForceStop,
         )
 
-        SectionCard(title = stringResource(R.string.home_active_profile)) {
-            Text(
-                text = profileState.activeProfileName,
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.SemiBold,
-            )
-            if (runtimeFilesState.dirtyFiles.isNotEmpty() || runtimeFilesState.isSaving) {
-                InlineMessage(stringResource(R.string.configure_saving))
-            }
-            profileState.lastProfileError?.let { InlineMessage(it, error = true) }
-            OutlinedButton(
-                onClick = onOpenProfiles,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(stringResource(R.string.home_open_profiles))
-            }
-        }
+        ActiveProfileCard(
+            profileState = profileState,
+            runtimeFilesState = runtimeFilesState,
+            onOpenProfiles = onOpenProfiles,
+        )
 
         if (!canStart) {
             ReadinessCard(
@@ -105,6 +94,21 @@ internal fun HomeScreen(
         }
 
         SectionCard(title = stringResource(R.string.home_runtime_summary)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                MetricTile(
+                    label = stringResource(R.string.label_connections),
+                    value = serviceState.connectionCount.toString(),
+                    modifier = Modifier.weight(1f),
+                )
+                MetricTile(
+                    label = stringResource(R.string.label_relay_bytes),
+                    value = formatBytes(serviceState.relayBytes),
+                    modifier = Modifier.weight(1f),
+                )
+            }
             DetailRow(stringResource(R.string.label_mode), serviceState.mode)
             DetailRow(stringResource(R.string.label_bypass_method), serviceState.bypassMethod)
             DetailRow(stringResource(R.string.label_listener), serviceState.listener)
@@ -118,13 +122,82 @@ internal fun HomeScreen(
                 stringResource(R.string.label_next_scan),
                 nextScanCountdown(serviceState.nextScanAtElapsedRealtimeMs),
             )
-            DetailRow(
-                stringResource(R.string.label_connections),
-                serviceState.connectionCount.toString(),
+        }
+    }
+}
+
+@Composable
+private fun ActiveProfileCard(
+    profileState: ProfileUiState,
+    runtimeFilesState: RuntimeFilesUiState,
+    onOpenProfiles: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.extraLarge,
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        tonalElevation = 2.dp,
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Icon(Icons.Default.AccountCircle, contentDescription = null)
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = stringResource(R.string.home_active_profile),
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                    Text(
+                        text = profileState.activeProfileName,
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.semantics { heading() },
+                    )
+                }
+            }
+            if (runtimeFilesState.dirtyFiles.isNotEmpty() || runtimeFilesState.isSaving) {
+                InlineMessage(stringResource(R.string.configure_saving))
+            }
+            profileState.lastProfileError?.let { InlineMessage(it, error = true) }
+            OutlinedButton(
+                onClick = onOpenProfiles,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(stringResource(R.string.home_open_profiles))
+            }
+        }
+    }
+}
+
+@Composable
+private fun MetricTile(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = value,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
             )
-            DetailRow(
-                stringResource(R.string.label_relay_bytes),
-                formatBytes(serviceState.relayBytes),
+            Text(
+                text = label,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium,
             )
         }
     }
@@ -319,7 +392,7 @@ private fun nextScanCountdown(deadlineElapsedRealtimeMs: Long?): String {
 }
 
 @Composable
-private fun statusLabel(status: RuntimeStatus): String =
+internal fun statusLabel(status: RuntimeStatus): String =
     stringResource(
         when (status) {
             RuntimeStatus.Stopped -> R.string.status_stopped

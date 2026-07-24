@@ -88,6 +88,33 @@ class ZeroDpiServiceInstrumentedTest {
     }
 
     @Test
+    fun clearLogsRemovesMemoryAndPersistedSessionsWhileRunning() {
+        configureRootlessRunningMode()
+        val service = bindZeroDpiService()
+
+        service.startZeroDpi()
+        service.waitForState {
+            it.status == RuntimeStatus.Running && it.recentLogs.isNotEmpty()
+        }
+        val logsDir = File(context.filesDir, "zerodpi/logs")
+
+        service.clearLogs()
+
+        service.waitForState { it.recentLogs.isEmpty() }
+        val deadline = SystemClock.elapsedRealtime() + 5_000
+        while (
+            logsDir.listFiles().orEmpty().any { it.extension == "log" } &&
+            SystemClock.elapsedRealtime() < deadline
+        ) {
+            SystemClock.sleep(50)
+        }
+        assertTrue(logsDir.listFiles().orEmpty().none { it.extension == "log" })
+
+        service.stopZeroDpi()
+        service.waitForState { it.status == RuntimeStatus.Stopped && it.lastExitCode == 0 }
+    }
+
+    @Test
     fun selectedProfileConfigControlsWhetherRootIsRequested() {
         configureRootlessRunningMode()
         configureRootRequiredWorkProfile()

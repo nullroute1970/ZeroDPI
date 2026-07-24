@@ -7,9 +7,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -42,7 +42,7 @@ internal enum class AppDestination(
     Home(R.string.nav_home, Icons.Default.Home),
     Profiles(R.string.nav_profiles, Icons.Default.AccountCircle),
     Configure(R.string.nav_configure, Icons.Default.Settings),
-    Logs(R.string.nav_logs, Icons.Default.List),
+    Logs(R.string.nav_logs, Icons.AutoMirrored.Filled.List),
 }
 
 internal enum class ConfigView {
@@ -83,6 +83,7 @@ fun DashboardScreen(
     onRunRootDiagnostics: () -> Unit,
     onRefreshDiagnostics: () -> Unit,
     onExportSupportBundle: (Boolean) -> Unit,
+    onClearLogs: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var destination by rememberSaveable { mutableStateOf(AppDestination.Home) }
@@ -102,27 +103,25 @@ fun DashboardScreen(
     Scaffold(
         modifier = modifier.fillMaxSize(),
         topBar = {
-            CenterAlignedTopAppBar(
-                title = {
-                    Text(
-                        text = listEditor?.titleResource()?.let { stringResource(it) }
-                            ?: stringResource(destination.labelRes),
-                    )
-                },
-                navigationIcon = {
-                    if (listEditor != null) {
+            listEditor?.let { editor ->
+                CenterAlignedTopAppBar(
+                    title = {
+                        Text(text = stringResource(editor.titleResource()))
+                    },
+                    navigationIcon = {
                         IconButton(onClick = { listEditor = null }) {
                             Icon(
                                 imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                                 contentDescription = stringResource(R.string.navigate_back),
                             )
                         }
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface,
-                ),
-            )
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                    ),
+                    modifier = Modifier.testTag("contextual_top_bar"),
+                )
+            }
         },
         bottomBar = {
             if (listEditor == null) {
@@ -209,6 +208,7 @@ fun DashboardScreen(
 
                     AppDestination.Logs -> LiveLogsScreen(
                         serviceState = state,
+                        onClearLogs = onClearLogs,
                     )
                 }
             }

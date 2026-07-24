@@ -9,7 +9,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -42,7 +42,7 @@ internal enum class AppDestination(
     Home(R.string.nav_home, Icons.Default.Home),
     Profiles(R.string.nav_profiles, Icons.Default.AccountCircle),
     Configure(R.string.nav_configure, Icons.Default.Settings),
-    Support(R.string.nav_support, Icons.Default.Info),
+    Logs(R.string.nav_logs, Icons.Default.List),
 }
 
 internal enum class ConfigView {
@@ -207,13 +207,8 @@ fun DashboardScreen(
                         onOpenList = openList,
                     )
 
-                    AppDestination.Support -> SupportScreen(
+                    AppDestination.Logs -> LiveLogsScreen(
                         serviceState = state,
-                        runtimeFilesState = runtimeFilesState,
-                        diagnosticsState = diagnosticsState,
-                        onRunRootDiagnostics = onRunRootDiagnostics,
-                        onRefreshDiagnostics = onRefreshDiagnostics,
-                        onExportSupportBundle = onExportSupportBundle,
                     )
                 }
             }

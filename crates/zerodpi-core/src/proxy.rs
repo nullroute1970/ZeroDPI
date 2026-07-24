@@ -114,7 +114,7 @@ pub enum ProxyEvent {
         score: u8,
     },
     /// The active IP-bypass target changed after a background rescan.
-    IpTargetChanged { ip: IpAddr },
+    IpTargetChanged { ip: IpAddr, score: u8 },
 }
 
 /// Sender half of the [`ProxyEvent`] channel; pass to [`run_proxy`] to enable

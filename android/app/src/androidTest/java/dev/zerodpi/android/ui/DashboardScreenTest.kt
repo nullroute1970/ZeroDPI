@@ -26,8 +26,8 @@ class DashboardScreenTest {
         composeRule.onNodeWithTag("screen_profiles").assertIsDisplayed()
         composeRule.onNodeWithTag("nav_configure").performClick()
         composeRule.onNodeWithTag("screen_configure").assertIsDisplayed()
-        composeRule.onNodeWithTag("nav_support").performClick()
-        composeRule.onNodeWithTag("screen_support").assertIsDisplayed()
+        composeRule.onNodeWithTag("nav_logs").performClick()
+        composeRule.onNodeWithTag("screen_logs").assertIsDisplayed()
     }
 
     @Test
@@ -43,11 +43,40 @@ class DashboardScreenTest {
     }
 
     @Test
+    fun homeShowsSelectedTargetScore() {
+        composeRule.setContent {
+            TestDashboard(
+                serviceState = ZeroDpiServiceState(activeTargetScore = 95),
+            )
+        }
+
+        composeRule.onNodeWithText("Target score").assertIsDisplayed()
+        composeRule.onNodeWithText("95").assertIsDisplayed()
+        composeRule.onNodeWithText("Next scan").assertIsDisplayed()
+    }
+
+    @Test
+    fun logsDestinationDisplaysRuntimeOutput() {
+        composeRule.setContent {
+            TestDashboard(
+                serviceState = ZeroDpiServiceState(
+                    recentLogs = listOf("first log", "latest log"),
+                ),
+            )
+        }
+
+        composeRule.onNodeWithTag("nav_logs").performClick()
+        composeRule.onNodeWithText("first log").assertIsDisplayed()
+        composeRule.onNodeWithText("latest log").assertIsDisplayed()
+    }
+
+    @Test
     fun configureSwitchesBetweenBasicAndAdvancedSections() {
         composeRule.setContent { TestDashboard() }
         composeRule.onNodeWithTag("nav_configure").performClick()
 
         composeRule.onNodeWithTag("config_section_ProxyListener").assertIsDisplayed()
+        composeRule.onNodeWithTag("config_section_BypassEngine").assertIsDisplayed()
         composeRule.onNodeWithTag("config_advanced").performClick()
         composeRule.onNodeWithTag("config_section_ScanBehavior").assertIsDisplayed()
     }

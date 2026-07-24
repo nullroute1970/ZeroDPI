@@ -38,6 +38,7 @@ private val basicSections = setOf(
     ConfigSection.OperatingMode,
     ConfigSection.InputFiles,
     ConfigSection.DnsResolution,
+    ConfigSection.BypassEngine,
 )
 
 @Composable

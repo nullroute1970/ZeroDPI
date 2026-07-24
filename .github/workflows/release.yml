@@ -257,7 +257,13 @@ jobs:
           : "${ANDROID_RELEASE_KEYSTORE_BASE64:?Missing ANDROID_RELEASE_KEYSTORE_BASE64 secret}"
           : "${ZERODPI_RELEASE_STORE_PASSWORD:?Missing ANDROID_RELEASE_STORE_PASSWORD secret}"
           : "${ZERODPI_RELEASE_KEY_ALIAS:?Missing ANDROID_RELEASE_KEY_ALIAS secret}"
-          printf '%s' "$ANDROID_RELEASE_KEYSTORE_BASE64" | base64 --decode > "$ZERODPI_RELEASE_STORE_FILE"
+          if ! printf '%s' "$ANDROID_RELEASE_KEYSTORE_BASE64" \
+            | tr -d '[:space:]' \
+            | base64 --decode > "$ZERODPI_RELEASE_STORE_FILE"; then
+            echo "::error title=Invalid Android keystore secret::ANDROID_RELEASE_KEYSTORE_BASE64 must contain the Base64-encoded bytes of the JKS file."
+            exit 1
+          fi
+          test -s "$ZERODPI_RELEASE_STORE_FILE"
 
       - name: Build signed rootless and full-root Android APKs
         run: >-

@@ -1049,7 +1049,7 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
         ProxyEvent::SniTargetChanged { sni, ip, score } => {
             state.active_sni = Some((sni, ip, score));
         }
-        ProxyEvent::IpTargetChanged { ip } => {
+        ProxyEvent::IpTargetChanged { ip, .. } => {
             state.active_ip = Some(ip);
         }
     }

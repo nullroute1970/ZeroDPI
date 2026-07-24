@@ -84,6 +84,10 @@ pub enum RuntimeEvent {
         scan: ScanKind,
         results: usize,
     },
+    NextScanScheduled {
+        scan: ScanKind,
+        interval_secs: u64,
+    },
     SelectedTarget {
         target: TargetKind,
         sni: Option<String>,
@@ -149,4 +153,23 @@ pub enum TargetKind {
 pub enum BypassStatus {
     Completed,
     Failed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RuntimeEvent, ScanKind};
+
+    #[test]
+    fn serializes_next_scan_schedule() {
+        let json = serde_json::to_string(&RuntimeEvent::NextScanScheduled {
+            scan: ScanKind::Sni,
+            interval_secs: 300,
+        })
+        .unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"event":"next_scan_scheduled","scan":"sni","interval_secs":300}"#,
+        );
+    }
 }

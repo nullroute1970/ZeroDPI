@@ -62,6 +62,18 @@ class RuntimeEventLineParserTest {
     }
 
     @Test
+    fun parsesNextScanSchedule() {
+        val event = RuntimeEventLineParser.parse(
+            """{"event":"next_scan_scheduled","scan":"sni","interval_secs":300}""",
+        )
+
+        assertTrue(event is ZeroDpiRunnerEvent.NextScanScheduled)
+        val schedule = event as ZeroDpiRunnerEvent.NextScanScheduled
+        assertEquals("sni", schedule.scan)
+        assertEquals(300L, schedule.intervalSeconds)
+    }
+
+    @Test
     fun parsesRootlessAlternativeArray() {
         val event = RuntimeEventLineParser.parse(
             """

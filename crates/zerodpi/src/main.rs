@@ -534,6 +534,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         } else {
             Some(event_tx.clone())
         };
+        let rescan_events = events.clone();
         rt.spawn(async move {
             background_rescan(
                 rescan_cfg,
@@ -541,6 +542,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                 interval,
                 active_target,
                 rescan_event_tx,
+                rescan_events,
                 no_tui,
             )
             .await;
@@ -864,11 +866,16 @@ async fn background_rescan(
     interval_secs: u64,
     active_target: Arc<std::sync::RwLock<ActiveSniTarget>>,
     event_tx: Option<ProxyEventSender>,
+    events: RuntimeEventEmitter,
     headless: bool,
 ) {
     let interval = Duration::from_secs(interval_secs);
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     loop {
+        events.emit(RuntimeEvent::NextScanScheduled {
+            scan: ScanKind::Sni,
+            interval_secs,
+        });
         tokio::time::sleep(interval).await;
         if headless {
             info!(path = %path.display(), "background SNI rescan starting");
@@ -1289,12 +1296,12 @@ async fn log_headless_proxy_events(
                 });
                 info!(%sni, %ip, score, "active SNI target changed");
             }
-            ProxyEvent::IpTargetChanged { ip } => {
+            ProxyEvent::IpTargetChanged { ip, score } => {
                 events.emit(RuntimeEvent::ActiveTargetChanged {
                     target: TargetKind::Ip,
                     sni: None,
                     ip: ip.to_string(),
-                    score: None,
+                    score: Some(score),
                 });
                 info!(%ip, "active IP target changed");
             }
@@ -1450,6 +1457,7 @@ fn ip_bypass_main(
         } else {
             Some(event_tx.clone())
         };
+        let rescan_events = events.clone();
         rt.spawn(async move {
             background_ip_rescan(
                 rescan_cfg,
@@ -1457,6 +1465,7 @@ fn ip_bypass_main(
                 interval,
                 active_clone,
                 rescan_event_tx,
+                rescan_events,
                 no_tui,
                 IpRescanPolicy {
                     mode_label: "ip_bypass",
@@ -1612,6 +1621,7 @@ fn ip_bypass_plus_main(
         } else {
             Some(event_tx.clone())
         };
+        let rescan_events = events.clone();
         rt.spawn(async move {
             background_ip_rescan(
                 rescan_cfg,
@@ -1619,6 +1629,7 @@ fn ip_bypass_plus_main(
                 interval,
                 active_clone,
                 rescan_event_tx,
+                rescan_events,
                 no_tui,
                 IpRescanPolicy {
                     mode_label: "ip_bypass_plus",
@@ -1815,6 +1826,7 @@ async fn background_ip_rescan(
     interval_secs: u64,
     active_ip: Arc<std::sync::RwLock<std::net::IpAddr>>,
     event_tx: Option<ProxyEventSender>,
+    events: RuntimeEventEmitter,
     headless: bool,
     policy: IpRescanPolicy,
 ) {
@@ -1822,6 +1834,10 @@ async fn background_ip_rescan(
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
     loop {
+        events.emit(RuntimeEvent::NextScanScheduled {
+            scan: ScanKind::Ip,
+            interval_secs,
+        });
         tokio::time::sleep(interval).await;
         if headless {
             info!(mode = policy.mode_label, path = %ip_list_path.display(), "background IP rescan starting");
@@ -1868,7 +1884,10 @@ async fn background_ip_rescan(
         if best.ip != current {
             *active_ip.write().unwrap() = best.ip;
             if let Some(ref tx) = event_tx {
-                let _ = tx.send(ProxyEvent::IpTargetChanged { ip: best.ip });
+                let _ = tx.send(ProxyEvent::IpTargetChanged {
+                    ip: best.ip,
+                    score: best.score,
+                });
             }
             info!(mode = policy.mode_label, old = %current, new = %best.ip, "hot-swapped active IP");
         }

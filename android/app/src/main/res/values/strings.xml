@@ -7,7 +7,7 @@
     <string name="nav_home">Home</string>
     <string name="nav_profiles">Profiles</string>
     <string name="nav_configure">Configure</string>
-    <string name="nav_support">Support</string>
+    <string name="nav_logs">Logs</string>
     <string name="navigate_back">Go back</string>
     <string name="show_more_actions">More actions</string>
 
@@ -33,7 +33,6 @@
 
     <string name="home_active_profile">Active profile</string>
     <string name="home_status">Runtime status</string>
-    <string name="home_ready">Ready to start</string>
     <string name="home_needs_attention">Needs attention</string>
     <string name="home_runtime_summary">Runtime summary</string>
     <string name="home_open_configure">Review configuration</string>
@@ -63,7 +62,7 @@
     <string name="configure_title">Configure</string>
     <string name="configure_basic">Basic</string>
     <string name="configure_advanced">Advanced</string>
-    <string name="configure_basic_description">Common connection, mode, input, and DNS settings.</string>
+    <string name="configure_basic_description">Common connection, mode, input, DNS, and bypass engine settings.</string>
     <string name="configure_advanced_description">Scanner tuning and specialist bypass controls.</string>
     <string name="configure_valid">Configuration is valid</string>
     <string name="configure_errors">%1$d configuration errors</string>
@@ -75,12 +74,8 @@
     <string name="configure_reset_message">Replace the active profile’s configuration with the packaged defaults?</string>
     <string name="configure_required">Required</string>
 
-    <string name="support_diagnostics">Diagnostics</string>
-    <string name="support_runtime_details">Runtime details</string>
-    <string name="support_logs">Recent logs</string>
-    <string name="support_no_logs">No runtime logs yet.</string>
-    <string name="support_include_private">Include private lists</string>
-    <string name="support_include_private_description">Off by default so production SNI and IP lists are not exported accidentally.</string>
+    <string name="logs_description">Live ZeroDPI runtime output. New entries appear automatically.</string>
+    <string name="logs_empty">No runtime logs yet. Start ZeroDPI to see live output.</string>
 
     <string name="list_sni_title">SNI list</string>
     <string name="list_ip_title">IP list</string>
@@ -102,6 +97,11 @@
     <string name="label_bypass_method">Bypass method</string>
     <string name="label_listener">Listener</string>
     <string name="label_active_target">Active target</string>
+    <string name="label_target_score">Target score</string>
+    <string name="label_next_scan">Next scan</string>
+    <string name="next_scan_not_scheduled">Not scheduled</string>
+    <string name="next_scan_in_progress">Scanning…</string>
+    <string name="value_not_available">—</string>
     <string name="label_connections">Connections</string>
     <string name="label_relay_bytes">Relayed bytes</string>
     <string name="label_root">Root requirement</string>

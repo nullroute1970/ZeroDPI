@@ -42,6 +42,10 @@ sealed interface ZeroDpiRunnerEvent {
         val scan: String,
         val results: Int,
     ) : ZeroDpiRunnerEvent
+    data class NextScanScheduled(
+        val scan: String,
+        val intervalSeconds: Long,
+    ) : ZeroDpiRunnerEvent
     data class SelectedTarget(
         val target: String,
         val sni: String?,

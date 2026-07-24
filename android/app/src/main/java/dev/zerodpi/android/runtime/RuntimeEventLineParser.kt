@@ -64,6 +64,10 @@ internal object RuntimeEventLineParser {
                 scan = stringValue(json, "scan").orEmpty(),
                 results = longValue(json, "results")?.toInt() ?: 0,
             )
+            "next_scan_scheduled" -> ZeroDpiRunnerEvent.NextScanScheduled(
+                scan = stringValue(json, "scan").orEmpty(),
+                intervalSeconds = longValue(json, "interval_secs") ?: 0L,
+            )
             "selected_target" -> ZeroDpiRunnerEvent.SelectedTarget(
                 target = stringValue(json, "target").orEmpty(),
                 sni = stringValue(json, "sni"),

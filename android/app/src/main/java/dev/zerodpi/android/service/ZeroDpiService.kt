@@ -9,6 +9,7 @@ import android.content.Intent
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import dev.zerodpi.android.BuildConfig
 import dev.zerodpi.android.R
@@ -65,6 +66,7 @@ data class ZeroDpiServiceState(
     val listener: String = "127.0.0.1:44444",
     val activeTarget: String = "None",
     val activeTargetScore: Int? = null,
+    val nextScanAtElapsedRealtimeMs: Long? = null,
     val connectionCount: Int = 0,
     val relayBytes: Long = 0L,
     val lastError: String? = null,
@@ -174,6 +176,7 @@ class ZeroDpiService : Service() {
                     listener = "$listenHost:$listenPort",
                     activeTarget = "None",
                     activeTargetScore = null,
+                    nextScanAtElapsedRealtimeMs = null,
                     connectionCount = 0,
                     relayBytes = 0L,
                     lastError = null,
@@ -348,6 +351,14 @@ class ZeroDpiService : Service() {
             is ZeroDpiRunnerEvent.ScanCompleted -> {
                 appendLog("${event.scan} scan completed with ${event.results} result(s).")
             }
+            is ZeroDpiRunnerEvent.NextScanScheduled -> {
+                state.update {
+                    it.copy(
+                        nextScanAtElapsedRealtimeMs =
+                            SystemClock.elapsedRealtime() + event.intervalSeconds * 1_000L,
+                    )
+                }
+            }
             is ZeroDpiRunnerEvent.SelectedTarget -> {
                 state.update {
                     it.copy(
@@ -449,6 +460,7 @@ class ZeroDpiService : Service() {
                         status = if (event.exitCode == 0) RuntimeStatus.Stopped else RuntimeStatus.Failed,
                         activeTarget = if (event.exitCode == 0) "None" else it.activeTarget,
                         activeTargetScore = if (event.exitCode == 0) null else it.activeTargetScore,
+                        nextScanAtElapsedRealtimeMs = null,
                         connectionCount = 0,
                         lastExitCode = event.exitCode,
                         forceStopAvailable = false,

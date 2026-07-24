@@ -1,5 +1,6 @@
 package dev.zerodpi.android.ui
 
+import android.os.SystemClock
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -21,6 +22,11 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -33,6 +39,8 @@ import dev.zerodpi.android.R
 import dev.zerodpi.android.service.RuntimeStatus
 import dev.zerodpi.android.service.ZeroDpiServiceState
 import dev.zerodpi.android.storage.RuntimeFileKind
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 
 @Composable
 internal fun HomeScreen(
@@ -86,20 +94,30 @@ internal fun HomeScreen(
             }
         }
 
-        ReadinessCard(
-            state = runtimeFilesState,
-            profileState = profileState,
-            canStart = canStart,
-            blockingList = blockingList,
-            onOpenConfigure = onOpenConfigure,
-            onOpenList = onOpenList,
-        )
+        if (!canStart) {
+            ReadinessCard(
+                state = runtimeFilesState,
+                profileState = profileState,
+                blockingList = blockingList,
+                onOpenConfigure = onOpenConfigure,
+                onOpenList = onOpenList,
+            )
+        }
 
         SectionCard(title = stringResource(R.string.home_runtime_summary)) {
             DetailRow(stringResource(R.string.label_mode), serviceState.mode)
             DetailRow(stringResource(R.string.label_bypass_method), serviceState.bypassMethod)
             DetailRow(stringResource(R.string.label_listener), serviceState.listener)
             DetailRow(stringResource(R.string.label_active_target), serviceState.activeTarget)
+            DetailRow(
+                stringResource(R.string.label_target_score),
+                serviceState.activeTargetScore?.toString()
+                    ?: stringResource(R.string.value_not_available),
+            )
+            DetailRow(
+                stringResource(R.string.label_next_scan),
+                nextScanCountdown(serviceState.nextScanAtElapsedRealtimeMs),
+            )
             DetailRow(
                 stringResource(R.string.label_connections),
                 serviceState.connectionCount.toString(),
@@ -227,58 +245,76 @@ private fun RuntimeStatusCard(
 private fun ReadinessCard(
     state: RuntimeFilesUiState,
     profileState: ProfileUiState,
-    canStart: Boolean,
     blockingList: RuntimeFileKind?,
     onOpenConfigure: () -> Unit,
     onOpenList: (RuntimeFileKind) -> Unit,
 ) {
-    SectionCard(
-        title = if (canStart) {
-            stringResource(R.string.home_ready)
-        } else {
-            stringResource(R.string.home_needs_attention)
-        },
-    ) {
-        if (canStart) {
-            InlineMessage(state.configEditor.rootRequirement.message)
-        } else {
-            when {
-                state.isLoading -> InlineMessage(stringResource(R.string.list_loading))
-                state.isSaving -> InlineMessage(stringResource(R.string.configure_saving))
-                profileState.isRemoteUpdating -> InlineMessage(stringResource(R.string.profiles_updating))
-                state.configEditor.issues.isNotEmpty() -> {
-                    InlineMessage(
-                        stringResource(
-                            R.string.configure_errors,
-                            state.configEditor.issues.size,
-                        ),
-                        error = true,
-                    )
-                    Button(
-                        onClick = onOpenConfigure,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text(stringResource(R.string.home_open_configure))
-                    }
+    SectionCard(title = stringResource(R.string.home_needs_attention)) {
+        when {
+            state.isLoading -> InlineMessage(stringResource(R.string.list_loading))
+            state.isSaving -> InlineMessage(stringResource(R.string.configure_saving))
+            profileState.isRemoteUpdating -> InlineMessage(stringResource(R.string.profiles_updating))
+            state.configEditor.issues.isNotEmpty() -> {
+                InlineMessage(
+                    stringResource(
+                        R.string.configure_errors,
+                        state.configEditor.issues.size,
+                    ),
+                    error = true,
+                )
+                Button(
+                    onClick = onOpenConfigure,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(stringResource(R.string.home_open_configure))
                 }
-
-                blockingList != null -> {
-                    val issues = state.validationFor(blockingList)?.issues.orEmpty()
-                    InlineMessage(
-                        stringResource(R.string.configure_list_errors, issues.size),
-                        error = true,
-                    )
-                    Button(
-                        onClick = { onOpenList(blockingList) },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text(stringResource(R.string.home_open_list))
-                    }
-                }
-
-                else -> InlineMessage(stringResource(R.string.home_needs_attention), error = true)
             }
+
+            blockingList != null -> {
+                val issues = state.validationFor(blockingList)?.issues.orEmpty()
+                InlineMessage(
+                    stringResource(R.string.configure_list_errors, issues.size),
+                    error = true,
+                )
+                Button(
+                    onClick = { onOpenList(blockingList) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(stringResource(R.string.home_open_list))
+                }
+            }
+
+            else -> InlineMessage(stringResource(R.string.home_needs_attention), error = true)
         }
+    }
+}
+
+@Composable
+private fun nextScanCountdown(deadlineElapsedRealtimeMs: Long?): String {
+    var nowElapsedRealtimeMs by remember(deadlineElapsedRealtimeMs) {
+        mutableLongStateOf(SystemClock.elapsedRealtime())
+    }
+    LaunchedEffect(deadlineElapsedRealtimeMs) {
+        while (isActive && deadlineElapsedRealtimeMs != null) {
+            nowElapsedRealtimeMs = SystemClock.elapsedRealtime()
+            delay(1_000)
+        }
+    }
+
+    val deadline = deadlineElapsedRealtimeMs
+        ?: return stringResource(R.string.next_scan_not_scheduled)
+    if (deadline <= nowElapsedRealtimeMs) {
+        return stringResource(R.string.next_scan_in_progress)
+    }
+
+    val totalSeconds = (deadline - nowElapsedRealtimeMs + 999L) / 1_000L
+    val hours = totalSeconds / 3_600L
+    val minutes = totalSeconds % 3_600L / 60L
+    val seconds = totalSeconds % 60L
+    return if (hours > 0) {
+        "$hours:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}"
+    } else {
+        "$minutes:${seconds.toString().padStart(2, '0')}"
     }
 }
 

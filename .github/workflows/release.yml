@@ -207,7 +207,6 @@ jobs:
   android:
     runs-on: ubuntu-latest
     env:
-      ZERODPI_RELEASE_STORE_FILE: ${{ runner.temp }}/zerodpi-release.jks
       ZERODPI_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
       ZERODPI_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
       ZERODPI_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
@@ -234,6 +233,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+
+      - name: Configure Android release keystore path
+        shell: bash
+        run: echo "ZERODPI_RELEASE_STORE_FILE=${RUNNER_TEMP}/zerodpi-release.jks" >> "$GITHUB_ENV"
 
       - name: Install Android SDK and NDK packages
         shell: bash

@@ -62,16 +62,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          version="$(python3 - <<'PY'
-          import tomllib
-
-          with open("Cargo.toml", "rb") as cargo_toml:
-              manifest = tomllib.load(cargo_toml)
-
-          print(manifest["workspace"]["package"]["version"])
-          PY
-          )"
-
           repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           current_sha="$(git rev-parse HEAD)"
           current_short_sha="$(git rev-parse --short=12 HEAD)"
@@ -80,7 +70,6 @@ jobs:
           {
             echo "## Changes"
             echo
-            echo "- Version: \`$version\`"
             echo "- Commit: [\`$current_short_sha\`]($repo_url/commit/$current_sha)"
 
             if [[ -n "$previous_tag" ]]; then

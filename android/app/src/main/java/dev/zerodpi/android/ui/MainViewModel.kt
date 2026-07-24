@@ -281,6 +281,10 @@ class MainViewModel(
         service?.forceStopZeroDpi()
     }
 
+    fun clearLogs() {
+        service?.clearLogs()
+    }
+
     fun runRootDiagnostics() {
         val validation = ZeroDpiConfigToml.analyze(_runtimeFilesState.value.configText)
         _runtimeFilesState.update {

@@ -78,7 +78,7 @@ data class ZeroDpiServiceState(
 class ZeroDpiService : Service() {
     private val binder = LocalBinder()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val logScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val logScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
     private val state = MutableStateFlow(ZeroDpiServiceState())
     private lateinit var runner: ZeroDpiRunner
     private lateinit var rootManager: RootManager
@@ -269,6 +269,21 @@ class ZeroDpiService : Service() {
         state.update { it.copy(status = RuntimeStatus.Stopping, forceStopAvailable = false) }
         scope.launch {
             runner.forceStop()
+        }
+    }
+
+    fun clearLogs() {
+        sessionLogLines.clear()
+        state.update { current ->
+            current.copy(recentLogs = emptyList())
+        }
+        logScope.launch {
+            runCatching { runtimeStorage.clearLogs() }
+                .onFailure { error ->
+                    state.update { current ->
+                        current.copy(lastError = "Could not clear logs: ${error.message}")
+                    }
+                }
         }
     }
 

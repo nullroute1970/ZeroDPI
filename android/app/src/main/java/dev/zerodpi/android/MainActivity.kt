@@ -95,6 +95,7 @@ class MainActivity : ComponentActivity() {
                     onRunRootDiagnostics = viewModel::runRootDiagnostics,
                     onRefreshDiagnostics = viewModel::refreshDiagnostics,
                     onExportSupportBundle = ::launchSupportBundleExport,
+                    onClearLogs = viewModel::clearLogs,
                 )
             }
         }

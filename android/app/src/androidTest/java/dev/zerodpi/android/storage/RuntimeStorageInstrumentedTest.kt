@@ -120,6 +120,27 @@ class RuntimeStorageInstrumentedTest {
         assertTrue(resolved.scanOutput?.parentFile?.isDirectory == true)
     }
 
+    @Test
+    fun clearLogsDeletesStoredSessionsAndAllowsFreshOutput() = runBlocking {
+        val storage = RuntimeStorage(context)
+        val files = storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).files
+        storage.startNewLogSession("first")
+        storage.appendLogLine("old entry")
+        storage.startNewLogSession("second")
+        storage.appendLogLine("another old entry")
+
+        assertTrue(files.logsDir.listFiles().orEmpty().count { it.extension == "log" } >= 2)
+
+        storage.clearLogs()
+
+        assertTrue(files.logsDir.listFiles().orEmpty().none { it.extension == "log" })
+
+        storage.appendLogLine("fresh entry")
+        val freshLogs = files.logsDir.listFiles().orEmpty().filter { it.extension == "log" }
+        assertEquals(1, freshLogs.size)
+        assertTrue(freshLogs.single().readText().contains("fresh entry"))
+    }
+
     private fun String.replaceField(fieldName: String, value: String): String =
         ZeroDpiConfigToml.replaceOrAppendField(this, fieldName, value)
 

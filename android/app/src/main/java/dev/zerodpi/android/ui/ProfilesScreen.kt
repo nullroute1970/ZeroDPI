@@ -11,6 +11,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.ContentCopy
@@ -23,6 +24,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -36,6 +38,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -75,9 +79,10 @@ internal fun ProfilesScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text(
-            text = stringResource(R.string.profiles_description),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        ProfilesOverviewCard(
+            activeProfileName = profileState.activeProfileName,
+            profileCount = profileState.profiles.size,
+            isBusy = profileState.isProfileSwitching || profileState.isRemoteUpdating,
         )
         if (!canChangeProfiles(serviceStatus)) {
             InlineMessage(stringResource(R.string.profiles_stop_first))
@@ -86,6 +91,12 @@ internal fun ProfilesScreen(
             InlineMessage(stringResource(R.string.profiles_switching))
         }
 
+        Text(
+            text = stringResource(R.string.profiles_choose),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.semantics { heading() },
+        )
         profileState.profiles.forEach { profile ->
             val selected = profile.id == profileState.activeProfileId
             androidx.compose.material3.Surface(
@@ -143,7 +154,7 @@ internal fun ProfilesScreen(
             }
         }
 
-        SectionCard(title = stringResource(R.string.profiles_title)) {
+        SectionCard(title = stringResource(R.string.profiles_actions)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -275,6 +286,62 @@ internal fun ProfilesScreen(
                 }
             },
         )
+    }
+}
+
+@Composable
+private fun ProfilesOverviewCard(
+    activeProfileName: String,
+    profileCount: Int,
+    isBusy: Boolean,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.extraLarge,
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        tonalElevation = 2.dp,
+    ) {
+        Row(
+            modifier = Modifier.padding(18.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Surface(
+                shape = MaterialTheme.shapes.large,
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.7f),
+            ) {
+                Icon(
+                    Icons.Default.AccountCircle,
+                    contentDescription = null,
+                    modifier = Modifier.padding(12.dp),
+                )
+            }
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                Text(
+                    text = stringResource(R.string.home_active_profile),
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Text(
+                    text = activeProfileName,
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.semantics { heading() },
+                )
+                Text(
+                    text = if (isBusy) {
+                        stringResource(R.string.profiles_busy)
+                    } else {
+                        stringResource(R.string.profiles_count, profileCount)
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+        }
     }
 }
 

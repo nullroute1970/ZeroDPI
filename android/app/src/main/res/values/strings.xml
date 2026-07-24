@@ -41,7 +41,10 @@
     <string name="home_last_error">Last error</string>
 
     <string name="profiles_title">Profiles</string>
-    <string name="profiles_description">Each profile has its own configuration and candidate lists.</string>
+    <string name="profiles_choose">Choose profile</string>
+    <string name="profiles_actions">Profile actions</string>
+    <string name="profiles_count">%1$d local profiles</string>
+    <string name="profiles_busy">Profile operation in progress…</string>
     <string name="profiles_active">Active</string>
     <string name="profiles_switching">Switching profile…</string>
     <string name="profiles_stop_first">Stop ZeroDPI before switching or changing profiles.</string>
@@ -74,8 +77,20 @@
     <string name="configure_reset_message">Replace the active profile’s configuration with the packaged defaults?</string>
     <string name="configure_required">Required</string>
 
-    <string name="logs_description">Live ZeroDPI runtime output. New entries appear automatically.</string>
     <string name="logs_empty">No runtime logs yet. Start ZeroDPI to see live output.</string>
+    <string name="logs_no_matches">No log entries match the current search and level filter.</string>
+    <string name="logs_search">Search log text</string>
+    <string name="logs_count">%1$d visible of %2$d entries</string>
+    <string name="logs_pause">Pause auto-scroll</string>
+    <string name="logs_resume">Resume auto-scroll</string>
+    <string name="logs_clear_action">Clear logs</string>
+    <string name="logs_clear_title">Delete all logs?</string>
+    <string name="logs_clear_message">This clears the current log stream and permanently deletes every stored log file. New entries will appear normally if ZeroDPI is running.</string>
+    <string name="logs_clear_confirm">Delete logs</string>
+    <string name="logs_filter_all">All</string>
+    <string name="logs_filter_info">Info</string>
+    <string name="logs_filter_warning">Warning</string>
+    <string name="logs_filter_error">Error</string>
 
     <string name="list_sni_title">SNI list</string>
     <string name="list_ip_title">IP list</string>

@@ -9,13 +9,19 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -23,9 +29,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import dev.zerodpi.android.R
@@ -64,46 +73,36 @@ internal fun ConfigureScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Row(
+        ConfigReadinessCard(
+            state = state,
+            enabled = enabled,
+            onReset = { showResetDialog = true },
+        )
+
+        SingleChoiceSegmentedButtonRow(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            if (view == ConfigView.Basic) {
-                Button(
-                    onClick = { view = ConfigView.Basic },
+            ConfigView.entries.forEachIndexed { index, item ->
+                SegmentedButton(
+                    selected = view == item,
+                    onClick = { view = item },
+                    shape = SegmentedButtonDefaults.itemShape(
+                        index = index,
+                        count = ConfigView.entries.size,
+                    ),
                     modifier = Modifier
                         .weight(1f)
-                        .testTag("config_basic"),
+                        .testTag("config_${item.name.lowercase()}"),
                 ) {
-                    Text(stringResource(R.string.configure_basic))
-                }
-            } else {
-                OutlinedButton(
-                    onClick = { view = ConfigView.Basic },
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("config_basic"),
-                ) {
-                    Text(stringResource(R.string.configure_basic))
-                }
-            }
-            if (view == ConfigView.Advanced) {
-                Button(
-                    onClick = { view = ConfigView.Advanced },
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("config_advanced"),
-                ) {
-                    Text(stringResource(R.string.configure_advanced))
-                }
-            } else {
-                OutlinedButton(
-                    onClick = { view = ConfigView.Advanced },
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("config_advanced"),
-                ) {
-                    Text(stringResource(R.string.configure_advanced))
+                    Text(
+                        stringResource(
+                            if (item == ConfigView.Basic) {
+                                R.string.configure_basic
+                            } else {
+                                R.string.configure_advanced
+                            },
+                        ),
+                    )
                 }
             }
         }
@@ -116,12 +115,6 @@ internal fun ConfigureScreen(
                 },
             ),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-
-        ConfigReadinessCard(
-            state = state,
-            enabled = enabled,
-            onReset = { showResetDialog = true },
         )
 
         if (view == ConfigView.Basic) {
@@ -184,36 +177,73 @@ private fun ConfigReadinessCard(
     enabled: Boolean,
     onReset: () -> Unit,
 ) {
-    SectionCard(
-        title = if (state.configEditor.canStart) {
-            stringResource(R.string.configure_valid)
+    val isValid = state.configEditor.canStart
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.extraLarge,
+        color = if (isValid) {
+            MaterialTheme.colorScheme.primaryContainer
         } else {
-            stringResource(R.string.configure_errors, state.configEditor.issues.size)
+            MaterialTheme.colorScheme.errorContainer
         },
+        tonalElevation = 2.dp,
     ) {
-        InlineMessage(
-            message = state.configEditor.rootRequirement.message,
-            error = state.configEditor.rootRequirement.requiresRoot,
-        )
-        state.configEditor.rootRequirement.alternatives.takeIf { it.isNotEmpty() }?.let {
-            InlineMessage("Rootless alternatives: ${it.joinToString()}")
-        }
-        if (state.dirtyFiles.contains(RuntimeFileKind.Config) || state.isSaving) {
-            InlineMessage(stringResource(R.string.configure_saving))
-        }
-        state.configEditor.issues
-            .filter { it.fieldName == null }
-            .forEach { InlineMessage(it.message, error = true) }
-        OutlinedButton(
-            onClick = onReset,
-            enabled = enabled && !state.isSaving,
-            modifier = Modifier.fillMaxWidth(),
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Icon(Icons.Default.Refresh, contentDescription = null)
-            Text(
-                stringResource(R.string.action_reset),
-                modifier = Modifier.padding(start = 8.dp),
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Icon(
+                    imageVector = if (isValid) {
+                        Icons.Default.CheckCircle
+                    } else {
+                        Icons.Default.Error
+                    },
+                    contentDescription = null,
+                    tint = if (isValid) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.error
+                    },
+                )
+                Text(
+                    text = if (isValid) {
+                        stringResource(R.string.configure_valid)
+                    } else {
+                        stringResource(R.string.configure_errors, state.configEditor.issues.size)
+                    },
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.semantics { heading() },
+                )
+            }
+            InlineMessage(
+                message = state.configEditor.rootRequirement.message,
+                error = state.configEditor.rootRequirement.requiresRoot,
             )
+            state.configEditor.rootRequirement.alternatives.takeIf { it.isNotEmpty() }?.let {
+                InlineMessage("Rootless alternatives: ${it.joinToString()}")
+            }
+            if (state.dirtyFiles.contains(RuntimeFileKind.Config) || state.isSaving) {
+                InlineMessage(stringResource(R.string.configure_saving))
+            }
+            state.configEditor.issues
+                .filter { it.fieldName == null }
+                .forEach { InlineMessage(it.message, error = true) }
+            OutlinedButton(
+                onClick = onReset,
+                enabled = enabled && !state.isSaving,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(Icons.Default.Refresh, contentDescription = null)
+                Text(
+                    stringResource(R.string.action_reset),
+                    modifier = Modifier.padding(start = 8.dp),
+                )
+            }
         }
     }
 }

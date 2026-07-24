@@ -206,6 +206,21 @@ class RuntimeStorage(context: Context) {
         }
     }
 
+    suspend fun clearLogs() {
+        withContext(Dispatchers.IO) {
+            synchronized(lock) {
+                ensureLogStorageBlocking()
+                activeLogFile = null
+                val failedDeletes = logsDir.listFiles { file -> file.isFile && file.extension == "log" }
+                    .orEmpty()
+                    .filterNot(File::delete)
+                check(failedDeletes.isEmpty()) {
+                    "Could not delete ${failedDeletes.joinToString { it.name }}."
+                }
+            }
+        }
+    }
+
     suspend fun exportSupportBundle(
         profileId: String,
         output: OutputStream,

@@ -88,6 +88,7 @@ class ProcessZeroDpiRunnerTest {
         val executable = temporaryFolder.newFile("libzerodpi_exec.so")
         val helperExecutable = temporaryFolder.newFile("libzerodpi_root_helper_exec.so")
         val workingDirectory = temporaryFolder.newFolder("runtime")
+        val helperBootstrapParent = temporaryFolder.newFolder("helper-bootstrap")
         val configFile = temporaryFolder.newFile("config.toml")
         val rootManager = FakeRootManager(
             launchProcess = FakeProcess(
@@ -113,6 +114,7 @@ class ProcessZeroDpiRunnerTest {
             appPidProvider = { 777 },
             sessionProofProvider = { ByteArray(32) { 7 } },
             fileModeSetter = { _, _ -> },
+            helperBootstrapParentProvider = { helperBootstrapParent },
         )
 
         val events = collectRunnerEventsUntil(
@@ -136,6 +138,7 @@ class ProcessZeroDpiRunnerTest {
         assertEquals(helperExecutable, rootManager.launches.single().executable)
         assertEquals(workingDirectory, rootManager.launches.single().workingDirectory)
         assertEquals(10123, rootManager.launches.single().expectedAppUid)
+        assertEquals(helperBootstrapParent, rootManager.launches.single().socketPath.parentFile?.parentFile)
         assertEquals(executable.absolutePath, processLauncher.commands.single().first())
         assertTrue(processLauncher.commands.single().contains("--root-helper-socket"))
         assertTrue(processLauncher.commands.single().contains("--expected-data-plane-uid"))

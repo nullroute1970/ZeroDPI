@@ -174,7 +174,13 @@ class ProcessZeroDpiRunnerTest {
             )
         }
 
-        assertTrue(events.any { it is ZeroDpiRunnerEvent.Failed })
+        assertTrue(
+            events.any {
+                it is ZeroDpiRunnerEvent.Failed &&
+                    it.message.contains("exited before listener readiness with code 1") &&
+                    it.message.contains("Last output: helper failed")
+            },
+        )
         assertTrue(processLauncher.commands.isEmpty())
     }
 

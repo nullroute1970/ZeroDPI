@@ -24,6 +24,9 @@ private const val ZERO_DPI_EXECUTABLE_NAME = "libzerodpi_exec.so"
 private const val ROOT_HELPER_EXECUTABLE_NAME = "libzerodpi_root_helper_exec.so"
 private const val SESSION_PROOF_BYTES = 32
 private const val HELPER_READY_TIMEOUT_MS = 10_000L
+private const val HELPER_EXIT_STATUS_WAIT_MS = 250L
+private const val MAX_HELPER_STARTUP_LINES = 8
+private const val MAX_HELPER_STARTUP_LINE_LENGTH = 240
 
 internal interface ZeroDpiProcessLauncher {
     suspend fun start(command: List<String>, workingDirectory: File): Process
@@ -335,8 +338,9 @@ class ProcessZeroDpiRunner internal constructor(
         withTimeout(HELPER_READY_TIMEOUT_MS) {
             withContext(Dispatchers.IO) {
                 val reader = process.inputStream.bufferedReader()
+                val startupOutput = ArrayDeque<String>()
                 while (true) {
-                    val line = reader.readLine() ?: error("Root helper exited before listener readiness.")
+                    val line = reader.readLine() ?: error(helperExitDiagnostic(process, startupOutput))
                     HELPER_READY.matchEntire(line)?.let { match ->
                         return@withContext HelperReady(
                             pid = match.groupValues[1].toLong(),
@@ -344,11 +348,37 @@ class ProcessZeroDpiRunner internal constructor(
                             reader = reader,
                         )
                     }
+                    startupOutput.addLast(line.compactHelperOutput())
+                    if (startupOutput.size > MAX_HELPER_STARTUP_LINES) {
+                        startupOutput.removeFirst()
+                    }
                     events.emit(ZeroDpiRunnerEvent.Log(line))
                 }
                 error("unreachable")
             }
         }
+
+    private fun helperExitDiagnostic(process: Process, startupOutput: Collection<String>): String {
+        val exitCode = runCatching {
+            if (process.waitFor(HELPER_EXIT_STATUS_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                process.exitValue()
+            } else {
+                null
+            }
+        }.getOrNull()
+        return buildString {
+            append("Root helper exited before listener readiness")
+            if (exitCode != null) {
+                append(" with code ")
+                append(exitCode)
+            }
+            append('.')
+            if (startupOutput.isNotEmpty()) {
+                append(" Last output: ")
+                append(startupOutput.joinToString(" | "))
+            }
+        }
+    }
 
     private suspend fun emitExited(exitCode: Int) {
         if (exitEmitted.compareAndSet(false, true)) {
@@ -375,6 +405,15 @@ class ProcessZeroDpiRunner internal constructor(
 
     private companion object {
         val HELPER_READY = Regex("ZERODPI_HELPER_READY pid=(\\d+) uid=(\\d+)")
+    }
+}
+
+private fun String.compactHelperOutput(): String {
+    val compact = trim().replace(Regex("\\s+"), " ")
+    return if (compact.length <= MAX_HELPER_STARTUP_LINE_LENGTH) {
+        compact
+    } else {
+        compact.take(MAX_HELPER_STARTUP_LINE_LENGTH) + "..."
     }
 }
 

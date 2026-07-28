@@ -48,6 +48,9 @@ class ProcessZeroDpiRunner internal constructor(
     private val fileModeSetter: (File, Int) -> Unit = { file, mode ->
         Os.chmod(file.absolutePath, mode)
     },
+    private val helperBootstrapParentProvider: (File) -> File = { workingDirectory ->
+        workingDirectory
+    },
 ) : ZeroDpiRunner {
     constructor(
         context: Context,
@@ -62,6 +65,9 @@ class ProcessZeroDpiRunner internal constructor(
         processLauncher = SystemZeroDpiProcessLauncher,
         helperExecutableProvider = {
             File(context.applicationContext.applicationInfo.nativeLibraryDir, ROOT_HELPER_EXECUTABLE_NAME)
+        },
+        helperBootstrapParentProvider = {
+            context.applicationContext.filesDir
         },
     )
 
@@ -113,7 +119,9 @@ class ProcessZeroDpiRunner internal constructor(
                 events.emit(ZeroDpiRunnerEvent.Failed("Missing native root-helper artifact: ${helperExecutable.absolutePath}"))
                 return
             }
-            val bootstrap = runCatching { createBootstrap(workingDirectory) }.getOrElse { error ->
+            val bootstrap = runCatching {
+                createBootstrap(helperBootstrapParentProvider(workingDirectory))
+            }.getOrElse { error ->
                 events.emit(ZeroDpiRunnerEvent.Failed(error.message ?: "Failed to create root-helper bootstrap state."))
                 return
             }

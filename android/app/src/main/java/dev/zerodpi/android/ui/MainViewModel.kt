@@ -1134,6 +1134,7 @@ class MainViewModel(
             RuntimeStatus.Starting,
             RuntimeStatus.Scanning,
             RuntimeStatus.Running,
+            RuntimeStatus.Restarting,
             RuntimeStatus.Stopping,
             -> true
 

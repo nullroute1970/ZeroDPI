@@ -232,6 +232,7 @@ internal fun canChangeProfiles(status: RuntimeStatus): Boolean =
         RuntimeStatus.Starting,
         RuntimeStatus.Scanning,
         RuntimeStatus.Running,
+        RuntimeStatus.Restarting,
         RuntimeStatus.Stopping,
         -> false
     }

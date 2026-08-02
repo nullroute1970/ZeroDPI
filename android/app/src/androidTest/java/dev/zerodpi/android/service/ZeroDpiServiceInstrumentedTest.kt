@@ -88,6 +88,54 @@ class ZeroDpiServiceInstrumentedTest {
     }
 
     @Test
+    fun networkRestartPreservesProfileAndModeOverrideWithoutEndingForegroundRun() {
+        configureWorkProfile()
+        val service = bindZeroDpiService()
+
+        service.startZeroDpi(profileId = WORK_PROFILE_ID, modeOverride = "ip_bypass")
+        service.waitForState {
+            it.status == RuntimeStatus.Running &&
+                it.mode == "ip_bypass" &&
+                it.listener == "127.0.0.1:45555"
+        }
+
+        service.requestAutomaticRestart()
+
+        val restarting = service.state().value
+        assertEquals(RuntimeStatus.Restarting, restarting.status)
+        assertEquals("None", restarting.activeTarget)
+        assertEquals(0, restarting.connectionCount)
+        assertEquals(0L, restarting.relayBytes)
+        assertTrue(restarting.recentLogs.any { it == "Restarting after network change." })
+        assertTrue(ZeroDpiRuntimeStateStore.runtimeMarker(context).active)
+
+        service.waitForState {
+            it.status == RuntimeStatus.Running &&
+                it.mode == "ip_bypass" &&
+                it.listener == "127.0.0.1:45555" &&
+                it.recentLogs.any { line -> line.contains("Relaunching ZeroDPI with profile \"Work\"") }
+        }
+        service.stopZeroDpi()
+        service.waitForState { it.status == RuntimeStatus.Stopped && it.lastExitCode == 0 }
+    }
+
+    @Test
+    fun userStopCancelsPendingAutomaticRestart() {
+        configureRootlessRunningMode()
+        val service = bindZeroDpiService()
+        service.startZeroDpi()
+        service.waitForState { it.status == RuntimeStatus.Running }
+
+        service.requestAutomaticRestart()
+        service.stopZeroDpi()
+
+        val stopped = service.waitForState {
+            it.status == RuntimeStatus.Stopped && it.lastExitCode == 0
+        }
+        assertTrue(stopped.recentLogs.none { it.startsWith("Relaunching ZeroDPI") })
+    }
+
+    @Test
     fun clearLogsRemovesMemoryAndPersistedSessionsWhileRunning() {
         configureRootlessRunningMode()
         val service = bindZeroDpiService()

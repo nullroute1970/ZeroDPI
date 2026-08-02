@@ -105,6 +105,7 @@
     <string name="status_starting">Starting…</string>
     <string name="status_scanning">Scanning for a working target…</string>
     <string name="status_running">Running</string>
+    <string name="status_restarting">Restarting after network change…</string>
     <string name="status_stopping">Stopping…</string>
     <string name="status_failed">Failed</string>
 

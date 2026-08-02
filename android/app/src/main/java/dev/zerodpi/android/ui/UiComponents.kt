@@ -271,6 +271,7 @@ internal fun ConfigFieldControl(
 internal fun RuntimeStatus.isTransient(): Boolean =
     this == RuntimeStatus.Starting ||
         this == RuntimeStatus.Scanning ||
+        this == RuntimeStatus.Restarting ||
         this == RuntimeStatus.Stopping
 
 internal fun keyboardTypeFor(type: ConfigFieldType): KeyboardType =

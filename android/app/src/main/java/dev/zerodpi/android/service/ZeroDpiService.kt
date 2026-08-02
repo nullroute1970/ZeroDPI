@@ -26,6 +26,8 @@ import dev.zerodpi.android.runtime.ZeroDpiRunRequest
 import dev.zerodpi.android.runtime.ZeroDpiRunner
 import dev.zerodpi.android.runtime.ZeroDpiRunnerEvent
 import dev.zerodpi.android.storage.RuntimeStorage
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -38,6 +40,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 
@@ -46,6 +49,7 @@ enum class RuntimeStatus {
     Starting,
     Scanning,
     Running,
+    Restarting,
     Stopping,
     Failed,
 }
@@ -88,6 +92,14 @@ class ZeroDpiService : Service() {
     private val activeRelayBytes = mutableMapOf<Int, Long>()
     private val sessionLogLines = ArrayDeque<String>()
     private var completedRelayBytes = 0L
+    private var networkMonitor: DefaultNetworkMonitor? = null
+    private var activeRunSpec: ActiveRunSpec? = null
+    private var launchJob: Job? = null
+    private var restartStopInProgress = false
+    private var automaticForceStopRequested = false
+    private var userStopRequested = false
+    private var restartExitSignal: CompletableDeferred<Unit>? = null
+    private var restartStopTimeoutSignal: CompletableDeferred<Unit>? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -118,6 +130,9 @@ class ZeroDpiService : Service() {
     }
 
     override fun onDestroy() {
+        networkMonitor?.stop()
+        networkMonitor = null
+        launchJob?.cancel()
         runBlocking {
             runner.stop()
             runner.forceStop()
@@ -137,43 +152,27 @@ class ZeroDpiService : Service() {
         profileId: String = ZeroDpiProfile.DEFAULT_PROFILE_ID,
         modeOverride: String? = null,
     ) {
-        ZeroDpiRuntimeStateStore.markRuntimeActive(this, profileId = profileId)
         ensureForeground()
         scope.launch {
             if (state.value.status in activeStatuses) {
                 appendLog("ZeroDPI is already ${state.value.status.name.lowercase()}.")
                 return@launch
             }
+            val runSpec = ActiveRunSpec(profileId, modeOverride)
+            activeRunSpec = runSpec
+            userStopRequested = false
+            restartStopInProgress = false
+            automaticForceStopRequested = false
+            ZeroDpiRuntimeStateStore.markRuntimeActive(this@ZeroDpiService, profileId = profileId)
             runCatching {
                 runtimeStorage.startNewLogSession("runtime")
             }
 
-            val runConfig = runCatching {
-                runtimeStorage.prepareRunConfig(profileId = profileId, modeOverride = modeOverride)
-            }.getOrElse { error ->
-                val message = error.message ?: "Failed to prepare runtime storage."
-                appendLog(message)
-                state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
-                finishForegroundRun()
-                return@launch
-            }
-            val profileName = runCatching {
-                profileRepository.loadIndex().profiles.firstOrNull { profile -> profile.id == profileId }?.name
-            }.getOrNull()
-            val editorState = ZeroDpiConfigToml.analyze(runConfig.configText)
-            val mode = runConfig.modeOverride ?: editorState.valueFor("MODE").ifBlank { "unknown" }
-            val listenHost = editorState.valueFor("LISTEN_HOST").ifBlank { "127.0.0.1" }
-            val listenPort = editorState.valueFor("LISTEN_PORT").ifBlank { "1080" }
-            val bypassMethod = editorState.valueFor("BYPASS_METHOD").ifBlank { "unknown" }
-            val rootRequired = editorState.rootRequirement.requiresRoot
             resetRuntimeCounters()
+            sessionLogLines.clear()
             state.update {
                 it.copy(
                     status = RuntimeStatus.Starting,
-                    rootStatus = if (rootRequired) RootStatus.Needed else RootStatus.NotNeeded,
-                    mode = mode,
-                    bypassMethod = bypassMethod,
-                    listener = "$listenHost:$listenPort",
                     activeTarget = "None",
                     activeTargetScore = null,
                     nextScanAtElapsedRealtimeMs = null,
@@ -185,43 +184,110 @@ class ZeroDpiService : Service() {
                     forceStopAvailable = false,
                 )
             }
-            sessionLogLines.clear()
-            appendLog("Starting ZeroDPI with profile ${profileDescription(profileId, profileName)}.")
-            appendLog("Profile runtime directory: ${runConfig.files.runtimeDir.absolutePath}.")
-            modeOverride?.let { modeName ->
-                appendLog("Running temporary $modeName test scan config.")
+            startNetworkMonitoring()
+            launchJob = scope.launch {
+                launchRun(runSpec, isAutomaticRestart = false)
             }
-            if (rootRequired) {
-                appendLog(editorState.rootRequirement.message)
-                appendRootlessAlternatives(editorState.rootRequirement.alternatives)
-                val rootResult = rootManager.requestRootFor("starting $mode with $bypassMethod")
-                appendLog(rootResult.message)
-                when (rootResult.state) {
-                    RootAccessState.Granted -> {
-                        state.update { it.copy(rootStatus = RootStatus.Granted) }
-                    }
-                    RootAccessState.Denied -> {
-                        failBeforeLaunch(rootStatus = RootStatus.Denied, message = rootResult.message)
-                        return@launch
-                    }
-                    RootAccessState.Unsupported -> {
-                        failBeforeLaunch(rootStatus = RootStatus.Unsupported, message = rootResult.message)
-                        return@launch
-                    }
-                }
-            }
+        }
+    }
 
-            val request = ZeroDpiRunRequest(
-                configPath = runConfig.configFile.absolutePath,
-                workingDirectory = runConfig.files.runtimeDir.absolutePath,
-                useRoot = rootRequired,
+    private suspend fun launchRun(
+        runSpec: ActiveRunSpec,
+        isAutomaticRestart: Boolean,
+    ) {
+        val profileId = runSpec.profileId
+        val modeOverride = runSpec.modeOverride
+
+        val runConfig = runCatching {
+            runtimeStorage.prepareRunConfig(profileId = profileId, modeOverride = modeOverride)
+        }.getOrElse { error ->
+            if (error is CancellationException) {
+                throw error
+            }
+            val message = error.message ?: "Failed to prepare runtime storage."
+            appendLog(message)
+            state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
+            finishForegroundRun()
+            return
+        }
+        val profileName = runCatching {
+            profileRepository.loadIndex().profiles.firstOrNull { profile -> profile.id == profileId }?.name
+        }.getOrNull()
+        val editorState = ZeroDpiConfigToml.analyze(runConfig.configText)
+        val mode = runConfig.modeOverride ?: editorState.valueFor("MODE").ifBlank { "unknown" }
+        val listenHost = editorState.valueFor("LISTEN_HOST").ifBlank { "127.0.0.1" }
+        val listenPort = editorState.valueFor("LISTEN_PORT").ifBlank { "1080" }
+        val bypassMethod = editorState.valueFor("BYPASS_METHOD").ifBlank { "unknown" }
+        val rootRequired = editorState.rootRequirement.requiresRoot
+        resetRuntimeCounters()
+        state.update {
+            it.copy(
+                status = RuntimeStatus.Starting,
+                rootStatus = if (rootRequired) RootStatus.Needed else RootStatus.NotNeeded,
                 mode = mode,
                 bypassMethod = bypassMethod,
-                listenHost = listenHost,
-                listenPort = listenPort.toIntOrNull() ?: 0,
+                listener = "$listenHost:$listenPort",
+                activeTarget = "None",
+                activeTargetScore = null,
+                nextScanAtElapsedRealtimeMs = null,
+                connectionCount = 0,
+                relayBytes = 0L,
+                lastError = null,
+                lastExitCode = null,
+                recentLogs = if (isAutomaticRestart) it.recentLogs else emptyList(),
+                forceStopAvailable = false,
             )
-            runner.start(request)
         }
+        appendLog(
+            if (isAutomaticRestart) {
+                "Relaunching ZeroDPI with profile ${profileDescription(profileId, profileName)}."
+            } else {
+                "Starting ZeroDPI with profile ${profileDescription(profileId, profileName)}."
+            },
+        )
+        appendLog("Profile runtime directory: ${runConfig.files.runtimeDir.absolutePath}.")
+        modeOverride?.let { modeName ->
+            appendLog("Running temporary $modeName test scan config.")
+        }
+        if (rootRequired) {
+            appendLog(editorState.rootRequirement.message)
+            appendRootlessAlternatives(editorState.rootRequirement.alternatives)
+            val rootResult = rootManager.requestRootFor("starting $mode with $bypassMethod")
+            appendLog(rootResult.message)
+            when (rootResult.state) {
+                RootAccessState.Granted -> {
+                    state.update { it.copy(rootStatus = RootStatus.Granted) }
+                }
+                RootAccessState.Denied -> {
+                    failBeforeLaunch(rootStatus = RootStatus.Denied, message = rootResult.message)
+                    return
+                }
+                RootAccessState.Unsupported -> {
+                    failBeforeLaunch(rootStatus = RootStatus.Unsupported, message = rootResult.message)
+                    return
+                }
+            }
+        }
+
+        val request = ZeroDpiRunRequest(
+            configPath = runConfig.configFile.absolutePath,
+            workingDirectory = runConfig.files.runtimeDir.absolutePath,
+            useRoot = rootRequired,
+            mode = mode,
+            bypassMethod = bypassMethod,
+            listenHost = listenHost,
+            listenPort = listenPort.toIntOrNull() ?: 0,
+        )
+        runCatching { runner.start(request) }
+            .onFailure { error ->
+                if (error is CancellationException) {
+                    throw error
+                }
+                val message = error.message ?: "Failed to launch ZeroDPI."
+                appendLog(message)
+                state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
+                finishForegroundRun()
+            }
     }
 
     fun runRootDiagnostics(
@@ -257,19 +323,62 @@ class ZeroDpiService : Service() {
     }
 
     fun stopZeroDpi() {
-        ZeroDpiRuntimeStateStore.markRuntimeActive(this)
+        userStopRequested = true
+        networkMonitor?.stop()
+        launchJob?.cancel()
+        ZeroDpiRuntimeStateStore.markRuntimeActive(this, activeRunSpec?.profileId)
         state.update { it.copy(status = RuntimeStatus.Stopping, forceStopAvailable = false) }
-        scope.launch {
-            runner.stop()
+        if (!restartStopInProgress) {
+            scope.launch {
+                runner.stop()
+            }
         }
     }
 
     fun forceStopZeroDpi() {
-        ZeroDpiRuntimeStateStore.markRuntimeActive(this)
+        userStopRequested = true
+        networkMonitor?.stop()
+        launchJob?.cancel()
+        ZeroDpiRuntimeStateStore.markRuntimeActive(this, activeRunSpec?.profileId)
         state.update { it.copy(status = RuntimeStatus.Stopping, forceStopAvailable = false) }
         scope.launch {
             runner.forceStop()
         }
+    }
+
+    internal fun requestAutomaticRestart() {
+        if (
+            userStopRequested ||
+            activeRunSpec == null ||
+            state.value.status !in networkRestartableStatuses
+        ) {
+            return
+        }
+        if (restartStopInProgress) {
+            return
+        }
+
+        restartStopInProgress = true
+        automaticForceStopRequested = false
+        restartExitSignal = CompletableDeferred()
+        restartStopTimeoutSignal = CompletableDeferred()
+        launchJob?.cancel()
+        resetRuntimeCounters()
+        state.update {
+            it.copy(
+                status = RuntimeStatus.Restarting,
+                activeTarget = "None",
+                activeTargetScore = null,
+                nextScanAtElapsedRealtimeMs = null,
+                connectionCount = 0,
+                relayBytes = 0L,
+                lastError = null,
+                lastExitCode = null,
+                forceStopAvailable = false,
+            )
+        }
+        appendLog("Restarting after network change.")
+        scope.launch { performAutomaticRestartShutdown() }
     }
 
     fun clearLogs() {
@@ -470,21 +579,26 @@ class ZeroDpiService : Service() {
                 appendLog("ZeroDPI exited with code ${event.exitCode}.")
                 activeConnections.clear()
                 activeRelayBytes.clear()
-                state.update {
-                    it.copy(
-                        status = if (event.exitCode == 0) RuntimeStatus.Stopped else RuntimeStatus.Failed,
-                        activeTarget = if (event.exitCode == 0) "None" else it.activeTarget,
-                        activeTargetScore = if (event.exitCode == 0) null else it.activeTargetScore,
-                        nextScanAtElapsedRealtimeMs = null,
-                        connectionCount = 0,
-                        lastExitCode = event.exitCode,
-                        forceStopAvailable = false,
-                        lastError = if (event.exitCode == 0) null else "ZeroDPI exited with code ${event.exitCode}.",
-                    )
+                if (restartStopInProgress) {
+                    restartExitSignal?.complete(Unit)
+                    if (userStopRequested) {
+                        finishAfterExit(event.exitCode)
+                    }
+                    return
                 }
-                finishForegroundRun()
+                finishAfterExit(event.exitCode)
             }
             ZeroDpiRunnerEvent.StopTimedOut -> {
+                if (restartStopInProgress) {
+                    restartStopTimeoutSignal?.complete(Unit)
+                }
+                if (restartStopInProgress && !userStopRequested) {
+                    if (!automaticForceStopRequested) {
+                        automaticForceStopRequested = true
+                        appendLog("Graceful restart shutdown timed out; force-stopping ZeroDPI.")
+                    }
+                    return
+                }
                 val message = "Graceful stop timed out. Force stop is available."
                 appendLog(message)
                 state.update {
@@ -504,6 +618,62 @@ class ZeroDpiService : Service() {
         completedRelayBytes = 0L
     }
 
+    private suspend fun performAutomaticRestartShutdown() {
+        runner.stop()
+        val exitSignal = restartExitSignal ?: return
+        val timeoutSignal = restartStopTimeoutSignal ?: return
+        val gracefulStopTimedOut = select {
+            exitSignal.onAwait { false }
+            timeoutSignal.onAwait { true }
+        }
+        if (gracefulStopTimedOut && !userStopRequested) {
+            runner.forceStop()
+            exitSignal.await()
+        }
+        if (userStopRequested || !restartStopInProgress) {
+            return
+        }
+
+        val runSpec = activeRunSpec
+        restartStopInProgress = false
+        automaticForceStopRequested = false
+        restartExitSignal = null
+        restartStopTimeoutSignal = null
+        if (runSpec == null) {
+            state.update {
+                it.copy(
+                    status = RuntimeStatus.Failed,
+                    lastError = "Could not restore the active run after a network change.",
+                )
+            }
+            finishForegroundRun()
+            return
+        }
+        launchJob = scope.launch {
+            launchRun(runSpec, isAutomaticRestart = true)
+        }
+    }
+
+    private fun finishAfterExit(exitCode: Int) {
+        restartStopInProgress = false
+        automaticForceStopRequested = false
+        restartExitSignal = null
+        restartStopTimeoutSignal = null
+        state.update {
+            it.copy(
+                status = if (exitCode == 0) RuntimeStatus.Stopped else RuntimeStatus.Failed,
+                activeTarget = if (exitCode == 0) "None" else it.activeTarget,
+                activeTargetScore = if (exitCode == 0) null else it.activeTargetScore,
+                nextScanAtElapsedRealtimeMs = null,
+                connectionCount = 0,
+                lastExitCode = exitCode,
+                forceStopAvailable = false,
+                lastError = if (exitCode == 0) null else "ZeroDPI exited with code $exitCode.",
+            )
+        }
+        finishForegroundRun()
+    }
+
     private fun failBeforeLaunch(rootStatus: RootStatus, message: String) {
         state.update {
             it.copy(
@@ -514,6 +684,15 @@ class ZeroDpiService : Service() {
             )
         }
         finishForegroundRun()
+    }
+
+    private fun startNetworkMonitoring() {
+        networkMonitor?.stop()
+        networkMonitor = DefaultNetworkMonitor(
+            context = this,
+            scope = scope,
+            onStableNetworkChange = ::requestAutomaticRestart,
+        ).also(DefaultNetworkMonitor::start)
     }
 
     private fun appendRootDiagnosticReport(report: RootDiagnosticReport) {
@@ -585,6 +764,14 @@ class ZeroDpiService : Service() {
     }
 
     private fun finishForegroundRun() {
+        networkMonitor?.stop()
+        networkMonitor = null
+        launchJob = null
+        activeRunSpec = null
+        restartStopInProgress = false
+        automaticForceStopRequested = false
+        restartExitSignal = null
+        restartStopTimeoutSignal = null
         ZeroDpiRuntimeStateStore.markRuntimeInactive(this)
         stopForegroundCompat()
         stopSelf()
@@ -625,6 +812,11 @@ class ZeroDpiService : Service() {
         fun service(): ZeroDpiService = this@ZeroDpiService
     }
 
+    private data class ActiveRunSpec(
+        val profileId: String,
+        val modeOverride: String?,
+    )
+
     companion object {
         const val ACTION_STOP = "dev.zerodpi.android.action.STOP"
         private const val CHANNEL_ID = "zerodpi-runtime"
@@ -636,7 +828,14 @@ class ZeroDpiService : Service() {
             RuntimeStatus.Starting,
             RuntimeStatus.Scanning,
             RuntimeStatus.Running,
+            RuntimeStatus.Restarting,
             RuntimeStatus.Stopping,
+        )
+        private val networkRestartableStatuses = setOf(
+            RuntimeStatus.Starting,
+            RuntimeStatus.Scanning,
+            RuntimeStatus.Running,
+            RuntimeStatus.Restarting,
         )
     }
 }

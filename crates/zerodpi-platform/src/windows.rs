@@ -158,6 +158,7 @@ fn parse_view<'a>(direction: Direction, buf: &'a [u8]) -> Result<(PacketView<'a>
             psh: tcp.psh(),
             rst: tcp.rst(),
             fin: tcp.fin(),
+            urg: false,
         },
         payload_len,
         payload: &buf[payload_off..payload_off + payload_len],
@@ -165,6 +166,7 @@ fn parse_view<'a>(direction: Direction, buf: &'a [u8]) -> Result<(PacketView<'a>
         new_seq: None,
         new_ack: None,
         new_flags: None,
+        new_urgent_pointer: None,
         new_payload: None,
         replace_tcp_options: None,
         append_tcp_options: Vec::new(),
@@ -299,6 +301,7 @@ mod tests {
                 psh: true,
                 ..Default::default()
             }),
+            new_urgent_pointer: None,
             new_payload: Some(vec![0xAB; 517]),
             replace_tcp_options: None,
             append_tcp_options: Vec::new(),

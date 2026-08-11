@@ -99,6 +99,7 @@ mod tests {
             bump_ipv4_ident: false,
             corrupt_tcp_checksum_delta: None,
             new_ipv4_ttl: None,
+            new_urgent_pointer: None,
         }
     }
 

@@ -28,6 +28,7 @@ pub struct TcpFlags {
     pub psh: bool,
     pub rst: bool,
     pub fin: bool,
+    pub urg: bool,
 }
 
 /// A read/write view of a captured TCP/IPv4 packet.
@@ -60,6 +61,10 @@ pub struct PacketView<'a> {
     pub new_seq: Option<u32>,
     pub new_ack: Option<u32>,
     pub new_flags: Option<TcpFlags>,
+    /// Override the TCP urgent pointer (RFC 793: offset from the segment's
+    /// sequence number, one byte past the urgent data). Only meaningful when
+    /// `new_flags` sets `urg`.
+    pub new_urgent_pointer: Option<u16>,
     /// Replace the entire TCP payload with these bytes.
     pub new_payload: Option<Vec<u8>>,
     /// Replace the entire TCP options area with these raw bytes before any
@@ -213,4 +218,15 @@ pub trait PacketInterceptor: Sized + Send + 'static {
 /// Convenience: many handlers want shared access to the flow table.
 pub trait FlowHandler: PacketHandler {
     fn flows(&self) -> FlowTable;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_flags_has_urg_and_defaults_to_false() {
+        let flags = TcpFlags::default();
+        assert!(!flags.urg);
+    }
 }

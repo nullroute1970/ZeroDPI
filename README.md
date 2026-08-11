@@ -52,7 +52,7 @@ It is not a replacement VPN client. It is a local TCP relay that your existing V
 
 | Feature | Description |
 |---------|-------------|
-| 🧩 **11 bypass methods** | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`, `wrong_ack`, `wrong_timestamp`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, `tls_frag` |
+| 🧩 **12 bypass methods** | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, `tls_frag` |
 | 🎯 **6 operating modes** | `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan` |
 | 🖥️ **TUI dashboard** | Ratatui-powered live progress, selection tables, and connection monitoring |
 | 🔄 **Auto-rescan** | Background re-scanning hot-swaps the best target without restart |
@@ -328,6 +328,7 @@ Results are blended using a configurable weight and displayed in the TUI.
 | `wrong_seq_wrong_md5` | Injects fake ClientHello with both an old TCP sequence number and TCP-MD5 option | ✅ Yes | DPI paths where one fake-packet rejection trick is not enough |
 | `wrong_ack` | Injects fake ClientHello with deliberately old TCP ACK number | ✅ Yes | DPI that accepts forged data but servers reject old ACKs |
 | `wrong_timestamp` | Injects fake ClientHello with backdated TCP Timestamp TSval | ✅ Yes | DPI that accepts forged data but servers enforce PAWS |
+| `low_ttl` | Injects fake ClientHello (whitelisted SNI) with a low IP TTL so only the DPI middlebox sees it | ✅ Yes | DPI sitting between client and server on TTL-visible networks |
 | `tls_record_frag` | TLS Record Fragment: splits the real ClientHello record body into multiple tiny TLS records | ✅ Yes | DPI that can't reassemble TLS records |
 | `wrong_seq_tls_frag` | Sends a wrong-sequence fake ClientHello, then fragments selected real client data with `TLS_FRAG_*` settings | ✅ Yes | Layered TCP-segment DPI paths |
 | `wrong_md5_tls_frag` | Sends a TCP-MD5 fake ClientHello, then fragments selected real client data with `TLS_FRAG_*` settings | ✅ Yes | Layered TCP-MD5 plus TCP-segment DPI paths |
@@ -346,6 +347,7 @@ Start with the least complex method that can run on your platform, then move to 
 | Rooted Android where NFQUEUE support is uncertain | `tls_frag` first |
 | You cannot run packet interception but can point the VPN client at ZeroDPI | `tls_frag` |
 | DPI appears to ignore invalid sequence tricks | `wrong_seq_wrong_md5`, `wrong_ack`, `wrong_timestamp`, `wrong_checksum`, `wrong_md5`, or `tls_record_frag` |
+| DPI middlebox is closer to you than the server and ignores invalid-packet tricks | `low_ttl` |
 | DPI sees through fake packets but fails with fragmented real handshakes | `tls_record_frag` |
 | You need a scanned IPv4 target but must preserve the VPN client's real SNI | `MODE = "ip_bypass_plus"` with `tls_record_frag` or `tls_frag` |
 | A first firewall layer is fooled, but another layer still blocks the real ClientHello | `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, or `wrong_seq_tls_record_frag` |
@@ -357,6 +359,7 @@ Method behavior in more detail:
 - `wrong_md5` is ZeroDPI's snake_case name for sing-box's `wrong-md5` spoof behavior. It adds a TCP-MD5 Signature option to the forged segment without negotiating a TCP-MD5 key.
 - `wrong_seq_wrong_md5` sends one fake ClientHello with both the `wrong_seq` sequence rewrite and the `wrong_md5` TCP-MD5 option.
 - `wrong_timestamp` is ZeroDPI's snake_case name for sing-box's `wrong-timestamp` spoof behavior. It requires TCP timestamps on the intercepted flow and backdates `TSval` so PAWS rejects the forged segment.
+- `low_ttl` sends a valid decoy ClientHello carrying the selected whitelisted SNI but stamps it with a low IP TTL (`LOW_TTL_VALUE`). The decoy reaches an inline DPI middlebox and then expires, so the server never receives it; the real handshake completes via TCP retransmission. Tune `LOW_TTL_VALUE` to the DPI's hop distance (typically 4–8).
 - `tls_record_frag` rewrites the real first TLS record into many smaller TLS records. The server should reassemble the TLS handshake normally.
 - `tls_frag` keeps the TLS bytes unchanged and writes selected client data in small TCP chunks from the proxy. It can fragment a 1-based range of client writes such as `TLS_FRAG_PACKETS = "1-3"` or the first TLS ClientHello with `TLS_FRAG_PACKETS = "tlshello"`.
 - The combo methods such as `wrong_seq_tls_frag` and `wrong_md5_tls_frag` first send a decoy ClientHello, then also fragment the real ClientHello path.
@@ -594,7 +597,7 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `BYPASS_METHOD` | `string` | `"wrong_seq_tls_frag"` | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`, `wrong_ack`, `wrong_timestamp`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, or `tls_frag`; `ip_bypass_plus` allows only `tls_record_frag` or `tls_frag` |
+| `BYPASS_METHOD` | `string` | `"wrong_seq_tls_frag"` | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, or `tls_frag`; `ip_bypass_plus` allows only `tls_record_frag` or `tls_frag` |
 | `BYPASS_TIMEOUT_SECS` | `u64` | `20` | Time to wait for bypass setup before giving up |
 | `RELAY_MAX_LIFETIME_SECS` | `u64` | `0` | Rotate established relays after this many seconds (`0` = disabled/default) |
 | `NFQUEUE_NUM` | `u16` | `1` | (Linux) NFQUEUE queue number |
@@ -609,6 +612,17 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 | `WRONG_SEQ_BUMP_IP_IDENT` | `bool` | `true` | Bump IPv4 Identification field |
 
 `wrong_seq_wrong_md5` uses these `wrong_seq` parameters for the sequence rewrite, PSH flag, and IPv4 Identification behavior.
+
+#### `low_ttl` Parameters
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `LOW_TTL_VALUE` | `u8` | `5` | IPv4 TTL stamped on the decoy ClientHello packet (1–64) |
+| `LOW_TTL_SET_PSH` | `bool` | `true` | Set PSH flag on the spoofed packet |
+| `LOW_TTL_BUMP_IP_IDENT` | `bool` | `true` | Bump IPv4 Identification field |
+| `LOW_TTL_COMPLETE_IMMEDIATELY` | `bool` | `true` | Signal bypass complete immediately after emission |
+
+`LOW_TTL_VALUE` must be high enough to reach the ISP's inline DPI middlebox but low enough to expire before the destination server. Typical DPI middleboxes sit 4–8 hops from the client; verify with `traceroute` and tune from there.
 
 #### `wrong_checksum` Parameters
 

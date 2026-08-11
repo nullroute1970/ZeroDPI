@@ -303,6 +303,7 @@ mod tests {
     use crate::config::Config;
     use crate::flow::{new_flow_table, BypassOutcome, FlowEntry, FlowKey};
     use crate::interceptor::{Direction, PacketView, TcpFlags};
+    use crate::methods::low_ttl::LowTtl;
     use crate::methods::tls_record_frag::TlsRecordFrag;
     use crate::methods::wrong_ack::WrongAck;
     use crate::methods::wrong_checksum::WrongChecksum;
@@ -381,6 +382,7 @@ mod tests {
             append_tcp_options: Vec::new(),
             bump_ipv4_ident: false,
             corrupt_tcp_checksum_delta: None,
+            new_ipv4_ttl: None,
         }
     }
 
@@ -536,6 +538,72 @@ mod tests {
         assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
         assert_eq!(p.new_seq, None);
         assert_eq!(p.corrupt_tcp_checksum_delta, Some(1));
+        assert_eq!(
+            entry.state.lock().outcome,
+            Some(BypassOutcome::FakeDataAcked)
+        );
+        assert!(!entry.state.lock().monitor);
+    }
+
+    #[test]
+    fn low_ttl_completes_on_modified_ack() {
+        let flows = new_flow_table();
+        let key = FlowKey {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            dst_port: 443,
+        };
+        let entry = FlowEntry::new(vec![0xAA; 517]);
+        flows.insert(key, entry.clone());
+
+        let mut cfg = default_cfg();
+        cfg.BYPASS_METHOD = "low_ttl".into();
+        let mut h = Handler::new(flows, Arc::new(LowTtl::new(&cfg)));
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            1000,
+            0,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                syn: true,
+                ack: true,
+                ..Default::default()
+            },
+            5000,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
+        assert_eq!(p.new_payload.as_ref().unwrap().len(), 517);
+        assert_eq!(p.new_seq, None);
+        assert_eq!(p.new_ack, None);
+        assert_eq!(p.corrupt_tcp_checksum_delta, None);
+        assert_eq!(p.new_ipv4_ttl, Some(5));
+        assert!(p.new_flags.unwrap().psh);
+        assert!(p.bump_ipv4_ident);
         assert_eq!(
             entry.state.lock().outcome,
             Some(BypassOutcome::FakeDataAcked)

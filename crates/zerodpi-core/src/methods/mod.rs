@@ -10,7 +10,7 @@
 //!
 //! - [`BypassMethod::on_handshake_complete_ack`] — fires on the first outbound
 //!   bare ACK after the TCP handshake.  `wrong_seq`, `wrong_ack`,
-//!   `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`,
+//!   `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`, `low_ttl`,
 //!   `wrong_timestamp`, and the first stage of combo methods act here (fake
 //!   injection).
 //! - [`BypassMethod::on_first_data_packet`] — fires on the first outbound
@@ -33,6 +33,7 @@
 //! registered in [`build_method`].  New socket-based methods must be wired
 //! directly into `proxy.rs` instead.
 
+pub mod low_ttl;
 pub mod tcp_segmentation;
 pub mod tls_record_frag;
 pub mod wrong_ack;
@@ -142,7 +143,7 @@ pub trait BypassMethod: Send + Sync + 'static {
 ///
 /// Returns `Some(method)` for interceptor-based methods (`wrong_seq`,
 /// `wrong_ack`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`,
-/// `wrong_timestamp`, `tls_record_frag`, `wrong_seq_tls_frag`,
+/// `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `wrong_seq_tls_frag`,
 /// `wrong_seq_tls_record_frag`, `wrong_md5_tls_frag`) and `None` for socket-based methods
 /// (`tls_frag`) or unknown names.  Callers should validate the method
 /// name via [`crate::config::Config::validate`] before calling this function.
@@ -152,6 +153,7 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
         "wrong_ack" => Some(Box::new(wrong_ack::WrongAck::new(cfg))),
         "wrong_checksum" => Some(Box::new(wrong_checksum::WrongChecksum::new(cfg))),
         "wrong_md5" => Some(Box::new(wrong_md5::WrongMd5::new(cfg))),
+        "low_ttl" => Some(Box::new(low_ttl::LowTtl::new(cfg))),
         "wrong_seq_wrong_md5" => Some(Box::new(wrong_seq_wrong_md5::WrongSeqWrongMd5::new(cfg))),
         "wrong_md5_tls_frag" => Some(Box::new(wrong_md5_tls_frag::WrongMd5TlsFrag::new(cfg))),
         "wrong_timestamp" => Some(Box::new(wrong_timestamp::WrongTimestamp::new(cfg))),
@@ -197,6 +199,13 @@ mod tests {
         let cfg = cfg_with_method("wrong_md5");
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "wrong_md5");
+    }
+
+    #[test]
+    fn build_low_ttl_method() {
+        let cfg = cfg_with_method("low_ttl");
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "low_ttl");
     }
 
     #[test]

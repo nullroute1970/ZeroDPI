@@ -540,6 +540,10 @@ pub fn interceptor_config(
             tls_record_frag_size: cfg.TLS_RECORD_FRAG_SIZE,
             tls_record_frag_set_psh: cfg.TLS_RECORD_FRAG_SET_PSH,
             tls_record_frag_bump_ip_ident: cfg.TLS_RECORD_FRAG_BUMP_IP_IDENT,
+            low_ttl_value: cfg.LOW_TTL_VALUE,
+            low_ttl_set_psh: cfg.LOW_TTL_SET_PSH,
+            low_ttl_bump_ip_ident: cfg.LOW_TTL_BUMP_IP_IDENT,
+            low_ttl_complete_immediately: cfg.LOW_TTL_COMPLETE_IMMEDIATELY,
         },
     }
 }

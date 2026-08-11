@@ -128,6 +128,10 @@ pub struct MethodConfig {
     pub tls_record_frag_size: usize,
     pub tls_record_frag_set_psh: bool,
     pub tls_record_frag_bump_ip_ident: bool,
+    pub low_ttl_value: u8,
+    pub low_ttl_set_psh: bool,
+    pub low_ttl_bump_ip_ident: bool,
+    pub low_ttl_complete_immediately: bool,
 }
 
 impl MethodConfig {
@@ -140,6 +144,7 @@ impl MethodConfig {
             "wrong_seq_wrong_md5",
             "wrong_md5_tls_frag",
             "wrong_timestamp",
+            "low_ttl",
             "tls_record_frag",
             "wrong_seq_tls_frag",
             "wrong_seq_tls_record_frag",
@@ -155,6 +160,12 @@ impl MethodConfig {
         }
         if self.wrong_timestamp_offset == 0 {
             return Err(ProtocolError::InvalidField("wrong timestamp offset"));
+        }
+        if self.low_ttl_value == 0 {
+            return Err(ProtocolError::InvalidField("low TTL value"));
+        }
+        if self.low_ttl_value > 64 {
+            return Err(ProtocolError::InvalidField("low TTL value"));
         }
         if self.tls_record_frag_size == 0 || self.tls_record_frag_size > u16::MAX as usize {
             return Err(ProtocolError::InvalidField("TLS record fragment size"));
@@ -518,6 +529,10 @@ mod tests {
             tls_record_frag_size: 1,
             tls_record_frag_set_psh: true,
             tls_record_frag_bump_ip_ident: true,
+            low_ttl_value: 5,
+            low_ttl_set_psh: true,
+            low_ttl_bump_ip_ident: true,
+            low_ttl_complete_immediately: true,
         }
     }
 
@@ -724,6 +739,15 @@ mod tests {
         config.queue_num = 100;
         config.method.name = "arbitrary_command".into();
         assert!(config.validate().is_err());
+
+        let mut low_ttl = method();
+        low_ttl.name = "low_ttl".into();
+        low_ttl.low_ttl_value = 0;
+        assert!(low_ttl.validate().is_err());
+        low_ttl.low_ttl_value = 65;
+        assert!(low_ttl.validate().is_err());
+        low_ttl.low_ttl_value = 5;
+        assert!(low_ttl.validate().is_ok());
 
         let mut key = flow_key();
         key.dst_ip = Ipv4Addr::BROADCAST;

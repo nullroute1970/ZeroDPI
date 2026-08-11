@@ -34,8 +34,8 @@ pub struct TcpFlags {
 ///
 /// Backends construct this from their native packet representation and apply
 /// the staged mutations (`new_*`, `replace_tcp_options`,
-/// `append_tcp_options`, `bump_ipv4_ident`, `corrupt_tcp_checksum_delta`)
-/// when the handler returns
+/// `append_tcp_options`, `bump_ipv4_ident`, `new_ipv4_ttl`,
+/// `corrupt_tcp_checksum_delta`) when the handler returns
 /// [`Verdict::AcceptModified`].
 #[derive(Debug, Clone)]
 pub struct PacketView<'a> {
@@ -75,6 +75,12 @@ pub struct PacketView<'a> {
     /// Add this value to the valid computed TCP checksum after normal packet
     /// rebuild/checksum calculation. `None` leaves the checksum valid.
     pub corrupt_tcp_checksum_delta: Option<u16>,
+    /// Override the IPv4 Time-To-Live (TTL) field.
+    ///
+    /// Used by decoy-injection methods that want a fake packet to reach an
+    /// inline DPI middlebox but expire before the destination server. Only
+    /// affects IPv4 packets; IPv6 has a hop-limit field instead.
+    pub new_ipv4_ttl: Option<u8>,
 }
 
 impl PacketView<'_> {

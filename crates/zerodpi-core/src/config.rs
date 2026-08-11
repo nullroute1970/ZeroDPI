@@ -205,6 +205,12 @@ pub struct Config {
     /// - `"wrong_timestamp"` — injects a fake TLS ClientHello with a
     ///   backdated TCP Timestamp TSval so DPI inspects the fake SNI while the
     ///   real server rejects the segment as a PAWS replay.
+    /// - `"low_ttl"` — injects a fake TLS ClientHello carrying the selected
+    ///   whitelisted SNI with the normal TCP sequence/acknowledgment numbers
+    ///   and a valid checksum, but stamps the IP packet with a low Time-To-Live
+    ///   (`LOW_TTL_VALUE`) so the decoy reaches an inline DPI middlebox yet
+    ///   expires before reaching the destination server. The real handshake
+    ///   completes via TCP retransmission.
     /// - `"tls_record_frag"` — TLS Record Fragment / TLS-layer fragmentation.
     ///   Splits the real ClientHello into multiple small TLS records so no
     ///   single record contains the full SNI. No fake packet is injected; the
@@ -291,6 +297,34 @@ pub struct Config {
     /// invalid-checksum packet should be silently dropped by the server.
     #[serde(default = "default_true")]
     pub WRONG_CHECKSUM_COMPLETE_IMMEDIATELY: bool,
+
+    // -----------------------------------------------------------------------
+    // low_ttl method parameters
+    // -----------------------------------------------------------------------
+    /// IPv4 Time-To-Live stamped on the spoofed decoy ClientHello packet.
+    /// The value must be high enough to reach the ISP's inline DPI middlebox
+    /// (typically 4-8 hops from the client) but low enough that the segment
+    /// expires before reaching the destination server.
+    /// Must be `>= 1` and `<= 64`. Default: `5`.
+    #[serde(default = "default_low_ttl_value")]
+    pub LOW_TTL_VALUE: u8,
+
+    /// Whether to set the `PSH` flag on the spoofed decoy ClientHello packet.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub LOW_TTL_SET_PSH: bool,
+
+    /// Whether to increment the IPv4 `Identification` field on the spoofed
+    /// decoy packet. Default: `true`.
+    #[serde(default = "default_true")]
+    pub LOW_TTL_BUMP_IP_IDENT: bool,
+
+    /// Whether to signal bypass completion immediately after emitting the
+    /// low-TTL decoy packet. The default is `true` because the segment is
+    /// expected to expire before reaching the server and therefore will not
+    /// produce an ACK.
+    #[serde(default = "default_true")]
+    pub LOW_TTL_COMPLETE_IMMEDIATELY: bool,
 
     // -----------------------------------------------------------------------
     // wrong_md5 method parameters
@@ -650,6 +684,9 @@ fn default_true() -> bool {
 fn default_wrong_checksum_delta() -> u16 {
     1
 }
+fn default_low_ttl_value() -> u8 {
+    5
+}
 fn default_wrong_ack_offset() -> u32 {
     1
 }
@@ -811,6 +848,7 @@ impl Config {
                 | "wrong_seq_wrong_md5"
                 | "wrong_ack"
                 | "wrong_timestamp"
+                | "low_ttl"
                 | "tls_record_frag"
                 | "wrong_seq_tls_frag"
                 | "wrong_md5_tls_frag"
@@ -818,7 +856,7 @@ impl Config {
                 | "tls_frag"
         ) {
             anyhow::bail!(
-                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_md5\", \"wrong_seq_wrong_md5\", \"wrong_ack\", \"wrong_timestamp\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_md5_tls_frag\", \"wrong_seq_tls_record_frag\", \"tls_frag\"",
+                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_md5\", \"wrong_seq_wrong_md5\", \"wrong_ack\", \"wrong_timestamp\", \"low_ttl\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_md5_tls_frag\", \"wrong_seq_tls_record_frag\", \"tls_frag\"",
                 self.BYPASS_METHOD
             );
         }
@@ -830,6 +868,12 @@ impl Config {
         }
         if self.WRONG_TIMESTAMP_OFFSET == 0 {
             anyhow::bail!("WRONG_TIMESTAMP_OFFSET must be >= 1");
+        }
+        if self.LOW_TTL_VALUE == 0 {
+            anyhow::bail!("LOW_TTL_VALUE must be >= 1");
+        }
+        if self.LOW_TTL_VALUE > 64 {
+            anyhow::bail!("LOW_TTL_VALUE must be <= 64");
         }
         if self.TLS_RECORD_FRAG_SIZE == 0 {
             anyhow::bail!("TLS_RECORD_FRAG_SIZE must be >= 1");
@@ -933,6 +977,11 @@ mod tests {
         assert!(cfg.WRONG_CHECKSUM_SET_PSH);
         assert!(cfg.WRONG_CHECKSUM_BUMP_IP_IDENT);
         assert!(cfg.WRONG_CHECKSUM_COMPLETE_IMMEDIATELY);
+        // low_ttl defaults
+        assert_eq!(cfg.LOW_TTL_VALUE, 5);
+        assert!(cfg.LOW_TTL_SET_PSH);
+        assert!(cfg.LOW_TTL_BUMP_IP_IDENT);
+        assert!(cfg.LOW_TTL_COMPLETE_IMMEDIATELY);
         // wrong_md5 defaults
         assert!(cfg.WRONG_MD5_SET_PSH);
         assert!(cfg.WRONG_MD5_BUMP_IP_IDENT);
@@ -1008,6 +1057,65 @@ mod tests {
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_checksum"
             WRONG_CHECKSUM_DELTA = 0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn low_ttl_defaults() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "low_ttl"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.BYPASS_METHOD, "low_ttl");
+        assert_eq!(cfg.LOW_TTL_VALUE, 5);
+        assert!(cfg.LOW_TTL_SET_PSH);
+        assert!(cfg.LOW_TTL_BUMP_IP_IDENT);
+        assert!(cfg.LOW_TTL_COMPLETE_IMMEDIATELY);
+    }
+
+    #[test]
+    fn parses_low_ttl_fields() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "low_ttl"
+            LOW_TTL_VALUE = 8
+            LOW_TTL_SET_PSH = false
+            LOW_TTL_BUMP_IP_IDENT = false
+            LOW_TTL_COMPLETE_IMMEDIATELY = false
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.LOW_TTL_VALUE, 8);
+        assert!(!cfg.LOW_TTL_SET_PSH);
+        assert!(!cfg.LOW_TTL_BUMP_IP_IDENT);
+        assert!(!cfg.LOW_TTL_COMPLETE_IMMEDIATELY);
+    }
+
+    #[test]
+    fn rejects_low_ttl_value_zero() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "low_ttl"
+            LOW_TTL_VALUE = 0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_low_ttl_value_out_of_range() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "low_ttl"
+            LOW_TTL_VALUE = 65
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert!(cfg.validate().is_err());
@@ -1501,6 +1609,7 @@ mod tests {
             "wrong_seq_wrong_md5",
             "wrong_ack",
             "wrong_timestamp",
+            "low_ttl",
             "wrong_seq_tls_frag",
             "wrong_md5_tls_frag",
             "wrong_seq_tls_record_frag",

@@ -205,6 +205,19 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     devices can inspect the payload using the allowed SNI, while the real
 #     upstream server rejects the segment as a PAWS replay.
 #
+#   "low_ttl"
+#     TTL-Based Decoy Injection.  Waits for the first outbound TCP ACK after
+#     the SYN/SYN-ACK exchange, then injects a fake TLS ClientHello carrying
+#     the selected whitelisted SNI on that packet with the normal valid TCP
+#     sequence/ACK numbers and a valid checksum, but stamps the IP packet with
+#     the LOW_TTL_VALUE.  The TTL is tuned so the decoy reaches an inline DPI
+#     middlebox (typically 4-8 hops from the client) but expires before the
+#     destination server, so the server never sees the fake payload.  The real
+#     handshake still completes because the kernel retransmits the bare ACK.
+#     Works best when the DPI is physically closer to the client than the
+#     destination server; use "traceroute" or similar to find the middlebox
+#     distance and adjust LOW_TTL_VALUE accordingly.
+#
 #   "tls_record_frag"
 #     TLS Record Fragment / TLS-layer fragmentation.  Does NOT inject any fake
 #     packet.  Instead, it intercepts the first outbound data packet carrying
@@ -344,6 +357,43 @@ WRONG_CHECKSUM_BUMP_IP_IDENT = true
 # The default is true because a correctly invalid-checksum packet should be
 # dropped silently by the real server and therefore will not produce an ACK.
 WRONG_CHECKSUM_COMPLETE_IMMEDIATELY = true
+
+# ---------------------------------------------------------------------------
+# low_ttl method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "low_ttl".
+
+# IPv4 Time-To-Live stamped on the spoofed decoy ClientHello packet.
+#
+# The decoy carries the selected whitelisted SNI from the SNI scan.  Set this
+# high enough that the packet reaches the ISP's inline DPI middlebox, but low
+# enough that it expires before reaching the destination server.  Typical DPI
+# middleboxes sit 4 to 8 hops from the client; find the exact distance with
+# "traceroute" and tune from there.  If the value is too high, the real server
+# receives the decoy payload; if too low, the DPI never sees it.
+#
+# Must be between 1 and 64.  Default: 5.
+LOW_TTL_VALUE = 5
+
+# Whether to set the TCP PSH flag on the spoofed decoy ClientHello packet.
+#
+# Keep this enabled for normal use.  Disable it only when testing a network or
+# middlebox that reacts poorly to PSH.
+LOW_TTL_SET_PSH = true
+
+# Whether to increment the IPv4 Identification field on the spoofed packet.
+#
+# Bumping the ID makes the spoofed packet look like a fresh IPv4 datagram.
+# This only affects IPv4 packets; IPv6 has no IPv4 Identification field.
+LOW_TTL_BUMP_IP_IDENT = true
+
+# Whether to signal the bypass phase complete immediately after the low-TTL
+# packet is emitted.
+#
+# The default is true because the segment is expected to expire before reaching
+# the server and therefore will not produce an ACK; the real handshake
+# completes via TCP retransmission instead.
+LOW_TTL_COMPLETE_IMMEDIATELY = true
 
 # ---------------------------------------------------------------------------
 # wrong_md5 method parameters

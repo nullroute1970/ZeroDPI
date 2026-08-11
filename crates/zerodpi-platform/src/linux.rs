@@ -198,6 +198,7 @@ fn parse_view<'a>(direction: Direction, buf: &'a [u8]) -> Result<(PacketView<'a>
         append_tcp_options: Vec::new(),
         bump_ipv4_ident: false,
         corrupt_tcp_checksum_delta: None,
+        new_ipv4_ttl: None,
     };
     let layout = PacketLayout {
         ip_hdr_len,
@@ -235,6 +236,9 @@ fn build_modified(orig: &[u8], layout: &PacketLayout, view: &PacketView<'_>) -> 
     }
     if view.bump_ipv4_ident {
         ip_hdr.identification = ip_hdr.identification.wrapping_add(1);
+    }
+    if let Some(ttl) = view.new_ipv4_ttl {
+        ip_hdr.time_to_live = ttl;
     }
     if let Some(options) = view.replace_tcp_options.as_deref() {
         tcp_hdr
@@ -761,6 +765,7 @@ mod tests {
             append_tcp_options: Vec::new(),
             bump_ipv4_ident: true,
             corrupt_tcp_checksum_delta: None,
+            new_ipv4_ttl: None,
         }
     }
 
@@ -1059,6 +1064,45 @@ mod tests {
             .calc_checksum_ipv4(&ip2.to_header(), &modified[40..])
             .unwrap();
         assert_eq!(tcp2.checksum(), calculated);
+    }
+
+    #[test]
+    fn ttl_can_be_overridden_after_rebuild() {
+        use etherparse::{IpNumber, Ipv4Header, TcpHeader};
+        let mut ip = Ipv4Header::new(20, 64, IpNumber::TCP, [10, 0, 0, 1], [1, 2, 3, 4]).unwrap();
+        ip.header_checksum = ip.calc_header_checksum();
+        let mut tcp = TcpHeader::new(12345, 443, 1001, 65535);
+        tcp.acknowledgment_number = 5001;
+        tcp.ack = true;
+        tcp.checksum = tcp.calc_checksum_ipv4(&ip, &[]).unwrap();
+
+        let mut buf = Vec::new();
+        ip.write(&mut buf).unwrap();
+        tcp.write(&mut buf).unwrap();
+
+        let layout = PacketLayout {
+            ip_hdr_len: 20,
+            tcp_hdr_len: 20,
+            payload_off: 40,
+            total_len: 40,
+        };
+        let mut view = make_view();
+        view.corrupt_tcp_checksum_delta = None;
+        view.new_ipv4_ttl = Some(5);
+        let modified = build_modified(&buf, &layout, &view).unwrap();
+
+        let ip2 = Ipv4HeaderSlice::from_slice(&modified).unwrap();
+        let tcp2 = TcpHeaderSlice::from_slice(&modified[ip2.slice().len()..]).unwrap();
+        assert_eq!(ip2.ttl(), 5);
+        let calculated = tcp2
+            .to_header()
+            .calc_checksum_ipv4(&ip2.to_header(), &modified[40..])
+            .unwrap();
+        assert_eq!(tcp2.checksum(), calculated);
+        assert_eq!(
+            ip2.header_checksum(),
+            ip2.to_header().calc_header_checksum()
+        );
     }
 
     #[test]

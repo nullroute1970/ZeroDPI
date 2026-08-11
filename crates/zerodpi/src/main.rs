@@ -2498,6 +2498,7 @@ mod tests {
             "sni_spoof",
             "wrong_timestamp"
         ));
+        assert!(mode_requires_packet_interception("sni_spoof", "low_ttl"));
         assert!(mode_requires_packet_interception(
             "sni_spoof",
             "tls_record_frag"

@@ -460,6 +460,10 @@ fn build_wire_method(
     cfg.TLS_RECORD_FRAG_SIZE = wire.tls_record_frag_size;
     cfg.TLS_RECORD_FRAG_SET_PSH = wire.tls_record_frag_set_psh;
     cfg.TLS_RECORD_FRAG_BUMP_IP_IDENT = wire.tls_record_frag_bump_ip_ident;
+    cfg.LOW_TTL_VALUE = wire.low_ttl_value;
+    cfg.LOW_TTL_SET_PSH = wire.low_ttl_set_psh;
+    cfg.LOW_TTL_BUMP_IP_IDENT = wire.low_ttl_bump_ip_ident;
+    cfg.LOW_TTL_COMPLETE_IMMEDIATELY = wire.low_ttl_complete_immediately;
     let method = build_method(&cfg).context("unsupported helper bypass method")?;
     Ok(Arc::from(method))
 }

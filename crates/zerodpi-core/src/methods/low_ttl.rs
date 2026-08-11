@@ -1,11 +1,18 @@
-//! `wrong_ack` bypass: replace the first outbound bare ACK's payload with a
-//! fake TLS ClientHello that keeps the valid TCP sequence number but uses an
-//! intentionally old TCP acknowledgment number.
+//! `low_ttl` bypass: replace the first outbound bare ACK's payload with a fake
+//! TLS ClientHello that carries a whitelisted SNI, and stamp the IP packet with
+//! a low Time-To-Live (TTL) value.
 //!
-//! The DPI middlebox can inspect the spoofed ClientHello and classify the flow
-//! as benign. The real upstream server should reject the segment because its
-//! ACK is before the server's current send window, so it never consumes the
-//! fake payload.
+//! The TTL is tuned so the decoy segment survives exactly as far as an inline
+//! DPI middlebox (typically 4-8 hops from the client) but expires before it
+//! reaches the destination server.  The DPI inspects the decoy ClientHello and
+//! classifies the flow as benign, while the real server never receives the
+//! fake payload.  The TCP handshake still completes because the kernel
+//! retransmits the bare ACK (or the first data segment carries the ACK
+//! itself), and that retransmission passes through unmodified.
+//!
+//! Unlike `wrong_checksum`, the segment keeps valid TCP sequence/acknowledgment
+//! numbers and a valid checksum — the TTL alone is what keeps the server from
+//! seeing it.
 
 use tracing::trace;
 
@@ -14,32 +21,33 @@ use crate::config::Config;
 use crate::flow::FlowState;
 use crate::interceptor::PacketView;
 
-pub struct WrongAck {
-    /// Bytes subtracted from `syn_ack_seq + 1` for the spoofed ACK number.
-    offset: u32,
+pub struct LowTtl {
+    /// IPv4 TTL stamped on the spoofed packet: high enough to reach the ISP's
+    /// DPI middlebox, low enough to expire before the destination server.
+    ttl: u8,
     /// Whether to set the PSH flag on the spoofed packet.
     set_psh: bool,
     /// Whether to bump the IPv4 Identification field on the spoofed packet.
     bump_ip_ident: bool,
     /// Whether to signal bypass completion immediately after emitting the
-    /// old-ACK packet.
+    /// low-TTL packet.
     complete_immediately: bool,
 }
 
-impl WrongAck {
+impl LowTtl {
     pub fn new(cfg: &Config) -> Self {
         Self {
-            offset: cfg.WRONG_ACK_OFFSET,
-            set_psh: cfg.WRONG_ACK_SET_PSH,
-            bump_ip_ident: cfg.WRONG_ACK_BUMP_IP_IDENT,
-            complete_immediately: cfg.WRONG_ACK_COMPLETE_IMMEDIATELY,
+            ttl: cfg.LOW_TTL_VALUE,
+            set_psh: cfg.LOW_TTL_SET_PSH,
+            bump_ip_ident: cfg.LOW_TTL_BUMP_IP_IDENT,
+            complete_immediately: cfg.LOW_TTL_COMPLETE_IMMEDIATELY,
         }
     }
 }
 
-impl BypassMethod for WrongAck {
+impl BypassMethod for LowTtl {
     fn name(&self) -> &'static str {
-        "wrong_ack"
+        "low_ttl"
     }
 
     fn on_handshake_complete_ack(
@@ -47,34 +55,29 @@ impl BypassMethod for WrongAck {
         flow: &FlowState,
         pkt: &mut PacketView<'_>,
     ) -> MethodAction {
-        let syn_ack_seq = flow
-            .syn_ack_seq
-            .expect("syn_ack_seq must be set before handshake-complete ACK");
         let payload = flow.fake_data.clone();
         let payload_len = payload.len();
-        let new_ack = syn_ack_seq.wrapping_add(1).wrapping_sub(self.offset);
 
         let mut flags = pkt.flags;
         flags.psh = self.set_psh;
 
-        // Keep the kernel ACK's valid sequence number and move only the TCP
-        // acknowledgment number before the server's send window.
-        pkt.new_ack = Some(new_ack);
+        // Keep the kernel ACK's valid seq/ack numbers and a valid checksum.
+        // The low TTL is what stops the fake payload from reaching the server.
         pkt.new_flags = Some(flags);
         pkt.new_payload = Some(payload);
         pkt.bump_ipv4_ident = self.bump_ip_ident;
+        pkt.new_ipv4_ttl = Some(self.ttl);
 
         trace!(
-            target = "zerodpi::wrong_ack",
+            target = "zerodpi::low_ttl",
             seq = pkt.seq,
             ack = pkt.ack,
-            new_ack,
             payload_len,
-            offset = self.offset,
+            ttl = self.ttl,
             set_psh = self.set_psh,
             bump_ip_ident = self.bump_ip_ident,
             complete_immediately = self.complete_immediately,
-            "staged fake ClientHello with old TCP acknowledgment number"
+            "staged fake ClientHello with low IP TTL"
         );
 
         if self.complete_immediately {
@@ -97,7 +100,7 @@ mod tests {
         toml::from_str(
             r#"LISTEN_HOST = "127.0.0.1"
                LISTEN_PORT = 44444
-               BYPASS_METHOD = "wrong_ack""#,
+               BYPASS_METHOD = "low_ttl""#,
         )
         .unwrap()
     }
@@ -131,65 +134,41 @@ mod tests {
     }
 
     #[test]
-    fn stages_payload_preserves_seq_and_sets_old_ack() {
+    fn stages_payload_keeps_valid_seq_and_sets_ttl() {
         let mut state = FlowState::new(vec![0xAB; 517]);
         state.syn_seq = Some(1000);
         state.syn_ack_seq = Some(2000);
 
         let mut pkt = ack_pkt(1000, 2000);
-        let action = WrongAck::new(&default_cfg()).on_handshake_complete_ack(&state, &mut pkt);
+        let action = LowTtl::new(&default_cfg()).on_handshake_complete_ack(&state, &mut pkt);
 
         assert_eq!(action, MethodAction::emit_and_complete());
         assert_eq!(pkt.seq, 1001);
         assert_eq!(pkt.ack, 2001);
         assert_eq!(pkt.new_seq, None);
-        assert_eq!(pkt.new_ack, Some(2000));
+        assert_eq!(pkt.new_ack, None);
         assert_eq!(pkt.new_payload.as_ref().unwrap().len(), 517);
         assert!(pkt.new_flags.unwrap().psh);
         assert!(pkt.bump_ipv4_ident);
+        assert_eq!(pkt.new_ipv4_ttl, Some(5));
         assert_eq!(pkt.corrupt_tcp_checksum_delta, None);
-    }
-
-    #[test]
-    fn offset_shifts_ack_further_back() {
-        let mut cfg = default_cfg();
-        cfg.WRONG_ACK_OFFSET = 7;
-        let mut state = FlowState::new(vec![0xCD; 10]);
-        state.syn_ack_seq = Some(2000);
-
-        let mut pkt = ack_pkt(10, 2000);
-        WrongAck::new(&cfg).on_handshake_complete_ack(&state, &mut pkt);
-
-        assert_eq!(pkt.new_ack, Some(2001u32.wrapping_sub(7)));
     }
 
     #[test]
     fn honors_disabled_toggles_and_completion_wait() {
         let mut cfg = default_cfg();
-        cfg.WRONG_ACK_SET_PSH = false;
-        cfg.WRONG_ACK_BUMP_IP_IDENT = false;
-        cfg.WRONG_ACK_COMPLETE_IMMEDIATELY = false;
-        let mut state = FlowState::new(vec![0xCD; 10]);
-        state.syn_ack_seq = Some(20);
+        cfg.LOW_TTL_VALUE = 8;
+        cfg.LOW_TTL_SET_PSH = false;
+        cfg.LOW_TTL_BUMP_IP_IDENT = false;
+        cfg.LOW_TTL_COMPLETE_IMMEDIATELY = false;
 
+        let state = FlowState::new(vec![0xCD; 10]);
         let mut pkt = ack_pkt(10, 20);
-        let action = WrongAck::new(&cfg).on_handshake_complete_ack(&state, &mut pkt);
+        let action = LowTtl::new(&cfg).on_handshake_complete_ack(&state, &mut pkt);
 
         assert_eq!(action, MethodAction::emit_and_wait_for_ack());
         assert!(!pkt.new_flags.unwrap().psh);
         assert!(!pkt.bump_ipv4_ident);
-    }
-
-    #[test]
-    fn handles_ack_wraparound() {
-        let mut cfg = default_cfg();
-        cfg.WRONG_ACK_OFFSET = 7;
-        let mut state = FlowState::new(vec![0; 517]);
-        state.syn_ack_seq = Some(2);
-
-        let mut pkt = ack_pkt(10, 2);
-        WrongAck::new(&cfg).on_handshake_complete_ack(&state, &mut pkt);
-
-        assert_eq!(pkt.new_ack, Some(3u32.wrapping_sub(7)));
+        assert_eq!(pkt.new_ipv4_ttl, Some(8));
     }
 }

@@ -351,7 +351,8 @@ Combination limits:
   `tls_record_frag`; it cannot be combined with other handshake-stage methods.
 - `MODE = "ip_bypass_plus"` supports only `tls_record_frag` or `tls_frag` so
   the VPN client's real SNI is preserved.
-- `LOW_TTL_DISCOVER = true` requires `low_ttl` in the list.
+- `LOW_TTL_DISCOVER` only takes effect when `low_ttl` is in the list;
+  otherwise discovery is silently skipped.
 
 How combinations behave:
 
@@ -665,6 +666,7 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 With `LOW_TTL_DISCOVER = true`, ZeroDPI probes TTL candidates from `1` up to `LOW_TTL_DISCOVER_MAX` at startup (before the listener starts) and applies the **largest working value** — the target server's hop distance minus one — which reaches any inline DPI with maximum margin. Each probe runs the full bypass machinery: a decoy ClientHello carrying the selected whitelisted SNI is injected with the candidate TTL, then a real TLS handshake verifies the decoy was neither dropped before the DPI nor delivered to the server. Discovery re-runs whenever a background rescan hot-swaps the SNI/IP target (new connections briefly keep the previous TTL until discovery finishes). Requirements and caveats:
 
 - `LOW_TTL_COMPLETE_IMMEDIATELY` must be `true`; otherwise discovery is skipped with a warning.
+- `low_ttl` must be in `BYPASS_METHOD`; otherwise discovery is skipped silently.
 - Discovery adds a one-time startup delay — typically a few seconds, up to roughly `LOW_TTL_DISCOVER_MAX` × `LOW_TTL_DISCOVER_TIMEOUT_MS` in the worst case.
 - The discovered value is session-only and shown in the logs and dashboard; copy it into `LOW_TTL_VALUE` to make it permanent.
 - On Android/Linux the discovery probes and result are applied through the root helper (`SetLowTtlValue` protocol message); no reconfiguration is needed.

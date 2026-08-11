@@ -927,7 +927,7 @@ fn default_rescan_interval_secs() -> u64 {
 }
 fn default_method() -> BypassMethodList {
     // `low_ttl` is included because LOW_TTL_DISCOVER defaults to `true` and
-    // validation requires "low_ttl" in BYPASS_METHOD when discovery is on.
+    // discovery only runs when `low_ttl` is in BYPASS_METHOD.
     BypassMethodList::from_delimited("wrong_seq_tls_frag, low_ttl")
 }
 fn default_queue_num() -> u16 {
@@ -1164,9 +1164,6 @@ impl Config {
         }
         if self.LOW_TTL_DISCOVER_TIMEOUT_MS < 100 {
             anyhow::bail!("LOW_TTL_DISCOVER_TIMEOUT_MS must be >= 100");
-        }
-        if self.LOW_TTL_DISCOVER && !self.BYPASS_METHOD.contains("low_ttl") {
-            anyhow::bail!("LOW_TTL_DISCOVER = true requires \"low_ttl\" in BYPASS_METHOD");
         }
         if self.TLS_RECORD_FRAG_SIZE == 0 {
             anyhow::bail!("TLS_RECORD_FRAG_SIZE must be >= 1");
@@ -1885,7 +1882,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_low_ttl_discover_without_low_ttl_method() {
+    fn accepts_low_ttl_discover_without_low_ttl_method() {
+        // Discovery is skipped at runtime when `low_ttl` is not in the list;
+        // the config must still load.
         let toml_str = r#"
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
@@ -1893,7 +1892,7 @@ mod tests {
             LOW_TTL_DISCOVER = true
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert!(cfg.validate().is_err());
+        cfg.validate().unwrap();
     }
 
     #[test]

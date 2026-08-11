@@ -1922,6 +1922,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "zerodpi-core",

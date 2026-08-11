@@ -264,14 +264,15 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   methods.
 # - MODE = "ip_bypass_plus" supports only "tls_record_frag" or "tls_frag" so
 #   the upstream VPN client's real SNI is preserved.
-# - LOW_TTL_DISCOVER = true requires "low_ttl" in the list.
+# - LOW_TTL_DISCOVER only takes effect when "low_ttl" is in the list;
+#   otherwise discovery is silently skipped.
 #
 # This setting is used by SNI-based modes ("sni_spoof", "sni_scan", and
 # "proxy_scan").  The "ip_bypass" and "ip_scan" modes do not use a bypass
 # method.
 #
 # "low_ttl" is included because LOW_TTL_DISCOVER defaults to true (see below)
-# and validation requires "low_ttl" in this list when discovery is enabled.
+# and discovery only runs when "low_ttl" is in this list.
 BYPASS_METHOD = ["wrong_seq_tls_frag", "low_ttl"]
 
 # Seconds the proxy waits for the intercept thread to confirm that the spoofed
@@ -420,7 +421,8 @@ LOW_TTL_COMPLETE_IMMEDIATELY = true
 # + full TLS handshake), and applies the largest working value: the server's
 # hop distance minus one, which reaches any inline DPI middlebox with maximum
 # margin.  It adds a one-time startup delay (a few seconds up to ~30 s worst
-# case) and requires LOW_TTL_COMPLETE_IMMEDIATELY = true.
+# case), requires LOW_TTL_COMPLETE_IMMEDIATELY = true, and only runs when
+# "low_ttl" is in the BYPASS_METHOD list.
 #
 # Default: true.
 LOW_TTL_DISCOVER = true

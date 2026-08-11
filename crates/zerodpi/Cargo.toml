@@ -9,6 +9,9 @@ repository.workspace = true
 description = "ZeroDPI: cross-platform DPI bypass via SNI spoofing."
 default-run = "zerodpi"
 
+[dev-dependencies]
+toml.workspace = true
+
 [[bin]]
 name = "zerodpi"
 path = "src/main.rs"

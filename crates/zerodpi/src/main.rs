@@ -530,36 +530,39 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
 
     // ---- step 3b: automatic LOW_TTL_VALUE discovery ----
-    let low_ttl_discovery_state = if cfg.LOW_TTL_DISCOVER {
-        if !cfg.LOW_TTL_COMPLETE_IMMEDIATELY {
+    let low_ttl_discovery_state = match decide_low_ttl_discovery(&cfg) {
+        LowTtlDiscoveryDecision::Disabled => None,
+        LowTtlDiscoveryDecision::SkippedNoLowTtlMethod => None,
+        LowTtlDiscoveryDecision::SkippedCompleteImmediately => {
             warn!(
                 "LOW_TTL_DISCOVER requires LOW_TTL_COMPLETE_IMMEDIATELY = true; \
                  keeping LOW_TTL_VALUE = {}",
                 cfg.LOW_TTL_VALUE
             );
             None
-        } else if let Some(handle) = low_ttl_handle.clone() {
-            Some(LowTtlDiscoveryState {
-                settings: LowTtlDiscovery::from_config(&cfg),
-                connector: zerodpi_core::low_ttl_discover::make_discovery_tls_connector(),
-                flow_controller: flow_controller.clone(),
-                interface_ip,
-                applier: LowTtlApplier::Local(handle),
-            })
-        } else if let Some(helper) = remote_helper.clone() {
-            Some(LowTtlDiscoveryState {
-                settings: LowTtlDiscovery::from_config(&cfg),
-                connector: zerodpi_core::low_ttl_discover::make_discovery_tls_connector(),
-                flow_controller: flow_controller.clone(),
-                interface_ip,
-                applier: LowTtlApplier::Remote(helper),
-            })
-        } else {
-            warn!("LOW_TTL_DISCOVER skipped: no interceptor method handle available");
-            None
         }
-    } else {
-        None
+        LowTtlDiscoveryDecision::Run => {
+            if let Some(handle) = low_ttl_handle.clone() {
+                Some(LowTtlDiscoveryState {
+                    settings: LowTtlDiscovery::from_config(&cfg),
+                    connector: zerodpi_core::low_ttl_discover::make_discovery_tls_connector(),
+                    flow_controller: flow_controller.clone(),
+                    interface_ip,
+                    applier: LowTtlApplier::Local(handle),
+                })
+            } else if let Some(helper) = remote_helper.clone() {
+                Some(LowTtlDiscoveryState {
+                    settings: LowTtlDiscovery::from_config(&cfg),
+                    connector: zerodpi_core::low_ttl_discover::make_discovery_tls_connector(),
+                    flow_controller: flow_controller.clone(),
+                    interface_ip,
+                    applier: LowTtlApplier::Remote(helper),
+                })
+            } else {
+                warn!("LOW_TTL_DISCOVER skipped: no interceptor method handle available");
+                None
+            }
+        }
     };
 
     if let Some(discovery_state) = low_ttl_discovery_state.as_ref() {
@@ -916,6 +919,36 @@ fn log_ip_scan_top(context: &str, entries: &[IpProbeEntry]) {
             remaining = entries.len() - 5,
             "{context}: additional candidates omitted"
         );
+    }
+}
+
+/// Whether `LOW_TTL_DISCOVER` should probe TTL candidates for this config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LowTtlDiscoveryDecision {
+    /// `LOW_TTL_DISCOVER = false`: discovery disabled.
+    Disabled,
+    /// Discovery enabled but skipped: `LOW_TTL_COMPLETE_IMMEDIATELY = false`.
+    SkippedCompleteImmediately,
+    /// Discovery enabled but skipped: `low_ttl` not in `BYPASS_METHOD`.
+    /// Skipped silently because the config is valid either way.
+    SkippedNoLowTtlMethod,
+    /// Discovery enabled and should run.
+    Run,
+}
+
+/// Decides whether `LOW_TTL_DISCOVER` probes TTL candidates.
+///
+/// Discovery applies its result through the live `low_ttl` method's TTL
+/// handle, so it only runs when `low_ttl` is actually in `BYPASS_METHOD`.
+fn decide_low_ttl_discovery(cfg: &Config) -> LowTtlDiscoveryDecision {
+    if !cfg.LOW_TTL_DISCOVER {
+        LowTtlDiscoveryDecision::Disabled
+    } else if !cfg.LOW_TTL_COMPLETE_IMMEDIATELY {
+        LowTtlDiscoveryDecision::SkippedCompleteImmediately
+    } else if !cfg.BYPASS_METHOD.contains("low_ttl") {
+        LowTtlDiscoveryDecision::SkippedNoLowTtlMethod
+    } else {
+        LowTtlDiscoveryDecision::Run
     }
 }
 
@@ -2625,6 +2658,56 @@ mod tests {
 
     fn method_list(name: &str) -> BypassMethodList {
         BypassMethodList::from(name)
+    }
+
+    fn config_with(toml_extra: &str) -> Config {
+        let toml_str = format!(
+            r#"
+                LISTEN_HOST = "0.0.0.0"
+                LISTEN_PORT = 40443
+                {toml_extra}
+            "#
+        );
+        toml::from_str(&toml_str).unwrap()
+    }
+
+    #[test]
+    fn low_ttl_discover_runs_when_low_ttl_method_listed() {
+        let cfg = config_with(r#"BYPASS_METHOD = "low_ttl""#);
+        assert_eq!(decide_low_ttl_discovery(&cfg), LowTtlDiscoveryDecision::Run);
+    }
+
+    #[test]
+    fn low_ttl_discover_silently_skipped_when_method_not_listed() {
+        let cfg = config_with(r#"BYPASS_METHOD = "wrong_seq""#);
+        assert_eq!(
+            decide_low_ttl_discovery(&cfg),
+            LowTtlDiscoveryDecision::SkippedNoLowTtlMethod
+        );
+    }
+
+    #[test]
+    fn low_ttl_discover_disabled_when_flag_false() {
+        let cfg = config_with(
+            r#"BYPASS_METHOD = "low_ttl"
+                LOW_TTL_DISCOVER = false"#,
+        );
+        assert_eq!(
+            decide_low_ttl_discovery(&cfg),
+            LowTtlDiscoveryDecision::Disabled
+        );
+    }
+
+    #[test]
+    fn low_ttl_discover_skipped_without_complete_immediately() {
+        let cfg = config_with(
+            r#"BYPASS_METHOD = "low_ttl"
+                LOW_TTL_COMPLETE_IMMEDIATELY = false"#,
+        );
+        assert_eq!(
+            decide_low_ttl_discovery(&cfg),
+            LowTtlDiscoveryDecision::SkippedCompleteImmediately
+        );
     }
 
     #[test]

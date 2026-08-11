@@ -176,6 +176,7 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
         "wrong_seq_tls_record_frag" => Some(Box::new(
             wrong_seq_tls_record_frag::WrongSeqTlsRecordFrag::new(cfg),
         )),
+        "urg_sni_split" => Some(Box::new(urg_sni_split::UrgSniSplit::new(cfg))),
         // "tls_frag" is socket-based and handled directly in proxy.rs.
         _ => None,
     }
@@ -255,6 +256,13 @@ mod tests {
         let cfg = cfg_with_method("wrong_seq_tls_record_frag");
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "wrong_seq_tls_record_frag");
+    }
+
+    #[test]
+    fn build_urg_sni_split_method() {
+        let cfg = cfg_with_method("urg_sni_split");
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "urg_sni_split");
     }
 
     #[test]

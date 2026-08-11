@@ -124,13 +124,116 @@ fn insert_dummy(payload: &[u8], at: usize, byte: u8) -> Vec<u8> {
     out
 }
 
+/// `urg_sni_split` bypass method.
+pub struct UrgSniSplit {
+    dummy_byte: u8,
+    position: SniSplitPosition,
+}
+
+impl UrgSniSplit {
+    pub fn new(cfg: &Config) -> Self {
+        Self {
+            dummy_byte: cfg.SNI_SPLIT_DUMMY_BYTE,
+            position: cfg.SNI_SPLIT_POSITION,
+        }
+    }
+}
+
+impl BypassMethod for UrgSniSplit {
+    fn name(&self) -> &'static str {
+        "urg_sni_split"
+    }
+
+    /// Returns `PassThrough` — this method operates on the first data packet,
+    /// not the handshake-complete ACK. The handler sets `waiting_for_data` and
+    /// calls [`on_first_data_packet`] instead.
+    ///
+    /// [`on_first_data_packet`]: UrgSniSplit::on_first_data_packet
+    fn on_handshake_complete_ack(
+        &self,
+        _flow: &FlowState,
+        _pkt: &mut PacketView<'_>,
+    ) -> MethodAction {
+        MethodAction::PassThrough
+    }
+
+    /// Splices the dummy byte into the middle of the SNI and stages the URG
+    /// flag and urgent pointer, then returns `EmitFakeAndAccept` to signal
+    /// bypass completion. When the payload does not contain a parseable
+    /// ClientHello with an SNI, returns `PassThrough` so the handler keeps
+    /// offering subsequent data packets.
+    fn on_first_data_packet(&self, _flow: &FlowState, pkt: &mut PacketView<'_>) -> MethodAction {
+        let Some((name_start, name_len)) = find_sni_range(pkt.payload) else {
+            return MethodAction::PassThrough;
+        };
+        let insert_at = name_start + resolve_insert_position(name_len, self.position);
+        let new_payload = insert_dummy(pkt.payload, insert_at, self.dummy_byte);
+
+        let mut flags = pkt.flags;
+        flags.urg = true;
+
+        // RFC 793: the urgent pointer is the offset from this segment's
+        // sequence number, one byte past the urgent data.
+        let urgent_pointer = u16::try_from(insert_at + 1).unwrap_or(u16::MAX);
+
+        pkt.new_payload = Some(new_payload);
+        pkt.new_flags = Some(flags);
+        pkt.new_urgent_pointer = Some(urgent_pointer);
+
+        MethodAction::emit_and_complete()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
+    use crate::flow::FlowState;
+    use crate::interceptor::{Direction, PacketView, TcpFlags};
     use crate::tls_template::build_client_hello;
 
     fn client_hello(sni: &[u8]) -> Vec<u8> {
         build_client_hello(&[0u8; 32], &[0u8; 32], sni, &[0u8; 32])
+    }
+
+    fn default_cfg() -> Config {
+        toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .unwrap()
+    }
+
+    fn data_pkt(payload: &'static [u8]) -> PacketView<'static> {
+        let payload_len = payload.len();
+        PacketView {
+            direction: Direction::Outbound,
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            src_port: 12345,
+            dst_port: 443,
+            seq: 1001,
+            ack: 5001,
+            flags: TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            payload_len,
+            payload,
+            tcp_options: &[],
+            new_seq: None,
+            new_ack: None,
+            new_flags: None,
+            new_payload: None,
+            replace_tcp_options: None,
+            append_tcp_options: Vec::new(),
+            bump_ipv4_ident: false,
+            corrupt_tcp_checksum_delta: None,
+            new_ipv4_ttl: None,
+            new_urgent_pointer: None,
+        }
     }
 
     #[test]
@@ -229,5 +332,74 @@ mod tests {
     fn insert_dummy_at_zero_and_end() {
         assert_eq!(insert_dummy(b"ab", 0, 0x00), vec![0x00, b'a', b'b']);
         assert_eq!(insert_dummy(b"ab", 2, 0x00), vec![b'a', b'b', 0x00]);
+    }
+
+    #[test]
+    fn on_handshake_complete_ack_is_passthrough() {
+        let method = UrgSniSplit::new(&default_cfg());
+        let state = FlowState::new(vec![]);
+        let mut pkt = data_pkt(&[]);
+        assert_eq!(
+            method.on_handshake_complete_ack(&state, &mut pkt),
+            MethodAction::PassThrough
+        );
+    }
+
+    #[test]
+    fn on_first_data_packet_splits_sni_and_sets_urg() {
+        let method = UrgSniSplit::new(&default_cfg());
+        let state = FlowState::new(vec![]);
+        let sni = b"auth.vercel.com";
+        let ch = client_hello(sni);
+        let payload: &'static [u8] = Box::leak(ch.into_boxed_slice());
+        let mut pkt = data_pkt(payload);
+
+        let action = method.on_first_data_packet(&state, &mut pkt);
+
+        assert_eq!(action, MethodAction::emit_and_complete());
+        let new_payload = pkt.new_payload.as_ref().unwrap();
+        assert_eq!(new_payload.len(), payload.len() + 1);
+        // "auth.vercel.com" is 15 bytes; middle = index 7; SNI starts at 127.
+        let insert_at = 127 + 7;
+        assert_eq!(new_payload[insert_at], 0); // default dummy byte
+        assert_eq!(&new_payload[..insert_at], &payload[..insert_at]);
+        assert_eq!(&new_payload[insert_at + 1..], &payload[insert_at..]);
+        let flags = pkt.new_flags.unwrap();
+        assert!(flags.urg);
+        assert!(flags.ack);
+        assert!(flags.psh);
+        assert_eq!(pkt.new_urgent_pointer, Some((insert_at + 1) as u16));
+    }
+
+    #[test]
+    fn configurable_byte_and_position() {
+        let mut cfg = default_cfg();
+        cfg.SNI_SPLIT_DUMMY_BYTE = b'X';
+        cfg.SNI_SPLIT_POSITION = SniSplitPosition::Start;
+        let method = UrgSniSplit::new(&cfg);
+        let state = FlowState::new(vec![]);
+        let ch = client_hello(b"mci.ir");
+        let payload: &'static [u8] = Box::leak(ch.into_boxed_slice());
+        let mut pkt = data_pkt(payload);
+
+        let action = method.on_first_data_packet(&state, &mut pkt);
+
+        assert_eq!(action, MethodAction::emit_and_complete());
+        let new_payload = pkt.new_payload.as_ref().unwrap();
+        assert_eq!(new_payload[127], b'X');
+        assert_eq!(new_payload[128], b'm');
+        assert_eq!(pkt.new_urgent_pointer, Some(128));
+    }
+
+    #[test]
+    fn passes_through_when_sni_not_found() {
+        let method = UrgSniSplit::new(&default_cfg());
+        let state = FlowState::new(vec![]);
+        let mut pkt = data_pkt(b"GET / HTTP/1.1");
+        let action = method.on_first_data_packet(&state, &mut pkt);
+        assert_eq!(action, MethodAction::PassThrough);
+        assert!(pkt.new_payload.is_none());
+        assert!(pkt.new_flags.is_none());
+        assert!(pkt.new_urgent_pointer.is_none());
     }
 }

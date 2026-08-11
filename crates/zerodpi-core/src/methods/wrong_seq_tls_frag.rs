@@ -27,8 +27,8 @@ impl WrongSeqTlsFrag {
 }
 
 impl BypassMethod for WrongSeqTlsFrag {
-    fn name(&self) -> &'static str {
-        "wrong_seq_tls_frag"
+    fn name(&self) -> String {
+        "wrong_seq_tls_frag".into()
     }
 
     fn on_handshake_complete_ack(

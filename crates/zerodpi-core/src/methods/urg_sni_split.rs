@@ -140,8 +140,8 @@ impl UrgSniSplit {
 }
 
 impl BypassMethod for UrgSniSplit {
-    fn name(&self) -> &'static str {
-        "urg_sni_split"
+    fn name(&self) -> String {
+        "urg_sni_split".into()
     }
 
     /// Returns `PassThrough` — this method operates on the first data packet,

@@ -38,8 +38,8 @@ impl WrongChecksum {
 }
 
 impl BypassMethod for WrongChecksum {
-    fn name(&self) -> &'static str {
-        "wrong_checksum"
+    fn name(&self) -> String {
+        "wrong_checksum".into()
     }
 
     fn on_handshake_complete_ack(

@@ -38,8 +38,8 @@ impl WrongAck {
 }
 
 impl BypassMethod for WrongAck {
-    fn name(&self) -> &'static str {
-        "wrong_ack"
+    fn name(&self) -> String {
+        "wrong_ack".into()
     }
 
     fn on_handshake_complete_ack(

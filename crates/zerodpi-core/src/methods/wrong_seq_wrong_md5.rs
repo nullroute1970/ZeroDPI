@@ -30,8 +30,8 @@ impl WrongSeqWrongMd5 {
 }
 
 impl BypassMethod for WrongSeqWrongMd5 {
-    fn name(&self) -> &'static str {
-        "wrong_seq_wrong_md5"
+    fn name(&self) -> String {
+        "wrong_seq_wrong_md5".into()
     }
 
     fn on_handshake_complete_ack(

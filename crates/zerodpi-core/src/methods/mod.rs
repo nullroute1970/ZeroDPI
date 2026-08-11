@@ -33,6 +33,7 @@
 //! registered in [`build_method`].  New socket-based methods must be wired
 //! directly into `proxy.rs` instead.
 
+pub mod composite;
 pub mod low_ttl;
 pub mod tcp_segmentation;
 pub mod tls_record_frag;
@@ -111,8 +112,9 @@ impl MethodAction {
 
 /// A pluggable DPI-bypass technique.
 pub trait BypassMethod: Send + Sync + 'static {
-    /// Short identifier (matches the `BYPASS_METHOD` config value).
-    fn name(&self) -> &'static str;
+    /// Human-readable identifier (matches the `BYPASS_METHOD` config value, or
+    /// a `" + "`-joined list for a composite).
+    fn name(&self) -> String;
 
     /// Handle to the IPv4 TTL stamped by the `low_ttl` method.
     ///

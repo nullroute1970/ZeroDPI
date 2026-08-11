@@ -59,8 +59,8 @@ impl LowTtl {
 }
 
 impl BypassMethod for LowTtl {
-    fn name(&self) -> &'static str {
-        "low_ttl"
+    fn name(&self) -> String {
+        "low_ttl".into()
     }
 
     fn low_ttl_handle(&self) -> Option<Arc<AtomicU8>> {

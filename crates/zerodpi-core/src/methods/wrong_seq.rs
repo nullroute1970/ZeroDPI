@@ -36,8 +36,8 @@ impl WrongSeq {
 }
 
 impl BypassMethod for WrongSeq {
-    fn name(&self) -> &'static str {
-        "wrong_seq"
+    fn name(&self) -> String {
+        "wrong_seq".into()
     }
 
     fn on_handshake_complete_ack(

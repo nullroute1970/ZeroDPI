@@ -102,8 +102,8 @@ impl WrongTimestamp {
 }
 
 impl BypassMethod for WrongTimestamp {
-    fn name(&self) -> &'static str {
-        "wrong_timestamp"
+    fn name(&self) -> String {
+        "wrong_timestamp".into()
     }
 
     fn on_handshake_complete_ack(

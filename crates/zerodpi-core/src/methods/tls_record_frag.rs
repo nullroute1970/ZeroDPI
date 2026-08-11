@@ -58,8 +58,8 @@ impl TlsRecordFrag {
 }
 
 impl BypassMethod for TlsRecordFrag {
-    fn name(&self) -> &'static str {
-        "tls_record_frag"
+    fn name(&self) -> String {
+        "tls_record_frag".into()
     }
 
     /// Returns `PassThrough` — this method operates on the first data packet,

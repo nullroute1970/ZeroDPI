@@ -26,8 +26,8 @@ impl WrongMd5TlsFrag {
 }
 
 impl BypassMethod for WrongMd5TlsFrag {
-    fn name(&self) -> &'static str {
-        "wrong_md5_tls_frag"
+    fn name(&self) -> String {
+        "wrong_md5_tls_frag".into()
     }
 
     fn on_handshake_complete_ack(

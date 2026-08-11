@@ -226,6 +226,16 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     TLS records across fragment boundaries will fail to extract the SNI.  The
 #     upstream TLS server reassembles the fragments normally.
 #
+#   "urg_sni_split"
+#     TCP Urgent + SNI byte splice.  Does NOT inject any fake packet.  Instead,
+#     it intercepts the first outbound data packet carrying the real TLS
+#     ClientHello, splices a single dummy byte (SNI_SPLIT_DUMMY_BYTE) into the
+#     middle of the SNI domain string (at SNI_SPLIT_POSITION), and sets the TCP
+#     URG flag with the urgent pointer marking the dummy byte.  BSD-style
+#     destination stacks extract the urgent byte from the stream, so the server
+#     still receives the original ClientHello; DPI middleboxes that read the
+#     raw byte stream sequentially see a mangled SNI instead.
+#
 #   "wrong_seq_tls_frag" (default)
 #     Combines wrong_seq with TLS Fragment / TCP-level fragmentation for
 #     layered filtering.  First, it injects a fake wrong-sequence ClientHello

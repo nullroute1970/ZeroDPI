@@ -5,6 +5,11 @@
 //! - on Windows: [`windows::WinDivertInterceptor`]
 //!
 //! Both implement [`zerodpi_core::interceptor::PacketInterceptor`].
+//!
+//! Socket-only bypass configurations (`BYPASS_METHOD = ["tls_frag"]`) never
+//! open these backends; a method list containing other methods alongside
+//! `tls_frag` still requires interception. See the `BYPASS_METHOD` docs in
+//! zerodpi-core for the list syntax and combination limits.
 
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),

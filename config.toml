@@ -149,9 +149,14 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 # Bypass Engine
 # ---------------------------------------------------------------------------
 
-# Bypass method to use for SNI-spoof mode.
+# Bypass method(s) to use for SNI-spoof mode.
 #
-# Supported values:
+# Accepts a single method name or a list of method names, e.g.:
+#
+#   BYPASS_METHOD = "wrong_seq"
+#   BYPASS_METHOD = ["wrong_seq", "tls_frag"]
+#
+# Base methods:
 #
 #   "wrong_seq"
 #     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
@@ -174,21 +179,6 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     TCP sequence number and ACK number plus a TCP-MD5 Signature option.  DPI
 #     devices can inspect the payload using the allowed SNI, while the real
 #     upstream server rejects the segment because no TCP-MD5 key was negotiated.
-#
-#   "wrong_seq_wrong_md5"
-#     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
-#     then injects a fake TLS ClientHello on that packet with a deliberately
-#     old TCP sequence number plus a TCP-MD5 Signature option.  DPI devices can
-#     inspect the payload using the allowed SNI, while the real upstream server
-#     rejects the segment because it is out of window and no TCP-MD5 key was
-#     negotiated.
-#
-#   "wrong_md5_tls_frag"
-#     Combines wrong_md5 with TLS Fragment / TCP-level fragmentation for
-#     layered filtering.  First, it injects a fake TCP-MD5 ClientHello on the
-#     handshake ACK.  Then it fragments configured real client data using the
-#     TLS_FRAG_* settings, so later DPI layers still do not see the complete
-#     SNI in any single TCP segment.
 #
 #   "wrong_ack"
 #     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
@@ -236,22 +226,6 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     still receives the original ClientHello; DPI middleboxes that read the
 #     raw byte stream sequentially see a mangled SNI instead.
 #
-#   "wrong_seq_tls_frag" (default)
-#     Combines wrong_seq with TLS Fragment / TCP-level fragmentation for
-#     layered filtering.  First, it injects a fake wrong-sequence ClientHello
-#     on the handshake ACK.  Then it fragments configured real client data
-#     using the TLS_FRAG_* settings, so later DPI layers still do not see the
-#     complete SNI in any single TCP segment even if the fake packet was
-#     dropped by an earlier firewall.
-#
-#   "wrong_seq_tls_record_frag"
-#     Combines wrong_seq with TLS Record Fragment / TLS-layer fragmentation for
-#     layered filtering.  First, it injects a fake wrong-sequence ClientHello
-#     on the handshake ACK.  Then it intercepts the real first ClientHello and
-#     re-wraps it as TLS record fragments, so later DPI layers still do not see
-#     an unfragmented TLS record containing the SNI even if the fake packet was
-#     dropped by an earlier firewall.
-#
 #   "tls_frag"
 #     TLS Fragment / TCP-level fragmentation.  Does NOT inject fake packets
 #     and does NOT use WinDivert or NFQUEUE packet interception.  Instead, it
@@ -261,10 +235,40 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     likely to coalesce small writes, so no single packet carries the full
 #     SNI.  The upstream server reassembles the stream normally.
 #
+# Combo aliases (equivalent to their expanded lists, kept for compatibility):
+#
+#   "wrong_seq_wrong_md5"        -> ["wrong_seq", "wrong_md5"]
+#   "wrong_seq_tls_frag"         -> ["wrong_seq", "tls_frag"]          (default)
+#   "wrong_md5_tls_frag"         -> ["wrong_md5", "tls_frag"]
+#   "wrong_seq_tls_record_frag"  -> ["wrong_seq", "tls_record_frag"]
+#
+# Combining methods:
+#
+# - Handshake-stage methods (wrong_seq, wrong_ack, wrong_checksum, wrong_md5,
+#   wrong_timestamp, low_ttl) all inject the same fake ClientHello; when
+#   several are listed they merge their tricks onto that one fake packet.
+#   PSH / IPv4-Identification behavior comes from the first listed method;
+#   completion behavior comes from the last listed method.
+# - "tls_record_frag" and/or "tls_frag" add the data stage after the fake
+#   packet: TLS-record fragmentation inside the interceptor and TCP-level
+#   write segmentation inside the proxy respectively.  A list containing
+#   "tls_frag" alongside other methods still uses packet interception.
+# - A list of exactly ["tls_frag"] skips the packet interceptor entirely.
+#
+# Limitations:
+#
+# - The list must not be empty and must not contain duplicate method names
+#   (after alias expansion).
+# - "urg_sni_split" can only be used alone or together with "tls_frag" /
+#   "tls_record_frag"; it cannot be combined with other handshake-stage
+#   methods.
+# - MODE = "ip_bypass_plus" supports only "tls_record_frag" or "tls_frag" so
+#   the upstream VPN client's real SNI is preserved.
+# - LOW_TTL_DISCOVER = true requires "low_ttl" in the list.
+#
 # This setting is used by SNI-based modes ("sni_spoof", "sni_scan", and
-# "proxy_scan").  MODE = "ip_bypass_plus" supports only "tls_record_frag" or
-# "tls_frag" so the upstream VPN client's real SNI is preserved. The
-# "ip_bypass" and "ip_scan" modes do not use a bypass method.
+# "proxy_scan").  The "ip_bypass" and "ip_scan" modes do not use a bypass
+# method.
 BYPASS_METHOD = "wrong_seq_tls_frag"
 
 # Seconds the proxy waits for the intercept thread to confirm that the spoofed

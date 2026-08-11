@@ -52,7 +52,7 @@ It is not a replacement VPN client. It is a local TCP relay that your existing V
 
 | Feature | Description |
 |---------|-------------|
-| 🧩 **13 bypass methods** | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, `tls_frag`, `urg_sni_split` |
+| 🧩 **9 combinable bypass methods** | `wrong_seq`, `wrong_ack`, `wrong_checksum`, `wrong_md5`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `tls_frag`, `urg_sni_split` — combinable via `BYPASS_METHOD = ["wrong_seq", "tls_frag"]` |
 | 🎯 **6 operating modes** | `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan` |
 | 🖥️ **TUI dashboard** | Ratatui-powered live progress, selection tables, and connection monitoring |
 | 🔄 **Auto-rescan** | Background re-scanning hot-swaps the best target without restart |
@@ -325,16 +325,48 @@ Results are blended using a configurable weight and displayed in the TUI.
 | `wrong_seq` | Injects fake ClientHello with deliberately old TCP sequence number | ✅ Yes (WinDivert/NFQUEUE) | Most DPI systems |
 | `wrong_checksum` | Injects fake ClientHello with corrupted TCP checksum | ✅ Yes | DPI that doesn't verify checksums |
 | `wrong_md5` | Injects fake ClientHello with a TCP-MD5 Signature option | ✅ Yes | DPI that accepts spoofed data but servers reject TCP-MD5 |
-| `wrong_seq_wrong_md5` | Injects fake ClientHello with both an old TCP sequence number and TCP-MD5 option | ✅ Yes | DPI paths where one fake-packet rejection trick is not enough |
+| `wrong_seq_wrong_md5` | Alias for `["wrong_seq", "wrong_md5"]` — one fake ClientHello with both an old TCP sequence number and TCP-MD5 option | ✅ Yes | DPI paths where one fake-packet rejection trick is not enough |
 | `wrong_ack` | Injects fake ClientHello with deliberately old TCP ACK number | ✅ Yes | DPI that accepts forged data but servers reject old ACKs |
 | `wrong_timestamp` | Injects fake ClientHello with backdated TCP Timestamp TSval | ✅ Yes | DPI that accepts forged data but servers enforce PAWS |
 | `low_ttl` | Injects fake ClientHello (whitelisted SNI) with a low IP TTL so only the DPI middlebox sees it | ✅ Yes | DPI sitting between client and server on TTL-visible networks |
 | `tls_record_frag` | TLS Record Fragment: splits the real ClientHello record body into multiple tiny TLS records | ✅ Yes | DPI that can't reassemble TLS records |
 | `urg_sni_split` | Splicing a dummy byte into the middle of the real SNI and marking it with the TCP URG flag, so the server strips the byte while DPI reads a mangled name | ✅ Yes | Byte-scanning stateless DPI that ignores TCP urgent data |
-| `wrong_seq_tls_frag` | Sends a wrong-sequence fake ClientHello, then fragments selected real client data with `TLS_FRAG_*` settings | ✅ Yes | Layered TCP-segment DPI paths |
-| `wrong_md5_tls_frag` | Sends a TCP-MD5 fake ClientHello, then fragments selected real client data with `TLS_FRAG_*` settings | ✅ Yes | Layered TCP-MD5 plus TCP-segment DPI paths |
-| `wrong_seq_tls_record_frag` | Sends a wrong-sequence fake ClientHello, then splits the real ClientHello body into tiny TLS records | ✅ Yes | Layered TLS-record DPI paths |
+| `wrong_seq_tls_frag` | Alias for `["wrong_seq", "tls_frag"]` — sends a wrong-sequence fake ClientHello, then fragments selected real client data with `TLS_FRAG_*` settings | ✅ Yes | Layered TCP-segment DPI paths |
+| `wrong_md5_tls_frag` | Alias for `["wrong_md5", "tls_frag"]` — sends a TCP-MD5 fake ClientHello, then fragments selected real client data with `TLS_FRAG_*` settings | ✅ Yes | Layered TCP-MD5 plus TCP-segment DPI paths |
+| `wrong_seq_tls_record_frag` | Alias for `["wrong_seq", "tls_record_frag"]` — sends a wrong-sequence fake ClientHello, then splits the real ClientHello body into tiny TLS records | ✅ Yes | Layered TLS-record DPI paths |
 | `tls_frag` | TLS Fragment: writes selected client data in small TCP chunks without changing TLS bytes | ❌ No | DPI that inspects individual TCP segments |
+
+## Combining Bypass Methods
+
+`BYPASS_METHOD` accepts a single name or a list, e.g.
+`BYPASS_METHOD = ["wrong_seq", "low_ttl", "tls_frag"]`. The hard-coded combo
+names (`wrong_seq_wrong_md5`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`,
+`wrong_seq_tls_record_frag`) still work as aliases for their lists.
+
+Combination limits:
+
+- The list must not be empty and must not contain duplicate method names
+  (after alias expansion).
+- `urg_sni_split` can only be used alone or together with `tls_frag` /
+  `tls_record_frag`; it cannot be combined with other handshake-stage methods.
+- `MODE = "ip_bypass_plus"` supports only `tls_record_frag` or `tls_frag` so
+  the VPN client's real SNI is preserved.
+- `LOW_TTL_DISCOVER = true` requires `low_ttl` in the list.
+
+How combinations behave:
+
+- Handshake-stage methods (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
+  `wrong_md5`, `wrong_timestamp`, `low_ttl`) all inject the same fake
+  ClientHello; when several are listed they merge their tricks onto that one
+  fake packet (e.g. `["wrong_seq", "low_ttl"]` rewinds the sequence number
+  **and** stamps a low TTL).
+- PSH / IPv4-Identification behavior comes from the **first** listed
+  handshake method; completion behavior (`wait for ACK` vs `complete
+  immediately`) comes from the **last** listed handshake method.
+- `tls_record_frag` and/or `tls_frag` add the data stage after the fake
+  packet. A list containing `tls_frag` alongside other methods still uses
+  packet interception; a list of exactly `["tls_frag"]` skips the interceptor
+  entirely.
 
 ---
 
@@ -364,7 +396,7 @@ Method behavior in more detail:
 - `tls_record_frag` rewrites the real first TLS record into many smaller TLS records. The server should reassemble the TLS handshake normally.
 - `urg_sni_split` rewrites the real first TLS record, splicing a configurable dummy byte into the middle of the SNI and setting the TCP URG flag. The destination server's TCP stack extracts the urgent byte, so its TLS stream is the original ClientHello; DPI that reads raw bytes sees a mangled SNI.
 - `tls_frag` keeps the TLS bytes unchanged and writes selected client data in small TCP chunks from the proxy. It can fragment a 1-based range of client writes such as `TLS_FRAG_PACKETS = "1-3"` or the first TLS ClientHello with `TLS_FRAG_PACKETS = "tlshello"`.
-- The combo methods such as `wrong_seq_tls_frag` and `wrong_md5_tls_frag` first send a decoy ClientHello, then also fragment the real ClientHello path.
+- The combo names such as `wrong_seq_tls_frag` are compatibility aliases for method lists, e.g. `BYPASS_METHOD = ["wrong_seq", "tls_frag"]`.
 
 If a method works but connection setup is slow, increase fragment sizes gradually (`TLS_FRAG_LENGTH`, `TLS_RECORD_FRAG_SIZE`) or try a higher-scoring SNI/IP. Very small fragments are aggressive and can add connection-start overhead.
 
@@ -381,6 +413,7 @@ MODE = "sni_spoof"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 44444
 SNI_LIST = "sni_list.txt"
+# BYPASS_METHOD = ["wrong_seq", "tls_frag"]  # same as the alias below
 BYPASS_METHOD = "wrong_seq_tls_frag"
 BYPASS_TIMEOUT_SECS = 20
 TLS_FRAG_PACKETS = "1-3"
@@ -599,7 +632,7 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `BYPASS_METHOD` | `string` | `"wrong_seq_tls_frag"` | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, `tls_frag`, or `urg_sni_split`; `ip_bypass_plus` allows only `tls_record_frag` or `tls_frag` |
+| `BYPASS_METHOD` | `string` or array of strings | `"wrong_seq_tls_frag"` | One or more of `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `tls_frag`, `urg_sni_split`, or the aliases `wrong_seq_wrong_md5`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`; see "Combining Bypass Methods" for limits; `ip_bypass_plus` allows only `tls_record_frag` or `tls_frag` |
 | `BYPASS_TIMEOUT_SECS` | `u64` | `20` | Time to wait for bypass setup before giving up |
 | `RELAY_MAX_LIFETIME_SECS` | `u64` | `0` | Rotate established relays after this many seconds (`0` = disabled/default) |
 | `NFQUEUE_NUM` | `u16` | `1` | (Linux) NFQUEUE queue number |
@@ -874,7 +907,7 @@ Options:
       --no-tui                         Disable ratatui screens for headless/service runs
       --json-events                    Emit newline-delimited JSON runtime events to stdout; implies --no-tui
       --sni <SNI>                      Override SELECTED_SNI (skip scan)
-      --method <METHOD>                Override BYPASS_METHOD (e.g. wrong_seq, wrong_timestamp, tls_frag)
+      --method <METHOD>                Override BYPASS_METHOD (single method or comma-separated list, e.g. wrong_seq,tls_frag)
       --queue-num <N>                  Override NFQUEUE_NUM (Linux)
       --scan-timeout <SECS>            Override SCAN_TIMEOUT_SECS
       --rescan-interval <SECS>         Override RESCAN_INTERVAL_SECS

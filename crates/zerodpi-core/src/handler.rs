@@ -305,6 +305,7 @@ mod tests {
     use crate::interceptor::{Direction, PacketView, TcpFlags};
     use crate::methods::low_ttl::LowTtl;
     use crate::methods::tls_record_frag::TlsRecordFrag;
+    use crate::methods::urg_sni_split::UrgSniSplit;
     use crate::methods::wrong_ack::WrongAck;
     use crate::methods::wrong_checksum::WrongChecksum;
     use crate::methods::wrong_md5::{tcp_md5_signature_option, WrongMd5};
@@ -314,6 +315,7 @@ mod tests {
     use crate::methods::wrong_seq_tls_record_frag::WrongSeqTlsRecordFrag;
     use crate::methods::wrong_seq_wrong_md5::WrongSeqWrongMd5;
     use crate::methods::wrong_timestamp::WrongTimestamp;
+    use crate::tls_template::build_client_hello;
 
     fn default_cfg() -> Config {
         toml::from_str(
@@ -391,6 +393,10 @@ mod tests {
         let mut record = vec![0x16, 0x03, 0x03, (body.len() >> 8) as u8, body.len() as u8];
         record.extend_from_slice(body);
         Box::leak(record.into_boxed_slice())
+    }
+
+    fn client_hello(sni: &[u8]) -> &'static [u8] {
+        Box::leak(build_client_hello(&[0u8; 32], &[0u8; 32], sni, &[0u8; 32]).into_boxed_slice())
     }
 
     #[test]
@@ -928,6 +934,173 @@ mod tests {
         );
         assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
         assert_eq!(p.new_payload.as_ref().unwrap().len(), 18);
+        assert_eq!(
+            entry.state.lock().outcome,
+            Some(BypassOutcome::FakeDataAcked)
+        );
+    }
+
+    #[test]
+    fn urg_sni_split_rewrites_first_data_packet() {
+        let flows = new_flow_table();
+        let key = FlowKey {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            dst_port: 443,
+        };
+        let entry = FlowEntry::new(vec![0xAA; 517]);
+        flows.insert(key, entry.clone());
+
+        let mut cfg = default_cfg();
+        cfg.BYPASS_METHOD = "urg_sni_split".into();
+        let mut h = Handler::new(flows, Arc::new(UrgSniSplit::new(&cfg)));
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            1000,
+            0,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                syn: true,
+                ack: true,
+                ..Default::default()
+            },
+            5000,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+        assert!(entry.state.lock().waiting_for_data);
+
+        let payload = client_hello(b"auth.vercel.com");
+        let mut p = pkt_with_payload(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            payload,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
+        assert_eq!(p.new_payload.as_ref().unwrap().len(), payload.len() + 1);
+        // "auth.vercel.com" = 15 bytes, middle = index 7, SNI at 127.
+        assert_eq!(p.new_payload.as_ref().unwrap()[127 + 7], 0);
+        assert!(p.new_flags.unwrap().urg);
+        assert_eq!(p.new_urgent_pointer, Some((127 + 7 + 1) as u16));
+        assert_eq!(
+            entry.state.lock().outcome,
+            Some(BypassOutcome::FakeDataAcked)
+        );
+    }
+
+    #[test]
+    fn urg_sni_split_scans_until_sni_found() {
+        let flows = new_flow_table();
+        let key = FlowKey {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            dst_port: 443,
+        };
+        let entry = FlowEntry::new(vec![0xAA; 517]);
+        flows.insert(key, entry.clone());
+
+        let mut cfg = default_cfg();
+        cfg.BYPASS_METHOD = "urg_sni_split".into();
+        let mut h = Handler::new(flows, Arc::new(UrgSniSplit::new(&cfg)));
+
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            1000,
+            0,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+        let mut p = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                syn: true,
+                ack: true,
+                ..Default::default()
+            },
+            5000,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+        let mut p = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+
+        // First data packet has no parseable SNI: passed through, scan alive.
+        let mut p = pkt_with_payload(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            b"NOT-TLS",
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::Accept);
+        assert!(p.new_payload.is_none());
+        assert!(entry.state.lock().waiting_for_data);
+
+        // Second data packet carries the ClientHello: rewritten.
+        let payload = client_hello(b"mci.ir");
+        let mut p = pkt_with_payload(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001,
+            5001,
+            payload,
+        );
+        assert_eq!(h.on_packet(&mut p), Verdict::AcceptModified);
+        assert_eq!(p.new_payload.as_ref().unwrap().len(), payload.len() + 1);
+        assert!(p.new_flags.unwrap().urg);
         assert_eq!(
             entry.state.lock().outcome,
             Some(BypassOutcome::FakeDataAcked)

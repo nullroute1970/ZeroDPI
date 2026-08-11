@@ -633,7 +633,7 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `BYPASS_METHOD` | `string` or array of strings | `"wrong_seq_tls_frag"` | One or more of `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `tls_frag`, `urg_sni_split`, or the aliases `wrong_seq_wrong_md5`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`; see "Combining Bypass Methods" for limits; `ip_bypass_plus` allows only `tls_record_frag` or `tls_frag` |
+| `BYPASS_METHOD` | `string` or array of strings | `["wrong_seq", "tls_frag"]` | One or more of `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `tls_frag`, `urg_sni_split`, or the aliases `wrong_seq_wrong_md5`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`; see "Combining Bypass Methods" for limits; `ip_bypass_plus` allows only `tls_record_frag` or `tls_frag` |
 | `BYPASS_TIMEOUT_SECS` | `u64` | `20` | Time to wait for bypass setup before giving up |
 | `RELAY_MAX_LIFETIME_SECS` | `u64` | `0` | Rotate established relays after this many seconds (`0` = disabled/default) |
 | `NFQUEUE_NUM` | `u16` | `1` | (Linux) NFQUEUE queue number |

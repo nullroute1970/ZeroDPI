@@ -271,9 +271,7 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 # "proxy_scan").  The "ip_bypass" and "ip_scan" modes do not use a bypass
 # method.
 #
-# "low_ttl" is included because LOW_TTL_DISCOVER defaults to true (see below)
-# and discovery only runs when "low_ttl" is in this list.
-BYPASS_METHOD = ["wrong_seq_tls_frag", "low_ttl"]
+BYPASS_METHOD = ["wrong_seq", "tls_frag"]
 
 # Seconds the proxy waits for the intercept thread to confirm that the spoofed
 # packet was acknowledged and the bypass phase completed.

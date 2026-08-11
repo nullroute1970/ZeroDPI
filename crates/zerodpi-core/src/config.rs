@@ -926,9 +926,7 @@ fn default_rescan_interval_secs() -> u64 {
     600
 }
 fn default_method() -> BypassMethodList {
-    // `low_ttl` is included because LOW_TTL_DISCOVER defaults to `true` and
-    // discovery only runs when `low_ttl` is in BYPASS_METHOD.
-    BypassMethodList::from_delimited("wrong_seq_tls_frag, low_ttl")
+    BypassMethodList::from_delimited("wrong_seq, tls_frag")
 }
 fn default_queue_num() -> u16 {
     1
@@ -1334,7 +1332,7 @@ mod tests {
         assert_eq!(cfg.LISTEN_PORT, 40443);
         assert_eq!(
             cfg.BYPASS_METHOD.iter().collect::<Vec<_>>(),
-            vec!["wrong_seq", "tls_frag", "low_ttl"]
+            vec!["wrong_seq", "tls_frag"]
         );
         assert_eq!(cfg.NFQUEUE_NUM, 1);
         assert_eq!(cfg.LINUX_FIREWALL_BACKEND, "iptables");

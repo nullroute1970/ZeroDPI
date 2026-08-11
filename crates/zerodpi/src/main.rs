@@ -19,6 +19,7 @@ mod tui;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +36,7 @@ use zerodpi_core::flow::{new_flow_table, FlowController, LocalFlowController};
 use zerodpi_core::handler::Handler;
 use zerodpi_core::interceptor::{FilterSpec, InterceptorShutdown, PacketInterceptor};
 use zerodpi_core::ip_scanner::{load_ip_list, scan_ip_list, IpProbeEntry, IpScanEvent};
+use zerodpi_core::low_ttl_discover::{discover_low_ttl, LowTtlDiscovery};
 use zerodpi_core::methods::build_method;
 use zerodpi_core::net::default_interface_ipv4;
 use zerodpi_core::proxy::{
@@ -459,6 +461,8 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         .context("could not determine local interface IP for upstream")?;
     info!(%interface_ip, %connect_ip, sni = %selected.sni, "starting proxy");
 
+    let mut low_ttl_handle: Option<Arc<AtomicU8>> = None;
+
     let (flow_controller, interceptor_runtime): (
         Arc<dyn FlowController>,
         Option<InterceptorRuntime>,
@@ -466,7 +470,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         info!("tls_frag selected; skipping packet interceptor");
         let flows = new_flow_table();
         (Arc::new(LocalFlowController::new(flows)), None)
-    } else if let Some(helper) = remote_helper {
+    } else if let Some(helper) = remote_helper.as_ref() {
         let config = interceptor_config(&cfg, interface_ip, None, CONNECT_PORT);
         rt.block_on(async {
             helper.configure(config).await?;
@@ -480,13 +484,14 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         );
         (
             Arc::new(helper.clone()),
-            Some(InterceptorRuntime::Remote(helper)),
+            Some(InterceptorRuntime::Remote(helper.clone())),
         )
     } else {
         let flows = new_flow_table();
         let method_box = build_method(&cfg)
             .with_context(|| format!("unknown BYPASS_METHOD '{}'", cfg.BYPASS_METHOD))?;
         let method: Arc<dyn zerodpi_core::methods::BypassMethod> = Arc::from(method_box);
+        low_ttl_handle = method.low_ttl_handle();
 
         let filter = FilterSpec {
             interface_ip,
@@ -523,6 +528,62 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
 
+    // ---- step 3b: automatic LOW_TTL_VALUE discovery ----
+    let low_ttl_discovery_state = if cfg.LOW_TTL_DISCOVER && cfg.BYPASS_METHOD == "low_ttl" {
+        if !cfg.LOW_TTL_COMPLETE_IMMEDIATELY {
+            warn!(
+                "LOW_TTL_DISCOVER requires LOW_TTL_COMPLETE_IMMEDIATELY = true; \
+                 keeping LOW_TTL_VALUE = {}",
+                cfg.LOW_TTL_VALUE
+            );
+            None
+        } else if let Some(handle) = low_ttl_handle.clone() {
+            Some(LowTtlDiscoveryState {
+                settings: LowTtlDiscovery::from_config(&cfg),
+                connector: zerodpi_core::low_ttl_discover::make_discovery_tls_connector(),
+                flow_controller: flow_controller.clone(),
+                interface_ip,
+                applier: LowTtlApplier::Local(handle),
+            })
+        } else if let Some(helper) = remote_helper.clone() {
+            Some(LowTtlDiscoveryState {
+                settings: LowTtlDiscovery::from_config(&cfg),
+                connector: zerodpi_core::low_ttl_discover::make_discovery_tls_connector(),
+                flow_controller: flow_controller.clone(),
+                interface_ip,
+                applier: LowTtlApplier::Remote(helper),
+            })
+        } else {
+            warn!("LOW_TTL_DISCOVER skipped: no interceptor method handle available");
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(discovery_state) = low_ttl_discovery_state.as_ref() {
+        info!(
+            sni = %selected.sni,
+            max_ttl = discovery_state.settings.max_ttl,
+            "LOW_TTL_DISCOVER: probing TTL candidates before listening"
+        );
+        let started = std::time::Instant::now();
+        match rt.block_on(discovery_state.run(&selected.sni, connect_ip)) {
+            Some(value) => {
+                info!(
+                    value,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "LOW_TTL_DISCOVER: applied discovered TTL"
+                );
+                let _ = event_tx.send(ProxyEvent::LowTtlDiscovered { value });
+            }
+            None => warn!(
+                "LOW_TTL_DISCOVER: no working TTL found; keeping LOW_TTL_VALUE = {}",
+                cfg.LOW_TTL_VALUE
+            ),
+        }
+    }
+
     // ---- step 4: optional background rescan ----
     let rescan_cfg = cfg.clone();
     let rescan_path = sni_list_path.clone();
@@ -535,6 +596,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
             Some(event_tx.clone())
         };
         let rescan_events = events.clone();
+        let rescan_discovery = low_ttl_discovery_state.clone();
         rt.spawn(async move {
             background_rescan(
                 rescan_cfg,
@@ -544,6 +606,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                 rescan_event_tx,
                 rescan_events,
                 no_tui,
+                rescan_discovery,
             )
             .await;
         });
@@ -855,11 +918,64 @@ fn log_ip_scan_top(context: &str, entries: &[IpProbeEntry]) {
     }
 }
 
+/// Applies a discovered `low_ttl` TTL to the running interceptor.
+#[derive(Clone)]
+enum LowTtlApplier {
+    /// Local interceptor: the shared handle of the live `LowTtl` method.
+    Local(Arc<AtomicU8>),
+    /// Remote root helper: `SetLowTtlValue` wire message.
+    Remote(RemoteHelperClient),
+}
+
+impl LowTtlApplier {
+    async fn apply(&self, value: u8) -> bool {
+        match self {
+            Self::Local(handle) => {
+                handle.store(value, Ordering::Relaxed);
+                true
+            }
+            Self::Remote(helper) => helper.set_low_ttl_value(value).await.is_ok(),
+        }
+    }
+}
+
+/// Everything `LOW_TTL_DISCOVER` needs to probe one target and apply the
+/// result. Used at startup and after every background-rescan target swap.
+#[derive(Clone)]
+struct LowTtlDiscoveryState {
+    settings: LowTtlDiscovery,
+    connector: tokio_rustls::TlsConnector,
+    flow_controller: Arc<dyn FlowController>,
+    interface_ip: Ipv4Addr,
+    applier: LowTtlApplier,
+}
+
+impl LowTtlDiscoveryState {
+    async fn run(&self, sni: &str, connect_ip: Ipv4Addr) -> Option<u8> {
+        let flow_controller = self.flow_controller.clone();
+        let applier = self.applier.clone();
+        discover_low_ttl(
+            self.settings,
+            sni,
+            connect_ip,
+            self.interface_ip,
+            flow_controller,
+            self.connector.clone(),
+            move |value| {
+                let applier = applier.clone();
+                async move { applier.apply(value).await }
+            },
+        )
+        .await
+    }
+}
+
 /// Background rescan task: runs every `interval_secs` seconds and switches
 /// new connections to better SNI targets.
 ///
 /// This runs while the ratatui dashboard owns the terminal. Keep routine scan
 /// output below `info` so it does not write over the live UI.
+#[allow(clippy::too_many_arguments)]
 async fn background_rescan(
     cfg: Arc<Config>,
     path: PathBuf,
@@ -868,6 +984,7 @@ async fn background_rescan(
     event_tx: Option<ProxyEventSender>,
     events: RuntimeEventEmitter,
     headless: bool,
+    low_ttl_discovery: Option<LowTtlDiscoveryState>,
 ) {
     let interval = Duration::from_secs(interval_secs);
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
@@ -939,6 +1056,30 @@ async fn background_rescan(
                                 ip: next.ip,
                                 score: next.score,
                             });
+                        }
+                        // Rediscover LOW_TTL_VALUE for the new target's route.
+                        if let Some(discovery_state) = low_ttl_discovery.as_ref() {
+                            info!(
+                                sni = %next.sni,
+                                ip = %next.ip,
+                                "LOW_TTL_DISCOVER: rediscovering for new target"
+                            );
+                            match discovery_state.run(&next.sni, next.ip).await {
+                                Some(value) => {
+                                    info!(
+                                        sni = %next.sni,
+                                        value,
+                                        "LOW_TTL_DISCOVER: applied TTL for new target"
+                                    );
+                                    if let Some(ref tx) = event_tx {
+                                        let _ = tx.send(ProxyEvent::LowTtlDiscovered { value });
+                                    }
+                                }
+                                None => warn!(
+                                    sni = %next.sni,
+                                    "LOW_TTL_DISCOVER: no working TTL for new target; keeping previous value"
+                                ),
+                            }
                         }
                     }
                 }
@@ -1304,6 +1445,9 @@ async fn log_headless_proxy_events(
                     score: Some(score),
                 });
                 info!(%ip, "active IP target changed");
+            }
+            ProxyEvent::LowTtlDiscovered { value } => {
+                info!(value, "LOW_TTL_DISCOVER: applied discovered low_ttl TTL");
             }
         }
     }
@@ -1820,6 +1964,7 @@ struct IpRescanPolicy {
     ipv4_only: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn background_ip_rescan(
     cfg: Arc<Config>,
     ip_list_path: PathBuf,

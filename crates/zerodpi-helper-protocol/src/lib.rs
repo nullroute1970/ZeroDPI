@@ -12,7 +12,7 @@ use thiserror::Error;
 
 pub const MAGIC: [u8; 4] = *b"ZDHP";
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 pub const HEADER_LEN: usize = 20;
 pub const MAX_FRAME_SIZE: usize = 256 * 1024;
 pub const MAX_FAKE_DATA_SIZE: usize = 64 * 1024;
@@ -41,6 +41,8 @@ pub enum MessageType {
     ShutdownComplete = 17,
     HelperWarning = 18,
     HelperFatal = 19,
+    SetLowTtlValue = 20,
+    SetLowTtlAck = 21,
 }
 
 impl MessageType {
@@ -65,6 +67,8 @@ impl MessageType {
             17 => Self::ShutdownComplete,
             18 => Self::HelperWarning,
             19 => Self::HelperFatal,
+            20 => Self::SetLowTtlValue,
+            21 => Self::SetLowTtlAck,
             other => return Err(ProtocolError::UnknownMessageType(other)),
         })
     }
@@ -277,6 +281,12 @@ pub enum Message {
         code: ErrorCode,
         message: String,
     },
+    /// Update the live `low_ttl` method's stamped TTL (used by
+    /// `LOW_TTL_DISCOVER`). Only accepted while the interceptor is open.
+    SetLowTtlValue {
+        value: u8,
+    },
+    SetLowTtlAck,
 }
 
 impl Message {
@@ -301,6 +311,8 @@ impl Message {
             Self::ShutdownComplete => MessageType::ShutdownComplete,
             Self::HelperWarning { .. } => MessageType::HelperWarning,
             Self::HelperFatal { .. } => MessageType::HelperFatal,
+            Self::SetLowTtlValue { .. } => MessageType::SetLowTtlValue,
+            Self::SetLowTtlAck => MessageType::SetLowTtlAck,
         }
     }
 
@@ -358,6 +370,9 @@ impl Message {
                 if message.len() > 512 =>
             {
                 return Err(ProtocolError::InvalidField("diagnostic message"));
+            }
+            Self::SetLowTtlValue { value } if *value == 0 || *value > 64 => {
+                return Err(ProtocolError::InvalidField("low TTL value"));
             }
             _ => {}
         }
@@ -486,6 +501,7 @@ impl HelperState {
                 )
             }
             Message::CloseInterceptor => matches!(self, Self::Configured | Self::InterceptorOpen),
+            Message::SetLowTtlValue { .. } => self == Self::InterceptorOpen,
             Message::Ping => !matches!(self, Self::Created | Self::Exited),
             Message::Shutdown => self != Self::Exited,
             _ => false,
@@ -603,6 +619,8 @@ mod tests {
                 code: ErrorCode::InterceptorFailed,
                 message: "fatal".into(),
             },
+            Message::SetLowTtlValue { value: 12 },
+            Message::SetLowTtlAck,
         ];
 
         let mut bytes = Vec::new();
@@ -695,6 +713,27 @@ mod tests {
         };
         assert!(!HelperState::Configured.accepts(&flow));
         assert!(HelperState::InterceptorOpen.accepts(&flow));
+    }
+
+    #[test]
+    fn set_low_ttl_value_round_trips_and_validates() {
+        let message = Message::SetLowTtlValue { value: 9 };
+        let frame = Frame::new(77, message.clone());
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &frame).unwrap();
+        assert_eq!(read_frame(bytes.as_slice()).unwrap(), frame);
+        assert!(message.validate().is_ok());
+        assert!(Message::SetLowTtlValue { value: 0 }.validate().is_err());
+        assert!(Message::SetLowTtlValue { value: 65 }.validate().is_err());
+        assert!(Message::SetLowTtlAck.validate().is_ok());
+    }
+
+    #[test]
+    fn set_low_ttl_value_requires_open_interceptor() {
+        let message = Message::SetLowTtlValue { value: 9 };
+        assert!(!HelperState::Configured.accepts(&message));
+        assert!(HelperState::InterceptorOpen.accepts(&message));
+        assert!(!HelperState::Authenticated.accepts(&message));
     }
 
     #[test]

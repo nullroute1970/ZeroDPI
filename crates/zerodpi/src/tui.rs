@@ -740,6 +740,8 @@ struct DashboardState {
     filter: FilterStatus,
     active_sni: Option<(String, Ipv4Addr, u8)>,
     active_ip: Option<IpAddr>,
+    /// Last value discovered by `LOW_TTL_DISCOVER` (startup or rescan).
+    low_ttl: Option<u8>,
     start: Instant,
     channel_closed: bool,
 }
@@ -855,6 +857,7 @@ pub fn run_dashboard(
         filter: FilterStatus::All,
         active_sni,
         active_ip,
+        low_ttl: None,
         start: Instant::now(),
         channel_closed: false,
     };
@@ -1052,6 +1055,9 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
         ProxyEvent::IpTargetChanged { ip, .. } => {
             state.active_ip = Some(ip);
         }
+        ProxyEvent::LowTtlDiscovered { value } => {
+            state.low_ttl = Some(value);
+        }
     }
 
     prune_connection_records(&mut state.records);
@@ -1115,19 +1121,33 @@ fn draw_dashboard(
                         Span::styled("Score: ", label_style()),
                         Span::styled(score.to_string(), score_style(*score)),
                     ]),
-                    Line::from(vec![
-                        Span::styled("Method: ", label_style()),
-                        Span::styled(cfg.BYPASS_METHOD.clone(), Style::default().fg(Color::White)),
-                        Span::raw("   "),
-                        Span::styled("Listen: ", label_style()),
-                        Span::styled(
-                            format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT),
-                            Style::default().fg(Color::White),
-                        ),
-                        Span::raw("   "),
-                        Span::styled("Uptime: ", label_style()),
-                        Span::styled(uptime, Style::default().fg(Color::White)),
-                    ]),
+                    Line::from({
+                        let mut spans = vec![
+                            Span::styled("Method: ", label_style()),
+                            Span::styled(
+                                cfg.BYPASS_METHOD.clone(),
+                                Style::default().fg(Color::White),
+                            ),
+                            Span::raw("   "),
+                            Span::styled("Listen: ", label_style()),
+                            Span::styled(
+                                format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT),
+                                Style::default().fg(Color::White),
+                            ),
+                            Span::raw("   "),
+                            Span::styled("Uptime: ", label_style()),
+                            Span::styled(uptime, Style::default().fg(Color::White)),
+                        ];
+                        if let Some(value) = state.low_ttl {
+                            spans.push(Span::raw("   "));
+                            spans.push(Span::styled("Low TTL: ", label_style()));
+                            spans.push(Span::styled(
+                                value.to_string(),
+                                Style::default().fg(Color::Green),
+                            ));
+                        }
+                        spans
+                    }),
                 ]
             }
             DashboardInfo::IpBypass { .. } | DashboardInfo::IpBypassPlus { .. } => {
@@ -2003,6 +2023,7 @@ mod tests {
             filter: FilterStatus::All,
             active_sni: None,
             active_ip: None,
+            low_ttl: None,
             start: Instant::now(),
             channel_closed: false,
         }

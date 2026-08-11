@@ -31,6 +31,7 @@ ratatui.workspace = true
 crossterm.workspace = true
 
 rustls.workspace = true
+tokio-rustls.workspace = true
 
 zerodpi-core = { path = "../zerodpi-core" }
 zerodpi-helper-protocol = { path = "../zerodpi-helper-protocol" }

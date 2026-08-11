@@ -5,6 +5,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -138,6 +139,7 @@ fn serve(mut writer: UnixStream, peer: PeerCredentials, proof: Vec<u8>) -> Resul
     let mut state = HelperState::Created;
     let mut config: Option<InterceptorConfig> = None;
     let mut interceptor: Option<InterceptorSession> = None;
+    let mut low_ttl_handle: Option<Arc<AtomicU8>> = None;
     let mut registered: HashMap<u64, RegisteredFlow> = HashMap::new();
     let mut last_activity = Instant::now();
 
@@ -264,6 +266,9 @@ fn serve(mut writer: UnixStream, peer: PeerCredentials, proof: Vec<u8>) -> Resul
                     .context("missing interceptor configuration")?;
                 let flows = new_flow_table();
                 let method = build_wire_method(&value.method)?;
+                // Keep the method's TTL handle so `SetLowTtlValue` can update
+                // the live value used by `LOW_TTL_DISCOVER`.
+                low_ttl_handle = method.low_ttl_handle();
                 let filter = FilterSpec {
                     interface_ip: value.interface_ip,
                     remote_ip: value.remote_ip,
@@ -364,6 +369,13 @@ fn serve(mut writer: UnixStream, peer: PeerCredentials, proof: Vec<u8>) -> Resul
                     frame.request_id,
                     Message::FlowRemoved { flow_id },
                 )?;
+            }
+            Message::SetLowTtlValue { value } => {
+                if let Some(handle) = low_ttl_handle.as_ref() {
+                    handle.store(value, Ordering::Relaxed);
+                    info!(value, "low_ttl TTL updated by discovery");
+                }
+                send(&mut writer, frame.request_id, Message::SetLowTtlAck)?;
             }
             Message::CloseInterceptor => {
                 close_interceptor(&mut interceptor, &mut registered)?;

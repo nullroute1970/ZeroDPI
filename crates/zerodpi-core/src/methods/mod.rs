@@ -46,6 +46,9 @@ pub mod wrong_seq_tls_record_frag;
 pub mod wrong_seq_wrong_md5;
 pub mod wrong_timestamp;
 
+use std::sync::atomic::AtomicU8;
+use std::sync::Arc;
+
 use crate::config::Config;
 use crate::flow::FlowState;
 use crate::interceptor::PacketView;
@@ -109,6 +112,16 @@ impl MethodAction {
 pub trait BypassMethod: Send + Sync + 'static {
     /// Short identifier (matches the `BYPASS_METHOD` config value).
     fn name(&self) -> &'static str;
+
+    /// Handle to the IPv4 TTL stamped by the `low_ttl` method.
+    ///
+    /// Returns `Some` only for the `low_ttl` method. `LOW_TTL_DISCOVER`
+    /// updates this handle at runtime (per discovery probe and after a
+    /// successful discovery) so the interceptor's method follows without
+    /// rebuilding it. Returns `None` for all other methods.
+    fn low_ttl_handle(&self) -> Option<Arc<AtomicU8>> {
+        None
+    }
 
     /// Called when the first outbound bare ACK of the handshake is observed.
     ///

@@ -326,6 +326,29 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub LOW_TTL_COMPLETE_IMMEDIATELY: bool,
 
+    /// Whether to automatically discover the correct `LOW_TTL_VALUE` at
+    /// startup (and again after every background rescan that switches the
+    /// SNI/IP target). Discovery probes TTL candidates from `1` up to
+    /// `LOW_TTL_DISCOVER_MAX`, injecting a real decoy ClientHello and
+    /// verifying the handshake completes for each candidate, then applies the
+    /// largest working value (the server's hop distance minus one, which
+    /// reaches any inline DPI middlebox with maximum margin). It adds a
+    /// one-time startup delay and requires
+    /// `LOW_TTL_COMPLETE_IMMEDIATELY = true`. Default: `false`.
+    #[serde(default = "default_false")]
+    pub LOW_TTL_DISCOVER: bool,
+
+    /// Upper bound of the `LOW_TTL_DISCOVER` search range, bounding the
+    /// worst-case startup delay. Must be `>= 1` and `<= 64`. Default: `32`.
+    #[serde(default = "default_low_ttl_discover_max")]
+    pub LOW_TTL_DISCOVER_MAX: u8,
+
+    /// Per-candidate timeout in milliseconds used while discovering
+    /// `LOW_TTL_VALUE`. Lower values speed up discovery but may cause false
+    /// negatives on slow links. Must be `>= 100`. Default: `1500`.
+    #[serde(default = "default_low_ttl_discover_timeout_ms")]
+    pub LOW_TTL_DISCOVER_TIMEOUT_MS: u64,
+
     // -----------------------------------------------------------------------
     // wrong_md5 method parameters
     // -----------------------------------------------------------------------
@@ -681,11 +704,20 @@ fn default_linux_firewall_backend() -> String {
 fn default_true() -> bool {
     true
 }
+fn default_false() -> bool {
+    false
+}
 fn default_wrong_checksum_delta() -> u16 {
     1
 }
 fn default_low_ttl_value() -> u8 {
     5
+}
+fn default_low_ttl_discover_max() -> u8 {
+    32
+}
+fn default_low_ttl_discover_timeout_ms() -> u64 {
+    1500
 }
 fn default_wrong_ack_offset() -> u32 {
     1
@@ -874,6 +906,15 @@ impl Config {
         }
         if self.LOW_TTL_VALUE > 64 {
             anyhow::bail!("LOW_TTL_VALUE must be <= 64");
+        }
+        if self.LOW_TTL_DISCOVER_MAX == 0 {
+            anyhow::bail!("LOW_TTL_DISCOVER_MAX must be >= 1");
+        }
+        if self.LOW_TTL_DISCOVER_MAX > 64 {
+            anyhow::bail!("LOW_TTL_DISCOVER_MAX must be <= 64");
+        }
+        if self.LOW_TTL_DISCOVER_TIMEOUT_MS < 100 {
+            anyhow::bail!("LOW_TTL_DISCOVER_TIMEOUT_MS must be >= 100");
         }
         if self.TLS_RECORD_FRAG_SIZE == 0 {
             anyhow::bail!("TLS_RECORD_FRAG_SIZE must be >= 1");
@@ -1076,6 +1117,9 @@ mod tests {
         assert!(cfg.LOW_TTL_SET_PSH);
         assert!(cfg.LOW_TTL_BUMP_IP_IDENT);
         assert!(cfg.LOW_TTL_COMPLETE_IMMEDIATELY);
+        assert!(!cfg.LOW_TTL_DISCOVER);
+        assert_eq!(cfg.LOW_TTL_DISCOVER_MAX, 32);
+        assert_eq!(cfg.LOW_TTL_DISCOVER_TIMEOUT_MS, 1500);
     }
 
     #[test]
@@ -1088,6 +1132,9 @@ mod tests {
             LOW_TTL_SET_PSH = false
             LOW_TTL_BUMP_IP_IDENT = false
             LOW_TTL_COMPLETE_IMMEDIATELY = false
+            LOW_TTL_DISCOVER = true
+            LOW_TTL_DISCOVER_MAX = 16
+            LOW_TTL_DISCOVER_TIMEOUT_MS = 700
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
@@ -1095,6 +1142,9 @@ mod tests {
         assert!(!cfg.LOW_TTL_SET_PSH);
         assert!(!cfg.LOW_TTL_BUMP_IP_IDENT);
         assert!(!cfg.LOW_TTL_COMPLETE_IMMEDIATELY);
+        assert!(cfg.LOW_TTL_DISCOVER);
+        assert_eq!(cfg.LOW_TTL_DISCOVER_MAX, 16);
+        assert_eq!(cfg.LOW_TTL_DISCOVER_TIMEOUT_MS, 700);
     }
 
     #[test]
@@ -1116,6 +1166,45 @@ mod tests {
             LISTEN_PORT = 40443
             BYPASS_METHOD = "low_ttl"
             LOW_TTL_VALUE = 65
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_low_ttl_discover_max_zero() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "low_ttl"
+            LOW_TTL_DISCOVER = true
+            LOW_TTL_DISCOVER_MAX = 0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_low_ttl_discover_max_out_of_range() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "low_ttl"
+            LOW_TTL_DISCOVER = true
+            LOW_TTL_DISCOVER_MAX = 65
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_low_ttl_discover_timeout_too_small() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "low_ttl"
+            LOW_TTL_DISCOVER = true
+            LOW_TTL_DISCOVER_TIMEOUT_MS = 50
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert!(cfg.validate().is_err());

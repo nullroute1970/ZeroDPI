@@ -115,6 +115,8 @@ pub enum ProxyEvent {
     },
     /// The active IP-bypass target changed after a background rescan.
     IpTargetChanged { ip: IpAddr, score: u8 },
+    /// `LOW_TTL_DISCOVER` found a working TTL and applied it.
+    LowTtlDiscovered { value: u8 },
 }
 
 /// Sender half of the [`ProxyEvent`] channel; pass to [`run_proxy`] to enable

@@ -359,7 +359,7 @@ Method behavior in more detail:
 - `wrong_md5` is ZeroDPI's snake_case name for sing-box's `wrong-md5` spoof behavior. It adds a TCP-MD5 Signature option to the forged segment without negotiating a TCP-MD5 key.
 - `wrong_seq_wrong_md5` sends one fake ClientHello with both the `wrong_seq` sequence rewrite and the `wrong_md5` TCP-MD5 option.
 - `wrong_timestamp` is ZeroDPI's snake_case name for sing-box's `wrong-timestamp` spoof behavior. It requires TCP timestamps on the intercepted flow and backdates `TSval` so PAWS rejects the forged segment.
-- `low_ttl` sends a valid decoy ClientHello carrying the selected whitelisted SNI but stamps it with a low IP TTL (`LOW_TTL_VALUE`). The decoy reaches an inline DPI middlebox and then expires, so the server never receives it; the real handshake completes via TCP retransmission. Tune `LOW_TTL_VALUE` to the DPI's hop distance (typically 4–8).
+- `low_ttl` sends a valid decoy ClientHello carrying the selected whitelisted SNI but stamps it with a low IP TTL (`LOW_TTL_VALUE`). The decoy reaches an inline DPI middlebox and then expires, so the server never receives it; the real handshake completes via TCP retransmission. Tune `LOW_TTL_VALUE` to the DPI's hop distance (typically 4–8), or enable `LOW_TTL_DISCOVER` and let ZeroDPI find the correct value automatically.
 - `tls_record_frag` rewrites the real first TLS record into many smaller TLS records. The server should reassemble the TLS handshake normally.
 - `tls_frag` keeps the TLS bytes unchanged and writes selected client data in small TCP chunks from the proxy. It can fragment a 1-based range of client writes such as `TLS_FRAG_PACKETS = "1-3"` or the first TLS ClientHello with `TLS_FRAG_PACKETS = "tlshello"`.
 - The combo methods such as `wrong_seq_tls_frag` and `wrong_md5_tls_frag` first send a decoy ClientHello, then also fragment the real ClientHello path.
@@ -621,8 +621,18 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 | `LOW_TTL_SET_PSH` | `bool` | `true` | Set PSH flag on the spoofed packet |
 | `LOW_TTL_BUMP_IP_IDENT` | `bool` | `true` | Bump IPv4 Identification field |
 | `LOW_TTL_COMPLETE_IMMEDIATELY` | `bool` | `true` | Signal bypass complete immediately after emission |
+| `LOW_TTL_DISCOVER` | `bool` | `false` | Discover the correct TTL automatically (see below) |
+| `LOW_TTL_DISCOVER_MAX` | `u8` | `32` | Upper bound of the discovery search (1–64) |
+| `LOW_TTL_DISCOVER_TIMEOUT_MS` | `u64` | `1500` | Per-candidate discovery probe timeout (≥ 100) |
 
 `LOW_TTL_VALUE` must be high enough to reach the ISP's inline DPI middlebox but low enough to expire before the destination server. Typical DPI middleboxes sit 4–8 hops from the client; verify with `traceroute` and tune from there.
+
+With `LOW_TTL_DISCOVER = true`, ZeroDPI probes TTL candidates from `1` up to `LOW_TTL_DISCOVER_MAX` at startup (before the listener starts) and applies the **largest working value** — the target server's hop distance minus one — which reaches any inline DPI with maximum margin. Each probe runs the full bypass machinery: a decoy ClientHello carrying the selected whitelisted SNI is injected with the candidate TTL, then a real TLS handshake verifies the decoy was neither dropped before the DPI nor delivered to the server. Discovery re-runs whenever a background rescan hot-swaps the SNI/IP target (new connections briefly keep the previous TTL until discovery finishes). Requirements and caveats:
+
+- `LOW_TTL_COMPLETE_IMMEDIATELY` must be `true`; otherwise discovery is skipped with a warning.
+- Discovery adds a one-time startup delay — typically a few seconds, up to roughly `LOW_TTL_DISCOVER_MAX` × `LOW_TTL_DISCOVER_TIMEOUT_MS` in the worst case.
+- The discovered value is session-only and shown in the logs and dashboard; copy it into `LOW_TTL_VALUE` to make it permanent.
+- On Android/Linux the discovery probes and result are applied through the root helper (`SetLowTtlValue` protocol message); no reconfiguration is needed.
 
 #### `wrong_checksum` Parameters
 

@@ -229,6 +229,15 @@ mod unix {
             }
         }
 
+        /// Update the live `low_ttl` TTL used by the helper's interceptor
+        /// (part of `LOW_TTL_DISCOVER`).
+        pub async fn set_low_ttl_value(&self, value: u8) -> Result<()> {
+            match self.request(Message::SetLowTtlValue { value }).await? {
+                Message::SetLowTtlAck => Ok(()),
+                other => bail!("unexpected helper set-low-ttl response: {other:?}"),
+            }
+        }
+
         pub async fn shutdown(&self) -> Result<()> {
             match self.request(Message::Shutdown).await? {
                 Message::ShutdownComplete => Ok(()),
@@ -485,6 +494,9 @@ impl RemoteHelperClient {
         bail!("external root helper is unavailable")
     }
     pub async fn close(&self) -> Result<()> {
+        bail!("external root helper is unavailable")
+    }
+    pub async fn set_low_ttl_value(&self, _value: u8) -> Result<()> {
         bail!("external root helper is unavailable")
     }
     pub async fn shutdown(&self) -> Result<()> {

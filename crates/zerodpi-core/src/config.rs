@@ -130,6 +130,59 @@ impl TlsFragPackets {
     }
 }
 
+/// Where inside the SNI domain string `urg_sni_split` inserts its dummy byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SniSplitPosition {
+    /// Exact middle of the name (`len / 2`).
+    Middle,
+    /// Before the first name byte.
+    Start,
+    /// Before the last name byte.
+    End,
+    /// 0-based index, clamped to `[0, len - 1]`.
+    Index(u16),
+}
+
+impl<'de> Deserialize<'de> for SniSplitPosition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Int(u16),
+            Text(String),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Int(value) => Ok(Self::Index(value)),
+            Repr::Text(value) => match value.to_ascii_lowercase().as_str() {
+                "middle" => Ok(Self::Middle),
+                "start" => Ok(Self::Start),
+                "end" => Ok(Self::End),
+                _ => Err(de::Error::custom(format!(
+                    "'{value}' is not a valid SNI_SPLIT_POSITION; valid values: \"middle\", \"start\", \"end\", or an integer"
+                ))),
+            },
+        }
+    }
+}
+
+impl Serialize for SniSplitPosition {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Middle => serializer.serialize_str("middle"),
+            Self::Start => serializer.serialize_str("start"),
+            Self::End => serializer.serialize_str("end"),
+            Self::Index(n) => serializer.serialize_u16(*n),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub struct Config {
@@ -228,6 +281,11 @@ pub struct Config {
     ///   segments so DPI cannot reassemble the SNI from any single packet.
     ///   Does **not** inject fake packets or use WinDivert/NFQUEUE interception;
     ///   operates entirely inside the proxy via controlled socket writes.
+    /// - `"urg_sni_split"` — injects a 1-byte dummy payload into the middle of
+    ///   the SNI inside the real ClientHello and sets the TCP URG flag so the
+    ///   destination server strips the byte while byte-scanning DPI sees a
+    ///   mangled SNI. No fake packet is injected; the server reassembles the
+    ///   original handshake via BSD urgent-data semantics.
     #[serde(default = "default_method")]
     pub BYPASS_METHOD: String,
     /// (Linux only) NFQUEUE queue number used to intercept packets. Must
@@ -449,6 +507,23 @@ pub struct Config {
     /// carrying the fragmented ClientHello.  Default: `true`.
     #[serde(default = "default_true")]
     pub TLS_RECORD_FRAG_BUMP_IP_IDENT: bool,
+
+    // -----------------------------------------------------------------------
+    // urg_sni_split method parameters
+    // -----------------------------------------------------------------------
+    /// The 1-byte dummy payload `urg_sni_split` inserts into the middle of the
+    /// SNI domain string. The destination server's TCP stack extracts this
+    /// byte as urgent data, so its TLS stream is unaffected; DPI middleboxes
+    /// that read the raw byte stream see the mangled name.
+    /// Default: `0`.
+    #[serde(default = "default_sni_split_dummy_byte")]
+    pub SNI_SPLIT_DUMMY_BYTE: u8,
+
+    /// Where `urg_sni_split` inserts the dummy byte inside the SNI domain
+    /// string. Supported values: `"middle"` (default), `"start"`, `"end"`,
+    /// or a 0-based integer index (clamped to the last byte).
+    #[serde(default = "default_sni_split_position")]
+    pub SNI_SPLIT_POSITION: SniSplitPosition,
 
     // -----------------------------------------------------------------------
     // tls_frag method parameters
@@ -728,6 +803,12 @@ fn default_wrong_timestamp_offset() -> u32 {
 fn default_tls_frag_size() -> usize {
     1
 }
+fn default_sni_split_dummy_byte() -> u8 {
+    0
+}
+fn default_sni_split_position() -> SniSplitPosition {
+    SniSplitPosition::Middle
+}
 fn default_tls_frag_packets() -> String {
     "1-3".into()
 }
@@ -886,9 +967,10 @@ impl Config {
                 | "wrong_md5_tls_frag"
                 | "wrong_seq_tls_record_frag"
                 | "tls_frag"
+                | "urg_sni_split"
         ) {
             anyhow::bail!(
-                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_md5\", \"wrong_seq_wrong_md5\", \"wrong_ack\", \"wrong_timestamp\", \"low_ttl\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_md5_tls_frag\", \"wrong_seq_tls_record_frag\", \"tls_frag\"",
+                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_md5\", \"wrong_seq_wrong_md5\", \"wrong_ack\", \"wrong_timestamp\", \"low_ttl\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_md5_tls_frag\", \"wrong_seq_tls_record_frag\", \"tls_frag\", \"urg_sni_split\"",
                 self.BYPASS_METHOD
             );
         }
@@ -1054,6 +1136,60 @@ mod tests {
         // proxy timing defaults
         assert_eq!(cfg.BYPASS_TIMEOUT_SECS, 20);
         assert_eq!(cfg.RELAY_MAX_LIFETIME_SECS, 0);
+    }
+
+    #[test]
+    fn sni_split_defaults() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.SNI_SPLIT_DUMMY_BYTE, 0);
+        assert_eq!(cfg.SNI_SPLIT_POSITION, SniSplitPosition::Middle);
+    }
+
+    #[test]
+    fn sni_split_position_parsing() {
+        for (toml_value, expected) in [
+            ("\"middle\"", SniSplitPosition::Middle),
+            ("\"MIDDLE\"", SniSplitPosition::Middle),
+            ("\"start\"", SniSplitPosition::Start),
+            ("\"end\"", SniSplitPosition::End),
+            ("3", SniSplitPosition::Index(3)),
+            ("0", SniSplitPosition::Index(0)),
+        ] {
+            let toml_str = format!(
+                r#"
+                LISTEN_HOST = "0.0.0.0"
+                LISTEN_PORT = 40443
+                SNI_SPLIT_POSITION = {toml_value}
+            "#
+            );
+            let cfg: Config = toml::from_str(&toml_str).unwrap();
+            assert_eq!(cfg.SNI_SPLIT_POSITION, expected);
+        }
+    }
+
+    #[test]
+    fn invalid_sni_split_position_rejected() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            SNI_SPLIT_POSITION = "sideways"
+        "#;
+        assert!(toml::from_str::<Config>(toml_str).is_err());
+    }
+
+    #[test]
+    fn urg_sni_split_is_a_valid_method() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "urg_sni_split"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]

@@ -567,7 +567,7 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `MODE` | `string` | `"sni_spoof"` | One of: `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan` |
-| `AUTO_SELECT` | `bool` | `false` | Auto-pick rank-1 after scan (skip manual selection table) |
+| `AUTO_SELECT` | `bool` | `true` | Auto-pick rank-1 after scan (skip manual selection table) |
 | `SELECTED_SNI` | `string` | — | Skip SNI scan; use this hostname directly |
 | `SELECTED_IP` | `string` | — | Skip IP scan; use this IP directly |
 
@@ -601,7 +601,7 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `SCAN_TIMEOUT_SECS` | `u64` | `5` | Per-probe timeout (seconds) |
-| `RESCAN_INTERVAL_SECS` | `u64` | `0` | Background rescan interval (`0` = disabled) |
+| `RESCAN_INTERVAL_SECS` | `u64` | `600` | Background rescan interval (`0` = disabled) |
 | `SNI_SWITCH_MIN_SCORE` | `u8` | `1` | Minimum score to auto-switch target on rescan (0–100) |
 | `SCAN_OUTPUT` | `string` | — | Path to save scan results as JSON (scan-only modes) |
 
@@ -656,9 +656,9 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 | `LOW_TTL_SET_PSH` | `bool` | `true` | Set PSH flag on the spoofed packet |
 | `LOW_TTL_BUMP_IP_IDENT` | `bool` | `true` | Bump IPv4 Identification field |
 | `LOW_TTL_COMPLETE_IMMEDIATELY` | `bool` | `true` | Signal bypass complete immediately after emission |
-| `LOW_TTL_DISCOVER` | `bool` | `false` | Discover the correct TTL automatically (see below) |
+| `LOW_TTL_DISCOVER` | `bool` | `true` | Discover the correct TTL automatically (see below) |
 | `LOW_TTL_DISCOVER_MAX` | `u8` | `32` | Upper bound of the discovery search (1–64) |
-| `LOW_TTL_DISCOVER_TIMEOUT_MS` | `u64` | `1500` | Per-candidate discovery probe timeout (≥ 100) |
+| `LOW_TTL_DISCOVER_TIMEOUT_MS` | `u64` | `5000` | Per-candidate discovery probe timeout (≥ 100) |
 
 `LOW_TTL_VALUE` must be high enough to reach the ISP's inline DPI middlebox but low enough to expire before the destination server. Typical DPI middleboxes sit 4–8 hops from the client; verify with `traceroute` and tune from there.
 

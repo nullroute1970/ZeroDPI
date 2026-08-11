@@ -37,7 +37,7 @@ MODE = "sni_spoof"
 # after scanning instead of showing the manual selection table.
 # TUI progress, results, and dashboard views are still shown.
 # For systemd/headless runs, use the CLI flag: --no-tui.
-AUTO_SELECT = false
+AUTO_SELECT = true
 
 # If set to a hostname, skip the scan entirely and use this hostname as the spoofed SNI.
 # The IP address is resolved from DNS automatically.
@@ -87,7 +87,7 @@ SCAN_TIMEOUT_SECS = 5
 # How often (in seconds) ZeroDPI re-runs the full SNI scan in the background
 # while the proxy is running. In sni_spoof mode, a better top result switches
 # the active SNI/IP for new connections. Set to 0 to disable periodic rescanning.
-RESCAN_INTERVAL_SECS = 0
+RESCAN_INTERVAL_SECS = 600
 
 # Minimum score required before a background SNI rescan can switch the active
 # SNI/IP target.
@@ -269,7 +269,10 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 # This setting is used by SNI-based modes ("sni_spoof", "sni_scan", and
 # "proxy_scan").  The "ip_bypass" and "ip_scan" modes do not use a bypass
 # method.
-BYPASS_METHOD = "wrong_seq_tls_frag"
+#
+# "low_ttl" is included because LOW_TTL_DISCOVER defaults to true (see below)
+# and validation requires "low_ttl" in this list when discovery is enabled.
+BYPASS_METHOD = ["wrong_seq_tls_frag", "low_ttl"]
 
 # Seconds the proxy waits for the intercept thread to confirm that the spoofed
 # packet was acknowledged and the bypass phase completed.
@@ -419,8 +422,8 @@ LOW_TTL_COMPLETE_IMMEDIATELY = true
 # margin.  It adds a one-time startup delay (a few seconds up to ~30 s worst
 # case) and requires LOW_TTL_COMPLETE_IMMEDIATELY = true.
 #
-# Default: false.
-LOW_TTL_DISCOVER = false
+# Default: true.
+LOW_TTL_DISCOVER = true
 
 # Upper bound of the LOW_TTL_DISCOVER search range, bounding the worst-case
 # startup delay.  Must be between 1 and 64.  Default: 32.
@@ -428,8 +431,8 @@ LOW_TTL_DISCOVER_MAX = 32
 
 # Per-candidate timeout in milliseconds used while discovering LOW_TTL_VALUE.
 # Lower values speed up discovery but may cause false negatives on slow links.
-# Must be at least 100.  Default: 1500.
-LOW_TTL_DISCOVER_TIMEOUT_MS = 1500
+# Must be at least 100.  Default: 5000.
+LOW_TTL_DISCOVER_TIMEOUT_MS = 5000
 
 # ---------------------------------------------------------------------------
 # wrong_md5 method parameters

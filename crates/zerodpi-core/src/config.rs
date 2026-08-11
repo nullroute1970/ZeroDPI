@@ -374,14 +374,14 @@ pub struct Config {
     /// When `true` the application automatically picks the top-ranked entry
     /// after scanning instead of showing the manual selection table.
     /// TUI progress, result, and dashboard views are still shown.
-    /// Default: `false`.
-    #[serde(default)]
+    /// Default: `true`.
+    #[serde(default = "default_true")]
     pub AUTO_SELECT: bool,
 
     /// Rescan interval in seconds.  After the proxy starts the scanner runs
     /// again in the background every this many seconds and logs the new
-    /// rankings.  Set to `0` to disable periodic rescanning.  Default: `0`.
-    #[serde(default)]
+    /// rankings.  Set to `0` to disable periodic rescanning.  Default: `600`.
+    #[serde(default = "default_rescan_interval_secs")]
     pub RESCAN_INTERVAL_SECS: u64,
 
     /// Minimum score required before a background SNI rescan is allowed to
@@ -547,8 +547,8 @@ pub struct Config {
     /// largest working value (the server's hop distance minus one, which
     /// reaches any inline DPI middlebox with maximum margin). It adds a
     /// one-time startup delay and requires
-    /// `LOW_TTL_COMPLETE_IMMEDIATELY = true`. Default: `false`.
-    #[serde(default = "default_false")]
+    /// `LOW_TTL_COMPLETE_IMMEDIATELY = true`. Default: `true`.
+    #[serde(default = "default_true")]
     pub LOW_TTL_DISCOVER: bool,
 
     /// Upper bound of the `LOW_TTL_DISCOVER` search range, bounding the
@@ -558,7 +558,7 @@ pub struct Config {
 
     /// Per-candidate timeout in milliseconds used while discovering
     /// `LOW_TTL_VALUE`. Lower values speed up discovery but may cause false
-    /// negatives on slow links. Must be `>= 100`. Default: `1500`.
+    /// negatives on slow links. Must be `>= 100`. Default: `5000`.
     #[serde(default = "default_low_ttl_discover_timeout_ms")]
     pub LOW_TTL_DISCOVER_TIMEOUT_MS: u64,
 
@@ -922,8 +922,13 @@ fn default_sni_list() -> String {
 fn default_scan_timeout() -> u64 {
     5
 }
+fn default_rescan_interval_secs() -> u64 {
+    600
+}
 fn default_method() -> BypassMethodList {
-    BypassMethodList::from("wrong_seq_tls_frag")
+    // `low_ttl` is included because LOW_TTL_DISCOVER defaults to `true` and
+    // validation requires "low_ttl" in BYPASS_METHOD when discovery is on.
+    BypassMethodList::from_delimited("wrong_seq_tls_frag, low_ttl")
 }
 fn default_queue_num() -> u16 {
     1
@@ -933,9 +938,6 @@ fn default_linux_firewall_backend() -> String {
 }
 fn default_true() -> bool {
     true
-}
-fn default_false() -> bool {
-    false
 }
 fn default_wrong_checksum_delta() -> u16 {
     1
@@ -947,7 +949,7 @@ fn default_low_ttl_discover_max() -> u8 {
     32
 }
 fn default_low_ttl_discover_timeout_ms() -> u64 {
-    1500
+    5000
 }
 fn default_wrong_ack_offset() -> u32 {
     1
@@ -1335,12 +1337,12 @@ mod tests {
         assert_eq!(cfg.LISTEN_PORT, 40443);
         assert_eq!(
             cfg.BYPASS_METHOD.iter().collect::<Vec<_>>(),
-            vec!["wrong_seq", "tls_frag"]
+            vec!["wrong_seq", "tls_frag", "low_ttl"]
         );
         assert_eq!(cfg.NFQUEUE_NUM, 1);
         assert_eq!(cfg.LINUX_FIREWALL_BACKEND, "iptables");
-        assert!(!cfg.AUTO_SELECT);
-        assert_eq!(cfg.RESCAN_INTERVAL_SECS, 0);
+        assert!(cfg.AUTO_SELECT);
+        assert_eq!(cfg.RESCAN_INTERVAL_SECS, 600);
         assert_eq!(cfg.SNI_SWITCH_MIN_SCORE, 1);
         assert_eq!(cfg.SNI_LIST, "sni_list.txt");
         assert_eq!(cfg.SCAN_TIMEOUT_SECS, 5);
@@ -1440,6 +1442,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "urg_sni_split"
+            LOW_TTL_DISCOVER = false
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
@@ -1451,6 +1454,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_checksum"
+            LOW_TTL_DISCOVER = false
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
@@ -1467,6 +1471,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_checksum"
+            LOW_TTL_DISCOVER = false
             WRONG_CHECKSUM_DELTA = 17
             WRONG_CHECKSUM_SET_PSH = false
             WRONG_CHECKSUM_BUMP_IP_IDENT = false
@@ -1506,9 +1511,9 @@ mod tests {
         assert!(cfg.LOW_TTL_SET_PSH);
         assert!(cfg.LOW_TTL_BUMP_IP_IDENT);
         assert!(cfg.LOW_TTL_COMPLETE_IMMEDIATELY);
-        assert!(!cfg.LOW_TTL_DISCOVER);
+        assert!(cfg.LOW_TTL_DISCOVER);
         assert_eq!(cfg.LOW_TTL_DISCOVER_MAX, 32);
-        assert_eq!(cfg.LOW_TTL_DISCOVER_TIMEOUT_MS, 1500);
+        assert_eq!(cfg.LOW_TTL_DISCOVER_TIMEOUT_MS, 5000);
     }
 
     #[test]
@@ -1605,6 +1610,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_md5"
+            LOW_TTL_DISCOVER = false
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
@@ -1620,6 +1626,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_md5"
+            LOW_TTL_DISCOVER = false
             WRONG_MD5_SET_PSH = false
             WRONG_MD5_BUMP_IP_IDENT = false
             WRONG_MD5_COMPLETE_IMMEDIATELY = false
@@ -1637,6 +1644,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_seq_wrong_md5"
+            LOW_TTL_DISCOVER = false
             WRONG_SEQ_EXTRA_OFFSET = 33
             WRONG_SEQ_SET_PSH = false
             WRONG_SEQ_BUMP_IP_IDENT = false
@@ -1660,6 +1668,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_ack"
+            LOW_TTL_DISCOVER = false
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
@@ -1676,6 +1685,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_ack"
+            LOW_TTL_DISCOVER = false
             WRONG_ACK_OFFSET = 17
             WRONG_ACK_SET_PSH = false
             WRONG_ACK_BUMP_IP_IDENT = false
@@ -1707,6 +1717,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_timestamp"
+            LOW_TTL_DISCOVER = false
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
@@ -1723,6 +1734,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_timestamp"
+            LOW_TTL_DISCOVER = false
             WRONG_TIMESTAMP_OFFSET = 17
             WRONG_TIMESTAMP_SET_PSH = false
             WRONG_TIMESTAMP_BUMP_IP_IDENT = false
@@ -1754,6 +1766,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "tls_record_frag"
+            LOW_TTL_DISCOVER = false
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
@@ -1769,6 +1782,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "tls_record_frag"
+            LOW_TTL_DISCOVER = false
             TLS_RECORD_FRAG_SIZE = 5
             TLS_RECORD_FRAG_SET_PSH = false
             TLS_RECORD_FRAG_BUMP_IP_IDENT = false
@@ -1853,6 +1867,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = ["urg_sni_split", "tls_frag"]
+            LOW_TTL_DISCOVER = false
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
@@ -1916,6 +1931,7 @@ mod tests {
             SNI_SWITCH_MIN_SCORE = 40
             SELECTED_SNI = "auth.vercel.com"
             BYPASS_METHOD = "wrong_seq"
+            LOW_TTL_DISCOVER = false
             NFQUEUE_NUM = 2
             LINUX_FIREWALL_BACKEND = "nftables"
             WRONG_SEQ_EXTRA_OFFSET = 100
@@ -1976,6 +1992,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_seq_tls_frag"
+            LOW_TTL_DISCOVER = false
             TCP_SEG_SIZE = 9
             TCP_SEG_NODELAY = false
         "#;
@@ -1996,6 +2013,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_md5_tls_frag"
+            LOW_TTL_DISCOVER = false
             WRONG_MD5_SET_PSH = false
             WRONG_MD5_BUMP_IP_IDENT = false
             WRONG_MD5_COMPLETE_IMMEDIATELY = false
@@ -2021,6 +2039,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "wrong_seq_tls_record_frag"
+            LOW_TTL_DISCOVER = false
             TLS_RECORD_FRAG_SIZE = 7
             TLS_RECORD_FRAG_SET_PSH = false
             TLS_RECORD_FRAG_BUMP_IP_IDENT = false
@@ -2145,6 +2164,7 @@ mod tests {
             LISTEN_PORT = 40443
             MODE = "ip_bypass_plus"
             BYPASS_METHOD = "tls_record_frag"
+            LOW_TTL_DISCOVER = false
             SELECTED_IP = "1.2.3.4"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
@@ -2160,6 +2180,7 @@ mod tests {
             LISTEN_PORT = 40443
             MODE = "ip_bypass_plus"
             BYPASS_METHOD = "tls_frag"
+            LOW_TTL_DISCOVER = false
             SELECTED_IP = "1.2.3.4"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
@@ -2407,6 +2428,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "tls_frag"
+            LOW_TTL_DISCOVER = false
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
@@ -2430,6 +2452,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "tls_frag"
+            LOW_TTL_DISCOVER = false
             TCP_SEG_SIZE = 16
             TCP_SEG_NODELAY = false
         "#;
@@ -2450,6 +2473,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "tls_frag"
+            LOW_TTL_DISCOVER = false
             TLS_FRAG_PACKETS = "1-3"
             TLS_FRAG_LENGTH = "2-7"
             TLS_FRAG_INTERVAL_MS = "0-10"
@@ -2474,6 +2498,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "tls_frag"
+            LOW_TTL_DISCOVER = false
             TLS_FRAG_PACKETS = "2"
             TLS_FRAG_LENGTH = 5
             TLS_FRAG_INTERVAL_MS = 0
@@ -2554,6 +2579,7 @@ mod tests {
             LISTEN_HOST = "0.0.0.0"
             LISTEN_PORT = 40443
             BYPASS_METHOD = "tls_frag"
+            LOW_TTL_DISCOVER = false
             TCP_SEG_SIZE = 100
             TCP_SEG_NODELAY = true
         "#;

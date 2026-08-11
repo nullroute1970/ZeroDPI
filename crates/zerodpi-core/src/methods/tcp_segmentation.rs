@@ -347,6 +347,7 @@ mod tests {
             r#"LISTEN_HOST = "127.0.0.1"
                LISTEN_PORT = 44444
                BYPASS_METHOD = "tls_frag"
+               LOW_TTL_DISCOVER = false
                TLS_FRAG_PACKETS = "1-3"
                TLS_FRAG_LENGTH = "2-4"
                TLS_FRAG_INTERVAL_MS = "0-9"

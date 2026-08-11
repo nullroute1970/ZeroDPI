@@ -63,7 +63,7 @@ fn find_sni_range(data: &[u8]) -> Option<(usize, usize)> {
     // Extensions: total len(2) then the list
     let ext_pair = body.get(off..off + 2)?;
     let ext_total = u16::from_be_bytes([ext_pair[0], ext_pair[1]]) as usize;
-    let mut p = off + 2;
+    let p = off + 2;
     let extensions = body.get(p..p + ext_total)?;
 
     let mut e = 0;
@@ -313,7 +313,10 @@ mod tests {
     fn index_is_clamped_to_last_byte() {
         assert_eq!(resolve_insert_position(11, SniSplitPosition::Index(3)), 3);
         assert_eq!(resolve_insert_position(11, SniSplitPosition::Index(0)), 0);
-        assert_eq!(resolve_insert_position(11, SniSplitPosition::Index(999)), 10);
+        assert_eq!(
+            resolve_insert_position(11, SniSplitPosition::Index(999)),
+            10
+        );
         assert_eq!(resolve_insert_position(11, SniSplitPosition::Index(10)), 10);
     }
 

@@ -1101,7 +1101,7 @@ mod tests {
     #[test]
     fn parse_view_reads_urg_flag() {
         use etherparse::TcpHeader;
-        let mut buf = data_packet(&[]);
+        let buf = data_packet(&[]);
         let mut tcp = TcpHeader::from_slice(&buf[20..40]).unwrap().0;
         tcp.urg = true;
         let mut out = Vec::with_capacity(buf.len());

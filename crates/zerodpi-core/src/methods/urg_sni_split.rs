@@ -99,6 +99,31 @@ fn find_sni_range(data: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+/// Resolve the config position to a 0-based insertion index inside a name of
+/// `name_len` bytes. The index always lands inside the name (or at 0 for an
+/// empty name).
+fn resolve_insert_position(name_len: usize, pos: SniSplitPosition) -> usize {
+    if name_len == 0 {
+        return 0;
+    }
+    let idx = match pos {
+        SniSplitPosition::Middle => name_len / 2,
+        SniSplitPosition::Start => 0,
+        SniSplitPosition::End => name_len - 1,
+        SniSplitPosition::Index(n) => n as usize,
+    };
+    idx.min(name_len - 1)
+}
+
+/// Return `payload` with `byte` spliced in at index `at`.
+fn insert_dummy(payload: &[u8], at: usize, byte: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 1);
+    out.extend_from_slice(&payload[..at]);
+    out.push(byte);
+    out.extend_from_slice(&payload[at..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +190,44 @@ mod tests {
         ch[118] = 0x00;
         ch[119] = 0x0b;
         assert_eq!(find_sni_range(&ch), None);
+    }
+
+    #[test]
+    fn middle_inserts_at_len_div_two() {
+        assert_eq!(resolve_insert_position(11, SniSplitPosition::Middle), 5);
+        assert_eq!(resolve_insert_position(6, SniSplitPosition::Middle), 3);
+        assert_eq!(resolve_insert_position(1, SniSplitPosition::Middle), 0);
+    }
+
+    #[test]
+    fn start_and_end_are_clamped_into_the_name() {
+        assert_eq!(resolve_insert_position(11, SniSplitPosition::Start), 0);
+        assert_eq!(resolve_insert_position(11, SniSplitPosition::End), 10);
+        assert_eq!(resolve_insert_position(1, SniSplitPosition::End), 0);
+    }
+
+    #[test]
+    fn index_is_clamped_to_last_byte() {
+        assert_eq!(resolve_insert_position(11, SniSplitPosition::Index(3)), 3);
+        assert_eq!(resolve_insert_position(11, SniSplitPosition::Index(0)), 0);
+        assert_eq!(resolve_insert_position(11, SniSplitPosition::Index(999)), 10);
+        assert_eq!(resolve_insert_position(11, SniSplitPosition::Index(10)), 10);
+    }
+
+    #[test]
+    fn insert_dummy_splices_a_single_byte() {
+        let payload = b"0123456789";
+        let out = insert_dummy(payload, 4, 0x00);
+        assert_eq!(out.len(), payload.len() + 1);
+        assert_eq!(&out[..4], b"0123");
+        assert_eq!(out[4], 0x00);
+        assert_eq!(&out[5..], b"456789");
+        assert_eq!(out, [b"0123".as_slice(), &[0x00], b"456789"].concat());
+    }
+
+    #[test]
+    fn insert_dummy_at_zero_and_end() {
+        assert_eq!(insert_dummy(b"ab", 0, 0x00), vec![0x00, b'a', b'b']);
+        assert_eq!(insert_dummy(b"ab", 2, 0x00), vec![b'a', b'b', 0x00]);
     }
 }

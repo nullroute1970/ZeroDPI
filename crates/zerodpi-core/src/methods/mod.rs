@@ -41,11 +41,7 @@ pub mod urg_sni_split;
 pub mod wrong_ack;
 pub mod wrong_checksum;
 pub mod wrong_md5;
-pub mod wrong_md5_tls_frag;
 pub mod wrong_seq;
-pub mod wrong_seq_tls_frag;
-pub mod wrong_seq_tls_record_frag;
-pub mod wrong_seq_wrong_md5;
 pub mod wrong_timestamp;
 
 use std::sync::atomic::AtomicU8;
@@ -155,121 +151,143 @@ pub trait BypassMethod: Send + Sync + 'static {
     }
 }
 
-/// Build an interceptor-based method from the application config.
+/// Build the interceptor-based method chain from the application config.
 ///
-/// Returns `Some(method)` for interceptor-based methods (`wrong_seq`,
-/// `wrong_ack`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`,
-/// `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `wrong_seq_tls_frag`,
-/// `wrong_seq_tls_record_frag`, `wrong_md5_tls_frag`) and `None` for socket-based methods
-/// (`tls_frag`) or unknown names.  Callers should validate the method
-/// name via [`crate::config::Config::validate`] before calling this function.
+/// Returns `Some(method)` when the configured list contains any
+/// interceptor-based method (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
+/// `wrong_md5`, `wrong_timestamp`, `low_ttl`, `urg_sni_split`,
+/// `tls_record_frag`) and `None` for socket-only lists (`["tls_frag"]`) or
+/// empty lists. Callers should validate the method list via
+/// [`crate::config::Config::validate`] before calling this function.
 pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
-    match cfg.BYPASS_METHOD.as_str() {
-        "wrong_seq" => Some(Box::new(wrong_seq::WrongSeq::new(cfg))),
-        "wrong_ack" => Some(Box::new(wrong_ack::WrongAck::new(cfg))),
-        "wrong_checksum" => Some(Box::new(wrong_checksum::WrongChecksum::new(cfg))),
-        "wrong_md5" => Some(Box::new(wrong_md5::WrongMd5::new(cfg))),
-        "low_ttl" => Some(Box::new(low_ttl::LowTtl::new(cfg))),
-        "wrong_seq_wrong_md5" => Some(Box::new(wrong_seq_wrong_md5::WrongSeqWrongMd5::new(cfg))),
-        "wrong_md5_tls_frag" => Some(Box::new(wrong_md5_tls_frag::WrongMd5TlsFrag::new(cfg))),
-        "wrong_timestamp" => Some(Box::new(wrong_timestamp::WrongTimestamp::new(cfg))),
-        "tls_record_frag" => Some(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
-        "wrong_seq_tls_frag" => Some(Box::new(wrong_seq_tls_frag::WrongSeqTlsFrag::new(cfg))),
-        "wrong_seq_tls_record_frag" => Some(Box::new(
-            wrong_seq_tls_record_frag::WrongSeqTlsRecordFrag::new(cfg),
-        )),
-        "urg_sni_split" => Some(Box::new(urg_sni_split::UrgSniSplit::new(cfg))),
-        // "tls_frag" is socket-based and handled directly in proxy.rs.
-        _ => None,
+    let list = &cfg.BYPASS_METHOD;
+    if list.is_empty() || list.is_socket_only() {
+        return None;
     }
+    let mut handshake: Vec<Box<dyn BypassMethod>> = Vec::new();
+    let mut data: Option<Box<dyn BypassMethod>> = None;
+    for name in list.iter() {
+        match name {
+            "tls_frag" => {} // socket side; handled directly in proxy.rs
+            "tls_record_frag" => data = Some(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
+            "wrong_seq" => handshake.push(Box::new(wrong_seq::WrongSeq::new(cfg))),
+            "wrong_ack" => handshake.push(Box::new(wrong_ack::WrongAck::new(cfg))),
+            "wrong_checksum" => handshake.push(Box::new(wrong_checksum::WrongChecksum::new(cfg))),
+            "wrong_md5" => handshake.push(Box::new(wrong_md5::WrongMd5::new(cfg))),
+            "wrong_timestamp" => {
+                handshake.push(Box::new(wrong_timestamp::WrongTimestamp::new(cfg)))
+            }
+            "low_ttl" => handshake.push(Box::new(low_ttl::LowTtl::new(cfg))),
+            "urg_sni_split" => handshake.push(Box::new(urg_sni_split::UrgSniSplit::new(cfg))),
+            _ => return None,
+        }
+    }
+    Some(Box::new(composite::CompositeMethod::new(
+        handshake,
+        data,
+        list.contains("tls_frag"),
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cfg_with_method(method: &str) -> Config {
+    fn cfg_with_method(method_line: &str) -> Config {
         toml::from_str(&format!(
             r#"LISTEN_HOST = "127.0.0.1"
                LISTEN_PORT = 44444
-               BYPASS_METHOD = "{method}""#
+               {method_line}"#
         ))
         .unwrap()
     }
 
     #[test]
     fn build_wrong_checksum_method() {
-        let cfg = cfg_with_method("wrong_checksum");
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "wrong_checksum""#);
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "wrong_checksum");
     }
 
     #[test]
     fn build_wrong_ack_method() {
-        let cfg = cfg_with_method("wrong_ack");
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "wrong_ack""#);
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "wrong_ack");
     }
 
     #[test]
     fn build_wrong_md5_method() {
-        let cfg = cfg_with_method("wrong_md5");
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "wrong_md5""#);
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "wrong_md5");
     }
 
     #[test]
     fn build_low_ttl_method() {
-        let cfg = cfg_with_method("low_ttl");
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "low_ttl""#);
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "low_ttl");
     }
 
     #[test]
     fn build_wrong_seq_wrong_md5_method() {
-        let cfg = cfg_with_method("wrong_seq_wrong_md5");
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "wrong_seq_wrong_md5""#);
         let method = build_method(&cfg).unwrap();
-        assert_eq!(method.name(), "wrong_seq_wrong_md5");
+        assert_eq!(method.name(), "wrong_seq + wrong_md5");
     }
 
     #[test]
     fn build_wrong_md5_tls_frag_method() {
-        let cfg = cfg_with_method("wrong_md5_tls_frag");
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "wrong_md5_tls_frag""#);
         let method = build_method(&cfg).unwrap();
-        assert_eq!(method.name(), "wrong_md5_tls_frag");
+        assert_eq!(method.name(), "wrong_md5 + tls_frag");
     }
 
     #[test]
     fn build_wrong_timestamp_method() {
-        let cfg = cfg_with_method("wrong_timestamp");
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "wrong_timestamp""#);
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "wrong_timestamp");
     }
 
     #[test]
     fn build_wrong_seq_tls_frag_method() {
-        let cfg = cfg_with_method("wrong_seq_tls_frag");
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "wrong_seq_tls_frag""#);
         let method = build_method(&cfg).unwrap();
-        assert_eq!(method.name(), "wrong_seq_tls_frag");
+        assert_eq!(method.name(), "wrong_seq + tls_frag");
     }
 
     #[test]
     fn build_wrong_seq_tls_record_frag_method() {
-        let cfg = cfg_with_method("wrong_seq_tls_record_frag");
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "wrong_seq_tls_record_frag""#);
         let method = build_method(&cfg).unwrap();
-        assert_eq!(method.name(), "wrong_seq_tls_record_frag");
+        assert_eq!(method.name(), "wrong_seq + tls_record_frag");
     }
 
     #[test]
     fn build_urg_sni_split_method() {
-        let cfg = cfg_with_method("urg_sni_split");
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "urg_sni_split""#);
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "urg_sni_split");
     }
 
     #[test]
     fn socket_method_returns_none() {
-        let cfg = cfg_with_method("tls_frag");
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "tls_frag""#);
+        assert!(build_method(&cfg).is_none());
+    }
+
+    #[test]
+    fn builds_composite_for_list() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["wrong_seq", "low_ttl"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "wrong_seq + low_ttl");
+    }
+
+    #[test]
+    fn socket_list_returns_none() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["tls_frag"]"#);
         assert!(build_method(&cfg).is_none());
     }
 }

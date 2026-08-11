@@ -12,7 +12,7 @@ use thiserror::Error;
 
 pub const MAGIC: [u8; 4] = *b"ZDHP";
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 2;
 pub const HEADER_LEN: usize = 20;
 pub const MAX_FRAME_SIZE: usize = 256 * 1024;
 pub const MAX_FAKE_DATA_SIZE: usize = 64 * 1024;
@@ -110,7 +110,7 @@ pub struct InterceptorConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MethodConfig {
-    pub name: String,
+    pub methods: Vec<String>,
     pub wrong_seq_extra_offset: u32,
     pub wrong_seq_set_psh: bool,
     pub wrong_seq_bump_ip_ident: bool,
@@ -145,16 +145,19 @@ impl MethodConfig {
             "wrong_ack",
             "wrong_checksum",
             "wrong_md5",
-            "wrong_seq_wrong_md5",
-            "wrong_md5_tls_frag",
             "wrong_timestamp",
             "low_ttl",
             "tls_record_frag",
-            "wrong_seq_tls_frag",
-            "wrong_seq_tls_record_frag",
+            "tls_frag",
+            "urg_sni_split",
         ];
-        if !SUPPORTED.contains(&self.name.as_str()) {
-            return Err(ProtocolError::InvalidField("method name"));
+        if self.methods.is_empty()
+            || self
+                .methods
+                .iter()
+                .any(|m| !SUPPORTED.contains(&m.as_str()))
+        {
+            return Err(ProtocolError::InvalidField("method names"));
         }
         if self.wrong_checksum_delta == 0 {
             return Err(ProtocolError::InvalidField("wrong checksum delta"));
@@ -523,7 +526,7 @@ mod tests {
 
     fn method() -> MethodConfig {
         MethodConfig {
-            name: "wrong_seq".into(),
+            methods: vec!["wrong_seq".into()],
             wrong_seq_extra_offset: 100,
             wrong_seq_set_psh: true,
             wrong_seq_bump_ip_ident: true,
@@ -776,11 +779,11 @@ mod tests {
         config.queue_num = 0;
         assert!(config.validate().is_err());
         config.queue_num = 100;
-        config.method.name = "arbitrary_command".into();
+        config.method.methods = vec!["arbitrary_command".into()];
         assert!(config.validate().is_err());
 
         let mut low_ttl = method();
-        low_ttl.name = "low_ttl".into();
+        low_ttl.methods = vec!["low_ttl".into()];
         low_ttl.low_ttl_value = 0;
         assert!(low_ttl.validate().is_err());
         low_ttl.low_ttl_value = 65;

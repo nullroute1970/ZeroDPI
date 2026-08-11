@@ -192,7 +192,7 @@ where
         candidate.sni_score(),
     )));
 
-    if config.BYPASS_METHOD == "tls_frag" {
+    if config.BYPASS_METHOD.is_socket_only() {
         let flows = new_flow_table();
         let flow_controller: Arc<dyn crate::flow::FlowController> =
             Arc::new(crate::flow::LocalFlowController::new(flows));

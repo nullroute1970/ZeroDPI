@@ -154,7 +154,7 @@ impl ConnectionSettings {
         Self {
             bypass_timeout: Duration::from_secs(cfg.BYPASS_TIMEOUT_SECS),
             max_lifetime: configured_relay_max_lifetime(cfg),
-            segment_first_client_hello: method_segments_first_client_hello(&cfg.BYPASS_METHOD),
+            segment_first_client_hello: cfg.BYPASS_METHOD.contains("tls_frag"),
             tcp_segmentation,
         }
     }
@@ -318,10 +318,6 @@ fn current_bypass_progress(entry: &FlowEntry) -> Option<BypassProgress> {
     }
 }
 
-fn method_segments_first_client_hello(method: &str) -> bool {
-    matches!(method, "wrong_seq_tls_frag" | "wrong_md5_tls_frag")
-}
-
 async fn wait_for_initial_bypass_progress(
     entry: &FlowEntry,
     timeout: Duration,
@@ -471,7 +467,7 @@ pub async fn run_proxy(
 
         // Route to the socket-based path for tls_frag.
         // No FlowTable registration; no interceptor involvement.
-        if cfg.BYPASS_METHOD == "tls_frag" {
+        if cfg.BYPASS_METHOD.is_socket_only() {
             let cfg = cfg.clone();
             let connect_ip = active_target.read().unwrap().ip;
             let event_tx = event_tx.clone();
@@ -789,7 +785,7 @@ pub async fn run_ip_bypass_plus_proxy(
             }
         };
 
-        if cfg.BYPASS_METHOD == "tls_frag" {
+        if cfg.BYPASS_METHOD.is_socket_only() {
             let cfg = cfg.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
@@ -1436,13 +1432,23 @@ mod tests {
     }
 
     #[test]
-    fn combo_tls_frag_methods_segment_first_client_hello() {
-        assert!(method_segments_first_client_hello("wrong_seq_tls_frag"));
-        assert!(method_segments_first_client_hello("wrong_md5_tls_frag"));
-        assert!(!method_segments_first_client_hello(
-            "wrong_seq_tls_record_frag"
-        ));
-        assert!(!method_segments_first_client_hello("tls_record_frag"));
-        assert!(!method_segments_first_client_hello("tls_frag"));
+    fn tls_frag_in_list_segments_first_client_hello() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = ["wrong_seq", "tls_frag"]"#,
+        )
+        .unwrap();
+        let settings = ConnectionSettings::from_config(&cfg);
+        assert!(settings.segment_first_client_hello);
+
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "wrong_seq_tls_record_frag""#,
+        )
+        .unwrap();
+        let settings = ConnectionSettings::from_config(&cfg);
+        assert!(!settings.segment_first_client_hello);
     }
 }

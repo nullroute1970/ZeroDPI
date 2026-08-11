@@ -450,7 +450,7 @@ fn build_wire_method(
     // typed method fields supplied by the protocol. No app file is read here.
     let mut cfg: Config = toml::from_str("LISTEN_HOST = '127.0.0.1'\nLISTEN_PORT = 1\n")
         .context("construct helper method baseline")?;
-    cfg.BYPASS_METHOD = wire.name.clone();
+    cfg.BYPASS_METHOD = wire.methods.clone().into();
     cfg.WRONG_SEQ_EXTRA_OFFSET = wire.wrong_seq_extra_offset;
     cfg.WRONG_SEQ_SET_PSH = wire.wrong_seq_set_psh;
     cfg.WRONG_SEQ_BUMP_IP_IDENT = wire.wrong_seq_bump_ip_ident;

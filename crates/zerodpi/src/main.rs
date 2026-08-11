@@ -30,7 +30,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
-use zerodpi_core::config::Config;
+use zerodpi_core::config::{BypassMethodList, Config};
 use zerodpi_core::dns::DnsResolver;
 use zerodpi_core::flow::{new_flow_table, FlowController, LocalFlowController};
 use zerodpi_core::handler::Handler;
@@ -116,7 +116,8 @@ struct Args {
     /// Override `SELECTED_SNI` — skip scanning and use this hostname.
     #[arg(long)]
     sni: Option<String>,
-    /// Override `BYPASS_METHOD` (e.g. `wrong_seq`, `wrong_timestamp`, `tls_frag`).
+    /// Override `BYPASS_METHOD` — a single method or a comma-separated list
+    /// (e.g. `wrong_seq,tls_frag`).
     #[arg(long)]
     method: Option<String>,
     /// Linux-only: NFQUEUE queue number to use.
@@ -242,7 +243,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         cfg.SELECTED_SNI = Some(v);
     }
     if let Some(v) = args.method {
-        cfg.BYPASS_METHOD = v;
+        cfg.BYPASS_METHOD = BypassMethodList::from_delimited(&v);
     }
     if let Some(v) = args.queue_num {
         cfg.NFQUEUE_NUM = v;
@@ -295,7 +296,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     events.emit(RuntimeEvent::ConfigLoaded {
         path: cfg_path.display().to_string(),
         mode: cfg.MODE.clone(),
-        bypass_method: cfg.BYPASS_METHOD.clone(),
+        bypass_method: cfg.BYPASS_METHOD.to_string(),
         listen_host: cfg.LISTEN_HOST.clone(),
         listen_port: cfg.LISTEN_PORT,
         auto_select: cfg.AUTO_SELECT,
@@ -306,7 +307,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         if let Err(error) = ensure_packet_interception_access() {
             events.emit(RuntimeEvent::RootRequired {
                 mode: cfg.MODE.clone(),
-                bypass_method: cfg.BYPASS_METHOD.clone(),
+                bypass_method: cfg.BYPASS_METHOD.to_string(),
                 message: root_required_message(&cfg),
                 rootless_alternatives: rootless_alternatives(),
             });
@@ -466,7 +467,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     let (flow_controller, interceptor_runtime): (
         Arc<dyn FlowController>,
         Option<InterceptorRuntime>,
-    ) = if cfg.BYPASS_METHOD == "tls_frag" {
+    ) = if cfg.BYPASS_METHOD.is_socket_only() {
         info!("tls_frag selected; skipping packet interceptor");
         let flows = new_flow_table();
         (Arc::new(LocalFlowController::new(flows)), None)
@@ -529,7 +530,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
 
     // ---- step 3b: automatic LOW_TTL_VALUE discovery ----
-    let low_ttl_discovery_state = if cfg.LOW_TTL_DISCOVER && cfg.BYPASS_METHOD == "low_ttl" {
+    let low_ttl_discovery_state = if cfg.LOW_TTL_DISCOVER {
         if !cfg.LOW_TTL_COMPLETE_IMMEDIATELY {
             warn!(
                 "LOW_TTL_DISCOVER requires LOW_TTL_COMPLETE_IMMEDIATELY = true; \
@@ -1106,8 +1107,8 @@ fn requires_packet_interception(cfg: &Config) -> bool {
     mode_requires_packet_interception(&cfg.MODE, &cfg.BYPASS_METHOD)
 }
 
-fn mode_requires_packet_interception(mode: &str, bypass_method: &str) -> bool {
-    matches!(mode, "sni_spoof" | "proxy_scan" | "ip_bypass_plus") && bypass_method != "tls_frag"
+fn mode_requires_packet_interception(mode: &str, bypass_method: &BypassMethodList) -> bool {
+    matches!(mode, "sni_spoof" | "proxy_scan" | "ip_bypass_plus") && !bypass_method.is_socket_only()
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1795,7 +1796,7 @@ fn ip_bypass_plus_main(
     let (flow_controller, interceptor_runtime): (
         Arc<dyn FlowController>,
         Option<InterceptorRuntime>,
-    ) = if cfg.BYPASS_METHOD == "tls_frag" {
+    ) = if cfg.BYPASS_METHOD.is_socket_only() {
         info!("ip_bypass_plus: tls_frag selected; skipping packet interceptor");
         let flows = new_flow_table();
         (Arc::new(LocalFlowController::new(flows)), None)
@@ -2622,59 +2623,87 @@ mod tests {
         assert!(should_switch_sni_target(&current(0), &c, 1));
     }
 
+    fn method_list(name: &str) -> BypassMethodList {
+        BypassMethodList::from(name)
+    }
+
     #[test]
     fn normal_spoofing_requires_packet_interception() {
-        assert!(mode_requires_packet_interception("sni_spoof", "wrong_seq"));
-        assert!(mode_requires_packet_interception("sni_spoof", "wrong_ack"));
         assert!(mode_requires_packet_interception(
             "sni_spoof",
-            "wrong_checksum"
-        ));
-        assert!(mode_requires_packet_interception("sni_spoof", "wrong_md5"));
-        assert!(mode_requires_packet_interception(
-            "sni_spoof",
-            "wrong_seq_wrong_md5"
+            &method_list("wrong_seq")
         ));
         assert!(mode_requires_packet_interception(
             "sni_spoof",
-            "wrong_md5_tls_frag"
+            &method_list("wrong_ack")
         ));
         assert!(mode_requires_packet_interception(
             "sni_spoof",
-            "wrong_timestamp"
-        ));
-        assert!(mode_requires_packet_interception("sni_spoof", "low_ttl"));
-        assert!(mode_requires_packet_interception(
-            "sni_spoof",
-            "tls_record_frag"
+            &method_list("wrong_checksum")
         ));
         assert!(mode_requires_packet_interception(
             "sni_spoof",
-            "wrong_seq_tls_frag"
+            &method_list("wrong_md5")
         ));
         assert!(mode_requires_packet_interception(
             "sni_spoof",
-            "wrong_seq_tls_record_frag"
+            &method_list("wrong_seq_wrong_md5")
+        ));
+        assert!(mode_requires_packet_interception(
+            "sni_spoof",
+            &method_list("wrong_md5_tls_frag")
+        ));
+        assert!(mode_requires_packet_interception(
+            "sni_spoof",
+            &method_list("wrong_timestamp")
+        ));
+        assert!(mode_requires_packet_interception(
+            "sni_spoof",
+            &method_list("low_ttl")
+        ));
+        assert!(mode_requires_packet_interception(
+            "sni_spoof",
+            &method_list("tls_record_frag")
+        ));
+        assert!(mode_requires_packet_interception(
+            "sni_spoof",
+            &method_list("wrong_seq_tls_frag")
+        ));
+        assert!(mode_requires_packet_interception(
+            "sni_spoof",
+            &method_list("wrong_seq_tls_record_frag")
         ));
     }
 
     #[test]
     fn non_interception_modes_do_not_require_packet_interception() {
-        assert!(!mode_requires_packet_interception("sni_spoof", "tls_frag"));
-        assert!(!mode_requires_packet_interception("ip_bypass", "wrong_seq"));
-        assert!(!mode_requires_packet_interception("sni_scan", "wrong_seq"));
-        assert!(!mode_requires_packet_interception("ip_scan", "wrong_seq"));
+        assert!(!mode_requires_packet_interception(
+            "sni_spoof",
+            &method_list("tls_frag")
+        ));
+        assert!(!mode_requires_packet_interception(
+            "ip_bypass",
+            &method_list("wrong_seq")
+        ));
+        assert!(!mode_requires_packet_interception(
+            "sni_scan",
+            &method_list("wrong_seq")
+        ));
+        assert!(!mode_requires_packet_interception(
+            "ip_scan",
+            &method_list("wrong_seq")
+        ));
     }
 
     #[test]
     fn ip_bypass_plus_requires_interception_only_for_tls_record_frag() {
         assert!(mode_requires_packet_interception(
             "ip_bypass_plus",
-            "tls_record_frag"
+            &method_list("tls_record_frag")
         ));
         assert!(!mode_requires_packet_interception(
             "ip_bypass_plus",
-            "tls_frag"
+            &method_list("tls_frag")
         ));
     }
 
@@ -2704,7 +2733,13 @@ mod tests {
 
     #[test]
     fn proxy_scan_only_requires_interception_for_interceptor_methods() {
-        assert!(mode_requires_packet_interception("proxy_scan", "wrong_seq"));
-        assert!(!mode_requires_packet_interception("proxy_scan", "tls_frag"));
+        assert!(mode_requires_packet_interception(
+            "proxy_scan",
+            &method_list("wrong_seq")
+        ));
+        assert!(!mode_requires_packet_interception(
+            "proxy_scan",
+            &method_list("tls_frag")
+        ));
     }
 }

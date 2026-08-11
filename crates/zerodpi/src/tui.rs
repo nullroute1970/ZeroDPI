@@ -1125,7 +1125,7 @@ fn draw_dashboard(
                         let mut spans = vec![
                             Span::styled("Method: ", label_style()),
                             Span::styled(
-                                cfg.BYPASS_METHOD.clone(),
+                                cfg.BYPASS_METHOD.to_string(),
                                 Style::default().fg(Color::White),
                             ),
                             Span::raw("   "),
@@ -1164,7 +1164,10 @@ fn draw_dashboard(
                     ]),
                     DashboardInfo::IpBypassPlus { .. } => Line::from(vec![
                         Span::styled("Method: ", label_style()),
-                        Span::styled(cfg.BYPASS_METHOD.clone(), Style::default().fg(Color::White)),
+                        Span::styled(
+                            cfg.BYPASS_METHOD.to_string(),
+                            Style::default().fg(Color::White),
+                        ),
                         Span::raw("   "),
                         Span::styled("Uptime: ", label_style()),
                         Span::styled(uptime, Style::default().fg(Color::White)),

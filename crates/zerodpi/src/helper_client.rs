@@ -530,7 +530,7 @@ pub fn interceptor_config(
             zerodpi_core::interceptor::LinuxFirewallBackend::Nftables => FirewallBackend::Nftables,
         },
         method: MethodConfig {
-            name: cfg.BYPASS_METHOD.clone(),
+            methods: cfg.BYPASS_METHOD.as_slice().to_vec(),
             wrong_seq_extra_offset: cfg.WRONG_SEQ_EXTRA_OFFSET,
             wrong_seq_set_psh: cfg.WRONG_SEQ_SET_PSH,
             wrong_seq_bump_ip_ident: cfg.WRONG_SEQ_BUMP_IP_IDENT,

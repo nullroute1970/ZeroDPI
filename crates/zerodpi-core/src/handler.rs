@@ -303,17 +303,14 @@ mod tests {
     use crate::config::Config;
     use crate::flow::{new_flow_table, BypassOutcome, FlowEntry, FlowKey};
     use crate::interceptor::{Direction, PacketView, TcpFlags};
+    use crate::methods::build_method;
     use crate::methods::low_ttl::LowTtl;
     use crate::methods::tls_record_frag::TlsRecordFrag;
     use crate::methods::urg_sni_split::UrgSniSplit;
     use crate::methods::wrong_ack::WrongAck;
     use crate::methods::wrong_checksum::WrongChecksum;
     use crate::methods::wrong_md5::{tcp_md5_signature_option, WrongMd5};
-    use crate::methods::wrong_md5_tls_frag::WrongMd5TlsFrag;
     use crate::methods::wrong_seq::WrongSeq;
-    use crate::methods::wrong_seq_tls_frag::WrongSeqTlsFrag;
-    use crate::methods::wrong_seq_tls_record_frag::WrongSeqTlsRecordFrag;
-    use crate::methods::wrong_seq_wrong_md5::WrongSeqWrongMd5;
     use crate::methods::wrong_timestamp::WrongTimestamp;
     use crate::tls_template::build_client_hello;
 
@@ -695,7 +692,7 @@ mod tests {
 
         let mut cfg = default_cfg();
         cfg.BYPASS_METHOD = "wrong_seq_wrong_md5".into();
-        let mut h = Handler::new(flows, Arc::new(WrongSeqWrongMd5::new(&cfg)));
+        let mut h = Handler::new(flows, Arc::from(build_method(&cfg).unwrap()));
 
         let mut p = pkt(
             Direction::Outbound,
@@ -1121,7 +1118,7 @@ mod tests {
 
         let mut cfg = default_cfg();
         cfg.BYPASS_METHOD = "wrong_seq_tls_frag".into();
-        let mut h = Handler::new(flows, Arc::new(WrongSeqTlsFrag::new(&cfg)));
+        let mut h = Handler::new(flows, Arc::from(build_method(&cfg).unwrap()));
 
         let mut p = pkt(
             Direction::Outbound,
@@ -1213,7 +1210,7 @@ mod tests {
 
         let mut cfg = default_cfg();
         cfg.BYPASS_METHOD = "wrong_md5_tls_frag".into();
-        let mut h = Handler::new(flows, Arc::new(WrongMd5TlsFrag::new(&cfg)));
+        let mut h = Handler::new(flows, Arc::from(build_method(&cfg).unwrap()));
 
         let mut p = pkt(
             Direction::Outbound,
@@ -1307,7 +1304,7 @@ mod tests {
 
         let mut cfg = default_cfg();
         cfg.BYPASS_METHOD = "wrong_seq_tls_record_frag".into();
-        let mut h = Handler::new(flows, Arc::new(WrongSeqTlsRecordFrag::new(&cfg)));
+        let mut h = Handler::new(flows, Arc::from(build_method(&cfg).unwrap()));
 
         let mut p = pkt(
             Direction::Outbound,

@@ -293,6 +293,19 @@ impl From<Vec<String>> for BypassMethodList {
     }
 }
 
+impl serde::Serialize for BypassMethodList {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.0.len() == 1 {
+            serializer.serialize_str(&self.0[0])
+        } else {
+            serializer.collect_seq(self.0.iter())
+        }
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for BypassMethodList {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -381,7 +394,11 @@ pub struct Config {
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub SELECTED_SNI: Option<String>,
 
-    /// Bypass method to use.  Supported values:
+    /// Bypass method(s) to use. Accepts a single method name or a TOML array
+    /// of method names, e.g. `["wrong_seq", "tls_frag"]`. Combo aliases
+    /// (`wrong_seq_wrong_md5`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`,
+    /// `wrong_seq_tls_record_frag`) are accepted and expand to their base
+    /// names. Base methods:
     /// - `"wrong_seq"` — injects a fake TLS ClientHello with a
     ///   deliberately wrong TCP sequence number so DPI inspects the fake SNI
     ///   while the real server discards the out-of-window payload.
@@ -392,10 +409,6 @@ pub struct Config {
     ///   sequence/acknowledgment numbers and a TCP-MD5 Signature option. DPI
     ///   can inspect the fake SNI while the real server rejects the segment
     ///   because no TCP-MD5 key was negotiated.
-    /// - `"wrong_seq_wrong_md5"` — injects a fake TLS ClientHello with both a
-    ///   deliberately wrong TCP sequence number and a TCP-MD5 Signature option.
-    ///   DPI can inspect the fake SNI while the real server rejects the segment
-    ///   because it is out of window and no TCP-MD5 key was negotiated.
     /// - `"wrong_ack"` — injects a fake TLS ClientHello with the normal TCP
     ///   sequence number and a deliberately old TCP acknowledgment number so
     ///   DPI inspects the fake SNI while the real server rejects the segment.
@@ -412,14 +425,6 @@ pub struct Config {
     ///   Splits the real ClientHello into multiple small TLS records so no
     ///   single record contains the full SNI. No fake packet is injected; the
     ///   server reassembles normally.
-    /// - `"wrong_seq_tls_frag"` (default) — injects a `wrong_seq` fake
-    ///   ClientHello, then fragments configured real client data for
-    ///   downstream DPI layers.
-    /// - `"wrong_md5_tls_frag"` — injects a `wrong_md5` fake ClientHello,
-    ///   then fragments configured real client data for downstream DPI layers.
-    /// - `"wrong_seq_tls_record_frag"` — injects a `wrong_seq` fake
-    ///   ClientHello, then fragments the real ClientHello into multiple small
-    ///   TLS records for downstream DPI layers.
     /// - `"tls_frag"` — TLS Fragment / TCP-level fragmentation.
     ///   Splits a normal, intact TLS ClientHello record into multiple tiny TCP
     ///   segments so DPI cannot reassemble the SNI from any single packet.
@@ -430,8 +435,14 @@ pub struct Config {
     ///   destination server strips the byte while byte-scanning DPI sees a
     ///   mangled SNI. No fake packet is injected; the server reassembles the
     ///   original handshake via BSD urgent-data semantics.
+    ///
+    /// Handshake-stage methods (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
+    /// `wrong_md5`, `wrong_timestamp`, `low_ttl`) all inject the same fake
+    /// ClientHello; several may be listed to merge their tricks onto one fake
+    /// packet. `tls_record_frag` and `tls_frag` add the data stage. See the
+    /// `BYPASS_METHOD` section of `config.toml` for the combination limits.
     #[serde(default = "default_method")]
-    pub BYPASS_METHOD: String,
+    pub BYPASS_METHOD: BypassMethodList,
     /// (Linux only) NFQUEUE queue number used to intercept packets. Must
     /// match the queue number in the firewall rules installed by ZeroDPI.
     /// Default: `1`.
@@ -911,8 +922,8 @@ fn default_sni_list() -> String {
 fn default_scan_timeout() -> u64 {
     5
 }
-fn default_method() -> String {
-    "wrong_seq_tls_frag".into()
+fn default_method() -> BypassMethodList {
+    BypassMethodList::from("wrong_seq_tls_frag")
 }
 fn default_queue_num() -> u16 {
     1
@@ -1097,26 +1108,36 @@ impl Config {
                 );
             }
         }
-        if !matches!(
-            self.BYPASS_METHOD.as_str(),
-            "wrong_seq"
-                | "wrong_checksum"
-                | "wrong_md5"
-                | "wrong_seq_wrong_md5"
-                | "wrong_ack"
-                | "wrong_timestamp"
-                | "low_ttl"
-                | "tls_record_frag"
-                | "wrong_seq_tls_frag"
-                | "wrong_md5_tls_frag"
-                | "wrong_seq_tls_record_frag"
-                | "tls_frag"
-                | "urg_sni_split"
-        ) {
+        if self.BYPASS_METHOD.is_empty() {
             anyhow::bail!(
-                "Unknown BYPASS_METHOD '{}'. Valid values: \"wrong_seq\", \"wrong_checksum\", \"wrong_md5\", \"wrong_seq_wrong_md5\", \"wrong_ack\", \"wrong_timestamp\", \"low_ttl\", \"tls_record_frag\", \"wrong_seq_tls_frag\", \"wrong_md5_tls_frag\", \"wrong_seq_tls_record_frag\", \"tls_frag\", \"urg_sni_split\"",
-                self.BYPASS_METHOD
+                "BYPASS_METHOD must not be empty; valid base methods: {:?}, aliases: \"wrong_seq_wrong_md5\", \"wrong_seq_tls_frag\", \"wrong_md5_tls_frag\", \"wrong_seq_tls_record_frag\"",
+                BASE_BYPASS_METHODS
             );
+        }
+        {
+            let mut seen = std::collections::HashSet::new();
+            for method in self.BYPASS_METHOD.iter() {
+                if !BASE_BYPASS_METHODS.contains(&method) {
+                    anyhow::bail!(
+                        "Unknown BYPASS_METHOD '{}'. Valid base methods: {:?}, aliases: \"wrong_seq_wrong_md5\", \"wrong_seq_tls_frag\", \"wrong_md5_tls_frag\", \"wrong_seq_tls_record_frag\"",
+                        method, BASE_BYPASS_METHODS
+                    );
+                }
+                if !seen.insert(method) {
+                    anyhow::bail!("Duplicate BYPASS_METHOD entry '{method}'");
+                }
+            }
+            if self.BYPASS_METHOD.contains("urg_sni_split")
+                && self.BYPASS_METHOD.len() > 1
+                && !self
+                    .BYPASS_METHOD
+                    .iter()
+                    .all(|m| m == "urg_sni_split" || matches!(m, "tls_frag" | "tls_record_frag"))
+            {
+                anyhow::bail!(
+                    "BYPASS_METHOD \"urg_sni_split\" can only be combined with \"tls_frag\" or \"tls_record_frag\""
+                );
+            }
         }
         if self.WRONG_CHECKSUM_DELTA == 0 {
             anyhow::bail!("WRONG_CHECKSUM_DELTA must be >= 1");
@@ -1141,6 +1162,9 @@ impl Config {
         }
         if self.LOW_TTL_DISCOVER_TIMEOUT_MS < 100 {
             anyhow::bail!("LOW_TTL_DISCOVER_TIMEOUT_MS must be >= 100");
+        }
+        if self.LOW_TTL_DISCOVER && !self.BYPASS_METHOD.contains("low_ttl") {
+            anyhow::bail!("LOW_TTL_DISCOVER = true requires \"low_ttl\" in BYPASS_METHOD");
         }
         if self.TLS_RECORD_FRAG_SIZE == 0 {
             anyhow::bail!("TLS_RECORD_FRAG_SIZE must be >= 1");
@@ -1172,7 +1196,10 @@ impl Config {
             );
         }
         if self.MODE == "ip_bypass_plus"
-            && !matches!(self.BYPASS_METHOD.as_str(), "tls_record_frag" | "tls_frag")
+            && !self
+                .BYPASS_METHOD
+                .iter()
+                .all(|m| matches!(m, "tls_record_frag" | "tls_frag"))
         {
             anyhow::bail!(
                 "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\" or \"tls_frag\""
@@ -1237,13 +1264,19 @@ mod tests {
     #[test]
     fn deserializes_array() {
         let list = parse_method("[\"wrong_seq\", \"low_ttl\"]").unwrap();
-        assert_eq!(list.iter().collect::<Vec<_>>(), vec!["wrong_seq", "low_ttl"]);
+        assert_eq!(
+            list.iter().collect::<Vec<_>>(),
+            vec!["wrong_seq", "low_ttl"]
+        );
     }
 
     #[test]
     fn expands_combo_alias_in_string() {
         let list = parse_method("\"wrong_seq_tls_frag\"").unwrap();
-        assert_eq!(list.iter().collect::<Vec<_>>(), vec!["wrong_seq", "tls_frag"]);
+        assert_eq!(
+            list.iter().collect::<Vec<_>>(),
+            vec!["wrong_seq", "tls_frag"]
+        );
     }
 
     #[test]
@@ -1300,7 +1333,10 @@ mod tests {
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.LISTEN_PORT, 40443);
-        assert_eq!(cfg.BYPASS_METHOD, "wrong_seq_tls_frag");
+        assert_eq!(
+            cfg.BYPASS_METHOD.iter().collect::<Vec<_>>(),
+            vec!["wrong_seq", "tls_frag"]
+        );
         assert_eq!(cfg.NFQUEUE_NUM, 1);
         assert_eq!(cfg.LINUX_FIREWALL_BACKEND, "iptables");
         assert!(!cfg.AUTO_SELECT);
@@ -1608,7 +1644,10 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.BYPASS_METHOD, "wrong_seq_wrong_md5");
+        assert_eq!(
+            cfg.BYPASS_METHOD.iter().collect::<Vec<_>>(),
+            vec!["wrong_seq", "wrong_md5"]
+        );
         assert_eq!(cfg.WRONG_SEQ_EXTRA_OFFSET, 33);
         assert!(!cfg.WRONG_SEQ_SET_PSH);
         assert!(!cfg.WRONG_SEQ_BUMP_IP_IDENT);
@@ -1765,6 +1804,84 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_method_list() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = []
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_method_entries() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = ["wrong_seq", "wrong_seq"]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_method_via_alias_expansion() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = ["wrong_seq_tls_frag", "wrong_seq"]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_urg_sni_split_with_handshake_method() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = ["urg_sni_split", "wrong_seq"]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_urg_sni_split_with_data_stage() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = ["urg_sni_split", "tls_frag"]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_handshake_and_data_stage_combination() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = ["wrong_seq", "low_ttl", "tls_frag"]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_low_ttl_discover_without_low_ttl_method() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            BYPASS_METHOD = "wrong_seq"
+            LOW_TTL_DISCOVER = true
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn linux_firewall_backend_accepts_nftables() {
         let toml_str = r#"
             LISTEN_HOST = "0.0.0.0"
@@ -1864,7 +1981,10 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.BYPASS_METHOD, "wrong_seq_tls_frag");
+        assert_eq!(
+            cfg.BYPASS_METHOD.iter().collect::<Vec<_>>(),
+            vec!["wrong_seq", "tls_frag"]
+        );
         assert_eq!(cfg.WRONG_SEQ_EXTRA_OFFSET, 0);
         assert_eq!(cfg.TCP_SEG_SIZE, 9);
         assert!(!cfg.TCP_SEG_NODELAY);
@@ -1884,7 +2004,10 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.BYPASS_METHOD, "wrong_md5_tls_frag");
+        assert_eq!(
+            cfg.BYPASS_METHOD.iter().collect::<Vec<_>>(),
+            vec!["wrong_md5", "tls_frag"]
+        );
         assert!(!cfg.WRONG_MD5_SET_PSH);
         assert!(!cfg.WRONG_MD5_BUMP_IP_IDENT);
         assert!(!cfg.WRONG_MD5_COMPLETE_IMMEDIATELY);
@@ -1904,7 +2027,10 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.BYPASS_METHOD, "wrong_seq_tls_record_frag");
+        assert_eq!(
+            cfg.BYPASS_METHOD.iter().collect::<Vec<_>>(),
+            vec!["wrong_seq", "tls_record_frag"]
+        );
         assert_eq!(cfg.WRONG_SEQ_EXTRA_OFFSET, 0);
         assert_eq!(cfg.TLS_RECORD_FRAG_SIZE, 7);
         assert!(!cfg.TLS_RECORD_FRAG_SET_PSH);

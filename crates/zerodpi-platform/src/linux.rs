@@ -186,7 +186,7 @@ fn parse_view<'a>(direction: Direction, buf: &'a [u8]) -> Result<(PacketView<'a>
             psh: tcp.psh(),
             rst: tcp.rst(),
             fin: tcp.fin(),
-            urg: false,
+            urg: tcp.urg(),
         },
         payload_len,
         payload: &buf[payload_off..payload_off + payload_len],
@@ -235,6 +235,10 @@ fn build_modified(orig: &[u8], layout: &PacketLayout, view: &PacketView<'_>) -> 
         tcp_hdr.psh = flags.psh;
         tcp_hdr.rst = flags.rst;
         tcp_hdr.fin = flags.fin;
+        tcp_hdr.urg = flags.urg;
+    }
+    if let Some(ptr) = view.new_urgent_pointer {
+        tcp_hdr.urgent_pointer = ptr;
     }
     if view.bump_ipv4_ident {
         ip_hdr.identification = ip_hdr.identification.wrapping_add(1);
@@ -1067,6 +1071,44 @@ mod tests {
             .calc_checksum_ipv4(&ip2.to_header(), &modified[40..])
             .unwrap();
         assert_eq!(tcp2.checksum(), calculated);
+    }
+
+    #[test]
+    fn urgent_flag_and_pointer_survive_rebuild() {
+        let payload = [0x16, 0x03, 0x03, 0x00, 0x01, 0xAA];
+        let buf = data_packet(&payload);
+        let (mut view, layout) = parse_view(Direction::Outbound, &buf).unwrap();
+        view.new_flags = Some(TcpFlags {
+            ack: true,
+            psh: true,
+            urg: true,
+            ..Default::default()
+        });
+        view.new_urgent_pointer = Some(40);
+        let modified = build_modified(&buf, &layout, &view).unwrap();
+
+        let ip2 = Ipv4HeaderSlice::from_slice(&modified).unwrap();
+        let tcp2 = TcpHeaderSlice::from_slice(&modified[ip2.slice().len()..]).unwrap();
+        assert!(tcp2.urg());
+        assert_eq!(tcp2.urgent_pointer(), 40);
+        let calculated = tcp2
+            .to_header()
+            .calc_checksum_ipv4(&ip2.to_header(), &modified[40..])
+            .unwrap();
+        assert_eq!(tcp2.checksum(), calculated);
+    }
+
+    #[test]
+    fn parse_view_reads_urg_flag() {
+        use etherparse::TcpHeader;
+        let mut buf = data_packet(&[]);
+        let mut tcp = TcpHeader::from_slice(&buf[20..40]).unwrap().0;
+        tcp.urg = true;
+        let mut out = Vec::with_capacity(buf.len());
+        out.extend_from_slice(&buf[..20]);
+        tcp.write(&mut out).unwrap();
+        let (view, _) = parse_view(Direction::Outbound, &out).unwrap();
+        assert!(view.flags.urg);
     }
 
     #[test]

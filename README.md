@@ -52,7 +52,7 @@ It is not a replacement VPN client. It is a local TCP relay that your existing V
 
 | Feature | Description |
 |---------|-------------|
-| 🧩 **12 bypass methods** | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, `tls_frag` |
+| 🧩 **13 bypass methods** | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, `tls_frag`, `urg_sni_split` |
 | 🎯 **6 operating modes** | `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan` |
 | 🖥️ **TUI dashboard** | Ratatui-powered live progress, selection tables, and connection monitoring |
 | 🔄 **Auto-rescan** | Background re-scanning hot-swaps the best target without restart |
@@ -330,6 +330,7 @@ Results are blended using a configurable weight and displayed in the TUI.
 | `wrong_timestamp` | Injects fake ClientHello with backdated TCP Timestamp TSval | ✅ Yes | DPI that accepts forged data but servers enforce PAWS |
 | `low_ttl` | Injects fake ClientHello (whitelisted SNI) with a low IP TTL so only the DPI middlebox sees it | ✅ Yes | DPI sitting between client and server on TTL-visible networks |
 | `tls_record_frag` | TLS Record Fragment: splits the real ClientHello record body into multiple tiny TLS records | ✅ Yes | DPI that can't reassemble TLS records |
+| `urg_sni_split` | Splicing a dummy byte into the middle of the real SNI and marking it with the TCP URG flag, so the server strips the byte while DPI reads a mangled name | ✅ Yes | Byte-scanning stateless DPI that ignores TCP urgent data |
 | `wrong_seq_tls_frag` | Sends a wrong-sequence fake ClientHello, then fragments selected real client data with `TLS_FRAG_*` settings | ✅ Yes | Layered TCP-segment DPI paths |
 | `wrong_md5_tls_frag` | Sends a TCP-MD5 fake ClientHello, then fragments selected real client data with `TLS_FRAG_*` settings | ✅ Yes | Layered TCP-MD5 plus TCP-segment DPI paths |
 | `wrong_seq_tls_record_frag` | Sends a wrong-sequence fake ClientHello, then splits the real ClientHello body into tiny TLS records | ✅ Yes | Layered TLS-record DPI paths |
@@ -361,6 +362,7 @@ Method behavior in more detail:
 - `wrong_timestamp` is ZeroDPI's snake_case name for sing-box's `wrong-timestamp` spoof behavior. It requires TCP timestamps on the intercepted flow and backdates `TSval` so PAWS rejects the forged segment.
 - `low_ttl` sends a valid decoy ClientHello carrying the selected whitelisted SNI but stamps it with a low IP TTL (`LOW_TTL_VALUE`). The decoy reaches an inline DPI middlebox and then expires, so the server never receives it; the real handshake completes via TCP retransmission. Tune `LOW_TTL_VALUE` to the DPI's hop distance (typically 4–8), or enable `LOW_TTL_DISCOVER` and let ZeroDPI find the correct value automatically.
 - `tls_record_frag` rewrites the real first TLS record into many smaller TLS records. The server should reassemble the TLS handshake normally.
+- `urg_sni_split` rewrites the real first TLS record, splicing a configurable dummy byte into the middle of the SNI and setting the TCP URG flag. The destination server's TCP stack extracts the urgent byte, so its TLS stream is the original ClientHello; DPI that reads raw bytes sees a mangled SNI.
 - `tls_frag` keeps the TLS bytes unchanged and writes selected client data in small TCP chunks from the proxy. It can fragment a 1-based range of client writes such as `TLS_FRAG_PACKETS = "1-3"` or the first TLS ClientHello with `TLS_FRAG_PACKETS = "tlshello"`.
 - The combo methods such as `wrong_seq_tls_frag` and `wrong_md5_tls_frag` first send a decoy ClientHello, then also fragment the real ClientHello path.
 
@@ -597,7 +599,7 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `BYPASS_METHOD` | `string` | `"wrong_seq_tls_frag"` | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, or `tls_frag`; `ip_bypass_plus` allows only `tls_record_frag` or `tls_frag` |
+| `BYPASS_METHOD` | `string` | `"wrong_seq_tls_frag"` | `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_seq_wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `wrong_seq_tls_frag`, `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, `tls_frag`, or `urg_sni_split`; `ip_bypass_plus` allows only `tls_record_frag` or `tls_frag` |
 | `BYPASS_TIMEOUT_SECS` | `u64` | `20` | Time to wait for bypass setup before giving up |
 | `RELAY_MAX_LIFETIME_SECS` | `u64` | `0` | Rotate established relays after this many seconds (`0` = disabled/default) |
 | `NFQUEUE_NUM` | `u16` | `1` | (Linux) NFQUEUE queue number |
@@ -680,6 +682,13 @@ With `LOW_TTL_DISCOVER = true`, ZeroDPI probes TTL candidates from `1` up to `LO
 | `TLS_RECORD_FRAG_BUMP_IP_IDENT` | `bool` | `true` | Bump IPv4 Identification field |
 
 `wrong_seq_tls_record_frag` uses both the `wrong_seq` and `tls_record_frag` parameter groups.
+
+#### `urg_sni_split` Parameters
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `SNI_SPLIT_DUMMY_BYTE` | `u8` | `0` | Dummy byte spliced into the middle of the SNI domain string; extracted by the server as TCP urgent data |
+| `SNI_SPLIT_POSITION` | `string` or `int` | `"middle"` | Insertion point inside the SNI: `"middle"`, `"start"`, `"end"`, or a 0-based index (clamped) |
 
 #### `tls_frag` Parameters
 

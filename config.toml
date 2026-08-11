@@ -555,6 +555,25 @@ TLS_RECORD_FRAG_SET_PSH = true
 TLS_RECORD_FRAG_BUMP_IP_IDENT = true
 
 # ---------------------------------------------------------------------------
+# urg_sni_split method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "urg_sni_split".
+
+# The 1-byte dummy payload inserted into the middle of the SNI domain string
+# of the real ClientHello.  The packet's TCP URG flag marks this byte as
+# urgent data: BSD-style destination stacks extract it from the stream, so the
+# server still sees the original SNI, while DPI middleboxes that read the raw
+# byte stream see a mangled name.  Default: 0.
+SNI_SPLIT_DUMMY_BYTE = 0
+
+# Where inside the SNI domain string the dummy byte is inserted.
+#   "middle" — exact middle of the name (default)
+#   "start"  — before the first name byte
+#   "end"    — before the last name byte
+#   N        — 0-based index into the name, clamped to the last byte
+SNI_SPLIT_POSITION = "middle"
+
+# ---------------------------------------------------------------------------
 # tls_frag method parameters
 # ---------------------------------------------------------------------------
 # These settings apply when BYPASS_METHOD = "tls_frag" or

@@ -183,6 +183,150 @@ impl Serialize for SniSplitPosition {
     }
 }
 
+/// Base bypass method names that can be combined in `BYPASS_METHOD`.
+pub const BASE_BYPASS_METHODS: &[&str] = &[
+    "wrong_seq",
+    "wrong_ack",
+    "wrong_checksum",
+    "wrong_md5",
+    "wrong_timestamp",
+    "low_ttl",
+    "tls_record_frag",
+    "tls_frag",
+    "urg_sni_split",
+];
+
+/// Expand a combo alias into its base method names; other names pass through.
+fn expand_method_alias(name: &str) -> Vec<String> {
+    match name {
+        "wrong_seq_wrong_md5" => vec!["wrong_seq".to_owned(), "wrong_md5".to_owned()],
+        "wrong_seq_tls_frag" => vec!["wrong_seq".to_owned(), "tls_frag".to_owned()],
+        "wrong_md5_tls_frag" => vec!["wrong_md5".to_owned(), "tls_frag".to_owned()],
+        "wrong_seq_tls_record_frag" => {
+            vec!["wrong_seq".to_owned(), "tls_record_frag".to_owned()]
+        }
+        other => vec![other.to_owned()],
+    }
+}
+
+/// The configured bypass method list.
+///
+/// Accepts either a single method name (`"wrong_seq"`) or a TOML array of
+/// method names (`["wrong_seq", "tls_frag"]`). Combo aliases such as
+/// `"wrong_seq_tls_frag"` are expanded to their base names at parse time, so
+/// this type always stores only [`BASE_BYPASS_METHODS`].
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct BypassMethodList(Vec<String>);
+
+impl BypassMethodList {
+    /// Parse a comma-separated list (used by the CLI `--method` flag),
+    /// e.g. `"wrong_seq,tls_frag"`.
+    pub fn from_delimited(input: &str) -> Self {
+        Self(
+            input
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .flat_map(expand_method_alias)
+                .collect(),
+        )
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.0.iter().any(|m| m == name)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// `true` when the list is exactly `["tls_frag"]` (socket-only relay).
+    pub fn is_socket_only(&self) -> bool {
+        self.0.len() == 1 && self.0[0] == "tls_frag"
+    }
+
+    /// `true` when any listed method needs the WinDivert/NFQUEUE interceptor.
+    pub fn requires_interceptor(&self) -> bool {
+        self.0.iter().any(|m| m != "tls_frag")
+    }
+}
+
+impl fmt::Display for BypassMethodList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.join(" + "))
+    }
+}
+
+impl PartialEq<&str> for BypassMethodList {
+    fn eq(&self, other: &&str) -> bool {
+        self.0.len() == 1 && self.0[0] == *other
+    }
+}
+
+impl From<&str> for BypassMethodList {
+    fn from(name: &str) -> Self {
+        Self(expand_method_alias(name))
+    }
+}
+
+impl From<String> for BypassMethodList {
+    fn from(name: String) -> Self {
+        Self(expand_method_alias(&name))
+    }
+}
+
+impl From<Vec<String>> for BypassMethodList {
+    fn from(names: Vec<String>) -> Self {
+        Self(names.iter().flat_map(|n| expand_method_alias(n)).collect())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BypassMethodList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct MethodListVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for MethodListVisitor {
+            type Value = BypassMethodList;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "a method name string or an array of method name strings")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(Self::Value::from(v))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut out = Vec::new();
+                while let Some(name) = seq.next_element::<String>()? {
+                    out.extend(expand_method_alias(&name));
+                }
+                Ok(BypassMethodList(out))
+            }
+        }
+
+        deserializer.deserialize_any(MethodListVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub struct Config {
@@ -1073,6 +1217,79 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Deserialize)]
+    struct MethodWrapper {
+        value: BypassMethodList,
+    }
+
+    fn parse_method(toml_value: &str) -> Result<BypassMethodList, toml::de::Error> {
+        toml::from_str::<MethodWrapper>(&format!("value = {toml_value}")).map(|w| w.value)
+    }
+
+    #[test]
+    fn deserializes_single_string() {
+        let list = parse_method("\"wrong_seq\"").unwrap();
+        assert_eq!(list, "wrong_seq");
+        assert_eq!(list.iter().collect::<Vec<_>>(), vec!["wrong_seq"]);
+    }
+
+    #[test]
+    fn deserializes_array() {
+        let list = parse_method("[\"wrong_seq\", \"low_ttl\"]").unwrap();
+        assert_eq!(list.iter().collect::<Vec<_>>(), vec!["wrong_seq", "low_ttl"]);
+    }
+
+    #[test]
+    fn expands_combo_alias_in_string() {
+        let list = parse_method("\"wrong_seq_tls_frag\"").unwrap();
+        assert_eq!(list.iter().collect::<Vec<_>>(), vec!["wrong_seq", "tls_frag"]);
+    }
+
+    #[test]
+    fn expands_combo_alias_in_array() {
+        let list = parse_method("[\"wrong_seq_tls_frag\", \"low_ttl\"]").unwrap();
+        assert_eq!(
+            list.iter().collect::<Vec<_>>(),
+            vec!["wrong_seq", "tls_frag", "low_ttl"]
+        );
+    }
+
+    #[test]
+    fn display_joins_methods_with_plus() {
+        let list = BypassMethodList::from_delimited("wrong_seq, tls_frag");
+        assert_eq!(list.to_string(), "wrong_seq + tls_frag");
+    }
+
+    #[test]
+    fn socket_only_and_interceptor_helpers() {
+        let socket_only = BypassMethodList::from("tls_frag");
+        assert!(socket_only.is_socket_only());
+        assert!(!socket_only.requires_interceptor());
+
+        let combo = BypassMethodList::from_delimited("tls_frag, wrong_seq");
+        assert!(!combo.is_socket_only());
+        assert!(combo.requires_interceptor());
+
+        let single = BypassMethodList::from("wrong_seq");
+        assert!(!single.is_socket_only());
+        assert!(single.requires_interceptor());
+    }
+
+    #[test]
+    fn from_delimited_splits_commas() {
+        let list = BypassMethodList::from_delimited("wrong_seq, wrong_ack, tls_frag");
+        assert_eq!(
+            list.iter().collect::<Vec<_>>(),
+            vec!["wrong_seq", "wrong_ack", "tls_frag"]
+        );
+    }
+
+    #[test]
+    fn rejects_non_string_method_type() {
+        assert!(parse_method("5").is_err());
+        assert!(parse_method("true").is_err());
+    }
 
     #[test]
     fn parses_minimal_toml() {

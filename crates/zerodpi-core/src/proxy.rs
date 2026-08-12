@@ -41,6 +41,7 @@ use tracing::{debug, info, warn};
 use crate::config::{Config, TlsFragPackets};
 use crate::flow::{BypassOutcome, FlowController, FlowEntry, FlowKey};
 use crate::methods::tcp_segmentation::{read_one_tls_record, write_fragmented, TcpSegmentation};
+use crate::methods::tls_padding::TlsPadding;
 use crate::tls_template::build_client_hello;
 
 // ---------------------------------------------------------------------------
@@ -145,6 +146,7 @@ struct ConnectionSettings {
     bypass_timeout: Duration,
     max_lifetime: Option<Duration>,
     segment_first_client_hello: bool,
+    tls_padding: Option<TlsPadding>,
     tcp_segmentation: TcpSegmentation,
 }
 
@@ -155,6 +157,10 @@ impl ConnectionSettings {
             bypass_timeout: Duration::from_secs(cfg.BYPASS_TIMEOUT_SECS),
             max_lifetime: configured_relay_max_lifetime(cfg),
             segment_first_client_hello: cfg.BYPASS_METHOD.contains("tls_frag"),
+            tls_padding: cfg
+                .BYPASS_METHOD
+                .contains("tls_padding")
+                .then(|| TlsPadding::new(cfg)),
             tcp_segmentation,
         }
     }
@@ -601,6 +607,10 @@ async fn handle_intercept_connection(
                             src_port,
                         )
                         .await?;
+                        let client_hello = settings
+                            .tls_padding
+                            .and_then(|p| p.apply(&client_hello))
+                            .unwrap_or(client_hello);
                         if let Err(e) = write_fragmented(
                             &mut outgoing,
                             &client_hello,
@@ -630,6 +640,12 @@ async fn handle_intercept_connection(
                             src_port,
                         )
                         .await?;
+                        // Fail-open: pad only when the first write parses as a
+                        // complete ClientHello record.
+                        let client_data = settings
+                            .tls_padding
+                            .and_then(|p| p.apply(&client_data))
+                            .unwrap_or(client_data);
                         if let Err(e) =
                             write_client_data(&mut outgoing, &client_data, segmentation, 1).await
                         {
@@ -655,6 +671,11 @@ async fn handle_intercept_connection(
                     src_port,
                 )
                 .await?;
+
+                let client_hello = settings
+                    .tls_padding
+                    .and_then(|p| p.apply(&client_hello))
+                    .unwrap_or(client_hello);
 
                 if let Err(e) = outgoing.write_all(&client_hello).await {
                     entry.finish(BypassOutcome::UnexpectedClose);
@@ -884,14 +905,26 @@ async fn handle_tcp_seg_connection_with_ip(
             .context("tls_frag: set_nodelay on upstream socket")?;
     }
 
-    let client_fragmentation = match method.packets {
-        TlsFragPackets::TlsHello => {
-            // Read exactly one TLS record (the ClientHello) from the client.
-            let client_hello = read_one_tls_record(&mut incoming)
-                .await
-                .context("tls_frag: reading ClientHello from client")?;
+    // When tls_padding is listed, read the first TLS record and expand it
+    // with the RFC 7685 padding extension before any mode-specific handling.
+    // Fail-open: unparseable records are forwarded unchanged.
+    let padded_prefix = if cfg.BYPASS_METHOD.contains("tls_padding") {
+        let record = read_one_tls_record(&mut incoming)
+            .await
+            .context("tls_padding: reading ClientHello from client")?;
+        Some(TlsPadding::new(&cfg).apply(&record).unwrap_or(record))
+    } else {
+        None
+    };
 
-            // Write it to the upstream socket in configured fragments.
+    let client_fragmentation = match method.packets {
+        TlsFragPackets::TlsHello if cfg.BYPASS_METHOD.contains("tls_frag") => {
+            let client_hello = match padded_prefix {
+                Some(record) => record,
+                None => read_one_tls_record(&mut incoming)
+                    .await
+                    .context("tls_frag: reading ClientHello from client")?,
+            };
             write_fragmented(
                 &mut outgoing,
                 &client_hello,
@@ -900,7 +933,6 @@ async fn handle_tcp_seg_connection_with_ip(
             )
             .await
             .context("tls_frag: writing fragmented ClientHello")?;
-
             debug!(
                 length = %method.length,
                 interval_ms = %method.interval_ms,
@@ -910,15 +942,29 @@ async fn handle_tcp_seg_connection_with_ip(
             );
             None
         }
-        TlsFragPackets::WriteRange { .. } => {
-            debug!(
-                packets = ?method.packets,
-                length = %method.length,
-                interval_ms = %method.interval_ms,
-                nodelay = method.nodelay,
-                "tls_frag: fragmenting selected client writes in relay"
-            );
-            Some((method, 0))
+        _ => {
+            if let Some(record) = padded_prefix {
+                outgoing
+                    .write_all(&record)
+                    .await
+                    .context("tls_padding: writing padded ClientHello")?;
+                outgoing
+                    .flush()
+                    .await
+                    .context("tls_padding: flushing padded ClientHello")?;
+            }
+            if cfg.BYPASS_METHOD.contains("tls_frag") {
+                debug!(
+                    packets = ?method.packets,
+                    length = %method.length,
+                    interval_ms = %method.interval_ms,
+                    nodelay = method.nodelay,
+                    "tls_frag: fragmenting selected client writes in relay"
+                );
+                Some((method, 0))
+            } else {
+                None
+            }
         }
     };
 
@@ -1429,6 +1475,40 @@ mod tests {
         assert_eq!(result.reason, RelayEndReason::MaxLifetime);
         assert_eq!(result.c2s_bytes, 5);
         assert_eq!(result.s2c_bytes, 0);
+    }
+
+    #[test]
+    fn tls_padding_in_list_populates_settings() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = ["wrong_seq", "tls_padding"]
+               TLS_PADDING_SIZE = "2000-3000"
+               TLS_PADDING_POSITION = "after""#,
+        )
+        .unwrap();
+        let settings = ConnectionSettings::from_config(&cfg);
+        let padding = settings.tls_padding.expect("tls_padding is listed");
+        assert_eq!(
+            padding.size,
+            crate::config::Int32Range::parse("2000-3000").unwrap()
+        );
+        assert_eq!(
+            padding.position,
+            crate::methods::tls_padding::PaddingPosition::After
+        );
+    }
+
+    #[test]
+    fn socket_only_lists_disable_padding_settings() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "tls_frag""#,
+        )
+        .unwrap();
+        let settings = ConnectionSettings::from_config(&cfg);
+        assert!(settings.tls_padding.is_none());
     }
 
     #[test]

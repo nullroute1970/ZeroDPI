@@ -904,11 +904,9 @@ fn header_content_rows(state: &DashboardState, now: Instant) -> usize {
 /// (header, stats, help, table header, borders). The header is two rows
 /// taller when the rescan status line is visible.
 fn fixed_dashboard_rows(state: &DashboardState) -> usize {
-    if state.rescan_running || state.next_rescan_at.is_some() {
-        16
-    } else {
-        14
-    }
+    // header (content lines + borders + slack) + stats(4) + help(3)
+    // + table header(1) + table borders(2)
+    header_content_rows(state, Instant::now()) + 3 + 4 + 3 + 1 + 2
 }
 
 fn fmt_rate(bps: f64) -> String {
@@ -946,6 +944,21 @@ fn live_transfer_totals(state: &DashboardState) -> (u64, u64) {
         state.total_c2s.saturating_add(active_c2s),
         state.total_s2c.saturating_add(active_s2c),
     )
+}
+
+/// Sum the instantaneous rates of all relaying connections:
+/// returns `(c2s_bps, s2c_bps)`.
+fn aggregate_throughput(records: &VecDeque<ConnectionRecord>) -> (f64, f64) {
+    let mut c2s = 0.0f64;
+    let mut s2c = 0.0f64;
+    for record in records
+        .iter()
+        .filter(|r| matches!(r.status, ConnStatus::Relaying))
+    {
+        c2s += record.rate_c2s_bps;
+        s2c += record.rate_s2c_bps;
+    }
+    (c2s, s2c)
 }
 
 // ---------------------------------------------------------------------------
@@ -1271,7 +1284,7 @@ fn draw_dashboard(
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length((header_content_rows(state, now) + 3) as u16), // header lines + borders + slack
-                Constraint::Length(3),                                         // stats bar
+                Constraint::Length(4),                                         // stats bar (2 content lines + borders)
                 Constraint::Min(5),                                            // connection log
                 Constraint::Length(3),                                         // help bar
             ])
@@ -1458,18 +1471,7 @@ fn draw_dashboard(
             .checked_div(state.total)
             .map_or_else(String::new, |pct| format!("({pct}%)"));
         // Aggregate instantaneous throughput from all relaying connections.
-        let agg_c2s_bps: f64 = state
-            .records
-            .iter()
-            .filter(|r| matches!(r.status, ConnStatus::Relaying))
-            .map(|r| r.rate_c2s_bps)
-            .sum();
-        let agg_s2c_bps: f64 = state
-            .records
-            .iter()
-            .filter(|r| matches!(r.status, ConnStatus::Relaying))
-            .map(|r| r.rate_s2c_bps)
-            .sum();
+        let (agg_c2s_bps, agg_s2c_bps) = aggregate_throughput(&state.records);
         let (total_upload, total_download) = live_transfer_totals(state);
         let stats_line = Line::from(vec![
             Span::styled(" Total: ", label_style()),
@@ -1503,6 +1505,15 @@ fn draw_dashboard(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
+            Span::styled("Peak: ", label_style()),
+            Span::styled(
+                state.peak_active.to_string(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        let stats_line2 = Line::from(vec![
             Span::styled("Download: ", label_style()),
             Span::styled(
                 fmt_stats_field(fmt_rate(agg_s2c_bps)),
@@ -1526,7 +1537,7 @@ fn draw_dashboard(
             ),
             Span::raw(" "),
         ]);
-        let stats = Paragraph::new(stats_line)
+        let stats = Paragraph::new(vec![stats_line, stats_line2])
             .block(Block::default().borders(Borders::ALL).title(" Stats "));
         frame.render_widget(stats, chunks[1]);
 
@@ -2457,7 +2468,7 @@ mod tests {
     #[test]
     fn fixed_dashboard_rows_grows_when_status_line_visible() {
         let mut state = dashboard_state(vec![]);
-        assert_eq!(fixed_dashboard_rows(&state), 14);
+        assert_eq!(fixed_dashboard_rows(&state), 15);
         state.next_rescan_at = Some(Instant::now() + Duration::from_secs(60));
         assert_eq!(fixed_dashboard_rows(&state), 16);
         state.next_rescan_at = None;
@@ -2626,6 +2637,20 @@ mod tests {
         assert_eq!(header_content_rows(&state, now), 3);
         state.next_rescan_at = Some(now + Duration::from_secs(60));
         assert_eq!(header_content_rows(&state, now), 4);
+    }
+
+    #[test]
+    fn aggregate_throughput_sums_only_relaying_connections() {
+        let mut up = record(ConnStatus::Relaying, ACTIVE_RATE_BPS, 0.0);
+        up.src_port = 1;
+        let mut down = record(ConnStatus::Relaying, 0.0, ACTIVE_RATE_BPS * 2.0);
+        down.src_port = 2;
+        let mut done = record(ConnStatus::Done, 999.0, 999.0);
+        done.src_port = 3;
+        let state = dashboard_state(vec![up, down, done]);
+        let (c2s, s2c) = aggregate_throughput(&state.records);
+        assert_eq!(c2s, ACTIVE_RATE_BPS);
+        assert_eq!(s2c, ACTIVE_RATE_BPS * 2.0);
     }
 }
 

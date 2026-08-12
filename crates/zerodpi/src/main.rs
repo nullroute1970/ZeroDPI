@@ -1542,6 +1542,15 @@ async fn log_headless_proxy_events(
             ProxyEvent::LowTtlDiscovered { value } => {
                 info!(value, "LOW_TTL_DISCOVER: applied discovered low_ttl TTL");
             }
+            ProxyEvent::NextRescanScheduled { .. } => {
+                // Rescan tasks emit RuntimeEvent::NextScanScheduled directly.
+            }
+            ProxyEvent::RescanStarted { kind } => {
+                debug!(?kind, "background rescan started");
+            }
+            ProxyEvent::RescanFinished { kind } => {
+                debug!(?kind, "background rescan finished");
+            }
         }
     }
 }

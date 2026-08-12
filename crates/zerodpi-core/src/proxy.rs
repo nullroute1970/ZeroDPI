@@ -118,6 +118,22 @@ pub enum ProxyEvent {
     IpTargetChanged { ip: IpAddr, score: u8 },
     /// `LOW_TTL_DISCOVER` found a working TTL and applied it.
     LowTtlDiscovered { value: u8 },
+    /// A periodic background rescan started (includes any TTL discovery
+    /// probe run before a potential hot-swap).
+    RescanStarted { kind: RescanKind },
+    /// A periodic background rescan finished (success, empty result, or failure).
+    RescanFinished { kind: RescanKind },
+    /// A new rescan cycle was scheduled; the TUI uses this for its countdown.
+    NextRescanScheduled { kind: RescanKind, interval_secs: u64 },
+}
+
+/// Which background rescan produced a [`ProxyEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RescanKind {
+    /// `sni_spoof` mode background SNI rescan.
+    Sni,
+    /// `ip_bypass` / `ip_bypass_plus` mode background IP rescan.
+    Ip,
 }
 
 /// Sender half of the [`ProxyEvent`] channel; pass to [`run_proxy`] to enable
@@ -1530,5 +1546,21 @@ mod tests {
         .unwrap();
         let settings = ConnectionSettings::from_config(&cfg);
         assert!(!settings.segment_first_client_hello);
+    }
+
+    #[test]
+    fn rescan_events_construct_with_kind_and_interval() {
+        let started = ProxyEvent::RescanStarted { kind: RescanKind::Sni };
+        let finished = ProxyEvent::RescanFinished { kind: RescanKind::Ip };
+        let scheduled = ProxyEvent::NextRescanScheduled {
+            kind: RescanKind::Sni,
+            interval_secs: 300,
+        };
+        assert_eq!(format!("{started:?}"), "RescanStarted { kind: Sni }");
+        assert_eq!(format!("{finished:?}"), "RescanFinished { kind: Ip }");
+        assert_eq!(
+            format!("{scheduled:?}"),
+            "NextRescanScheduled { kind: Sni, interval_secs: 300 }"
+        );
     }
 }

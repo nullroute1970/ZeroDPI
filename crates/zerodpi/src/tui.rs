@@ -37,7 +37,7 @@ use tokio::sync::mpsc;
 use zerodpi_core::config::Config;
 use zerodpi_core::flow::BypassOutcome;
 use zerodpi_core::ip_scanner::{IpProbeEntry, IpScanEvent};
-use zerodpi_core::proxy::{ProxyEvent, RelayEndReason};
+use zerodpi_core::proxy::{ProxyEvent, RelayEndReason, RescanKind};
 use zerodpi_core::sni_scanner::SniProbeEntry;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -742,6 +742,10 @@ struct DashboardState {
     active_ip: Option<IpAddr>,
     /// Last value discovered by `LOW_TTL_DISCOVER` (startup or rescan).
     low_ttl: Option<u8>,
+    /// `true` while a periodic background rescan is running.
+    rescan_running: bool,
+    /// Deadline for the next rescan cycle, set from `NextRescanScheduled`.
+    next_rescan_at: Option<Instant>,
     start: Instant,
     channel_closed: bool,
 }
@@ -858,6 +862,8 @@ pub fn run_dashboard(
         active_sni,
         active_ip,
         low_ttl: None,
+        rescan_running: false,
+        next_rescan_at: None,
         start: Instant::now(),
         channel_closed: false,
     };
@@ -1057,6 +1063,15 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
         }
         ProxyEvent::LowTtlDiscovered { value } => {
             state.low_ttl = Some(value);
+        }
+        ProxyEvent::NextRescanScheduled { interval_secs, .. } => {
+            state.next_rescan_at = Some(Instant::now() + Duration::from_secs(interval_secs));
+        }
+        ProxyEvent::RescanStarted { .. } => {
+            state.rescan_running = true;
+        }
+        ProxyEvent::RescanFinished { .. } => {
+            state.rescan_running = false;
         }
     }
 
@@ -2027,6 +2042,8 @@ mod tests {
             active_sni: None,
             active_ip: None,
             low_ttl: None,
+            rescan_running: false,
+            next_rescan_at: None,
             start: Instant::now(),
             channel_closed: false,
         }
@@ -2113,6 +2130,32 @@ mod tests {
             .collect();
 
         assert_eq!(ports, vec![2, 1]);
+    }
+
+    #[test]
+    fn apply_event_schedules_next_rescan_deadline() {
+        let mut state = dashboard_state(vec![]);
+        let before = Instant::now();
+        apply_event(
+            ProxyEvent::NextRescanScheduled {
+                kind: RescanKind::Sni,
+                interval_secs: 300,
+            },
+            &mut state,
+        );
+        let after = Instant::now();
+        let at = state.next_rescan_at.expect("deadline should be set");
+        assert!(at >= before + Duration::from_secs(300));
+        assert!(at <= after + Duration::from_secs(300));
+    }
+
+    #[test]
+    fn apply_event_tracks_rescan_running_state() {
+        let mut state = dashboard_state(vec![]);
+        apply_event(ProxyEvent::RescanStarted { kind: RescanKind::Ip }, &mut state);
+        assert!(state.rescan_running);
+        apply_event(ProxyEvent::RescanFinished { kind: RescanKind::Ip }, &mut state);
+        assert!(!state.rescan_running);
     }
 }
 

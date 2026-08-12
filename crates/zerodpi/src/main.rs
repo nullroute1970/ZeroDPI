@@ -1064,9 +1064,13 @@ async fn background_rescan(
                 kind: RescanKind::Sni,
             },
         );
+        let scan_started = std::time::Instant::now();
+        let mut switched = false;
+        let mut scan_summary: Option<(usize, Option<u8>)> = None;
         let cfg_clone = cfg.clone();
         match scan_sni_list(&path, scan_timeout, cfg_clone, None).await {
             Ok(entries) => {
+                scan_summary = Some((entries.len(), entries.first().map(|e| e.score)));
                 if headless {
                     info!(
                         "background SNI rescan complete — {} (SNI, IP) pairs",
@@ -1160,6 +1164,7 @@ async fn background_rescan(
                                         let _ = tx.send(ProxyEvent::LowTtlDiscovered { value });
                                     }
                                 }
+                                switched = true;
                             }
                             None => {
                                 warn!(
@@ -1177,10 +1182,15 @@ async fn background_rescan(
                 warn!(error = %e, "background rescan failed");
             }
         }
+        let (found, best_score) = scan_summary.unwrap_or((0, None));
         send_rescan_event(
             &event_tx,
             ProxyEvent::RescanFinished {
                 kind: RescanKind::Sni,
+                found,
+                best_score,
+                duration_ms: scan_started.elapsed().as_millis() as u64,
+                switched,
             },
         );
     }
@@ -1478,12 +1488,16 @@ async fn log_headless_proxy_events(
                     listen_addr: listen_addr.to_string(),
                 });
             }
-            ProxyEvent::ConnectionAccepted { peer, src_port } => {
+            ProxyEvent::ConnectionAccepted {
+                peer,
+                src_port,
+                target_ip,
+            } => {
                 events.emit(RuntimeEvent::ConnectionAccepted {
                     peer: peer.to_string(),
                     src_port,
                 });
-                info!(%peer, src_port, "accepted proxy connection");
+                info!(%peer, src_port, %target_ip, "accepted proxy connection");
             }
             ProxyEvent::BypassComplete { src_port, outcome } => match outcome {
                 zerodpi_core::flow::BypassOutcome::FakeDataAcked => {
@@ -1575,8 +1589,21 @@ async fn log_headless_proxy_events(
             ProxyEvent::RescanStarted { kind } => {
                 debug!(?kind, "background rescan started");
             }
-            ProxyEvent::RescanFinished { kind } => {
-                debug!(?kind, "background rescan finished");
+            ProxyEvent::RescanFinished {
+                kind,
+                found,
+                best_score,
+                duration_ms,
+                switched,
+            } => {
+                debug!(
+                    ?kind,
+                    found,
+                    ?best_score,
+                    duration_ms,
+                    switched,
+                    "background rescan finished"
+                );
             }
         }
     }
@@ -2131,6 +2158,7 @@ async fn background_ip_rescan(
                 kind: RescanKind::Ip,
             },
         );
+        let scan_started = std::time::Instant::now();
 
         let ips = match load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS) {
             Ok(v) => v,
@@ -2140,6 +2168,10 @@ async fn background_ip_rescan(
                     &event_tx,
                     ProxyEvent::RescanFinished {
                         kind: RescanKind::Ip,
+                        found: 0,
+                        best_score: None,
+                        duration_ms: scan_started.elapsed().as_millis() as u64,
+                        switched: false,
                     },
                 );
                 continue;
@@ -2152,6 +2184,10 @@ async fn background_ip_rescan(
                     &event_tx,
                     ProxyEvent::RescanFinished {
                         kind: RescanKind::Ip,
+                        found: 0,
+                        best_score: None,
+                        duration_ms: scan_started.elapsed().as_millis() as u64,
+                        switched: false,
                     },
                 );
                 continue;
@@ -2168,6 +2204,10 @@ async fn background_ip_rescan(
                 &event_tx,
                 ProxyEvent::RescanFinished {
                     kind: RescanKind::Ip,
+                    found: 0,
+                    best_score: None,
+                    duration_ms: scan_started.elapsed().as_millis() as u64,
+                    switched: false,
                 },
             );
             continue;
@@ -2186,7 +2226,8 @@ async fn background_ip_rescan(
         }
 
         let current = *active_ip.read().unwrap();
-        if best.ip != current {
+        let switched = best.ip != current;
+        if switched {
             *active_ip.write().unwrap() = best.ip;
             if let Some(ref tx) = event_tx {
                 let _ = tx.send(ProxyEvent::IpTargetChanged {
@@ -2200,6 +2241,10 @@ async fn background_ip_rescan(
             &event_tx,
             ProxyEvent::RescanFinished {
                 kind: RescanKind::Ip,
+                found: entries.len(),
+                best_score: Some(best.score),
+                duration_ms: scan_started.elapsed().as_millis() as u64,
+                switched,
             },
         );
     }

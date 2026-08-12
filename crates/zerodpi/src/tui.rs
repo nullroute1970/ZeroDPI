@@ -654,6 +654,8 @@ struct ConnectionRecord {
     src_port: u16,
     /// Address of the client that opened the inbound connection.
     peer: SocketAddr,
+    /// Outbound target IP this connection relays to (from ConnectionAccepted).
+    target_ip: IpAddr,
     status: ConnStatus,
     status_changed_at: Instant,
     c2s_bytes: u64,
@@ -1006,7 +1008,11 @@ pub fn run_dashboard(
 fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
     match event {
         ProxyEvent::ListenerStarted { .. } => {}
-        ProxyEvent::ConnectionAccepted { peer, src_port } => {
+        ProxyEvent::ConnectionAccepted {
+            peer,
+            src_port,
+            target_ip,
+        } => {
             state.total += 1;
             state.active += 1;
             let now = Instant::now();
@@ -1016,6 +1022,7 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
                 end_instant: None,
                 src_port,
                 peer,
+                target_ip,
                 status: ConnStatus::Connecting,
                 status_changed_at: now,
                 c2s_bytes: 0,
@@ -1961,6 +1968,7 @@ mod tests {
             end_instant: None,
             src_port: 443,
             peer: "127.0.0.1:12345".parse().unwrap(),
+            target_ip: "203.0.113.1".parse().unwrap(),
             status,
             status_changed_at: now,
             c2s_bytes: 0,
@@ -2114,6 +2122,7 @@ mod tests {
             ProxyEvent::ConnectionAccepted {
                 peer: "127.0.0.1:22222".parse().unwrap(),
                 src_port: new_active_port,
+                target_ip: "203.0.113.2".parse().unwrap(),
             },
             &mut state,
         );
@@ -2203,6 +2212,10 @@ mod tests {
         apply_event(
             ProxyEvent::RescanFinished {
                 kind: RescanKind::Ip,
+                found: 0,
+                best_score: None,
+                duration_ms: 0,
+                switched: false,
             },
             &mut state,
         );

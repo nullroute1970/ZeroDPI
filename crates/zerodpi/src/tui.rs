@@ -980,7 +980,7 @@ fn sample_throughput(state: &mut DashboardState) {
         || state
             .throughput_history
             .front()
-            .map_or(false, |s| now.saturating_duration_since(s.at) > THROUGHPUT_WINDOW)
+            .is_some_and(|s| now.saturating_duration_since(s.at) > THROUGHPUT_WINDOW)
     {
         state.throughput_history.pop_front();
     }
@@ -1311,10 +1311,10 @@ fn draw_dashboard(
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length((header_content_rows(state, now) + 3) as u16), // header lines + borders + slack
-                Constraint::Length(4),                                         // stats bar (2 content lines + borders)
-                Constraint::Length(3),                                         // throughput strip
-                Constraint::Min(5),                                            // connection log
-                Constraint::Length(3),                                         // help bar
+                Constraint::Length(4), // stats bar (2 content lines + borders)
+                Constraint::Length(3), // throughput strip
+                Constraint::Min(5),    // connection log
+                Constraint::Length(3), // help bar
             ])
             .split(area);
 
@@ -1477,9 +1477,7 @@ fn draw_dashboard(
             header_lines.push(Line::from(vec![
                 Span::styled(
                     "Last error: ",
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("[{}] {}", err.src_port, err.message),
@@ -1642,6 +1640,7 @@ fn draw_dashboard(
                 Row::new(vec![
                     Cell::from(fmt_time(r.started_at)),
                     Cell::from(r.peer.to_string()),
+                    Cell::from(r.target_ip.to_string()),
                     Cell::from(r.status.label()).style(r.status.style()),
                     Cell::from(fmt_bytes(r.c2s_bytes)),
                     Cell::from(fmt_bytes(r.s2c_bytes)),
@@ -1655,7 +1654,8 @@ fn draw_dashboard(
 
         let widths = [
             Constraint::Length(8),  // Time
-            Constraint::Length(21), // Peer
+            Constraint::Length(18), // Peer
+            Constraint::Length(16), // Target
             Constraint::Length(11), // Status
             Constraint::Length(8),  // ↑ Bytes
             Constraint::Length(8),  // ↓ Bytes
@@ -1668,6 +1668,7 @@ fn draw_dashboard(
                 Row::new(vec![
                     "Time",
                     "Peer",
+                    "Target",
                     "Status",
                     "↑ Bytes",
                     "↓ Bytes",

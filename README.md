@@ -105,7 +105,7 @@ After an SNI scan, ZeroDPI shows a ranked table of candidates. Use it to compare
 
 ![ZeroDPI running dashboard showing selected SNI, selected IP, bypass method, listener address, uptime, connection counts, traffic totals, and per-connection relay status.](images/tui-dashboard.png)
 
-The running dashboard confirms the active SNI/IP pair, current bypass method, local listener, uptime, connection state, byte counters, and recent relay activity. This is the main view for interactive desktop runs.
+The running dashboard confirms the active SNI/IP pair (with score and hot-swap count), current bypass method, local listener, uptime, connection state, byte counters, peak concurrency, the latest connection error, background-rescan results, a 60-second throughput graph, and recent relay activity including each connection's outbound target IP. This is the main view for interactive desktop runs.
 
 ### 🖥️ Headless Service Logs
 

@@ -36,6 +36,7 @@
 pub mod composite;
 pub mod low_ttl;
 pub mod tcp_segmentation;
+pub mod tls_padding;
 pub mod tls_record_frag;
 pub mod urg_sni_split;
 pub mod wrong_ack;

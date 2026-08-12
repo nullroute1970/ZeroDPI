@@ -193,10 +193,11 @@ mod tests {
         // record grew by 4 (extension header) + 1000 (zeros)
         assert_eq!(padded.len(), record.len() + 1004);
         // padding extension (type 0x0015, length 1000 = 0x03E8) sits right
-        // before the SNI extension
-        assert_eq!(&padded[127..131], &[0x00, 0x15, 0x03, 0xE8]);
-        assert!(padded[131..127 + 1004].iter().all(|&b| b == 0));
-        // SNI moved from offset 127 to 127 + 1004
+        // before the SNI extension (whose type field is at offset 118 in the
+        // template, 9 bytes before the SNI name at offset 127)
+        assert_eq!(&padded[118..122], &[0x00, 0x15, 0x03, 0xE8]);
+        assert!(padded[122..118 + 1004].iter().all(|&b| b == 0));
+        // SNI name moved from offset 127 to 127 + 1004
         assert_eq!(&padded[127 + 1004..127 + 1004 + 15], b"auth.vercel.com");
         // length fields updated
         assert_eq!(u16::from_be_bytes([padded[3], padded[4]]), padded.len() as u16 - 5);
@@ -205,7 +206,7 @@ mod tests {
         assert_eq!(hs_len, padded.len() - 9);
         // reparses with the SNI at the moved offset
         let layout = parse_client_hello(&padded).expect("padded record must reparse");
-        assert_eq!(layout.sni_off, Some(127 + 1004));
+        assert_eq!(layout.sni_off, Some(118 + 1004));
     }
 
     #[test]
@@ -222,7 +223,7 @@ mod tests {
         assert_eq!(&padded[start..start + 4], &[0x00, 0x15, 0x01, 0xF4]);
         assert!(padded[start + 4..].iter().all(|&b| b == 0));
         let layout = parse_client_hello(&padded).expect("padded record must reparse");
-        assert_eq!(layout.sni_off, Some(127));
+        assert_eq!(layout.sni_off, Some(118));
     }
 
     #[test]

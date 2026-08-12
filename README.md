@@ -657,13 +657,13 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 | `LOW_TTL_SET_PSH` | `bool` | `true` | Set PSH flag on the spoofed packet |
 | `LOW_TTL_BUMP_IP_IDENT` | `bool` | `true` | Bump IPv4 Identification field |
 | `LOW_TTL_COMPLETE_IMMEDIATELY` | `bool` | `true` | Signal bypass complete immediately after emission |
-| `LOW_TTL_DISCOVER` | `bool` | `true` | Discover the correct TTL automatically (see below) |
+| `LOW_TTL_DISCOVER` | `bool` | `true` | Discover the correct TTL once at startup (see below) |
 | `LOW_TTL_DISCOVER_MAX` | `u8` | `32` | Upper bound of the discovery search (1–64) |
 | `LOW_TTL_DISCOVER_TIMEOUT_MS` | `u64` | `5000` | Per-candidate discovery probe timeout (≥ 100) |
 
 `LOW_TTL_VALUE` must be high enough to reach the ISP's inline DPI middlebox but low enough to expire before the destination server. Typical DPI middleboxes sit 4–8 hops from the client; verify with `traceroute` and tune from there.
 
-With `LOW_TTL_DISCOVER = true`, ZeroDPI probes TTL candidates from `1` up to `LOW_TTL_DISCOVER_MAX` at startup (before the listener starts) and applies the **largest working value** — the target server's hop distance minus one — which reaches any inline DPI with maximum margin. Each probe runs the full bypass machinery: a decoy ClientHello carrying the selected whitelisted SNI is injected with the candidate TTL, then a real TLS handshake verifies the decoy was neither dropped before the DPI nor delivered to the server. Discovery re-runs whenever a background rescan hot-swaps the SNI/IP target (new connections briefly keep the previous TTL until discovery finishes). Requirements and caveats:
+With `LOW_TTL_DISCOVER = true`, ZeroDPI probes TTL candidates from `1` up to `LOW_TTL_DISCOVER_MAX` once at startup (before the listener starts) and applies the **largest working value** — the target server's hop distance minus one — which reaches any inline DPI with maximum margin. Each probe runs the full bypass machinery: a decoy ClientHello carrying the selected whitelisted SNI is injected with the candidate TTL, then a real TLS handshake verifies the decoy was neither dropped before the DPI nor delivered to the server. Background rescans may switch the active SNI/IP target, but retain the TTL discovered at startup. Requirements and caveats:
 
 - `LOW_TTL_COMPLETE_IMMEDIATELY` must be `true`; otherwise discovery is skipped with a warning.
 - `low_ttl` must be in `BYPASS_METHOD`; otherwise discovery is skipped silently.

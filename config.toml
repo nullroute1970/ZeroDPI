@@ -411,16 +411,16 @@ LOW_TTL_BUMP_IP_IDENT = true
 # completes via TCP retransmission instead.
 LOW_TTL_COMPLETE_IMMEDIATELY = true
 
-# Whether to automatically discover the correct LOW_TTL_VALUE at startup and
-# again after every background rescan that switches the SNI/IP target.
+# Whether to automatically discover the correct LOW_TTL_VALUE once at startup.
+# Background rescans keep using the TTL discovered for the initial target.
 #
 # Discovery probes TTL candidates from 1 up to LOW_TTL_DISCOVER_MAX, running
 # the real bypass machinery end-to-end for each candidate (decoy ClientHello
 # + full TLS handshake), and applies the largest working value: the server's
 # hop distance minus one, which reaches any inline DPI middlebox with maximum
 # margin.  It adds a one-time startup delay (a few seconds up to ~30 s worst
-# case), requires LOW_TTL_COMPLETE_IMMEDIATELY = true, and only runs when
-# "low_ttl" is in the BYPASS_METHOD list.
+# case), requires LOW_TTL_COMPLETE_IMMEDIATELY = true, and only runs at startup
+# when "low_ttl" is in the BYPASS_METHOD list.
 #
 # Default: true.
 LOW_TTL_DISCOVER = true

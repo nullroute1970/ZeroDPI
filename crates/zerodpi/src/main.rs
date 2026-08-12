@@ -600,7 +600,6 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
             Some(event_tx.clone())
         };
         let rescan_events = events.clone();
-        let rescan_discovery = low_ttl_discovery_state.clone();
         rt.spawn(async move {
             background_rescan(
                 rescan_cfg,
@@ -610,7 +609,6 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                 rescan_event_tx,
                 rescan_events,
                 no_tui,
-                rescan_discovery,
             )
             .await;
         });
@@ -973,8 +971,8 @@ impl LowTtlApplier {
     }
 }
 
-/// Everything `LOW_TTL_DISCOVER` needs to probe one target and apply the
-/// result. Used at startup and after every background-rescan target swap.
+/// Everything `LOW_TTL_DISCOVER` needs to probe the startup target and apply
+/// the result. The discovered value remains active for the process lifetime.
 #[derive(Clone)]
 struct LowTtlDiscoveryState {
     settings: LowTtlDiscovery,
@@ -1007,6 +1005,8 @@ impl LowTtlDiscoveryState {
 /// Background rescan task: runs every `interval_secs` seconds and switches
 /// new connections to better SNI targets.
 ///
+/// Rescans retain the TTL discovered at startup; they do not run TTL discovery.
+///
 /// This runs while the ratatui dashboard owns the terminal. Keep routine scan
 /// output below `info` so it does not write over the live UI.
 #[allow(clippy::too_many_arguments)]
@@ -1018,7 +1018,6 @@ async fn background_rescan(
     event_tx: Option<ProxyEventSender>,
     events: RuntimeEventEmitter,
     headless: bool,
-    low_ttl_discovery: Option<LowTtlDiscoveryState>,
 ) {
     let interval = Duration::from_secs(interval_secs);
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
@@ -1072,8 +1071,9 @@ async fn background_rescan(
                         );
                     }
 
-                    if should_switch_sni_target(&current, best, cfg.SNI_SWITCH_MIN_SCORE) {
-                        let next = ActiveSniTarget::new(best.sni.clone(), best.ip, best.score);
+                    if let Some(next) =
+                        select_rescan_target(&current, best, cfg.SNI_SWITCH_MIN_SCORE)
+                    {
                         *active_target.write().unwrap() = next.clone();
                         info!(
                             old_sni = %current.sni,
@@ -1091,30 +1091,6 @@ async fn background_rescan(
                                 score: next.score,
                             });
                         }
-                        // Rediscover LOW_TTL_VALUE for the new target's route.
-                        if let Some(discovery_state) = low_ttl_discovery.as_ref() {
-                            info!(
-                                sni = %next.sni,
-                                ip = %next.ip,
-                                "LOW_TTL_DISCOVER: rediscovering for new target"
-                            );
-                            match discovery_state.run(&next.sni, next.ip).await {
-                                Some(value) => {
-                                    info!(
-                                        sni = %next.sni,
-                                        value,
-                                        "LOW_TTL_DISCOVER: applied TTL for new target"
-                                    );
-                                    if let Some(ref tx) = event_tx {
-                                        let _ = tx.send(ProxyEvent::LowTtlDiscovered { value });
-                                    }
-                                }
-                                None => warn!(
-                                    sni = %next.sni,
-                                    "LOW_TTL_DISCOVER: no working TTL for new target; keeping previous value"
-                                ),
-                            }
-                        }
                     }
                 }
             }
@@ -1123,6 +1099,15 @@ async fn background_rescan(
             }
         }
     }
+}
+
+fn select_rescan_target(
+    current: &ActiveSniTarget,
+    candidate: &SniProbeEntry,
+    min_score: u8,
+) -> Option<ActiveSniTarget> {
+    should_switch_sni_target(current, candidate, min_score)
+        .then(|| ActiveSniTarget::new(candidate.sni.clone(), candidate.ip, candidate.score))
 }
 
 fn should_switch_sni_target(
@@ -2654,6 +2639,17 @@ mod tests {
     fn selected_sni_can_switch_after_qualifying_scan() {
         let c = candidate("new.example.com", Ipv4Addr::new(2, 2, 2, 2), 10);
         assert!(should_switch_sni_target(&current(0), &c, 1));
+    }
+
+    #[test]
+    fn rescan_target_selection_only_returns_target_update() {
+        let c = candidate("new.example.com", Ipv4Addr::new(2, 2, 2, 2), 61);
+
+        let next = select_rescan_target(&current(50), &c, 1).expect("candidate should qualify");
+
+        assert_eq!(next.sni.as_ref(), "new.example.com");
+        assert_eq!(next.ip, Ipv4Addr::new(2, 2, 2, 2));
+        assert_eq!(next.score, 61);
     }
 
     fn method_list(name: &str) -> BypassMethodList {

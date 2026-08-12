@@ -12,39 +12,40 @@ It is not a replacement VPN client. It is a local TCP relay that your existing V
 
 ---
 
-## Table of Contents
+## 📑 Table of Contents
 
-- [Features](#-features)
-- [What ZeroDPI Does](#what-zerodpi-does)
-- [Screenshots](#-screenshots)
-- [Quick Start](#-quick-start)
-- [First-Run Checklist](#first-run-checklist)
-- [Requirements](#requirements)
-- [Project Layout](#-project-layout)
-- [Release Package Contents](#release-package-contents)
-- [Choosing a Mode](#-choosing-a-mode)
-- [Operating Modes](#-operating-modes)
-- [Bypass Methods](#-bypass-methods)
-- [Choosing a Bypass Method](#choosing-a-bypass-method)
-- [Configuration Recipes](#-configuration-recipes)
-- [Configuration Reference](#-configuration-reference)
-- [Unified Probe Scoring](#-unified-probe-scoring-0100)
-- [How Scanning Works](#how-scanning-works)
-- [Scan Result JSON](#scan-result-json)
-- [Interactive TUI](#-interactive-tui)
-- [CLI Reference](#-cli-reference)
-- [Integrating with Upstream VPN Apps](#-integrating-with-upstream-vpn-apps)
-- [Choosing Decoy SNIs](#-choosing-decoy-snis-sni_listtxt)
-- [IP List](#-ip-list-ip_listtxt)
-- [Running](#-running)
-- [Building from Source](#-building-from-source)
-- [Testing](#-testing)
-- [Known Limitations](#known-limitations)
-- [Troubleshooting](#-troubleshooting)
-- [Security & Privacy Checklist](#-security--privacy-checklist)
-- [Extending](#-extending)
-- [Credits](#-credits)
-- [License](#-license)
+- [✨ Features](#-features)
+- [🔍 What ZeroDPI Does](#-what-zerodpi-does)
+- [📸 Screenshots](#-screenshots)
+- [🚀 Quick Start](#-quick-start)
+- [📋 First-Run Checklist](#-first-run-checklist)
+- [🧰 Requirements](#-requirements)
+- [🏗️ Project Layout](#-project-layout)
+- [📦 Release Package Contents](#-release-package-contents)
+- [🧭 Choosing a Mode](#-choosing-a-mode)
+- [🚀 Operating Modes](#-operating-modes)
+- [🧠 Bypass Methods](#-bypass-methods)
+- [🔗 Combining Bypass Methods](#-combining-bypass-methods)
+- [🎯 Choosing a Bypass Method](#-choosing-a-bypass-method)
+- [🧪 Configuration Recipes](#-configuration-recipes)
+- [⚙️ Configuration Reference](#-configuration-reference)
+- [📊 Unified Probe Scoring](#-unified-probe-scoring-0100)
+- [📡 How Scanning Works](#-how-scanning-works)
+- [🧾 Scan Result JSON](#-scan-result-json)
+- [🖥️ Interactive TUI](#-interactive-tui)
+- [💻 CLI Reference](#-cli-reference)
+- [🧩 Integrating with Upstream VPN Apps](#-integrating-with-upstream-vpn-apps)
+- [📝 Choosing Decoy SNIs](#-choosing-decoy-snis-sni_listtxt)
+- [📝 IP List](#-ip-list-ip_listtxt)
+- [🏃 Running](#-running)
+- [🔨 Building from Source](#-building-from-source)
+- [✅ Testing](#-testing)
+- [⚠️ Known Limitations](#-known-limitations)
+- [🧯 Troubleshooting](#-troubleshooting)
+- [🔐 Security & Privacy Checklist](#-security--privacy-checklist)
+- [🧩 Extending](#-extending)
+- [🙏 Credits](#-credits)
+- [📄 License](#-license)
 
 ---
 
@@ -64,29 +65,29 @@ It is not a replacement VPN client. It is a local TCP relay that your existing V
 
 ---
 
-## What ZeroDPI Does
+## 🔍 What ZeroDPI Does
 
 ZeroDPI creates a local TCP listener, scans candidate targets, chooses a reachable target, then relays your VPN client's TCP stream to port `443` on the selected upstream IP. Depending on `BYPASS_METHOD`, it may also inject or rewrite the first connection packets so DPI devices see a harmless or fragmented TLS ClientHello instead of the VPN ClientHello they would normally block.
 
 The normal connection path is:
 
-```text
-Your apps -> VPN client -> ZeroDPI local listener -> selected edge IP:443 -> real VPN service
+```
+🖥️ Your apps → 🌐 VPN client → 🔄 ZeroDPI local listener → 🌍 selected edge IP:443 → 🖥️ real VPN service
 ```
 
 ZeroDPI is useful when:
 
-- Your VPN protocol already works when the network does not inspect or block the TLS handshake.
-- Your upstream VPN profile is TCP + TLS based and can be configured to connect to `127.0.0.1:44444`.
-- A CDN edge, relay IP, or public SNI candidate can reach the same service path you need.
-- You want to scan many candidates and keep using the best one without manually editing the VPN profile each time.
+- ✅ Your VPN protocol already works when the network does not inspect or block the TLS handshake.
+- ✅ Your upstream VPN profile is TCP + TLS based and can be configured to connect to `127.0.0.1:44444`.
+- ✅ A CDN edge, relay IP, or public SNI candidate can reach the same service path you need.
+- ✅ You want to scan many candidates and keep using the best one without manually editing the VPN profile each time.
 
 ZeroDPI does not:
 
-- Provide VPN accounts, proxy credentials, routing rules, DNS rules, or encryption by itself.
-- Change the real TLS server name configured inside your VPN profile.
-- Bypass every DPI implementation. Different networks require different methods and candidate lists.
-- Support UDP-based VPN handshakes. The relay is TCP-focused and the current interceptor paths inspect IPv4 TCP packets.
+- ❌ Provide VPN accounts, proxy credentials, routing rules, DNS rules, or encryption by itself.
+- ❌ Change the real TLS server name configured inside your VPN profile.
+- ❌ Bypass every DPI implementation. Different networks require different methods and candidate lists.
+- ❌ Support UDP-based VPN handshakes. The relay is TCP-focused and the current interceptor paths inspect IPv4 TCP packets.
 
 Keep the upstream VPN profile's **real server name/SNI** in the VPN app. Change only the address and port that the VPN app dials so it connects to ZeroDPI's local listener.
 
@@ -94,19 +95,19 @@ Keep the upstream VPN profile's **real server name/SNI** in the VPN app. Change 
 
 ## 📸 Screenshots
 
-### Ranked SNI Selection
+### 📊 Ranked SNI Selection
 
 ![ZeroDPI SNI selection table showing ranked SNI candidates with scores, selected IPs, TCP and TLS latency, certificate status, TTFB, download and upload speed, and HTTP result.](images/sni-selection.png)
 
 After an SNI scan, ZeroDPI shows a ranked table of candidates. Use it to compare score, latency, certificate validity, response speed, and HTTP behavior before selecting the target that new proxy connections should use.
 
-### Live Connection Dashboard
+### 📈 Live Connection Dashboard
 
 ![ZeroDPI running dashboard showing selected SNI, selected IP, bypass method, listener address, uptime, connection counts, traffic totals, and per-connection relay status.](images/tui-dashboard.png)
 
 The running dashboard confirms the active SNI/IP pair, current bypass method, local listener, uptime, connection state, byte counters, and recent relay activity. This is the main view for interactive desktop runs.
 
-### Headless Service Logs
+### 🖥️ Headless Service Logs
 
 ![ZeroDPI service log output showing accepted proxy connections, bypass failures before relay, interceptor-closed flows, and successful bypass completion.](images/linux-service-logs.png)
 
@@ -140,24 +141,24 @@ For service deployments, combine `AUTO_SELECT = true` with `--no-tui` so the pro
 
 ---
 
-## First-Run Checklist
+## 📋 First-Run Checklist
 
 Use this checklist when ZeroDPI starts but the VPN app still does not connect:
 
-1. Confirm the VPN profile is TCP + TLS based. UDP-only profiles are outside ZeroDPI's relay path.
-2. Keep the VPN profile's real TLS `serverName` / SNI unchanged.
-3. Change the VPN profile's dial address to `127.0.0.1` and dial port to `44444` unless you changed `LISTEN_HOST` or `LISTEN_PORT`.
-4. Put candidate public hostnames in `sni_list.txt` when using `sni_spoof`, `sni_scan`, or `proxy_scan`.
-5. Put plain IPs or CIDR ranges in `ip_list.txt` when using `ip_bypass`, `ip_bypass_plus`, or `ip_scan`.
-6. Start ZeroDPI before starting or reconnecting the VPN client.
-7. Run as Administrator/root for all interceptor methods except standalone `tls_frag` / `tls_padding`, plain `ip_bypass`, and `ip_bypass_plus` when it uses `tls_frag` or `tls_padding`.
-8. If the TUI is unavailable, pass `--auto-select --no-tui` and read logs instead.
+1️⃣ Confirm the VPN profile is TCP + TLS based. UDP-only profiles are outside ZeroDPI's relay path.
+2️⃣ Keep the VPN profile's real TLS `serverName` / SNI unchanged.
+3️⃣ Change the VPN profile's dial address to `127.0.0.1` and dial port to `44444` unless you changed `LISTEN_HOST` or `LISTEN_PORT`.
+4️⃣ Put candidate public hostnames in `sni_list.txt` when using `sni_spoof`, `sni_scan`, or `proxy_scan`.
+5️⃣ Put plain IPs or CIDR ranges in `ip_list.txt` when using `ip_bypass`, `ip_bypass_plus`, or `ip_scan`.
+6️⃣ Start ZeroDPI before starting or reconnecting the VPN client.
+7️⃣ Run as Administrator/root for all interceptor methods except standalone `tls_frag` / `tls_padding`, plain `ip_bypass`, and `ip_bypass_plus` when it uses `tls_frag` or `tls_padding`.
+8️⃣ If the TUI is unavailable, pass `--auto-select --no-tui` and read logs instead.
 
 For the first test, keep the candidate list small. A short list makes failures easier to understand and avoids creating unnecessary outbound probes while you are still checking the VPN profile wiring.
 
 ---
 
-## Requirements
+## 🧰 Requirements
 
 | Platform | Runtime Requirements | Notes |
 |----------|----------------------|-------|
@@ -194,7 +195,7 @@ Build-time requirements are separate from runtime requirements. See [Building fr
 
 ---
 
-## Release Package Contents
+## 📦 Release Package Contents
 
 Packaged builds are designed to be run from the extracted directory. Keep the runtime files next to the executable unless you pass absolute paths in `config.toml`.
 
@@ -280,7 +281,7 @@ No packet interception, no SNI manipulation. Scans a list of IPs (or CIDR ranges
 
 Scans an IPv4 list, selects a target, then relays the VPN client's real TLS stream while applying a bypass method that does not inject or replace SNI. Use `BYPASS_METHOD = "tls_record_frag"` for TLS-record fragmentation with WinDivert/NFQUEUE, or `BYPASS_METHOD = "tls_frag"` / `BYPASS_METHOD = "tls_padding"` for socket-only transforms.
 
-```text
+```
 🖥️ Local apps → 🌐 VPN App → 🔄 ZeroDPI (ip_bypass_plus) → 🌍 Selected IPv4 :443
                  TCP :44444                                Real SNI + fragmentation
 ```
@@ -309,8 +310,8 @@ Runs the full IP scan pipeline (same as the IP relay modes), displays ranked res
 
 A two-phase hybrid scan:
 
-1. **Phase 1** — Standard SNI scan (`sni_list.txt`)
-2. **Phase 2** — For each passing candidate, opens a SOCKS5 connection through your running V2RayN/sing-box instance and measures real-world TCP latency, TTFB, and download speed
+1️⃣ **Phase 1** — Standard SNI scan (`sni_list.txt`)
+2️⃣ **Phase 2** — For each passing candidate, opens a SOCKS5 connection through your running V2RayN/sing-box instance and measures real-world TCP latency, TTFB, and download speed
 
 Results are blended using a configurable weight and displayed in the TUI.
 
@@ -333,7 +334,7 @@ Results are blended using a configurable weight and displayed in the TUI.
 | `tls_frag` | TLS Fragment: writes selected client data in small TCP chunks without changing TLS bytes | ❌ No | DPI that inspects individual TCP segments |
 | `tls_padding` | TLS ClientHello Padding Expansion: inserts an RFC 7685 padding extension into the real ClientHello so the SNI lands past the DPI's inspection window (before SNI by default) or the record exceeds its buffer (after) | ❌ No | DPI that inspects only the first N bytes of the stream |
 
-## Combining Bypass Methods
+## 🔗 Combining Bypass Methods
 
 `BYPASS_METHOD` accepts a single name or a list, e.g.
 `BYPASS_METHOD = ["wrong_seq", "low_ttl", "tls_frag"]`. Common layered
@@ -378,7 +379,7 @@ How combinations behave:
 
 ---
 
-## Choosing a Bypass Method
+## 🎯 Choosing a Bypass Method
 
 Start with the least complex method that can run on your platform, then move to stronger or more specific methods only when needed.
 
@@ -421,7 +422,7 @@ If a method works but connection setup is slow, increase fragment sizes graduall
 
 ## 🧪 Configuration Recipes
 
-### Default SNI Spoofing
+### 🛡️ Default SNI Spoofing
 
 Use this when your VPN server is reachable through a CDN edge and you have candidate hostnames in `sni_list.txt`.
 
@@ -440,7 +441,7 @@ AUTO_SELECT = false
 
 Run ZeroDPI, select a high-scoring SNI, then configure your VPN client to connect to `127.0.0.1:44444`.
 
-### Headless / Service Run
+### 🛰️ Headless / Service Run
 
 Use this for systemd, scheduled startup, or remote machines where no terminal UI is available.
 
@@ -458,7 +459,7 @@ Start the process with:
 ./zerodpi --config ./config.toml --auto-select --no-tui
 ```
 
-### Packet-Interception-Free TCP-Level TLS Fragment
+### ✂️ Packet-Interception-Free TCP-Level TLS Fragment
 
 Use this when WinDivert/NFQUEUE is unavailable or you want TCP-level TLS Fragment behavior that operates entirely inside the proxy.
 
@@ -475,7 +476,7 @@ This still requires your VPN client to connect to ZeroDPI's local listener. The 
 
 If the DPI instead inspects only the first N bytes of the stream, use `BYPASS_METHOD = "tls_padding"` — the ClientHello is expanded with an RFC 7685 padding extension (`TLS_PADDING_SIZE` / `TLS_PADDING_POSITION`) without any packet interception.
 
-### Scan Only and Save Results
+### 💾 Scan Only and Save Results
 
 Use scan-only modes to prepare candidate lists before a production run.
 
@@ -491,7 +492,7 @@ IP_LIST = "ip_list.txt"
 SCAN_OUTPUT = "ip-results.json"
 ```
 
-### IP Bypass
+### 🌍 IP Bypass
 
 Use this when you want ZeroDPI to pick a working IP from `ip_list.txt` and relay raw TCP without SNI spoofing.
 
@@ -502,7 +503,7 @@ IP_SCAN_SNI = "cloudflare.com"
 AUTO_SELECT = true
 ```
 
-### IP Bypass Plus
+### ➕ IP Bypass Plus
 
 Use this when you want IP scanning, but also need a bypass method that preserves the VPN client's real SNI. `ip_bypass_plus` is IPv4-only.
 
@@ -516,7 +517,7 @@ AUTO_SELECT = true
 
 For TLS-record fragmentation instead, set `BYPASS_METHOD = "tls_record_frag"` and run with packet interception privileges. For a socket-only padding transform, set `BYPASS_METHOD = "tls_padding"`.
 
-### Fixed Candidate After a Successful Scan
+### 📌 Fixed Candidate After a Successful Scan
 
 Use this after you have already run `sni_scan` and want deterministic startup without scanning every time.
 
@@ -540,7 +541,7 @@ MODE = "ip_bypass"
 SELECTED_IP = "104.16.132.229"
 ```
 
-### Proxy Scan Through an Existing SOCKS5 Client
+### 🔬 Proxy Scan Through an Existing SOCKS5 Client
 
 Use this when V2RayN, sing-box, or another local client already exposes a SOCKS5/mixed port and you want to measure candidate performance through the full VPN stack.
 
@@ -556,7 +557,7 @@ PROXY_TEST_SNI_WEIGHT = 0.5
 
 Start the SOCKS5 client first, then run ZeroDPI in `proxy_scan` mode. This mode exits after displaying or saving results.
 
-### Allow Another Device to Use ZeroDPI
+### 📶 Allow Another Device to Use ZeroDPI
 
 Use this only on trusted networks. It allows another device on your LAN to point its VPN client at the machine running ZeroDPI.
 
@@ -804,40 +805,40 @@ Both the SNI and IP scanners use the same scoring formula. Each `(SNI, IP)` pair
 
 ---
 
-## How Scanning Works
+## 📡 How Scanning Works
 
 The scanners are quality filters, not bypass methods. They help ZeroDPI choose a target before the relay starts.
 
-### SNI scanner
+### 🌐 SNI scanner
 
 `sni_scan`, `sni_spoof`, and Phase 1 of `proxy_scan` read `sni_list.txt`, ignore blank lines and `#` comments, resolve each hostname, and probe every resolved IPv4 address. For each `(SNI, IP)` pair, ZeroDPI measures:
 
-1. DNS resolution to IPv4 addresses.
-2. TCP connect latency to `ip:443`.
-3. TLS handshake success and TLS latency using the candidate hostname as SNI.
-4. Certificate validity through the bundled Mozilla root store from `webpki-roots`.
-5. HTTP `GET /` time-to-first-byte.
-6. Download speed up to `SCAN_DOWNLOAD_CAP` bytes.
-7. Upload speed up to `SCAN_UPLOAD_CAP` bytes using `POST SCAN_UPLOAD_PATH`.
-8. HTTP status code from the first response line.
+1️⃣ DNS resolution to IPv4 addresses.
+2️⃣ TCP connect latency to `ip:443`.
+3️⃣ TLS handshake success and TLS latency using the candidate hostname as SNI.
+4️⃣ Certificate validity through the bundled Mozilla root store from `webpki-roots`.
+5️⃣ HTTP `GET /` time-to-first-byte.
+6️⃣ Download speed up to `SCAN_DOWNLOAD_CAP` bytes.
+7️⃣ Upload speed up to `SCAN_UPLOAD_CAP` bytes using `POST SCAN_UPLOAD_PATH`.
+8️⃣ HTTP status code from the first response line.
 
 The result list is sorted by score descending, then TCP latency ascending. A high score usually means the candidate is reachable, fast, and able to complete normal TLS/HTTP checks from your network.
 
-### IP scanner
+### 📍 IP scanner
 
 `ip_scan` and `ip_bypass` read `ip_list.txt`, ignore blank lines and `#` comments, accept plain IPv4/IPv6 addresses, and expand CIDR ranges. IPv4 CIDRs are expanded in full; IPv6 CIDRs are capped by `IPV6_MAX_HOSTS`. `ip_bypass_plus` uses the same IP scanner but is IPv4-only and rejects IPv6 entries.
 
 The IP scanner runs a pipelined flow:
 
-1. Phase 1: TCP connect to each IP on port `443`.
-2. Phase 2: TLS handshake using `IP_SCAN_SNI`.
-3. Phase 3: HTTP `GET /cdn-cgi/trace`.
-4. Phase 4: small download sample up to `SCAN_DOWNLOAD_CAP`.
-5. Phase 5: separate upload sample up to `SCAN_UPLOAD_CAP` using `POST SCAN_UPLOAD_PATH`.
+1️⃣ Phase 1: TCP connect to each IP on port `443`.
+2️⃣ Phase 2: TLS handshake using `IP_SCAN_SNI`.
+3️⃣ Phase 3: HTTP `GET /cdn-cgi/trace`.
+4️⃣ Phase 4: small download sample up to `SCAN_DOWNLOAD_CAP`.
+5️⃣ Phase 5: separate upload sample up to `SCAN_UPLOAD_CAP` using `POST SCAN_UPLOAD_PATH`.
 
 `IP_SCAN_SNI` is only used for the scan's TLS/HTTP probe. It is not inserted into real proxied VPN traffic in `ip_bypass` or `ip_bypass_plus`; the upstream VPN client's own TLS handshake passes through unchanged.
 
-### Proxy scanner
+### 🔗 Proxy scanner
 
 `proxy_scan` first runs the SNI scanner, filters candidates using `PROXY_TEST_MIN_SNI_SCORE` and `PROXY_TEST_TOP_N`, then tests each survivor through `PROXY_TEST_SOCKS5_HOST:PROXY_TEST_SOCKS5_PORT`. This is useful when raw SNI reachability is not enough and you want to measure behavior through your actual local VPN/proxy client.
 
@@ -850,7 +851,7 @@ final_score = SNI scan score * PROXY_TEST_SNI_WEIGHT
 
 ---
 
-## Scan Result JSON
+## 🧾 Scan Result JSON
 
 Set `SCAN_OUTPUT` in scan-only modes to save results:
 
@@ -1115,7 +1116,7 @@ Runtime behavior to know:
 - Scan-only modes do not start the local proxy and do not need your VPN client to be running.
 - `proxy_scan` requires the configured SOCKS5 proxy to be running before ZeroDPI starts Phase 2.
 
-### Headless / Android Controller Contract
+### 🤖 Headless / Android Controller Contract
 
 Android process-wrapper runners should start ZeroDPI without the terminal UI:
 
@@ -1139,7 +1140,7 @@ Requires `CAP_NET_ADMIN` (or root), NFQUEUE kernel support, and the selected fir
 LINUX_FIREWALL_BACKEND = "nftables"
 ```
 
-#### systemd service installer
+#### 🛠️ systemd service installer
 
 `install-systemd.sh` exists for Linux servers and headless machines where ZeroDPI should start at boot and keep running without an interactive terminal. It installs ZeroDPI as a native `systemd` service instead of requiring you to keep a root shell open. It is not needed for interactive desktop runs, Windows, or Android/Termux.
 
@@ -1223,7 +1224,7 @@ python build.py --platform all
 ```
 
 <details>
-<summary><b>Linux</b> (click to expand)</summary>
+<summary><b>🐧 Linux</b> (click to expand)</summary>
 
 ```sh
 sudo apt-get install libnetfilter-queue-dev
@@ -1246,7 +1247,7 @@ python build.py --platform linux --linux-target all
 </details>
 
 <details>
-<summary><b>Windows</b> (click to expand)</summary>
+<summary><b>🪟 Windows</b> (click to expand)</summary>
 
 Requires the MSVC toolchain. When using `build.py`, WinDivert is downloaded into the repo-local `windivert/` folder automatically.
 
@@ -1269,7 +1270,7 @@ python build.py --platform windows --toolchain stable-x86_64-pc-windows-msvc
 </details>
 
 <details>
-<summary><b>Android / Termux</b> (click to expand)</summary>
+<summary><b>📱 Android / Termux</b> (click to expand)</summary>
 
 ```sh
 python build.py --platform termux --termux-arch all --android-ndk /path/to/android-ndk
@@ -1349,18 +1350,18 @@ Unit tests cover:
 
 ---
 
-## Known Limitations
+## ⚠️ Known Limitations
 
-- Upstream relay port is fixed to `443` in the current proxy path.
-- Interceptor-based methods currently parse and rewrite IPv4 TCP packets. IPv6 scan entries can be tested in IP scanning, but packet-interceptor bypass behavior is IPv4-oriented.
-- UDP VPN transports are not supported by the relay. Use TCP + TLS profiles.
-- ZeroDPI does not create candidate lists for you. Good results depend heavily on SNI/IP candidates that make sense for your network and upstream service.
-- `SELECTED_SNI` skips probing. It can start faster, but it will not tell you whether the resolved edge is currently healthy.
-- `ip_bypass` does not spoof SNI. It relays the upstream VPN client's original TLS bytes to the selected IP.
-- `ip_bypass_plus` also preserves the upstream VPN client's original SNI, but can fragment or pad the first real ClientHello with `tls_record_frag`, `tls_frag`, or `tls_padding`.
-- `wrong_timestamp` requires TCP timestamps to be negotiated by the host OS on the upstream connection. If the intercepted ACK has no Timestamp option, ZeroDPI aborts that bypass attempt.
-- Very aggressive fragmentation (`TLS_FRAG_LENGTH = "1"` or `TLS_RECORD_FRAG_SIZE = 1`) can add overhead during connection setup.
-- Firewall, antivirus, endpoint security, or kernel driver policy can block WinDivert/NFQUEUE even when ZeroDPI is configured correctly.
+- 🔒 Upstream relay port is fixed to `443` in the current proxy path.
+- 🌐 Interceptor-based methods currently parse and rewrite IPv4 TCP packets. IPv6 scan entries can be tested in IP scanning, but packet-interceptor bypass behavior is IPv4-oriented.
+- 🚫 UDP VPN transports are not supported by the relay. Use TCP + TLS profiles.
+- 🗒️ ZeroDPI does not create candidate lists for you. Good results depend heavily on SNI/IP candidates that make sense for your network and upstream service.
+- ⏩ `SELECTED_SNI` skips probing. It can start faster, but it will not tell you whether the resolved edge is currently healthy.
+- 🛡️ `ip_bypass` does not spoof SNI. It relays the upstream VPN client's original TLS bytes to the selected IP.
+- ✂️ `ip_bypass_plus` also preserves the upstream VPN client's original SNI, but can fragment or pad the first real ClientHello with `tls_record_frag`, `tls_frag`, or `tls_padding`.
+- ⏱️ `wrong_timestamp` requires TCP timestamps to be negotiated by the host OS on the upstream connection. If the intercepted ACK has no Timestamp option, ZeroDPI aborts that bypass attempt.
+- ⚡ Very aggressive fragmentation (`TLS_FRAG_LENGTH = "1"` or `TLS_RECORD_FRAG_SIZE = 1`) can add overhead during connection setup.
+- 🧱 Firewall, antivirus, endpoint security, or kernel driver policy can block WinDivert/NFQUEUE even when ZeroDPI is configured correctly.
 
 ---
 
@@ -1417,16 +1418,16 @@ strings, auto update settings, and last remote update status.
 
 ## 🔐 Security & Privacy Checklist
 
-- Do not publish real VPN endpoints, private SNI lists, proxy credentials, or machine-specific paths.
-- Treat screenshots as publishable artifacts only after removing visible private details and embedded metadata.
-- Keep `config.toml`, `sni_list.txt`, and `ip_list.txt` out of public commits if they contain operational infrastructure.
-- Treat Android profile remote URLs as secrets when they include query tokens or embedded credentials. Support bundles redact query strings, but screenshots and copied settings may not.
-- Prefer `LISTEN_HOST = "127.0.0.1"` unless another device must connect to ZeroDPI.
-- Review logs before sharing them. Logs can include local ports, selected candidates, timing, and failure reasons.
-- Use scan-only modes before production changes so you can validate candidates without running the relay.
-- Do not expose `LISTEN_HOST = "0.0.0.0"` on public interfaces unless you have a separate access-control layer.
-- Treat `SCAN_OUTPUT` files as operational data. They can reveal which CDNs, IP ranges, and hostnames work from your network.
-- Follow the laws and acceptable-use rules that apply to your network, service provider, and jurisdiction.
+- 🚫 Do not publish real VPN endpoints, private SNI lists, proxy credentials, or machine-specific paths.
+- 📸 Treat screenshots as publishable artifacts only after removing visible private details and embedded metadata.
+- 🔒 Keep `config.toml`, `sni_list.txt`, and `ip_list.txt` out of public commits if they contain operational infrastructure.
+- 🤫 Treat Android profile remote URLs as secrets when they include query tokens or embedded credentials. Support bundles redact query strings, but screenshots and copied settings may not.
+- 🏠 Prefer `LISTEN_HOST = "127.0.0.1"` unless another device must connect to ZeroDPI.
+- 🕵️ Review logs before sharing them. Logs can include local ports, selected candidates, timing, and failure reasons.
+- ✅ Use scan-only modes before production changes so you can validate candidates without running the relay.
+- 🚧 Do not expose `LISTEN_HOST = "0.0.0.0"` on public interfaces unless you have a separate access-control layer.
+- 🗂️ Treat `SCAN_OUTPUT` files as operational data. They can reveal which CDNs, IP ranges, and hostnames work from your network.
+- ⚖️ Follow the laws and acceptable-use rules that apply to your network, service provider, and jurisdiction.
 
 ---
 

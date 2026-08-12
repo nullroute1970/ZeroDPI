@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn on_handshake_complete_ack_is_passthrough() {
         let method = UrgSniSplit::new(&default_cfg());
-        let state = FlowState::new(vec![]);
+        let state = FlowState::new(vec![], None);
         let mut pkt = data_pkt(&[]);
         assert_eq!(
             method.on_handshake_complete_ack(&state, &mut pkt),
@@ -351,7 +351,7 @@ mod tests {
     #[test]
     fn on_first_data_packet_splits_sni_and_sets_urg() {
         let method = UrgSniSplit::new(&default_cfg());
-        let state = FlowState::new(vec![]);
+        let state = FlowState::new(vec![], None);
         let sni = b"auth.vercel.com";
         let ch = client_hello(sni);
         let payload: &'static [u8] = Box::leak(ch.into_boxed_slice());
@@ -380,7 +380,7 @@ mod tests {
         cfg.SNI_SPLIT_DUMMY_BYTE = b'X';
         cfg.SNI_SPLIT_POSITION = SniSplitPosition::Start;
         let method = UrgSniSplit::new(&cfg);
-        let state = FlowState::new(vec![]);
+        let state = FlowState::new(vec![], None);
         let ch = client_hello(b"mci.ir");
         let payload: &'static [u8] = Box::leak(ch.into_boxed_slice());
         let mut pkt = data_pkt(payload);
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn passes_through_when_sni_not_found() {
         let method = UrgSniSplit::new(&default_cfg());
-        let state = FlowState::new(vec![]);
+        let state = FlowState::new(vec![], None);
         let mut pkt = data_pkt(b"GET / HTTP/1.1");
         let action = method.on_first_data_packet(&state, &mut pkt);
         assert_eq!(action, MethodAction::PassThrough);

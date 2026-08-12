@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn stages_payload_preserves_seq_and_adds_tcp_md5_option() {
-        let mut state = FlowState::new(vec![0xAB; 517]);
+        let mut state = FlowState::new(vec![0xAB; 517], None);
         state.syn_seq = Some(1000);
         state.syn_ack_seq = Some(2000);
 
@@ -169,7 +169,7 @@ mod tests {
         cfg.WRONG_MD5_BUMP_IP_IDENT = false;
         cfg.WRONG_MD5_COMPLETE_IMMEDIATELY = false;
 
-        let state = FlowState::new(vec![0xCD; 10]);
+        let state = FlowState::new(vec![0xCD; 10], None);
         let mut pkt = ack_pkt(10, 20);
         let action = WrongMd5::new(&cfg).on_handshake_complete_ack(&state, &mut pkt);
 

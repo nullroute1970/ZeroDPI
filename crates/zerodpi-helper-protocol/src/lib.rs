@@ -12,7 +12,7 @@ use thiserror::Error;
 
 pub const MAGIC: [u8; 4] = *b"ZDHP";
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 3;
 pub const HEADER_LEN: usize = 20;
 pub const MAX_FRAME_SIZE: usize = 256 * 1024;
 pub const MAX_FAKE_DATA_SIZE: usize = 64 * 1024;
@@ -259,6 +259,11 @@ pub enum Message {
         flow_id: u64,
         key: FlowKey,
         fake_data: Vec<u8>,
+        /// Per-flow `low_ttl` stamp override carried by `LOW_TTL_DISCOVER`
+        /// probe flows. `None` for user flows (they use the live handle).
+        /// Additive with a serde default so minor-2 peers remain compatible.
+        #[serde(default)]
+        low_ttl_override: Option<u8>,
     },
     FlowRegistered {
         flow_id: u64,
@@ -338,11 +343,15 @@ impl Message {
                 flow_id,
                 key,
                 fake_data,
+                low_ttl_override,
             } => {
                 if *flow_id == 0 || fake_data.len() > MAX_FAKE_DATA_SIZE {
                     return Err(ProtocolError::InvalidField("flow registration"));
                 }
                 key.validate()?;
+                if low_ttl_override.is_some_and(|v| v == 0 || v > 64) {
+                    return Err(ProtocolError::InvalidField("low TTL override"));
+                }
             }
             Self::FlowRegistered { flow_id }
             | Self::RemoveFlow { flow_id }
@@ -603,6 +612,7 @@ mod tests {
                 flow_id: 1,
                 key: flow_key(),
                 fake_data: vec![1, 2, 3],
+                low_ttl_override: None,
             },
             Message::FlowRegistered { flow_id: 1 },
             Message::RemoveFlow { flow_id: 1 },
@@ -714,6 +724,7 @@ mod tests {
                 dst_port: 443,
             },
             fake_data: Vec::new(),
+            low_ttl_override: None,
         };
         assert!(!HelperState::Configured.accepts(&flow));
         assert!(HelperState::InterceptorOpen.accepts(&flow));
@@ -758,6 +769,7 @@ mod tests {
                 dst_port: 443,
             },
             fake_data: vec![0; MAX_FAKE_DATA_SIZE + 1],
+            low_ttl_override: None,
         };
         assert!(flow.validate().is_err());
     }
@@ -795,6 +807,70 @@ mod tests {
         let mut key = flow_key();
         key.dst_ip = Ipv4Addr::BROADCAST;
         assert!(key.validate().is_err());
+    }
+
+    #[test]
+    fn register_flow_low_ttl_override_round_trips_and_validates() {
+        let message = Message::RegisterFlow {
+            flow_id: 1,
+            key: flow_key(),
+            fake_data: vec![1, 2, 3],
+            low_ttl_override: Some(9),
+        };
+        let frame = Frame::new(78, message.clone());
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &frame).unwrap();
+        assert_eq!(read_frame(bytes.as_slice()).unwrap(), frame);
+        assert!(message.validate().is_ok());
+        assert!(Message::RegisterFlow {
+            flow_id: 1,
+            key: flow_key(),
+            fake_data: vec![1],
+            low_ttl_override: Some(0),
+        }
+        .validate()
+        .is_err());
+        assert!(Message::RegisterFlow {
+            flow_id: 1,
+            key: flow_key(),
+            fake_data: vec![1],
+            low_ttl_override: Some(65),
+        }
+        .validate()
+        .is_err());
+        assert!(Message::RegisterFlow {
+            flow_id: 1,
+            key: flow_key(),
+            fake_data: vec![1],
+            low_ttl_override: None,
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn register_flow_without_override_field_deserializes_as_none() {
+        // Minor-2 app shape: the JSON payload has no `low_ttl_override` key.
+        let payload = serde_json::json!({
+            "kind": "register_flow",
+            "data": {
+                "flow_id": 1,
+                "key": {
+                    "src_ip": "127.0.0.1",
+                    "src_port": 1000,
+                    "dst_ip": "1.1.1.1",
+                    "dst_port": 443
+                },
+                "fake_data": [1, 2, 3]
+            }
+        });
+        let message: Message = serde_json::from_value(payload).unwrap();
+        match message {
+            Message::RegisterFlow {
+                low_ttl_override, ..
+            } => assert_eq!(low_ttl_override, None),
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 
     #[test]

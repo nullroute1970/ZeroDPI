@@ -121,9 +121,11 @@ pub trait BypassMethod: Send + Sync + 'static {
     /// Handle to the IPv4 TTL stamped by the `low_ttl` method.
     ///
     /// Returns `Some` only for the `low_ttl` method. `LOW_TTL_DISCOVER`
-    /// updates this handle at runtime (per discovery probe and after a
-    /// successful discovery) so the interceptor's method follows without
-    /// rebuilding it. Returns `None` for all other methods.
+    /// probes never touch this handle — each probe flow carries its candidate
+    /// TTL as a per-flow override — and the caller updates the handle exactly
+    /// once, after a successful discovery (startup or rescan target switch),
+    /// so the interceptor's method follows without rebuilding it. Returns
+    /// `None` for all other methods.
     fn low_ttl_handle(&self) -> Option<Arc<AtomicU8>> {
         None
     }

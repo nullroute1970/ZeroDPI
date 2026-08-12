@@ -360,13 +360,18 @@ mod unix {
     }
 
     impl FlowController for RemoteHelperClient {
-        fn register_flow(&self, key: FlowKey, fake_data: Vec<u8>) -> FlowRegistrationFuture<'_> {
+        fn register_flow(
+            &self,
+            key: FlowKey,
+            fake_data: Vec<u8>,
+            low_ttl_override: Option<u8>,
+        ) -> FlowRegistrationFuture<'_> {
             Box::pin(async move {
                 let flow_id = self.inner.next_flow_id.fetch_add(1, Ordering::SeqCst);
                 if flow_id == 0 {
                     bail!("helper flow identifier space exhausted");
                 }
-                let entry = FlowEntry::new(Vec::new());
+                let entry = FlowEntry::new(Vec::new(), low_ttl_override);
                 self.inner
                     .flows
                     .lock()
@@ -388,6 +393,7 @@ mod unix {
                         flow_id,
                         key: wire_key,
                         fake_data,
+                        low_ttl_override,
                     })
                     .await;
                 match response {
@@ -423,6 +429,14 @@ mod unix {
                     tracing::warn!(%error, flow_id, "failed to release helper flow");
                 }
             }
+        }
+
+        fn flow_exists(&self, key: FlowKey) -> bool {
+            self.inner
+                .flow_ids
+                .lock()
+                .expect("flow IDs mutex poisoned")
+                .contains_key(&key)
         }
     }
 
@@ -507,8 +521,17 @@ impl RemoteHelperClient {
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl FlowController for RemoteHelperClient {
-    fn register_flow(&self, _key: FlowKey, _fake_data: Vec<u8>) -> FlowRegistrationFuture<'_> {
+    fn register_flow(
+        &self,
+        _key: FlowKey,
+        _fake_data: Vec<u8>,
+        _low_ttl_override: Option<u8>,
+    ) -> FlowRegistrationFuture<'_> {
         Box::pin(async { bail!("external root helper is unavailable") })
+    }
+
+    fn flow_exists(&self, _key: FlowKey) -> bool {
+        false
     }
 
     fn remove_flow(&self, _key: FlowKey) {}

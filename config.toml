@@ -427,22 +427,26 @@ LOW_TTL_BUMP_IP_IDENT = true
 # completes via TCP retransmission instead.
 LOW_TTL_COMPLETE_IMMEDIATELY = true
 
-# Whether to automatically discover the correct LOW_TTL_VALUE once at startup.
-# Background rescans keep using the TTL discovered for the initial target.
+# Whether to automatically discover the correct LOW_TTL_VALUE at startup and
+# again whenever a background rescan switches the active SNI/IP target.
 #
 # Discovery probes TTL candidates from 1 up to LOW_TTL_DISCOVER_MAX, running
 # the real bypass machinery end-to-end for each candidate (decoy ClientHello
 # + full TLS handshake), and applies the largest working value: the server's
 # hop distance minus one, which reaches any inline DPI middlebox with maximum
-# margin.  It adds a one-time startup delay (a few seconds up to ~30 s worst
-# case), requires LOW_TTL_COMPLETE_IMMEDIATELY = true, and only runs at startup
-# when "low_ttl" is in the BYPASS_METHOD list.
+# margin.  Probing uses per-flow TTL overrides, so live connections are never
+# disturbed; on a rescan the target hot-swap happens only after discovery
+# succeeds (failure keeps the current target and TTL).  It requires
+# LOW_TTL_COMPLETE_IMMEDIATELY = true, and only runs when "low_ttl" is in
+# the BYPASS_METHOD list.  It adds a startup delay (a few seconds up to ~30 s
+# worst case) and can extend a rescan cycle by up to LOW_TTL_DISCOVER_MAX ×
+# LOW_TTL_DISCOVER_TIMEOUT_MS.
 #
 # Default: true.
 LOW_TTL_DISCOVER = true
 
 # Upper bound of the LOW_TTL_DISCOVER search range, bounding the worst-case
-# startup delay.  Must be between 1 and 64.  Default: 32.
+# discovery delay (startup or rescan).  Must be between 1 and 64.  Default: 32.
 LOW_TTL_DISCOVER_MAX = 32
 
 # Per-candidate timeout in milliseconds used while discovering LOW_TTL_VALUE.

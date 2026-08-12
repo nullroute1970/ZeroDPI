@@ -369,7 +369,7 @@ mod tests {
     fn on_handshake_complete_ack_is_passthrough() {
         let cfg = default_cfg();
         let method = TlsRecordFrag::new(&cfg);
-        let state = FlowState::new(vec![]);
+        let state = FlowState::new(vec![], None);
         let mut pkt = data_pkt(&[]);
         let action = method.on_handshake_complete_ack(&state, &mut pkt);
         assert_eq!(action, MethodAction::PassThrough);
@@ -379,7 +379,7 @@ mod tests {
     fn on_first_data_packet_fragments_and_emits() {
         let cfg = default_cfg(); // TLS_RECORD_FRAG_SIZE = 1 by default
         let method = TlsRecordFrag::new(&cfg);
-        let state = FlowState::new(vec![]);
+        let state = FlowState::new(vec![], None);
 
         let body = vec![0x01u8; 12]; // fake ClientHello body
         let payload = make_tls_record(0x16, [0x03, 0x03], &body);
@@ -409,7 +409,7 @@ mod tests {
         let mut cfg = default_cfg();
         cfg.TLS_RECORD_FRAG_SIZE = 5;
         let method = TlsRecordFrag::new(&cfg);
-        let state = FlowState::new(vec![]);
+        let state = FlowState::new(vec![], None);
 
         // 10-byte body → 2 records of 5 bytes each.
         let payload = make_tls_record(0x16, [0x03, 0x03], &[0x01; 10]);
@@ -424,7 +424,7 @@ mod tests {
         let mut cfg = default_cfg();
         cfg.TLS_RECORD_FRAG_SET_PSH = false;
         let method = TlsRecordFrag::new(&cfg);
-        let state = FlowState::new(vec![]);
+        let state = FlowState::new(vec![], None);
         let payload = make_tls_record(0x16, [0x03, 0x03], &[0x01; 4]);
         let mut pkt = data_pkt(&payload);
         method.on_first_data_packet(&state, &mut pkt);
@@ -436,7 +436,7 @@ mod tests {
         let mut cfg = default_cfg();
         cfg.TLS_RECORD_FRAG_BUMP_IP_IDENT = false;
         let method = TlsRecordFrag::new(&cfg);
-        let state = FlowState::new(vec![]);
+        let state = FlowState::new(vec![], None);
         let payload = make_tls_record(0x16, [0x03, 0x03], &[0x01; 4]);
         let mut pkt = data_pkt(&payload);
         method.on_first_data_packet(&state, &mut pkt);
@@ -447,7 +447,7 @@ mod tests {
     fn malformed_first_data_packet_completes_without_rewrite() {
         let cfg = default_cfg();
         let method = TlsRecordFrag::new(&cfg);
-        let state = FlowState::new(vec![]);
+        let state = FlowState::new(vec![], None);
         let payload = [0x16, 0x03, 0x03];
         let mut pkt = data_pkt(&payload);
 

@@ -301,6 +301,7 @@ fn serve(mut writer: UnixStream, peer: PeerCredentials, proof: Vec<u8>) -> Resul
                 flow_id,
                 key,
                 fake_data,
+                low_ttl_override,
             } => {
                 if registered.contains_key(&flow_id) {
                     send(
@@ -341,7 +342,7 @@ fn serve(mut writer: UnixStream, peer: PeerCredentials, proof: Vec<u8>) -> Resul
                     )?;
                     bail!("duplicate flow key");
                 }
-                let entry = FlowEntry::new(fake_data);
+                let entry = FlowEntry::new(fake_data, low_ttl_override);
                 let active = interceptor.as_ref().context("interceptor is not open")?;
                 active.flows.insert(flow_key, entry.clone());
                 registered.insert(

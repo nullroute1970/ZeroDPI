@@ -67,10 +67,15 @@ pub struct FlowState {
     pub outcome: Option<BypassOutcome>,
     /// Spoofed TLS ClientHello payload to inject. Built once per flow.
     pub fake_data: Vec<u8>,
+    /// Per-flow `low_ttl` stamp override carried by `LOW_TTL_DISCOVER` probe
+    /// flows. `None` for user flows: they use the shared live handle. The
+    /// `low_ttl` method prefers this value over the handle at emission time,
+    /// so discovery probes never mutate the live handle.
+    pub low_ttl_override: Option<u8>,
 }
 
 impl FlowState {
-    pub fn new(fake_data: Vec<u8>) -> Self {
+    pub fn new(fake_data: Vec<u8>, low_ttl_override: Option<u8>) -> Self {
         Self {
             monitor: true,
             syn_seq: None,
@@ -80,6 +85,7 @@ impl FlowState {
             first_data_modified: false,
             outcome: None,
             fake_data,
+            low_ttl_override,
         }
     }
 }
@@ -93,9 +99,9 @@ pub struct FlowEntry {
 }
 
 impl FlowEntry {
-    pub fn new(fake_data: Vec<u8>) -> Arc<Self> {
+    pub fn new(fake_data: Vec<u8>, low_ttl_override: Option<u8>) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(FlowState::new(fake_data)),
+            state: Mutex::new(FlowState::new(fake_data, low_ttl_override)),
             ready_for_data: Notify::new(),
             notify: Notify::new(),
         })
@@ -130,7 +136,22 @@ pub type FlowRegistrationFuture<'a> =
 /// [`LocalFlowController`]; Android privilege separation supplies a remote
 /// implementation backed by the root-helper protocol.
 pub trait FlowController: Send + Sync {
-    fn register_flow(&self, key: FlowKey, fake_data: Vec<u8>) -> FlowRegistrationFuture<'_>;
+    /// Register a flow with the packet handler. `low_ttl_override` is the
+    /// per-flow `low_ttl` stamp used by `LOW_TTL_DISCOVER` probe flows so
+    /// probing never mutates the shared live handle; pass `None` for user
+    /// flows (they use the live handle).
+    fn register_flow(
+        &self,
+        key: FlowKey,
+        fake_data: Vec<u8>,
+        low_ttl_override: Option<u8>,
+    ) -> FlowRegistrationFuture<'_>;
+
+    /// Whether a flow with this key is already registered (live user flow or
+    /// another probe). Used by discovery to avoid clobbering an existing
+    /// flow locally and to avoid the helper's duplicate-flow-key rejection
+    /// remotely.
+    fn flow_exists(&self, key: FlowKey) -> bool;
 
     /// Idempotently release a flow. Implementations must make this safe to
     /// call from a cancellation/drop guard.
@@ -153,15 +174,57 @@ impl LocalFlowController {
 }
 
 impl FlowController for LocalFlowController {
-    fn register_flow(&self, key: FlowKey, fake_data: Vec<u8>) -> FlowRegistrationFuture<'_> {
+    fn register_flow(
+        &self,
+        key: FlowKey,
+        fake_data: Vec<u8>,
+        low_ttl_override: Option<u8>,
+    ) -> FlowRegistrationFuture<'_> {
         Box::pin(async move {
-            let entry = FlowEntry::new(fake_data);
+            let entry = FlowEntry::new(fake_data, low_ttl_override);
             self.flows.insert(key, entry.clone());
             Ok(entry)
         })
     }
 
+    fn flow_exists(&self, key: FlowKey) -> bool {
+        self.flows.contains_key(&key)
+    }
+
     fn remove_flow(&self, key: FlowKey) {
         self.flows.remove(&key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flow_entry_carries_low_ttl_override() {
+        let with_override = FlowEntry::new(vec![1], Some(7));
+        assert_eq!(with_override.state.lock().low_ttl_override, Some(7));
+        let without_override = FlowEntry::new(vec![1], None);
+        assert_eq!(without_override.state.lock().low_ttl_override, None);
+    }
+
+    #[tokio::test]
+    async fn local_flow_controller_tracks_registration_and_removal() {
+        let controller = LocalFlowController::new(new_flow_table());
+        let key = FlowKey {
+            src_ip: Ipv4Addr::LOCALHOST,
+            src_port: 1234,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            dst_port: 443,
+        };
+        assert!(!controller.flow_exists(key));
+        let entry = controller
+            .register_flow(key, vec![1], Some(5))
+            .await
+            .unwrap();
+        assert!(controller.flow_exists(key));
+        assert_eq!(entry.state.lock().low_ttl_override, Some(5));
+        controller.remove_flow(key);
+        assert!(!controller.flow_exists(key));
     }
 }

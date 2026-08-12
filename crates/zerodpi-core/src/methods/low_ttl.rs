@@ -74,7 +74,9 @@ impl BypassMethod for LowTtl {
     ) -> MethodAction {
         let payload = flow.fake_data.clone();
         let payload_len = payload.len();
-        let ttl = self.ttl();
+        // Per-flow override (LOW_TTL_DISCOVER probes) wins over the shared
+        // handle, so probing never mutates the live value for user flows.
+        let ttl = flow.low_ttl_override.unwrap_or_else(|| self.ttl());
 
         let mut flags = pkt.flags;
         flags.psh = self.set_psh;
@@ -154,7 +156,7 @@ mod tests {
 
     #[test]
     fn stages_payload_keeps_valid_seq_and_sets_ttl() {
-        let mut state = FlowState::new(vec![0xAB; 517]);
+        let mut state = FlowState::new(vec![0xAB; 517], None);
         state.syn_seq = Some(1000);
         state.syn_ack_seq = Some(2000);
 
@@ -181,7 +183,7 @@ mod tests {
         cfg.LOW_TTL_BUMP_IP_IDENT = false;
         cfg.LOW_TTL_COMPLETE_IMMEDIATELY = false;
 
-        let state = FlowState::new(vec![0xCD; 10]);
+        let state = FlowState::new(vec![0xCD; 10], None);
         let mut pkt = ack_pkt(10, 20);
         let action = LowTtl::new(&cfg).on_handshake_complete_ack(&state, &mut pkt);
 
@@ -192,6 +194,21 @@ mod tests {
     }
 
     #[test]
+    fn per_flow_override_stamps_ttl_without_touching_handle() {
+        let method = LowTtl::new(&default_cfg());
+        assert_eq!(method.ttl(), 5);
+
+        let state = FlowState::new(vec![0xEF; 10], Some(7));
+        let mut pkt = ack_pkt(10, 20);
+        let action = method.on_handshake_complete_ack(&state, &mut pkt);
+
+        assert_eq!(action, MethodAction::emit_and_complete());
+        assert_eq!(pkt.new_ipv4_ttl, Some(7));
+        // The shared handle must be untouched by the override.
+        assert_eq!(method.ttl(), 5);
+    }
+
+    #[test]
     fn shared_handle_updates_stamped_ttl_at_runtime() {
         let method = LowTtl::new(&default_cfg());
         let handle = method.low_ttl_handle().expect("low_ttl exposes a handle");
@@ -199,7 +216,7 @@ mod tests {
 
         handle.store(12, Ordering::Relaxed);
 
-        let state = FlowState::new(vec![0xEF; 10]);
+        let state = FlowState::new(vec![0xEF; 10], None);
         let mut pkt = ack_pkt(10, 20);
         let action = method.on_handshake_complete_ack(&state, &mut pkt);
 

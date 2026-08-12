@@ -545,7 +545,7 @@ async fn handle_intercept_connection(
     // A remote controller resolves this future only after the root helper has
     // inserted the flow. The upstream connect below must never move above it.
     let entry = flow_controller
-        .register_flow(key, target.fake_client_hello)
+        .register_flow(key, target.fake_client_hello, None)
         .await
         .context("register intercepted flow")?;
 

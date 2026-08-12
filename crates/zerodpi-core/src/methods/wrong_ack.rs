@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn stages_payload_preserves_seq_and_sets_old_ack() {
-        let mut state = FlowState::new(vec![0xAB; 517]);
+        let mut state = FlowState::new(vec![0xAB; 517], None);
         state.syn_seq = Some(1000);
         state.syn_ack_seq = Some(2000);
 
@@ -155,7 +155,7 @@ mod tests {
     fn offset_shifts_ack_further_back() {
         let mut cfg = default_cfg();
         cfg.WRONG_ACK_OFFSET = 7;
-        let mut state = FlowState::new(vec![0xCD; 10]);
+        let mut state = FlowState::new(vec![0xCD; 10], None);
         state.syn_ack_seq = Some(2000);
 
         let mut pkt = ack_pkt(10, 2000);
@@ -170,7 +170,7 @@ mod tests {
         cfg.WRONG_ACK_SET_PSH = false;
         cfg.WRONG_ACK_BUMP_IP_IDENT = false;
         cfg.WRONG_ACK_COMPLETE_IMMEDIATELY = false;
-        let mut state = FlowState::new(vec![0xCD; 10]);
+        let mut state = FlowState::new(vec![0xCD; 10], None);
         state.syn_ack_seq = Some(20);
 
         let mut pkt = ack_pkt(10, 20);
@@ -185,7 +185,7 @@ mod tests {
     fn handles_ack_wraparound() {
         let mut cfg = default_cfg();
         cfg.WRONG_ACK_OFFSET = 7;
-        let mut state = FlowState::new(vec![0; 517]);
+        let mut state = FlowState::new(vec![0; 517], None);
         state.syn_ack_seq = Some(2);
 
         let mut pkt = ack_pkt(10, 2);

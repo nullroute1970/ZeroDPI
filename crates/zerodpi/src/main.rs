@@ -605,6 +605,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                 rescan_cfg,
                 rescan_path,
                 interval,
+                low_ttl_discovery_state.clone(),
                 active_target,
                 rescan_event_tx,
                 rescan_events,
@@ -984,28 +985,37 @@ struct LowTtlDiscoveryState {
 
 impl LowTtlDiscoveryState {
     async fn run(&self, sni: &str, connect_ip: Ipv4Addr) -> Option<u8> {
-        let flow_controller = self.flow_controller.clone();
-        let applier = self.applier.clone();
-        discover_low_ttl(
+        let found = discover_low_ttl(
             self.settings,
             sni,
             connect_ip,
             self.interface_ip,
-            flow_controller,
+            self.flow_controller.clone(),
             self.connector.clone(),
-            move |value| {
-                let applier = applier.clone();
-                async move { applier.apply(value).await }
-            },
         )
-        .await
+        .await?;
+        // Apply the discovered value exactly once, after the scan completes:
+        // probing never touched the live handle, so there is no earlier
+        // mutation to reconcile (fixes the old "handle left at the first
+        // failing candidate" behavior).
+        if self.applier.apply(found).await {
+            Some(found)
+        } else {
+            None
+        }
     }
 }
 
 /// Background rescan task: runs every `interval_secs` seconds and switches
 /// new connections to better SNI targets.
 ///
-/// Rescans retain the TTL discovered at startup; they do not run TTL discovery.
+/// When `rescan_discovery` is configured, a rescan that warrants a target
+/// switch first runs `LOW_TTL_DISCOVER` against the candidate `(sni, ip)`
+/// (probe flows carry per-flow TTL overrides, so live connections are never
+/// disturbed). The hot-swap happens only if discovery succeeds: the new
+/// target and the discovered TTL become active together. On discovery
+/// failure the current target and TTL are kept. Targets that do not qualify
+/// for a switch are never probed.
 ///
 /// This runs while the ratatui dashboard owns the terminal. Keep routine scan
 /// output below `info` so it does not write over the live UI.
@@ -1014,6 +1024,7 @@ async fn background_rescan(
     cfg: Arc<Config>,
     path: PathBuf,
     interval_secs: u64,
+    rescan_discovery: Option<LowTtlDiscoveryState>,
     active_target: Arc<std::sync::RwLock<ActiveSniTarget>>,
     event_tx: Option<ProxyEventSender>,
     events: RuntimeEventEmitter,
@@ -1074,22 +1085,69 @@ async fn background_rescan(
                     if let Some(next) =
                         select_rescan_target(&current, best, cfg.SNI_SWITCH_MIN_SCORE)
                     {
-                        *active_target.write().unwrap() = next.clone();
-                        info!(
-                            old_sni = %current.sni,
-                            old_ip = %current.ip,
-                            old_score = current.score,
-                            new_sni = %next.sni,
-                            new_ip = %next.ip,
-                            new_score = next.score,
-                            "hot-swapped active SNI target"
-                        );
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx.send(ProxyEvent::SniTargetChanged {
-                                sni: next.sni.to_string(),
-                                ip: next.ip,
-                                score: next.score,
-                            });
+                        // A switch is warranted. With discovery configured,
+                        // probe the candidate first and gate the hot-swap on
+                        // success; the discovered TTL then goes live together
+                        // with the new target.
+                        let (switch, discovered) = match rescan_discovery.as_ref() {
+                            Some(state) => {
+                                if headless {
+                                    info!(
+                                        sni = %next.sni,
+                                        ip = %next.ip,
+                                        "rescan switch warranted; probing TTL candidates"
+                                    );
+                                } else {
+                                    debug!(
+                                        sni = %next.sni,
+                                        ip = %next.ip,
+                                        "rescan switch warranted; probing TTL candidates"
+                                    );
+                                }
+                                let discovered = state.run(&next.sni, next.ip).await;
+                                (
+                                    discovery_gated_switch(
+                                        discovered,
+                                        &current,
+                                        best,
+                                        cfg.SNI_SWITCH_MIN_SCORE,
+                                    ),
+                                    discovered,
+                                )
+                            }
+                            None => (Some(next), None),
+                        };
+                        match switch {
+                            Some(next) => {
+                                *active_target.write().unwrap() = next.clone();
+                                info!(
+                                    old_sni = %current.sni,
+                                    old_ip = %current.ip,
+                                    old_score = current.score,
+                                    new_sni = %next.sni,
+                                    new_ip = %next.ip,
+                                    new_score = next.score,
+                                    "hot-swapped active SNI target"
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx.send(ProxyEvent::SniTargetChanged {
+                                        sni: next.sni.to_string(),
+                                        ip: next.ip,
+                                        score: next.score,
+                                    });
+                                    if let Some(value) = discovered {
+                                        let _ = tx.send(ProxyEvent::LowTtlDiscovered { value });
+                                    }
+                                }
+                            }
+                            None => {
+                                warn!(
+                                    sni = %best.sni,
+                                    ip = %best.ip,
+                                    "rescan discovery found no working TTL; \
+                                     keeping current target and TTL"
+                                );
+                            }
                         }
                     }
                 }
@@ -1108,6 +1166,21 @@ fn select_rescan_target(
 ) -> Option<ActiveSniTarget> {
     should_switch_sni_target(current, candidate, min_score)
         .then(|| ActiveSniTarget::new(candidate.sni.clone(), candidate.ip, candidate.score))
+}
+
+/// Rescan-time switch decision when `LOW_TTL_DISCOVER` is configured:
+/// discovery must succeed for the switch to happen. `discovered` is the TTL
+/// found against the candidate (`None` = discovery ran but found nothing, or
+/// could not be applied), in which case the current target and TTL are kept
+/// regardless of how good the candidate is.
+fn discovery_gated_switch(
+    discovered: Option<u8>,
+    current: &ActiveSniTarget,
+    candidate: &SniProbeEntry,
+    min_score: u8,
+) -> Option<ActiveSniTarget> {
+    discovered?;
+    select_rescan_target(current, candidate, min_score)
 }
 
 fn should_switch_sni_target(
@@ -2651,6 +2724,31 @@ mod tests {
         assert_eq!(next.sni.as_ref(), "new.example.com");
         assert_eq!(next.ip, Ipv4Addr::new(2, 2, 2, 2));
         assert_eq!(next.score, 61);
+    }
+
+    #[test]
+    fn discovery_gated_switch_returns_candidate_when_discovery_succeeds() {
+        let c = candidate("new.example.com", Ipv4Addr::new(2, 2, 2, 2), 61);
+
+        let next = discovery_gated_switch(Some(9), &current(50), &c, 1)
+            .expect("discovery success with a qualifying candidate should switch");
+
+        assert_eq!(next.sni.as_ref(), "new.example.com");
+        assert_eq!(next.ip, Ipv4Addr::new(2, 2, 2, 2));
+        assert_eq!(next.score, 61);
+    }
+
+    #[test]
+    fn discovery_gated_switch_stays_on_current_when_discovery_fails() {
+        // Even a perfect candidate is rejected when discovery found no TTL.
+        let c = candidate("new.example.com", Ipv4Addr::new(2, 2, 2, 2), 100);
+        assert!(discovery_gated_switch(None, &current(50), &c, 1).is_none());
+    }
+
+    #[test]
+    fn discovery_gated_switch_still_requires_qualifying_candidate() {
+        let c = candidate("new.example.com", Ipv4Addr::new(2, 2, 2, 2), 40);
+        assert!(discovery_gated_switch(Some(9), &current(50), &c, 50).is_none());
     }
 
     fn method_list(name: &str) -> BypassMethodList {

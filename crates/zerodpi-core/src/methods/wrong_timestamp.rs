@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn stages_payload_and_replaces_timestamp_options() {
         let options = timestamp_option(100, 77);
-        let mut state = FlowState::new(vec![0xAB; 517]);
+        let mut state = FlowState::new(vec![0xAB; 517], None);
         state.syn_seq = Some(1000);
         state.syn_ack_seq = Some(2000);
 
@@ -283,7 +283,7 @@ mod tests {
         cfg.WRONG_TIMESTAMP_COMPLETE_IMMEDIATELY = false;
         let options = timestamp_option(100, 77);
 
-        let state = FlowState::new(vec![0xCD; 10]);
+        let state = FlowState::new(vec![0xCD; 10], None);
         let mut pkt = ack_pkt(10, 20, &options);
         let action = WrongTimestamp::new(&cfg).on_handshake_complete_ack(&state, &mut pkt);
 
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn aborts_when_no_timestamp_option_exists() {
-        let state = FlowState::new(vec![0xCD; 10]);
+        let state = FlowState::new(vec![0xCD; 10], None);
         let mut pkt = ack_pkt(10, 20, &[]);
         let action =
             WrongTimestamp::new(&default_cfg()).on_handshake_complete_ack(&state, &mut pkt);

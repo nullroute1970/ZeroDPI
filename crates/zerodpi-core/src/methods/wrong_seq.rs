@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn stages_payload_and_wrong_seq() {
-        let mut state = FlowState::new(vec![0xAB; 517]);
+        let mut state = FlowState::new(vec![0xAB; 517], None);
         state.syn_seq = Some(1000);
         state.syn_ack_seq = Some(2000);
 
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn handles_seq_wraparound() {
-        let mut state = FlowState::new(vec![0; 517]);
+        let mut state = FlowState::new(vec![0; 517], None);
         state.syn_seq = Some(10); // small ISN forces wrap
         let mut pkt = ack_pkt(10);
         WrongSeq::new(&default_cfg()).on_handshake_complete_ack(&state, &mut pkt);
@@ -156,7 +156,7 @@ mod tests {
     fn extra_offset_shifts_seq_further_back() {
         let mut cfg = default_cfg();
         cfg.WRONG_SEQ_EXTRA_OFFSET = 100;
-        let mut state = FlowState::new(vec![0xAB; 517]);
+        let mut state = FlowState::new(vec![0xAB; 517], None);
         state.syn_seq = Some(1000);
         state.syn_ack_seq = Some(2000);
 
@@ -170,7 +170,7 @@ mod tests {
     fn set_psh_false_clears_psh_flag() {
         let mut cfg = default_cfg();
         cfg.WRONG_SEQ_SET_PSH = false;
-        let mut state = FlowState::new(vec![0; 517]);
+        let mut state = FlowState::new(vec![0; 517], None);
         state.syn_seq = Some(1000);
         state.syn_ack_seq = Some(2000);
 
@@ -183,7 +183,7 @@ mod tests {
     fn bump_ip_ident_false() {
         let mut cfg = default_cfg();
         cfg.WRONG_SEQ_BUMP_IP_IDENT = false;
-        let mut state = FlowState::new(vec![0; 517]);
+        let mut state = FlowState::new(vec![0; 517], None);
         state.syn_seq = Some(1000);
         state.syn_ack_seq = Some(2000);
 

@@ -17,6 +17,12 @@
 //! any inline DPI middlebox with maximum margin. The search stops at the
 //! first failure observed after at least one success.
 //!
+//! Probing never mutates the live `low_ttl` handle: each probe registers its
+//! flow with the candidate TTL as a **per-flow override** carried in
+//! `FlowState`, so user flows keep using the shared handle throughout.
+//! `discover_low_ttl` therefore has no global side effect; the caller applies
+//! the discovered value exactly once, immediately before any target switch.
+//!
 //! Every probe registers a real intercepted flow (decoy ClientHello carrying
 //! the selected whitelisted SNI), connects to the target on the configured
 //! interface IP, waits for the bypass to complete, then performs a full rustls
@@ -84,24 +90,20 @@ where
 
 /// Run `LOW_TTL_DISCOVER` against one target.
 ///
-/// For each candidate TTL, `set_ttl` is invoked *before* the probe so the
-/// running interceptor stamps that value on the decoy; it returns `false`
-/// when the value could not be applied (the probe is then treated as failed).
+/// Each probe registers its flow with the candidate TTL as a per-flow
+/// override, so the running interceptor stamps that value on the decoy while
+/// the live handle stays untouched. A probe whose 4-tuple already belongs to
+/// another flow (live user flow or an earlier probe) is treated as failed.
 /// Returns the discovered TTL, or `None` if no candidate worked (the caller
-/// should keep `LOW_TTL_VALUE`).
-pub async fn discover_low_ttl<F, Fut>(
+/// should keep `LOW_TTL_VALUE` and the current target).
+pub async fn discover_low_ttl(
     discovery: LowTtlDiscovery,
     sni: &str,
     connect_ip: Ipv4Addr,
     interface_ip: Ipv4Addr,
     flow_controller: Arc<dyn FlowController>,
     connector: TlsConnector,
-    set_ttl: F,
-) -> Option<u8>
-where
-    F: Fn(u8) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = bool> + Send + 'static,
-{
+) -> Option<u8> {
     let server_name = match ServerName::try_from(sni.to_owned()) {
         Ok(name) => name,
         Err(_) => {
@@ -113,15 +115,11 @@ where
     let timeout = discovery.probe_timeout;
 
     let found = scan_ttl(discovery.max_ttl, |ttl| {
-        let apply = set_ttl.clone();
         let fake_data = fake_data.clone();
         let server_name = server_name.clone();
         let flow_controller = flow_controller.clone();
         let connector = connector.clone();
         async move {
-            if !apply(ttl).await {
-                return false;
-            }
             probe_ttl(
                 fake_data,
                 &server_name,
@@ -130,6 +128,7 @@ where
                 &flow_controller,
                 &connector,
                 timeout,
+                ttl,
             )
             .await
         }
@@ -150,11 +149,31 @@ where
     found
 }
 
+/// Register a probe flow, refusing to clobber a flow that already owns the
+/// 4-tuple: a live user flow locally, or any flow remotely (the root helper
+/// rejects duplicate flow keys with `HelperFatal`). `low_ttl_override` is
+/// the candidate TTL, so the interceptor stamps it without touching the
+/// shared live handle.
+async fn register_probe_flow(
+    flow_controller: &dyn FlowController,
+    key: FlowKey,
+    fake_data: Vec<u8>,
+    low_ttl_override: Option<u8>,
+) -> anyhow::Result<Arc<FlowEntry>> {
+    if flow_controller.flow_exists(key) {
+        return Err(anyhow::anyhow!("flow key already registered"));
+    }
+    flow_controller
+        .register_flow(key, fake_data, low_ttl_override)
+        .await
+}
+
 /// One full bypass + handshake probe at a fixed TTL.
 ///
 /// Mirrors the proxy's `handle_intercept_connection` socket pattern: bind on
 /// the interface IP with a kernel-chosen port, register the flow, connect,
 /// wait for the decoy bypass to complete, then run a rustls handshake.
+#[allow(clippy::too_many_arguments)]
 async fn probe_ttl(
     fake_data: Vec<u8>,
     server_name: &ServerName<'static>,
@@ -163,6 +182,7 @@ async fn probe_ttl(
     flow_controller: &Arc<dyn FlowController>,
     connector: &TlsConnector,
     timeout: Duration,
+    candidate_ttl: u8,
 ) -> bool {
     let socket = match TcpSocket::new_v4() {
         Ok(s) => s,
@@ -183,7 +203,14 @@ async fn probe_ttl(
         dst_ip: connect_ip,
         dst_port: CONNECT_PORT,
     };
-    let entry = match flow_controller.register_flow(key, fake_data).await {
+    let entry = match register_probe_flow(
+        flow_controller.as_ref(),
+        key,
+        fake_data,
+        Some(candidate_ttl),
+    )
+    .await
+    {
         Ok(entry) => entry,
         Err(_) => return false,
     };
@@ -262,7 +289,125 @@ pub fn make_discovery_tls_connector() -> TlsConnector {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::flow::FlowRegistrationFuture;
+
+    /// Records every `register_flow` call and can force `flow_exists` to
+    /// report a collision.
+    struct RecordingController {
+        registrations: Mutex<Vec<(FlowKey, Option<u8>)>>,
+        existing: Mutex<bool>,
+    }
+
+    impl RecordingController {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                registrations: Mutex::new(Vec::new()),
+                existing: Mutex::new(false),
+            })
+        }
+    }
+
+    impl FlowController for RecordingController {
+        fn register_flow(
+            &self,
+            key: FlowKey,
+            fake_data: Vec<u8>,
+            low_ttl_override: Option<u8>,
+        ) -> FlowRegistrationFuture<'_> {
+            Box::pin(async move {
+                self.registrations
+                    .lock()
+                    .unwrap()
+                    .push((key, low_ttl_override));
+                Ok(FlowEntry::new(fake_data, low_ttl_override))
+            })
+        }
+
+        fn flow_exists(&self, _key: FlowKey) -> bool {
+            *self.existing.lock().unwrap()
+        }
+
+        fn remove_flow(&self, _key: FlowKey) {}
+    }
+
+    fn probe_key() -> FlowKey {
+        FlowKey {
+            src_ip: Ipv4Addr::LOCALHOST,
+            src_port: 1234,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            dst_port: 443,
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_registers_each_candidate_with_its_own_override() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let recording = RecordingController::new();
+        let flow_controller: Arc<dyn FlowController> = recording.clone();
+        let discovery = LowTtlDiscovery {
+            max_ttl: 5,
+            probe_timeout: Duration::from_millis(50),
+        };
+        // No real target behind the probe I/O, so every probe fails and the
+        // scan walks all five candidates.
+        let found = discover_low_ttl(
+            discovery,
+            "example.com",
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::LOCALHOST,
+            flow_controller,
+            make_discovery_tls_connector(),
+        )
+        .await;
+        assert_eq!(found, None);
+
+        let registrations = recording.registrations.lock().unwrap();
+        assert_eq!(registrations.len(), 5);
+        for (index, (key, override_ttl)) in registrations.iter().enumerate() {
+            let expected = index as u8 + 1;
+            assert_eq!(*override_ttl, Some(expected));
+            assert_eq!(key.dst_ip, Ipv4Addr::new(1, 1, 1, 1));
+            assert_eq!(key.dst_port, CONNECT_PORT);
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_ttl_fails_on_key_collision_without_registering() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let recording = RecordingController::new();
+        let flow_controller: Arc<dyn FlowController> = recording.clone();
+        *recording.existing.lock().unwrap() = true;
+        let server_name = ServerName::try_from("example.com").unwrap();
+        let ok = probe_ttl(
+            vec![1],
+            &server_name,
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::LOCALHOST,
+            &flow_controller,
+            &make_discovery_tls_connector(),
+            Duration::from_secs(1),
+            5,
+        )
+        .await;
+        assert!(!ok);
+        assert!(recording.registrations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn register_probe_flow_registers_when_key_is_free() {
+        let recording = RecordingController::new();
+        let entry = register_probe_flow(recording.as_ref(), probe_key(), vec![1], Some(3))
+            .await
+            .unwrap();
+        assert_eq!(entry.state.lock().low_ttl_override, Some(3));
+        let registrations = recording.registrations.lock().unwrap();
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].0, probe_key());
+        assert_eq!(registrations[0].1, Some(3));
+    }
 
     #[tokio::test]
     async fn picks_last_success_in_contiguous_window() {

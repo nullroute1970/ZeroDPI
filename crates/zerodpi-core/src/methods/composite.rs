@@ -188,7 +188,7 @@ mod tests {
     }
 
     fn handshake_state() -> FlowState {
-        let mut state = FlowState::new(vec![0xAB; 517]);
+        let mut state = FlowState::new(vec![0xAB; 517], None);
         state.syn_seq = Some(1000);
         state.syn_ack_seq = Some(5000);
         state

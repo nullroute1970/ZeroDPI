@@ -422,7 +422,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0xAA; 517]);
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
         flows.insert(key, entry.clone());
         let mut h = Handler::new(flows.clone(), Arc::new(WrongSeq::new(&default_cfg())));
 
@@ -497,7 +497,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0xAA; 517]);
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
         flows.insert(key, entry.clone());
 
         let mut cfg = default_cfg();
@@ -558,7 +558,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0xAA; 517]);
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
         flows.insert(key, entry.clone());
 
         let mut cfg = default_cfg();
@@ -624,7 +624,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0xAA; 517]);
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
         flows.insert(key, entry.clone());
 
         let mut cfg = default_cfg();
@@ -687,7 +687,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0xAA; 517]);
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
         flows.insert(key, entry.clone());
 
         let mut cfg = default_cfg();
@@ -750,7 +750,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0xAA; 517]);
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
         flows.insert(key, entry.clone());
 
         let mut cfg = default_cfg();
@@ -812,7 +812,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0xAA; 517]);
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
         flows.insert(key, entry.clone());
 
         let mut cfg = default_cfg();
@@ -872,7 +872,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0xAA; 517]);
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
         flows.insert(key, entry.clone());
 
         let mut cfg = default_cfg();
@@ -946,7 +946,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0xAA; 517]);
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
         flows.insert(key, entry.clone());
 
         let mut cfg = default_cfg();
@@ -1024,7 +1024,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0xAA; 517]);
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
         flows.insert(key, entry.clone());
 
         let mut cfg = default_cfg();
@@ -1113,7 +1113,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0xAA; 517]);
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
         flows.insert(key, entry.clone());
 
         let mut cfg = default_cfg();
@@ -1205,7 +1205,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0xAA; 517]);
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
         flows.insert(key, entry.clone());
 
         let mut cfg = default_cfg();
@@ -1299,7 +1299,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0xAA; 517]);
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
         flows.insert(key, entry.clone());
 
         let mut cfg = default_cfg();
@@ -1390,7 +1390,7 @@ mod tests {
             dst_ip: Ipv4Addr::new(1, 2, 3, 4),
             dst_port: 443,
         };
-        let entry = FlowEntry::new(vec![0; 517]);
+        let entry = FlowEntry::new(vec![0; 517], None);
         flows.insert(key, entry.clone());
         let mut h = Handler::new(flows, Arc::new(WrongSeq::new(&default_cfg())));
         let mut p = pkt(

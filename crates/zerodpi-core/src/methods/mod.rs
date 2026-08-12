@@ -28,6 +28,11 @@
 //! - `tls_frag` — TCP-level TLS Fragment. Writes selected client data in
 //!   small chunks with `TCP_NODELAY` so DPI cannot reassemble the SNI from any
 //!   single packet.
+//! - `tls_padding` — RFC 7685 ClientHello Padding Expansion. Reads the first
+//!   TLS ClientHello record, inserts a padding extension of
+//!   `TLS_PADDING_SIZE` zero bytes (before the SNI extension by default),
+//!   and writes the expanded record to the upstream socket. The padding
+//!   pushes the SNI past DPI inspection windows (typically 512-1460 bytes).
 //!
 //! New interceptor-based methods only need to implement this trait and be
 //! registered in [`build_method`].  New socket-based methods must be wired
@@ -157,8 +162,9 @@ pub trait BypassMethod: Send + Sync + 'static {
 /// Returns `Some(method)` when the configured list contains any
 /// interceptor-based method (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
 /// `wrong_md5`, `wrong_timestamp`, `low_ttl`, `urg_sni_split`,
-/// `tls_record_frag`) and `None` for socket-only lists (`["tls_frag"]`) or
-/// empty lists. Callers should validate the method list via
+/// `tls_record_frag`) and `None` for socket-only lists (`["tls_frag"]`,
+/// `["tls_padding"]`, `["tls_frag", "tls_padding"]`) or empty lists.
+/// Callers should validate the method list via
 /// [`crate::config::Config::validate`] before calling this function.
 pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
     let list = &cfg.BYPASS_METHOD;
@@ -169,7 +175,8 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
     let mut data: Option<Box<dyn BypassMethod>> = None;
     for name in list.iter() {
         match name {
-            "tls_frag" => {} // socket side; handled directly in proxy.rs
+            "tls_frag" => {}    // socket side; handled directly in proxy.rs
+            "tls_padding" => {} // socket side; handled directly in proxy.rs
             "tls_record_frag" => data = Some(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
             "wrong_seq" => handshake.push(Box::new(wrong_seq::WrongSeq::new(cfg))),
             "wrong_ack" => handshake.push(Box::new(wrong_ack::WrongAck::new(cfg))),
@@ -187,6 +194,7 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
         handshake,
         data,
         list.contains("tls_frag"),
+        list.contains("tls_padding"),
     )))
 }
 
@@ -271,6 +279,19 @@ mod tests {
         let cfg = cfg_with_method(r#"BYPASS_METHOD = "urg_sni_split""#);
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "urg_sni_split");
+    }
+
+    #[test]
+    fn build_wrong_seq_tls_padding_method() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["wrong_seq", "tls_padding"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "wrong_seq + tls_padding");
+    }
+
+    #[test]
+    fn socket_padding_method_returns_none() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "tls_padding""#);
+        assert!(build_method(&cfg).is_none());
     }
 
     #[test]

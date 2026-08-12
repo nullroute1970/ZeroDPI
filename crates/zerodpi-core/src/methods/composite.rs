@@ -5,8 +5,9 @@
 //! packet (every injector uses the identical `flow.fake_data` payload and
 //! distinct `PacketView` fields), then delegates the data stage to
 //! `tls_record_frag` when present. Socket-side `tls_frag` segmentation is
-//! signaled through [`CompositeMethod::segments_first_client_hello`] so the
-//! proxy enables TCP-level write segmentation.
+//! signaled through [`CompositeMethod::segments_first_client_hello`] and
+//! `tls_padding` through [`CompositeMethod::pads_first_client_hello`] so the
+//! proxy enables the corresponding socket-side data-stage transforms.
 //!
 //! Composition rules (provably reproduce the former hard-coded combos):
 //! - PSH / IP-ident settings come from the **first** handshake-stage member.
@@ -26,6 +27,7 @@ pub struct CompositeMethod {
     pub handshake_methods: Vec<Box<dyn BypassMethod>>,
     pub data_method: Option<Box<dyn BypassMethod>>,
     pub segments_first_client_hello: bool,
+    pub pads_first_client_hello: bool,
 }
 
 impl CompositeMethod {
@@ -33,11 +35,13 @@ impl CompositeMethod {
         handshake_methods: Vec<Box<dyn BypassMethod>>,
         data_method: Option<Box<dyn BypassMethod>>,
         segments_first_client_hello: bool,
+        pads_first_client_hello: bool,
     ) -> Self {
         Self {
             handshake_methods,
             data_method,
             segments_first_client_hello,
+            pads_first_client_hello,
         }
     }
 }
@@ -50,6 +54,9 @@ impl BypassMethod for CompositeMethod {
         }
         if self.segments_first_client_hello {
             parts.push("tls_frag".into());
+        }
+        if self.pads_first_client_hello {
+            parts.push("tls_padding".into());
         }
         parts.join(" + ")
     }
@@ -90,7 +97,10 @@ impl BypassMethod for CompositeMethod {
         pkt.new_flags = first_flags;
         pkt.bump_ipv4_ident = first_bump_ident;
 
-        if self.data_method.is_some() || self.segments_first_client_hello {
+        if self.data_method.is_some()
+            || self.segments_first_client_hello
+            || self.pads_first_client_hello
+        {
             tracing::trace!(
                 target = "zerodpi::composite",
                 members = %self.name(),
@@ -191,14 +201,15 @@ mod tests {
             vec![Box::new(WrongSeq::new(&cfg)), Box::new(LowTtl::new(&cfg))],
             None,
             true,
+            true,
         );
-        assert_eq!(m.name(), "wrong_seq + low_ttl + tls_frag");
+        assert_eq!(m.name(), "wrong_seq + low_ttl + tls_frag + tls_padding");
     }
 
     #[test]
     fn wrong_seq_plus_tls_frag_matches_old_combo() {
         let cfg = cfg_with("");
-        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, true);
+        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, true, false);
 
         let mut packet = pkt(&[], 0);
         let action = m.on_handshake_complete_ack(&handshake_state(), &mut packet);
@@ -222,6 +233,7 @@ mod tests {
             vec![Box::new(WrongSeq::new(&cfg)), Box::new(WrongMd5::new(&cfg))],
             None,
             false,
+            false,
         );
 
         let mut packet = pkt(&[], 0);
@@ -239,6 +251,7 @@ mod tests {
             vec![Box::new(WrongSeq::new(&cfg)), Box::new(WrongMd5::new(&cfg))],
             None,
             false,
+            false,
         );
 
         let mut packet = pkt(&[], 0);
@@ -253,6 +266,7 @@ mod tests {
             vec![Box::new(WrongSeq::new(&cfg)), Box::new(LowTtl::new(&cfg))],
             None,
             false,
+            false,
         );
 
         let mut packet = pkt(&[], 0);
@@ -264,6 +278,17 @@ mod tests {
     }
 
     #[test]
+    fn wrong_seq_plus_tls_padding_waits_for_data_stage() {
+        let cfg = cfg_with("");
+        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, false, true);
+
+        let mut packet = pkt(&[], 0);
+        let action = m.on_handshake_complete_ack(&handshake_state(), &mut packet);
+        assert_eq!(action, MethodAction::emit_and_wait_for_data());
+        assert_eq!(m.name(), "wrong_seq + tls_padding");
+    }
+
+    #[test]
     fn last_handshake_member_controls_action() {
         let cfg = cfg_with("WRONG_CHECKSUM_COMPLETE_IMMEDIATELY = true");
         let m = CompositeMethod::new(
@@ -272,6 +297,7 @@ mod tests {
                 Box::new(WrongSeq::new(&cfg)),
             ],
             None,
+            false,
             false,
         );
         let mut packet = pkt(&[], 0);
@@ -286,6 +312,7 @@ mod tests {
                 Box::new(WrongChecksum::new(&cfg)),
             ],
             None,
+            false,
             false,
         );
         let mut packet = pkt(&[], 0);
@@ -304,6 +331,7 @@ mod tests {
             ],
             None,
             false,
+            false,
         );
         let mut packet = pkt(&[], 0);
         let action = m.on_handshake_complete_ack(&handshake_state(), &mut packet);
@@ -314,7 +342,12 @@ mod tests {
     #[test]
     fn abort_honored_when_nothing_staged() {
         let cfg = cfg_with("");
-        let m = CompositeMethod::new(vec![Box::new(WrongTimestamp::new(&cfg))], None, false);
+        let m = CompositeMethod::new(
+            vec![Box::new(WrongTimestamp::new(&cfg))],
+            None,
+            false,
+            false,
+        );
         let mut packet = pkt(&[], 0);
         let action = m.on_handshake_complete_ack(&handshake_state(), &mut packet);
         assert_eq!(action, MethodAction::abort_and_accept());
@@ -323,16 +356,22 @@ mod tests {
     #[test]
     fn forwards_low_ttl_handle_when_present() {
         let cfg = cfg_with("");
-        let with_ttl = CompositeMethod::new(vec![Box::new(LowTtl::new(&cfg))], None, false);
+        let with_ttl = CompositeMethod::new(vec![Box::new(LowTtl::new(&cfg))], None, false, false);
         assert!(with_ttl.low_ttl_handle().is_some());
-        let without_ttl = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, false);
+        let without_ttl =
+            CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, false, false);
         assert!(without_ttl.low_ttl_handle().is_none());
     }
 
     #[test]
     fn delegates_data_stage_to_tls_record_frag() {
         let cfg = cfg_with("");
-        let m = CompositeMethod::new(vec![], Some(Box::new(TlsRecordFrag::new(&cfg))), false);
+        let m = CompositeMethod::new(
+            vec![],
+            Some(Box::new(TlsRecordFrag::new(&cfg))),
+            false,
+            false,
+        );
 
         let mut packet = pkt(&[], 0);
         let action = m.on_handshake_complete_ack(&handshake_state(), &mut packet);

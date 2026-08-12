@@ -117,7 +117,7 @@ struct Args {
     #[arg(long)]
     sni: Option<String>,
     /// Override `BYPASS_METHOD` — a single method or a comma-separated list
-    /// (e.g. `wrong_seq,tls_frag`).
+    /// (e.g. `wrong_seq,tls_frag` or `tls_padding`).
     #[arg(long)]
     method: Option<String>,
     /// Linux-only: NFQUEUE queue number to use.
@@ -468,7 +468,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         Arc<dyn FlowController>,
         Option<InterceptorRuntime>,
     ) = if cfg.BYPASS_METHOD.is_socket_only() {
-        info!("tls_frag selected; skipping packet interceptor");
+        info!(method = %cfg.BYPASS_METHOD, "socket-only bypass method selected; skipping packet interceptor");
         let flows = new_flow_table();
         (Arc::new(LocalFlowController::new(flows)), None)
     } else if let Some(helper) = remote_helper.as_ref() {
@@ -1185,7 +1185,7 @@ fn verify_data_plane_uid(_expected_uid: u32) -> Result<()> {
 
 fn root_required_message(cfg: &Config) -> String {
     format!(
-        "MODE = \"{}\" with BYPASS_METHOD = \"{}\" requires packet interception; on Android the app must start the packaged root helper while keeping the data plane under the app UID. Rootless alternatives are MODE = \"ip_bypass\", scan-only modes, or BYPASS_METHOD = \"tls_frag\" where supported.",
+        "MODE = \"{}\" with BYPASS_METHOD = \"{}\" requires packet interception; on Android the app must start the packaged root helper while keeping the data plane under the app UID. Rootless alternatives are MODE = \"ip_bypass\", scan-only modes, or BYPASS_METHOD = \"tls_frag\" / \"tls_padding\" where supported.",
         cfg.MODE, cfg.BYPASS_METHOD
     )
 }
@@ -1196,6 +1196,7 @@ fn rootless_alternatives() -> Vec<String> {
         "MODE = \"sni_scan\"".to_owned(),
         "MODE = \"ip_scan\"".to_owned(),
         "BYPASS_METHOD = \"tls_frag\" for supported relay modes".to_owned(),
+        "BYPASS_METHOD = \"tls_padding\" for supported relay modes".to_owned(),
     ]
 }
 
@@ -1815,7 +1816,7 @@ fn ip_bypass_plus_main(
         Arc<dyn FlowController>,
         Option<InterceptorRuntime>,
     ) = if cfg.BYPASS_METHOD.is_socket_only() {
-        info!("ip_bypass_plus: tls_frag selected; skipping packet interceptor");
+        info!(method = %cfg.BYPASS_METHOD, "ip_bypass_plus: socket-only bypass method selected; skipping packet interceptor");
         let flows = new_flow_table();
         (Arc::new(LocalFlowController::new(flows)), None)
     } else if let Some(helper) = remote_helper {
@@ -2761,6 +2762,10 @@ mod tests {
             &method_list("tls_frag")
         ));
         assert!(!mode_requires_packet_interception(
+            "sni_spoof",
+            &method_list("tls_padding")
+        ));
+        assert!(!mode_requires_packet_interception(
             "ip_bypass",
             &method_list("wrong_seq")
         ));
@@ -2783,6 +2788,10 @@ mod tests {
         assert!(!mode_requires_packet_interception(
             "ip_bypass_plus",
             &method_list("tls_frag")
+        ));
+        assert!(!mode_requires_packet_interception(
+            "ip_bypass_plus",
+            &method_list("tls_padding")
         ));
     }
 

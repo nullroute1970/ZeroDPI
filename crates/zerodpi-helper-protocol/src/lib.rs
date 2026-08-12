@@ -149,6 +149,7 @@ impl MethodConfig {
             "low_ttl",
             "tls_record_frag",
             "tls_frag",
+            "tls_padding",
             "urg_sni_split",
         ];
         if self.methods.is_empty()

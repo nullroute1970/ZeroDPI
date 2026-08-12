@@ -1111,6 +1111,23 @@ In `crates/zerodpi-core/src/methods/mod.rs`:
             "tls_padding" => {} // socket side; handled directly in proxy.rs
 ```
 
+(b2) **Composite data-stage signaling (required for combos).**
+`CompositeMethod` must know about `tls_padding` so `["wrong_seq",
+"tls_padding"]` (1) names itself `"wrong_seq + tls_padding"` and (2) returns
+`MethodAction::emit_and_wait_for_data()` from `on_handshake_complete_ack` —
+without the latter the proxy never enters `ReadyForData` and never pads the
+ClientHello. Mirror the existing `segments_first_client_hello` pattern in
+`crates/zerodpi-core/src/methods/composite.rs`: add a
+`pads_first_client_hello: bool` field, a 4th `new` parameter, a
+`"tls_padding"` name part, and include it in the wait-for-data condition
+(`self.data_method.is_some() || self.segments_first_client_hello ||
+self.pads_first_client_hello`). Update all `CompositeMethod::new` test call
+sites (add `false`), extend `name_joins_members_with_plus` to expect
+`"wrong_seq + low_ttl + tls_frag + tls_padding"`, and add a
+`wrong_seq_plus_tls_padding_waits_for_data_stage` test asserting
+`emit_and_wait_for_data()` and the name. Then pass
+`list.contains("tls_padding")` as the 4th argument in `build_method`.
+
 (c) Update the `build_method` doc comment: replace `None for socket-only lists
 (\`["tls_frag"]\`)` with `None for socket-only lists
 (\`["tls_frag"]\`, \`["tls_padding"]\`, \`["tls_frag", "tls_padding"]\`)` in the

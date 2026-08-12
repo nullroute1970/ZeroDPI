@@ -2112,23 +2112,48 @@ async fn background_ip_rescan(
             scan: ScanKind::Ip,
             interval_secs,
         });
+        send_rescan_event(
+            &event_tx,
+            ProxyEvent::NextRescanScheduled {
+                kind: RescanKind::Ip,
+                interval_secs,
+            },
+        );
         tokio::time::sleep(interval).await;
         if headless {
             info!(mode = policy.mode_label, path = %ip_list_path.display(), "background IP rescan starting");
         } else {
             debug!(mode = policy.mode_label, "background IP rescan starting");
         }
+        send_rescan_event(
+            &event_tx,
+            ProxyEvent::RescanStarted {
+                kind: RescanKind::Ip,
+            },
+        );
 
         let ips = match load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS) {
             Ok(v) => v,
             Err(e) => {
                 warn!(mode = policy.mode_label, error = %e, "background IP rescan failed to load ip_list");
+                send_rescan_event(
+                    &event_tx,
+                    ProxyEvent::RescanFinished {
+                        kind: RescanKind::Ip,
+                    },
+                );
                 continue;
             }
         };
         if policy.ipv4_only {
             if let Err(e) = reject_ipv6_ip_candidates(&ips, policy.mode_label, &ip_list_path) {
                 warn!(mode = policy.mode_label, error = %e, "background IP rescan rejected ip_list");
+                send_rescan_event(
+                    &event_tx,
+                    ProxyEvent::RescanFinished {
+                        kind: RescanKind::Ip,
+                    },
+                );
                 continue;
             }
         }
@@ -2138,6 +2163,12 @@ async fn background_ip_rescan(
             warn!(
                 mode = policy.mode_label,
                 "background IP rescan found no working IPs"
+            );
+            send_rescan_event(
+                &event_tx,
+                ProxyEvent::RescanFinished {
+                    kind: RescanKind::Ip,
+                },
             );
             continue;
         }
@@ -2165,6 +2196,12 @@ async fn background_ip_rescan(
             }
             info!(mode = policy.mode_label, old = %current, new = %best.ip, "hot-swapped active IP");
         }
+        send_rescan_event(
+            &event_tx,
+            ProxyEvent::RescanFinished {
+                kind: RescanKind::Ip,
+            },
+        );
     }
 }
 

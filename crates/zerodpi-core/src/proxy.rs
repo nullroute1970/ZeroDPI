@@ -83,7 +83,12 @@ pub enum ProxyEvent {
         listen_addr: SocketAddr,
     },
     /// A new inbound connection was accepted and the outbound source port is known.
-    ConnectionAccepted { peer: SocketAddr, src_port: u16 },
+    ConnectionAccepted {
+        peer: SocketAddr,
+        src_port: u16,
+        /// The outbound IP this connection relays to (snapshot at accept time).
+        target_ip: IpAddr,
+    },
     /// The SNI-bypass phase finished (successfully or not).
     BypassComplete {
         src_port: u16,
@@ -122,7 +127,17 @@ pub enum ProxyEvent {
     /// probe run before a potential hot-swap).
     RescanStarted { kind: RescanKind },
     /// A periodic background rescan finished (success, empty result, or failure).
-    RescanFinished { kind: RescanKind },
+    RescanFinished {
+        kind: RescanKind,
+        /// Number of working candidates the scan produced (0 on failure).
+        found: usize,
+        /// Score of the best candidate, if the scan produced any.
+        best_score: Option<u8>,
+        /// How long the scan took (including list loading), in milliseconds.
+        duration_ms: u64,
+        /// Whether this rescan hot-swapped the active target.
+        switched: bool,
+    },
     /// A new rescan cycle was scheduled; the TUI uses this for its countdown.
     NextRescanScheduled {
         kind: RescanKind,
@@ -552,7 +567,14 @@ async fn handle_intercept_connection(
     let src_port = local.port();
 
     // Now that we have the source port, report the accepted connection.
-    emit(&event_tx, ProxyEvent::ConnectionAccepted { peer, src_port });
+    emit(
+        &event_tx,
+        ProxyEvent::ConnectionAccepted {
+            peer,
+            src_port,
+            target_ip: IpAddr::V4(connect_ip),
+        },
+    );
 
     let key = FlowKey {
         src_ip: interface_ip,
@@ -897,7 +919,14 @@ async fn handle_tcp_seg_connection_with_ip(
     event_tx: Option<ProxyEventSender>,
 ) -> anyhow::Result<()> {
     let src_port = peer.port();
-    emit(&event_tx, ProxyEvent::ConnectionAccepted { peer, src_port });
+    emit(
+        &event_tx,
+        ProxyEvent::ConnectionAccepted {
+            peer,
+            src_port,
+            target_ip: IpAddr::V4(connect_ip),
+        },
+    );
 
     let method = TcpSegmentation::new(&cfg);
     let connect_addr = SocketAddr::from((connect_ip, CONNECT_PORT));
@@ -1291,7 +1320,14 @@ async fn handle_ip_bypass_connection(
     relay_max_lifetime: Option<Duration>,
 ) -> anyhow::Result<()> {
     let connect_addr = SocketAddr::new(connect_ip, CONNECT_PORT);
-    emit(&event_tx, ProxyEvent::ConnectionAccepted { peer, src_port });
+    emit(
+        &event_tx,
+        ProxyEvent::ConnectionAccepted {
+            peer,
+            src_port,
+            target_ip: connect_ip,
+        },
+    );
 
     let outgoing = match TcpStream::connect(connect_addr).await {
         Ok(s) => {
@@ -1558,16 +1594,40 @@ mod tests {
         };
         let finished = ProxyEvent::RescanFinished {
             kind: RescanKind::Ip,
+            found: 0,
+            best_score: None,
+            duration_ms: 0,
+            switched: false,
         };
         let scheduled = ProxyEvent::NextRescanScheduled {
             kind: RescanKind::Sni,
             interval_secs: 300,
         };
         assert_eq!(format!("{started:?}"), "RescanStarted { kind: Sni }");
-        assert_eq!(format!("{finished:?}"), "RescanFinished { kind: Ip }");
+        assert_eq!(
+            format!("{finished:?}"),
+            "RescanFinished { kind: Ip, found: 0, best_score: None, duration_ms: 0, switched: false }"
+        );
         assert_eq!(
             format!("{scheduled:?}"),
             "NextRescanScheduled { kind: Sni, interval_secs: 300 }"
         );
+    }
+
+    #[test]
+    fn connection_accepted_event_carries_target_ip() {
+        let peer: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let target: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let ev = ProxyEvent::ConnectionAccepted {
+            peer,
+            src_port: 4242,
+            target_ip: target,
+        };
+        match ev {
+            ProxyEvent::ConnectionAccepted { target_ip, .. } => {
+                assert_eq!(target_ip, target);
+            }
+            _ => panic!("expected ConnectionAccepted"),
+        }
     }
 }

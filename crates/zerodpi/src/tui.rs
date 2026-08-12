@@ -30,7 +30,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{
+    Block, Borders, Cell, Gauge, Paragraph, RenderDirection, Row, Sparkline, Table, TableState,
+};
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
@@ -522,6 +524,9 @@ fn draw_selection(frame: &mut ratatui::Frame, entries: &[SniProbeEntry], state: 
 const MAX_RECORDS: usize = 200;
 const ACTIVE_RATE_BPS: f64 = 50.0;
 const NON_RELAYING_TOP_GRACE: Duration = Duration::from_secs(4);
+const THROUGHPUT_WINDOW: Duration = Duration::from_secs(60);
+const THROUGHPUT_MAX_SAMPLES: usize = 300;
+const THROUGHPUT_MIN_MAX: u64 = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrafficDirection {
@@ -906,7 +911,7 @@ fn header_content_rows(state: &DashboardState, now: Instant) -> usize {
 fn fixed_dashboard_rows(state: &DashboardState) -> usize {
     // header (content lines + borders + slack) + stats(4) + help(3)
     // + table header(1) + table borders(2)
-    header_content_rows(state, Instant::now()) + 3 + 4 + 3 + 1 + 2
+    header_content_rows(state, Instant::now()) + 3 + 4 + 3 + 3 + 1 + 2
 }
 
 fn fmt_rate(bps: f64) -> String {
@@ -961,6 +966,26 @@ fn aggregate_throughput(records: &VecDeque<ConnectionRecord>) -> (f64, f64) {
     (c2s, s2c)
 }
 
+/// Append one aggregate-throughput sample and drop samples older than
+/// [`THROUGHPUT_WINDOW`] (or beyond [`THROUGHPUT_MAX_SAMPLES`]).
+fn sample_throughput(state: &mut DashboardState) {
+    let (up_bps, down_bps) = aggregate_throughput(&state.records);
+    let now = Instant::now();
+    state.throughput_history.push_back(ThroughputSample {
+        at: now,
+        up_bps,
+        down_bps,
+    });
+    while state.throughput_history.len() > THROUGHPUT_MAX_SAMPLES
+        || state
+            .throughput_history
+            .front()
+            .map_or(false, |s| now.saturating_duration_since(s.at) > THROUGHPUT_WINDOW)
+    {
+        state.throughput_history.pop_front();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dashboard public entry point
 // ---------------------------------------------------------------------------
@@ -1011,7 +1036,7 @@ pub fn run_dashboard(
         last_error: None,
         active_ip_score: None,
         listener: None,
-        throughput_history: VecDeque::new(),
+        throughput_history: VecDeque::with_capacity(THROUGHPUT_MAX_SAMPLES),
         start: Instant::now(),
         channel_closed: false,
     };
@@ -1039,6 +1064,7 @@ pub fn run_dashboard(
             state.scroll_offset = 0;
         }
 
+        sample_throughput(&mut state);
         draw_dashboard(terminal, &state, info, cfg)?;
 
         // Filtered count — needed for scroll bounds in key handler.
@@ -1048,8 +1074,9 @@ pub fn run_dashboard(
             .filter(|r| state.filter.matches(&r.status))
             .count();
 
-        // Page size: terminal height minus the fixed widget rows (header=5 or 7,
-        // stats=3, help=3, table header=1, table borders=2 → 14 or 16 fixed rows).
+        // Page size: terminal height minus the fixed widget rows (computed by
+        // fixed_dashboard_rows: header, stats, throughput strip, help,
+        // table header, and table borders).
         let visible_rows = terminal
             .size()
             .map(|s| (s.height as usize).saturating_sub(fixed_dashboard_rows(&state)))
@@ -1285,6 +1312,7 @@ fn draw_dashboard(
             .constraints([
                 Constraint::Length((header_content_rows(state, now) + 3) as u16), // header lines + borders + slack
                 Constraint::Length(4),                                         // stats bar (2 content lines + borders)
+                Constraint::Length(3),                                         // throughput strip
                 Constraint::Min(5),                                            // connection log
                 Constraint::Length(3),                                         // help bar
             ])
@@ -1541,6 +1569,57 @@ fn draw_dashboard(
             .block(Block::default().borders(Borders::ALL).title(" Stats "));
         frame.render_widget(stats, chunks[1]);
 
+        // ── Throughput strip ─────────────────────────────────────────────────
+        let down_data: Vec<u64> = state
+            .throughput_history
+            .iter()
+            .map(|s| s.down_bps.max(0.0) as u64)
+            .collect();
+        let up_data: Vec<u64> = state
+            .throughput_history
+            .iter()
+            .map(|s| s.up_bps.max(0.0) as u64)
+            .collect();
+        let spark_max = down_data
+            .iter()
+            .chain(up_data.iter())
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(THROUGHPUT_MIN_MAX);
+        let strip = Block::default()
+            .borders(Borders::ALL)
+            .title(" Throughput — last 60s (B/s) ");
+        frame.render_widget(&strip, chunks[2]);
+        let inner = strip.inner(chunks[2]);
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(9),
+                Constraint::Min(10),
+                Constraint::Length(9),
+                Constraint::Min(10),
+            ])
+            .split(inner);
+        frame.render_widget(Paragraph::new(" ▼ Down"), cols[0]);
+        frame.render_widget(
+            Sparkline::default()
+                .data(&down_data)
+                .max(spark_max)
+                .direction(RenderDirection::RightToLeft)
+                .style(Style::default().fg(Color::Cyan)),
+            cols[1],
+        );
+        frame.render_widget(Paragraph::new(" ▲ Up"), cols[2]);
+        frame.render_widget(
+            Sparkline::default()
+                .data(&up_data)
+                .max(spark_max)
+                .direction(RenderDirection::RightToLeft)
+                .style(Style::default().fg(Color::Green)),
+            cols[3],
+        );
+
         // ── Connection log ───────────────────────────────────────────────────
         let filtered = ordered_connection_records(state, now);
         let filter_label = state.filter.label();
@@ -1603,7 +1682,7 @@ fn draw_dashboard(
                 ),
             )
             .block(Block::default().borders(Borders::ALL).title(table_title));
-        frame.render_widget(log_table, chunks[2]);
+        frame.render_widget(log_table, chunks[3]);
 
         // ── Help bar ─────────────────────────────────────────────────────────
         let auto_span = if state.auto_scroll {
@@ -1637,7 +1716,7 @@ fn draw_dashboard(
             Span::raw("quit "),
         ]);
         let help = Paragraph::new(help_line).block(Block::default().borders(Borders::ALL));
-        frame.render_widget(help, chunks[3]);
+        frame.render_widget(help, chunks[4]);
     })?;
     Ok(())
 }
@@ -2468,12 +2547,12 @@ mod tests {
     #[test]
     fn fixed_dashboard_rows_grows_when_status_line_visible() {
         let mut state = dashboard_state(vec![]);
-        assert_eq!(fixed_dashboard_rows(&state), 15);
+        assert_eq!(fixed_dashboard_rows(&state), 18);
         state.next_rescan_at = Some(Instant::now() + Duration::from_secs(60));
-        assert_eq!(fixed_dashboard_rows(&state), 16);
+        assert_eq!(fixed_dashboard_rows(&state), 19);
         state.next_rescan_at = None;
         state.rescan_running = true;
-        assert_eq!(fixed_dashboard_rows(&state), 16);
+        assert_eq!(fixed_dashboard_rows(&state), 19);
     }
 
     #[test]
@@ -2651,6 +2730,32 @@ mod tests {
         let (c2s, s2c) = aggregate_throughput(&state.records);
         assert_eq!(c2s, ACTIVE_RATE_BPS);
         assert_eq!(s2c, ACTIVE_RATE_BPS * 2.0);
+    }
+
+    #[test]
+    fn sample_throughput_prunes_samples_older_than_window() {
+        let mut state = dashboard_state(vec![]);
+        state.throughput_history.push_back(ThroughputSample {
+            at: Instant::now() - THROUGHPUT_WINDOW - Duration::from_secs(1),
+            up_bps: 5.0,
+            down_bps: 6.0,
+        });
+        sample_throughput(&mut state);
+        assert_eq!(state.throughput_history.len(), 1);
+        let sample = state.throughput_history.front().unwrap();
+        assert_eq!(sample.up_bps, 0.0);
+        assert_eq!(sample.down_bps, 0.0);
+    }
+
+    #[test]
+    fn sample_throughput_records_current_aggregate_rates() {
+        let mut relaying = record(ConnStatus::Relaying, 100.0, 200.0);
+        relaying.src_port = 1;
+        let mut state = dashboard_state(vec![relaying]);
+        sample_throughput(&mut state);
+        let sample = state.throughput_history.front().unwrap();
+        assert_eq!(sample.up_bps, 100.0);
+        assert_eq!(sample.down_bps, 200.0);
     }
 }
 

@@ -41,7 +41,7 @@ use zerodpi_core::methods::build_method;
 use zerodpi_core::net::default_interface_ipv4;
 use zerodpi_core::proxy::{
     run_ip_bypass_plus_proxy, run_ip_bypass_proxy, run_proxy, ActiveSniTarget, ProxyEvent,
-    ProxyEventSender, RelayEndReason, CONNECT_PORT,
+    ProxyEventSender, RelayEndReason, RescanKind, CONNECT_PORT,
 };
 use zerodpi_core::proxy_tester::{
     failed_candidate_entry, test_candidate_full, test_candidate_with_flow_controller,
@@ -1006,6 +1006,14 @@ impl LowTtlDiscoveryState {
     }
 }
 
+/// Forward a [`ProxyEvent`] to the dashboard channel when one is configured
+/// (`None` when running fully headless without runtime events).
+fn send_rescan_event(tx: &Option<ProxyEventSender>, event: ProxyEvent) {
+    if let Some(tx) = tx {
+        let _ = tx.send(event);
+    }
+}
+
 /// Background rescan task: runs every `interval_secs` seconds and switches
 /// new connections to better SNI targets.
 ///
@@ -1037,12 +1045,25 @@ async fn background_rescan(
             scan: ScanKind::Sni,
             interval_secs,
         });
+        send_rescan_event(
+            &event_tx,
+            ProxyEvent::NextRescanScheduled {
+                kind: RescanKind::Sni,
+                interval_secs,
+            },
+        );
         tokio::time::sleep(interval).await;
         if headless {
             info!(path = %path.display(), "background SNI rescan starting");
         } else {
             debug!("background rescan starting");
         }
+        send_rescan_event(
+            &event_tx,
+            ProxyEvent::RescanStarted {
+                kind: RescanKind::Sni,
+            },
+        );
         let cfg_clone = cfg.clone();
         match scan_sni_list(&path, scan_timeout, cfg_clone, None).await {
             Ok(entries) => {
@@ -1156,6 +1177,12 @@ async fn background_rescan(
                 warn!(error = %e, "background rescan failed");
             }
         }
+        send_rescan_event(
+            &event_tx,
+            ProxyEvent::RescanFinished {
+                kind: RescanKind::Sni,
+            },
+        );
     }
 }
 
@@ -2936,5 +2963,28 @@ mod tests {
             "proxy_scan",
             &method_list("tls_frag")
         ));
+    }
+
+    #[test]
+    fn rescan_event_sender_forwards_and_ignores_when_absent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_rescan_event(
+            &Some(tx),
+            ProxyEvent::RescanStarted {
+                kind: RescanKind::Sni,
+            },
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ProxyEvent::RescanStarted {
+                kind: RescanKind::Sni
+            }
+        ));
+        send_rescan_event(
+            &None,
+            ProxyEvent::RescanStarted {
+                kind: RescanKind::Sni,
+            },
+        );
     }
 }

@@ -37,7 +37,9 @@ use tokio::sync::mpsc;
 use zerodpi_core::config::Config;
 use zerodpi_core::flow::BypassOutcome;
 use zerodpi_core::ip_scanner::{IpProbeEntry, IpScanEvent};
-use zerodpi_core::proxy::{ProxyEvent, RelayEndReason, RescanKind};
+#[cfg(test)]
+use zerodpi_core::proxy::RescanKind;
+use zerodpi_core::proxy::{ProxyEvent, RelayEndReason};
 use zerodpi_core::sni_scanner::SniProbeEntry;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;

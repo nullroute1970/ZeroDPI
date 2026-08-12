@@ -235,6 +235,18 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     likely to coalesce small writes, so no single packet carries the full
 #     SNI.  The upstream server reassembles the stream normally.
 #
+#   "tls_padding"
+#     TLS ClientHello Padding Expansion (RFC 7685).  Does NOT inject fake
+#     packets and does NOT use WinDivert or NFQUEUE packet interception.
+#     Instead it inserts a padding extension (type 0x0015) filled with
+#     TLS_PADDING_SIZE zero bytes into the client's real TLS ClientHello.
+#     With TLS_PADDING_POSITION = "before" (default) the padding is inserted
+#     immediately before the SNI extension, pushing the SNI bytes past the
+#     DPI's inspection window (typically 512, 1024, or 1460 bytes); the
+#     destination server still parses the full record and skips the unknown
+#     extension.  "after" appends the padding at the end of the extension
+#     list instead.
+#
 # Combo aliases (equivalent to their expanded lists, kept for compatibility):
 #
 #   "wrong_seq_wrong_md5"        -> ["wrong_seq", "wrong_md5"]
@@ -253,7 +265,12 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   packet: TLS-record fragmentation inside the interceptor and TCP-level
 #   write segmentation inside the proxy respectively.  A list containing
 #   "tls_frag" alongside other methods still uses packet interception.
-# - A list of exactly ["tls_frag"] skips the packet interceptor entirely.
+# - "tls_padding" adds a socket-side data stage: the real ClientHello is
+#   expanded with an RFC 7685 padding extension before it is written to the
+#   upstream socket.  It combines with handshake-stage methods and with
+#   "tls_frag" (pad first, then fragment).
+# - A list containing only "tls_frag" and/or "tls_padding" skips the packet
+#   interceptor entirely.
 #
 # Limitations:
 #
@@ -262,8 +279,8 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 # - "urg_sni_split" can only be used alone or together with "tls_frag" /
 #   "tls_record_frag"; it cannot be combined with other handshake-stage
 #   methods.
-# - MODE = "ip_bypass_plus" supports only "tls_record_frag" or "tls_frag" so
-#   the upstream VPN client's real SNI is preserved.
+# - MODE = "ip_bypass_plus" supports only "tls_record_frag", "tls_frag", or
+#   "tls_padding" so the upstream VPN client's real SNI is preserved.
 # - LOW_TTL_DISCOVER only takes effect when "low_ttl" is in the list;
 #   otherwise discovery is silently skipped.
 #
@@ -638,6 +655,32 @@ TLS_FRAG_LENGTH = "100-200"
 #
 # Must be >= 0.  Default: "10-20".
 TLS_FRAG_INTERVAL_MS = "10-20"
+
+# ---------------------------------------------------------------------------
+# tls_padding method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "tls_padding" (alone or combined).
+
+# Zero-byte count of the RFC 7685 padding extension inserted into the first
+# TLS ClientHello record.
+#
+# Accepts either a fixed integer or an inclusive range string:
+#   1500        — always insert 1500 zero bytes
+#   "1500-2500" — randomly choose 1500 through 2500 bytes per connection
+#
+# A fresh value is chosen per connection.  The padding is clamped at runtime
+# so the final TLS record never exceeds 16383 bytes (the TLS record-layer
+# maximum).  Larger values push the SNI further past the DPI's inspection
+# window (typically 512, 1024, or 1460 bytes).
+#
+# Must be >= 1 and <= 16000.  Default: "1500-2500".
+TLS_PADDING_SIZE = "1500-2500"
+
+# Where the padding extension is inserted inside the ClientHello extensions.
+#   "before" — immediately before the SNI extension, pushing the SNI bytes
+#              past the DPI's inspection window (default)
+#   "after"  — at the end of the extension list (canonical RFC 7685 placement)
+TLS_PADDING_POSITION = "before"
 
 # Legacy fixed fragment length fallback.
 #

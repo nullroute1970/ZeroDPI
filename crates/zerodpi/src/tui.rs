@@ -786,6 +786,41 @@ fn fmt_uptime(d: Duration) -> String {
     }
 }
 
+/// Status line for the dashboard header: shows a running indicator while a
+/// background rescan is in progress, otherwise the countdown to the next
+/// scheduled rescan. Returns `None` when no rescan is configured or has
+/// ever been scheduled, so the line can be hidden entirely.
+fn rescan_status_line(state: &DashboardState, now: Instant) -> Option<Line<'static>> {
+    if state.rescan_running {
+        return Some(Line::from(vec![
+            Span::styled("Rescan: ", label_style()),
+            Span::styled(
+                "running…",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    let next_at = state.next_rescan_at?;
+    let remaining = next_at.saturating_duration_since(now);
+    Some(Line::from(vec![
+        Span::styled("Next rescan in: ", label_style()),
+        Span::styled(fmt_uptime(remaining), Style::default().fg(Color::White)),
+    ]))
+}
+
+/// Fixed rows consumed by the dashboard outside the connection table
+/// (header, stats, help, table header, borders). The header is two rows
+/// taller when the rescan status line is visible.
+fn fixed_dashboard_rows(state: &DashboardState) -> usize {
+    if state.rescan_running || state.next_rescan_at.is_some() {
+        16
+    } else {
+        14
+    }
+}
+
 fn fmt_rate(bps: f64) -> String {
     if bps < ACTIVE_RATE_BPS {
         return "—".to_string();
@@ -900,11 +935,11 @@ pub fn run_dashboard(
             .filter(|r| state.filter.matches(&r.status))
             .count();
 
-        // Page size: terminal height minus the fixed widget rows (header=5, stats=3,
-        // help=3, table header=1, table borders=2 → 14 total fixed rows).
+        // Page size: terminal height minus the fixed widget rows (header=5 or 7,
+        // stats=3, help=3, table header=1, table borders=2 → 14 or 16 fixed rows).
         let visible_rows = terminal
             .size()
-            .map(|s| (s.height as usize).saturating_sub(14))
+            .map(|s| (s.height as usize).saturating_sub(fixed_dashboard_rows(&state)))
             .unwrap_or(10)
             .max(1);
 
@@ -1097,13 +1132,14 @@ fn draw_dashboard(
 ) -> anyhow::Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
+        let rescan_line = rescan_status_line(state, Instant::now());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5), // header (2 info lines + borders)
-                Constraint::Length(3), // stats bar
-                Constraint::Min(5),    // connection log
-                Constraint::Length(3), // help bar
+                Constraint::Length(if rescan_line.is_some() { 7 } else { 5 }), // header (2 or 3 info lines + borders)
+                Constraint::Length(3),                                         // stats bar
+                Constraint::Min(5),                                            // connection log
+                Constraint::Length(3),                                         // help bar
             ])
             .split(area);
 
@@ -1114,7 +1150,7 @@ fn draw_dashboard(
             " ZeroDPI — Running "
         };
         let uptime = fmt_uptime(state.start.elapsed());
-        let header_lines = match info {
+        let mut header_lines = match info {
             DashboardInfo::SniSpoof { .. } => {
                 let (sni, ip, score) = state
                     .active_sni
@@ -1212,6 +1248,9 @@ fn draw_dashboard(
                 ]
             }
         };
+        if let Some(line) = rescan_line {
+            header_lines.push(line);
+        }
         let header =
             Paragraph::new(header_lines).block(Block::default().borders(Borders::ALL).title(title));
         frame.render_widget(header, chunks[0]);
@@ -2152,10 +2191,67 @@ mod tests {
     #[test]
     fn apply_event_tracks_rescan_running_state() {
         let mut state = dashboard_state(vec![]);
-        apply_event(ProxyEvent::RescanStarted { kind: RescanKind::Ip }, &mut state);
+        apply_event(
+            ProxyEvent::RescanStarted {
+                kind: RescanKind::Ip,
+            },
+            &mut state,
+        );
         assert!(state.rescan_running);
-        apply_event(ProxyEvent::RescanFinished { kind: RescanKind::Ip }, &mut state);
+        apply_event(
+            ProxyEvent::RescanFinished {
+                kind: RescanKind::Ip,
+            },
+            &mut state,
+        );
         assert!(!state.rescan_running);
+    }
+
+    #[test]
+    fn rescan_status_line_hidden_without_schedule() {
+        let state = dashboard_state(vec![]);
+        assert!(rescan_status_line(&state, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn rescan_status_line_shows_running_indicator() {
+        let mut state = dashboard_state(vec![]);
+        state.rescan_running = true;
+        let line = rescan_status_line(&state, Instant::now()).expect("line should be present");
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content, "Rescan: ");
+        assert_eq!(line.spans[1].content, "running…");
+    }
+
+    #[test]
+    fn rescan_status_line_shows_countdown_to_next_rescan() {
+        let mut state = dashboard_state(vec![]);
+        let now = Instant::now();
+        state.next_rescan_at = Some(now + Duration::from_secs(272)); // 4m 32s
+        let line = rescan_status_line(&state, now).expect("line should be present");
+        assert_eq!(line.spans[0].content, "Next rescan in: ");
+        assert_eq!(line.spans[1].content, "4m 32s");
+    }
+
+    #[test]
+    fn rescan_status_line_prefers_running_over_countdown() {
+        let mut state = dashboard_state(vec![]);
+        let now = Instant::now();
+        state.next_rescan_at = Some(now + Duration::from_secs(60));
+        state.rescan_running = true;
+        let line = rescan_status_line(&state, now).expect("line should be present");
+        assert_eq!(line.spans[1].content, "running…");
+    }
+
+    #[test]
+    fn fixed_dashboard_rows_grows_when_status_line_visible() {
+        let mut state = dashboard_state(vec![]);
+        assert_eq!(fixed_dashboard_rows(&state), 14);
+        state.next_rescan_at = Some(Instant::now() + Duration::from_secs(60));
+        assert_eq!(fixed_dashboard_rows(&state), 16);
+        state.next_rescan_at = None;
+        state.rescan_running = true;
+        assert_eq!(fixed_dashboard_rows(&state), 16);
     }
 }
 

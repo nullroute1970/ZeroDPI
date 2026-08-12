@@ -247,12 +247,12 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     extension.  "after" appends the padding at the end of the extension
 #     list instead.
 #
-# Combo aliases (equivalent to their expanded lists, kept for compatibility):
+# Common combinations (written as lists):
 #
-#   "wrong_seq_wrong_md5"        -> ["wrong_seq", "wrong_md5"]
-#   "wrong_seq_tls_frag"         -> ["wrong_seq", "tls_frag"]          (default)
-#   "wrong_md5_tls_frag"         -> ["wrong_md5", "tls_frag"]
-#   "wrong_seq_tls_record_frag"  -> ["wrong_seq", "tls_record_frag"]
+#   ["wrong_seq", "wrong_md5"]        -> fake ClientHello with old TCP seq + TCP-MD5
+#   ["wrong_seq", "tls_frag"]         -> fake ClientHello + TCP-level fragmentation (default)
+#   ["wrong_md5", "tls_frag"]         -> TCP-MD5 fake ClientHello + TCP-level fragmentation
+#   ["wrong_seq", "tls_record_frag"]  -> fake ClientHello + TLS-record fragmentation
 #
 # Combining methods:
 #
@@ -324,9 +324,8 @@ LINUX_FIREWALL_BACKEND = "iptables"
 # ---------------------------------------------------------------------------
 # wrong_seq method parameters
 # ---------------------------------------------------------------------------
-# These settings apply when BYPASS_METHOD = "wrong_seq" or
-# "wrong_seq_wrong_md5" or "wrong_seq_tls_frag" or
-# "wrong_seq_tls_record_frag".
+# These settings apply when BYPASS_METHOD = "wrong_seq", or when "wrong_seq"
+# is combined with "wrong_md5", "tls_frag", or "tls_record_frag".
 
 # Extra bytes subtracted from the injected TCP sequence number in addition to
 # the spoofed ClientHello payload length.
@@ -454,12 +453,12 @@ LOW_TTL_DISCOVER_TIMEOUT_MS = 5000
 # ---------------------------------------------------------------------------
 # wrong_md5 method parameters
 # ---------------------------------------------------------------------------
-# These settings apply when BYPASS_METHOD = "wrong_md5" or
-# "wrong_md5_tls_frag". "wrong_seq_wrong_md5" uses the TCP-MD5 option and
-# WRONG_MD5_COMPLETE_IMMEDIATELY, but uses the wrong_seq PSH/IP-ident settings
-# for packet shape. WRONG_MD5_COMPLETE_IMMEDIATELY does not affect
-# "wrong_md5_tls_frag"; that combo waits for the real ClientHello segmentation
-# stage.
+# These settings apply when BYPASS_METHOD = "wrong_md5" or when "wrong_md5"
+# is combined with "tls_frag". In a ["wrong_seq", "wrong_md5"] combination,
+# this group provides the TCP-MD5 option and WRONG_MD5_COMPLETE_IMMEDIATELY,
+# while the wrong_seq PSH/IP-ident settings control packet shape.
+# WRONG_MD5_COMPLETE_IMMEDIATELY does not affect a ["wrong_md5", "tls_frag"]
+# combination; it waits for the real ClientHello segmentation stage.
 
 # Whether to set the TCP PSH flag on the spoofed TCP-MD5 ClientHello packet.
 #
@@ -554,8 +553,8 @@ WRONG_TIMESTAMP_COMPLETE_IMMEDIATELY = true
 # ---------------------------------------------------------------------------
 # tls_record_frag method parameters
 # ---------------------------------------------------------------------------
-# These settings apply when BYPASS_METHOD = "tls_record_frag" or
-# "wrong_seq_tls_record_frag".
+# These settings apply when BYPASS_METHOD = "tls_record_frag" or when
+# "tls_record_frag" is combined with "wrong_seq".
 
 # Maximum number of TLS record body bytes placed in each TLS record fragment.
 #
@@ -610,8 +609,8 @@ SNI_SPLIT_POSITION = "middle"
 # ---------------------------------------------------------------------------
 # tls_frag method parameters
 # ---------------------------------------------------------------------------
-# These settings apply when BYPASS_METHOD = "tls_frag" or
-# "wrong_seq_tls_frag" or "wrong_md5_tls_frag".
+# These settings apply when BYPASS_METHOD = "tls_frag" or when "tls_frag" is
+# combined with "wrong_seq" or "wrong_md5".
 #
 # Unlike "wrong_seq" and "tls_record_frag", this method does NOT use the
 # WinDivert / NFQUEUE packet interceptor when used alone as "tls_frag".

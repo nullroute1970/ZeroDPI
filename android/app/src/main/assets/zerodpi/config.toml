@@ -149,11 +149,16 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 # Bypass Engine
 # ---------------------------------------------------------------------------
 
-# Bypass method to use for SNI-spoof mode.
+# Bypass method(s) to use for SNI-spoof mode.
 #
-# Supported values:
+# Accepts a single method name or a list of method names, e.g.:
 #
-#   "wrong_seq" (default)
+#   BYPASS_METHOD = "wrong_seq"
+#   BYPASS_METHOD = ["wrong_seq", "tls_frag"]
+#
+# Base methods:
+#
+#   "wrong_seq"
 #     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
 #     then injects a fake TLS ClientHello on that packet with a deliberately
 #     old TCP sequence number.  DPI devices inspect the payload using the
@@ -174,21 +179,6 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     TCP sequence number and ACK number plus a TCP-MD5 Signature option.  DPI
 #     devices can inspect the payload using the allowed SNI, while the real
 #     upstream server rejects the segment because no TCP-MD5 key was negotiated.
-#
-#   "wrong_seq_wrong_md5"
-#     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
-#     then injects a fake TLS ClientHello on that packet with a deliberately
-#     old TCP sequence number plus a TCP-MD5 Signature option.  DPI devices can
-#     inspect the payload using the allowed SNI, while the real upstream server
-#     rejects the segment because it is out of window and no TCP-MD5 key was
-#     negotiated.
-#
-#   "wrong_md5_tls_frag"
-#     Combines wrong_md5 with TLS Fragment / TCP-level fragmentation for
-#     layered filtering.  First, it injects a fake TCP-MD5 ClientHello on the
-#     handshake ACK.  Then it fragments configured real client data using the
-#     TLS_FRAG_* settings, so later DPI layers still do not see the complete
-#     SNI in any single TCP segment.
 #
 #   "wrong_ack"
 #     Waits for the first outbound TCP ACK after the SYN/SYN-ACK exchange,
@@ -236,22 +226,6 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     still receives the original ClientHello; DPI middleboxes that read the
 #     raw byte stream sequentially see a mangled SNI instead.
 #
-#   "wrong_seq_tls_frag"
-#     Combines wrong_seq with TLS Fragment / TCP-level fragmentation for
-#     layered filtering.  First, it injects a fake wrong-sequence ClientHello
-#     on the handshake ACK.  Then it fragments configured real client data
-#     using the TLS_FRAG_* settings, so later DPI layers still do not see the
-#     complete SNI in any single TCP segment even if the fake packet was
-#     dropped by an earlier firewall.
-#
-#   "wrong_seq_tls_record_frag"
-#     Combines wrong_seq with TLS Record Fragment / TLS-layer fragmentation for
-#     layered filtering.  First, it injects a fake wrong-sequence ClientHello
-#     on the handshake ACK.  Then it intercepts the real first ClientHello and
-#     re-wraps it as TLS record fragments, so later DPI layers still do not see
-#     an unfragmented TLS record containing the SNI even if the fake packet was
-#     dropped by an earlier firewall.
-#
 #   "tls_frag"
 #     TLS Fragment / TCP-level fragmentation.  Does NOT inject fake packets
 #     and does NOT use WinDivert or NFQUEUE packet interception.  Instead, it
@@ -261,10 +235,59 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     likely to coalesce small writes, so no single packet carries the full
 #     SNI.  The upstream server reassembles the stream normally.
 #
+#   "tls_padding"
+#     TLS ClientHello Padding Expansion (RFC 7685).  Does NOT inject fake
+#     packets and does NOT use WinDivert or NFQUEUE packet interception.
+#     Instead it inserts a padding extension (type 0x0015) filled with
+#     TLS_PADDING_SIZE zero bytes into the client's real TLS ClientHello.
+#     With TLS_PADDING_POSITION = "before" (default) the padding is inserted
+#     immediately before the SNI extension, pushing the SNI bytes past the
+#     DPI's inspection window (typically 512, 1024, or 1460 bytes); the
+#     destination server still parses the full record and skips the unknown
+#     extension.  "after" appends the padding at the end of the extension
+#     list instead.
+#
+# Common combinations (written as lists):
+#
+#   ["wrong_seq", "wrong_md5"]        -> fake ClientHello with old TCP seq + TCP-MD5
+#   ["wrong_seq", "tls_frag"]         -> fake ClientHello + TCP-level fragmentation (default)
+#   ["wrong_md5", "tls_frag"]         -> TCP-MD5 fake ClientHello + TCP-level fragmentation
+#   ["wrong_seq", "tls_record_frag"]  -> fake ClientHello + TLS-record fragmentation
+#
+# Combining methods:
+#
+# - Handshake-stage methods (wrong_seq, wrong_ack, wrong_checksum, wrong_md5,
+#   wrong_timestamp, low_ttl) all inject the same fake ClientHello; when
+#   several are listed they merge their tricks onto that one fake packet.
+#   PSH / IPv4-Identification behavior comes from the first listed method;
+#   completion behavior comes from the last listed method.
+# - "tls_record_frag" and/or "tls_frag" add the data stage after the fake
+#   packet: TLS-record fragmentation inside the interceptor and TCP-level
+#   write segmentation inside the proxy respectively.  A list containing
+#   "tls_frag" alongside other methods still uses packet interception.
+# - "tls_padding" adds a socket-side data stage: the real ClientHello is
+#   expanded with an RFC 7685 padding extension before it is written to the
+#   upstream socket.  It combines with handshake-stage methods and with
+#   "tls_frag" (pad first, then fragment).
+# - A list containing only "tls_frag" and/or "tls_padding" skips the packet
+#   interceptor entirely.
+#
+# Limitations:
+#
+# - The list must not be empty and must not contain duplicate method names
+#   (after alias expansion).
+# - "urg_sni_split" can only be used alone or together with "tls_frag" /
+#   "tls_record_frag"; it cannot be combined with other handshake-stage
+#   methods.
+# - MODE = "ip_bypass_plus" supports only "tls_record_frag", "tls_frag", or
+#   "tls_padding" so the upstream VPN client's real SNI is preserved.
+# - LOW_TTL_DISCOVER only takes effect when "low_ttl" is in the list;
+#   otherwise discovery is silently skipped.
+#
 # This setting is used by SNI-based modes ("sni_spoof", "sni_scan", and
-# "proxy_scan").  MODE = "ip_bypass_plus" supports only "tls_record_frag" or
-# "tls_frag" so the upstream VPN client's real SNI is preserved. The
-# "ip_bypass" and "ip_scan" modes do not use a bypass method.
+# "proxy_scan").  The "ip_bypass" and "ip_scan" modes do not use a bypass
+# method.
+#
 BYPASS_METHOD = "wrong_seq"
 
 # Seconds the proxy waits for the intercept thread to confirm that the spoofed
@@ -301,9 +324,8 @@ LINUX_FIREWALL_BACKEND = "iptables"
 # ---------------------------------------------------------------------------
 # wrong_seq method parameters
 # ---------------------------------------------------------------------------
-# These settings apply when BYPASS_METHOD = "wrong_seq" or
-# "wrong_seq_wrong_md5" or "wrong_seq_tls_frag" or
-# "wrong_seq_tls_record_frag".
+# These settings apply when BYPASS_METHOD = "wrong_seq", or when "wrong_seq"
+# is combined with "wrong_md5", "tls_frag", or "tls_record_frag".
 
 # Extra bytes subtracted from the injected TCP sequence number in addition to
 # the spoofed ClientHello payload length.
@@ -413,9 +435,10 @@ LOW_TTL_COMPLETE_IMMEDIATELY = true
 # + full TLS handshake), and applies the largest working value: the server's
 # hop distance minus one, which reaches any inline DPI middlebox with maximum
 # margin.  It adds a one-time startup delay (a few seconds up to ~30 s worst
-# case), requires LOW_TTL_COMPLETE_IMMEDIATELY = true, and only runs at startup.
+# case), requires LOW_TTL_COMPLETE_IMMEDIATELY = true, and only runs at startup
+# when "low_ttl" is in the BYPASS_METHOD list.
 #
-# Default: false.
+# Default: true.
 LOW_TTL_DISCOVER = false
 
 # Upper bound of the LOW_TTL_DISCOVER search range, bounding the worst-case
@@ -424,18 +447,18 @@ LOW_TTL_DISCOVER_MAX = 32
 
 # Per-candidate timeout in milliseconds used while discovering LOW_TTL_VALUE.
 # Lower values speed up discovery but may cause false negatives on slow links.
-# Must be at least 100.  Default: 1500.
+# Must be at least 100.  Default: 5000.
 LOW_TTL_DISCOVER_TIMEOUT_MS = 1500
 
 # ---------------------------------------------------------------------------
 # wrong_md5 method parameters
 # ---------------------------------------------------------------------------
-# These settings apply when BYPASS_METHOD = "wrong_md5" or
-# "wrong_md5_tls_frag". "wrong_seq_wrong_md5" uses the TCP-MD5 option and
-# WRONG_MD5_COMPLETE_IMMEDIATELY, but uses the wrong_seq PSH/IP-ident settings
-# for packet shape. WRONG_MD5_COMPLETE_IMMEDIATELY does not affect
-# "wrong_md5_tls_frag"; that combo waits for the real ClientHello segmentation
-# stage.
+# These settings apply when BYPASS_METHOD = "wrong_md5" or when "wrong_md5"
+# is combined with "tls_frag". In a ["wrong_seq", "wrong_md5"] combination,
+# this group provides the TCP-MD5 option and WRONG_MD5_COMPLETE_IMMEDIATELY,
+# while the wrong_seq PSH/IP-ident settings control packet shape.
+# WRONG_MD5_COMPLETE_IMMEDIATELY does not affect a ["wrong_md5", "tls_frag"]
+# combination; it waits for the real ClientHello segmentation stage.
 
 # Whether to set the TCP PSH flag on the spoofed TCP-MD5 ClientHello packet.
 #
@@ -530,8 +553,8 @@ WRONG_TIMESTAMP_COMPLETE_IMMEDIATELY = true
 # ---------------------------------------------------------------------------
 # tls_record_frag method parameters
 # ---------------------------------------------------------------------------
-# These settings apply when BYPASS_METHOD = "tls_record_frag" or
-# "wrong_seq_tls_record_frag".
+# These settings apply when BYPASS_METHOD = "tls_record_frag" or when
+# "tls_record_frag" is combined with "wrong_seq".
 
 # Maximum number of TLS record body bytes placed in each TLS record fragment.
 #
@@ -586,8 +609,8 @@ SNI_SPLIT_POSITION = "middle"
 # ---------------------------------------------------------------------------
 # tls_frag method parameters
 # ---------------------------------------------------------------------------
-# These settings apply when BYPASS_METHOD = "tls_frag" or
-# "wrong_seq_tls_frag" or "wrong_md5_tls_frag".
+# These settings apply when BYPASS_METHOD = "tls_frag" or when "tls_frag" is
+# combined with "wrong_seq" or "wrong_md5".
 #
 # Unlike "wrong_seq" and "tls_record_frag", this method does NOT use the
 # WinDivert / NFQUEUE packet interceptor when used alone as "tls_frag".
@@ -602,7 +625,7 @@ SNI_SPLIT_POSITION = "middle"
 #   "1-3"      — fragment the 1st through 3rd client-to-upstream data writes
 #                observed by ZeroDPI.
 #
-# Default: "tlshello".
+# Default: "1-3".
 TLS_FRAG_PACKETS = "tlshello"
 
 # Fragment length range in bytes.
@@ -614,9 +637,9 @@ TLS_FRAG_PACKETS = "tlshello"
 #
 # A fresh value is chosen for each fragment chunk. Smaller values produce more
 # chunks and are harder for DPI to reassemble, at the cost of connection-start
-# overhead. If this field is omitted, ZeroDPI falls back to legacy TCP_SEG_SIZE.
+# overhead. If this field is omitted, ZeroDPI uses the default range below.
 #
-# Must be >= 1.  Default: unset (uses TCP_SEG_SIZE).
+# Must be >= 1.  Default: "100-200".
 TLS_FRAG_LENGTH = "1"
 
 # Delay between fragment chunks, in milliseconds.
@@ -629,13 +652,40 @@ TLS_FRAG_LENGTH = "1"
 # A fresh value is chosen between each pair of chunks. ZeroDPI does not sleep
 # after the last chunk.
 #
-# Must be >= 0.  Default: 0.
+# Must be >= 0.  Default: "10-20".
 TLS_FRAG_INTERVAL_MS = "0"
+
+# ---------------------------------------------------------------------------
+# tls_padding method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "tls_padding" (alone or combined).
+
+# Zero-byte count of the RFC 7685 padding extension inserted into the first
+# TLS ClientHello record.
+#
+# Accepts either a fixed integer or an inclusive range string:
+#   1500        — always insert 1500 zero bytes
+#   "1500-2500" — randomly choose 1500 through 2500 bytes per connection
+#
+# A fresh value is chosen per connection.  The padding is clamped at runtime
+# so the final TLS record never exceeds 16383 bytes (the TLS record-layer
+# maximum).  Larger values push the SNI further past the DPI's inspection
+# window (typically 512, 1024, or 1460 bytes).
+#
+# Must be >= 1 and <= 16000.  Default: "1500-2500".
+TLS_PADDING_SIZE = "1500-2500"
+
+# Where the padding extension is inserted inside the ClientHello extensions.
+#   "before" — immediately before the SNI extension, pushing the SNI bytes
+#              past the DPI's inspection window (default)
+#   "after"  — at the end of the extension list (canonical RFC 7685 placement)
+TLS_PADDING_POSITION = "before"
 
 # Legacy fixed fragment length fallback.
 #
-# Existing configs can keep using TCP_SEG_SIZE. New configs should prefer
-# TLS_FRAG_LENGTH because it supports Xray-style ranges.
+# Existing configs that explicitly omit TLS_FRAG_LENGTH in code can keep using
+# TCP_SEG_SIZE. New configs should prefer TLS_FRAG_LENGTH because it supports
+# Xray-style ranges.
 #
 # Used only when TLS_FRAG_LENGTH is omitted. Must be >= 1. Default: 1.
 TCP_SEG_SIZE = 1

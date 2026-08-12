@@ -124,7 +124,10 @@ pub enum ProxyEvent {
     /// A periodic background rescan finished (success, empty result, or failure).
     RescanFinished { kind: RescanKind },
     /// A new rescan cycle was scheduled; the TUI uses this for its countdown.
-    NextRescanScheduled { kind: RescanKind, interval_secs: u64 },
+    NextRescanScheduled {
+        kind: RescanKind,
+        interval_secs: u64,
+    },
 }
 
 /// Which background rescan produced a [`ProxyEvent`].
@@ -1550,8 +1553,12 @@ mod tests {
 
     #[test]
     fn rescan_events_construct_with_kind_and_interval() {
-        let started = ProxyEvent::RescanStarted { kind: RescanKind::Sni };
-        let finished = ProxyEvent::RescanFinished { kind: RescanKind::Ip };
+        let started = ProxyEvent::RescanStarted {
+            kind: RescanKind::Sni,
+        };
+        let finished = ProxyEvent::RescanFinished {
+            kind: RescanKind::Ip,
+        };
         let scheduled = ProxyEvent::NextRescanScheduled {
             kind: RescanKind::Sni,
             interval_secs: 300,

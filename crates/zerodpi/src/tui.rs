@@ -835,16 +835,32 @@ fn fmt_uptime(d: Duration) -> String {
     }
 }
 
+/// Compact "how long ago" label for target switches.
+fn fmt_ago(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
+
 /// Status line for the dashboard header: shows a running indicator while a
 /// background rescan is in progress, otherwise the countdown to the next
 /// scheduled rescan. Returns `None` when no rescan is configured or has
 /// ever been scheduled, so the line can be hidden entirely.
 fn rescan_status_line(state: &DashboardState, now: Instant) -> Option<Line<'static>> {
     if state.rescan_running {
+        let elapsed = state
+            .rescan_started_at
+            .map(|t| format!(" {}", fmt_uptime(now.saturating_duration_since(t))))
+            .unwrap_or_default();
         return Some(Line::from(vec![
             Span::styled("Rescan: ", label_style()),
             Span::styled(
-                "running…",
+                format!("running…{elapsed}"),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -853,10 +869,35 @@ fn rescan_status_line(state: &DashboardState, now: Instant) -> Option<Line<'stat
     }
     let next_at = state.next_rescan_at?;
     let remaining = next_at.saturating_duration_since(now);
-    Some(Line::from(vec![
+    let mut spans = vec![
         Span::styled("Next rescan in: ", label_style()),
         Span::styled(fmt_uptime(remaining), Style::default().fg(Color::White)),
-    ]))
+    ];
+    if let Some(last) = &state.last_rescan {
+        let score = last
+            .best_score
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "—".into());
+        let verdict = if last.switched { "switched" } else { "kept" };
+        spans.push(Span::styled(
+            format!(
+                "   · rescan #{}: {} found, best {}, {:.1}s, {}",
+                state.rescan_count,
+                last.found,
+                score,
+                last.duration_ms as f64 / 1000.0,
+                verdict,
+            ),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    Some(Line::from(spans))
+}
+
+/// Number of text lines the dashboard header renders, excluding borders.
+fn header_content_rows(state: &DashboardState, now: Instant) -> usize {
+    2 + usize::from(rescan_status_line(state, now).is_some())
+        + usize::from(state.last_error.is_some())
 }
 
 /// Fixed rows consumed by the dashboard outside the connection table
@@ -1224,11 +1265,12 @@ fn draw_dashboard(
 ) -> anyhow::Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
-        let rescan_line = rescan_status_line(state, Instant::now());
+        let now = Instant::now();
+        let rescan_line = rescan_status_line(state, now);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(if rescan_line.is_some() { 7 } else { 5 }), // header (2 or 3 info lines + borders)
+                Constraint::Length((header_content_rows(state, now) + 3) as u16), // header lines + borders + slack
                 Constraint::Length(3),                                         // stats bar
                 Constraint::Min(5),                                            // connection log
                 Constraint::Length(3),                                         // help bar
@@ -1249,21 +1291,36 @@ fn draw_dashboard(
                     .as_ref()
                     .expect("SNI dashboard state is initialised");
                 vec![
-                    Line::from(vec![
-                        Span::styled("SNI: ", label_style()),
-                        Span::styled(
-                            sni.clone(),
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw("   "),
-                        Span::styled("IP: ", label_style()),
-                        Span::styled(ip.to_string(), Style::default().fg(Color::White)),
-                        Span::raw("   "),
-                        Span::styled("Score: ", label_style()),
-                        Span::styled(score.to_string(), score_style(*score)),
-                    ]),
+                    {
+                        let mut spans = vec![
+                            Span::styled("SNI: ", label_style()),
+                            Span::styled(
+                                sni.clone(),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw("   "),
+                            Span::styled("IP: ", label_style()),
+                            Span::styled(ip.to_string(), Style::default().fg(Color::White)),
+                            Span::raw("   "),
+                            Span::styled("Score: ", label_style()),
+                            Span::styled(score.to_string(), score_style(*score)),
+                            Span::raw("   "),
+                            Span::styled("Switches: ", label_style()),
+                            Span::styled(
+                                state.target_switches.to_string(),
+                                Style::default().fg(Color::White),
+                            ),
+                        ];
+                        if let Some(at) = state.last_switch_at {
+                            spans.push(Span::styled(
+                                format!(" ({})", fmt_ago(now.saturating_duration_since(at))),
+                                label_style(),
+                            ));
+                        }
+                        Line::from(spans)
+                    },
                     Line::from({
                         let mut spans = vec![
                             Span::styled("Method: ", label_style()),
@@ -1274,7 +1331,13 @@ fn draw_dashboard(
                             Span::raw("   "),
                             Span::styled("Listen: ", label_style()),
                             Span::styled(
-                                format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT),
+                                state
+                                    .listener
+                                    .as_ref()
+                                    .map(|(_, addr)| addr.to_string())
+                                    .unwrap_or_else(|| {
+                                        format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT)
+                                    }),
                                 Style::default().fg(Color::White),
                             ),
                             Span::raw("   "),
@@ -1318,30 +1381,71 @@ fn draw_dashboard(
                     DashboardInfo::SniSpoof { .. } => unreachable!(),
                 };
                 vec![
-                    Line::from(vec![
-                        Span::styled("Mode: ", label_style()),
-                        Span::styled(
-                            mode_label,
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw("   "),
-                        Span::styled("Active IP: ", label_style()),
-                        Span::styled(ip.to_string(), Style::default().fg(Color::White)),
-                        Span::raw("   "),
-                        Span::styled("Listen: ", label_style()),
-                        Span::styled(
-                            format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT),
+                    {
+                        let mut spans = vec![
+                            Span::styled("Mode: ", label_style()),
+                            Span::styled(
+                                mode_label,
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw("   "),
+                            Span::styled("Active IP: ", label_style()),
+                            Span::styled(ip.to_string(), Style::default().fg(Color::White)),
+                        ];
+                        if let Some(score) = state.active_ip_score {
+                            spans.push(Span::raw("  "));
+                            spans.push(Span::styled("Score: ", label_style()));
+                            spans.push(Span::styled(score.to_string(), score_style(score)));
+                        }
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled("Switches: ", label_style()));
+                        spans.push(Span::styled(
+                            state.target_switches.to_string(),
                             Style::default().fg(Color::White),
-                        ),
-                    ]),
+                        ));
+                        if let Some(at) = state.last_switch_at {
+                            spans.push(Span::styled(
+                                format!(" ({})", fmt_ago(now.saturating_duration_since(at))),
+                                label_style(),
+                            ));
+                        }
+                        spans.push(Span::raw("   "));
+                        spans.push(Span::styled("Listen: ", label_style()));
+                        spans.push(Span::styled(
+                            state
+                                .listener
+                                .as_ref()
+                                .map(|(_, addr)| addr.to_string())
+                                .unwrap_or_else(|| {
+                                    format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT)
+                                }),
+                            Style::default().fg(Color::White),
+                        ));
+                        Line::from(spans)
+                    },
                     status_line,
                 ]
             }
         };
         if let Some(line) = rescan_line {
             header_lines.push(line);
+        }
+        if let Some(err) = &state.last_error {
+            header_lines.push(Line::from(vec![
+                Span::styled(
+                    "Last error: ",
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("[{}] {}", err.src_port, err.message),
+                    Style::default().fg(Color::Red),
+                ),
+                Span::styled(format!("  {}", fmt_time(err.at)), label_style()),
+            ]));
         }
         let header =
             Paragraph::new(header_lines).block(Block::default().borders(Borders::ALL).title(title));
@@ -1427,7 +1531,6 @@ fn draw_dashboard(
         frame.render_widget(stats, chunks[1]);
 
         // ── Connection log ───────────────────────────────────────────────────
-        let now = Instant::now();
         let filtered = ordered_connection_records(state, now);
         let filter_label = state.filter.label();
         let table_title = if filtered.is_empty() {
@@ -2475,6 +2578,54 @@ mod tests {
         );
         let rec = state.records.front().expect("record should exist");
         assert_eq!(rec.target_ip, "203.0.113.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn fmt_ago_formats_seconds_minutes_hours() {
+        assert_eq!(fmt_ago(Duration::from_secs(9)), "9s ago");
+        assert_eq!(fmt_ago(Duration::from_secs(90)), "1m ago");
+        assert_eq!(fmt_ago(Duration::from_secs(7200)), "2h ago");
+    }
+
+    #[test]
+    fn rescan_status_line_shows_elapsed_while_running() {
+        let mut state = dashboard_state(vec![]);
+        state.rescan_running = true;
+        state.rescan_started_at = Some(Instant::now() - Duration::from_secs(3));
+        let line = rescan_status_line(&state, Instant::now()).expect("line should be present");
+        assert_eq!(line.spans[1].content, "running… 3s");
+    }
+
+    #[test]
+    fn rescan_status_line_includes_last_rescan_summary() {
+        let mut state = dashboard_state(vec![]);
+        let now = Instant::now();
+        state.next_rescan_at = Some(now + Duration::from_secs(300));
+        state.rescan_count = 2;
+        state.last_rescan = Some(RescanSummary {
+            found: 3,
+            best_score: Some(88),
+            duration_ms: 2100,
+            switched: true,
+        });
+        let line = rescan_status_line(&state, now).expect("line should be present");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("rescan #2: 3 found, best 88, 2.1s, switched"));
+    }
+
+    #[test]
+    fn header_content_rows_counts_error_and_rescan_lines() {
+        let mut state = dashboard_state(vec![]);
+        let now = Instant::now();
+        assert_eq!(header_content_rows(&state, now), 2);
+        state.last_error = Some(LastError {
+            src_port: 1,
+            message: "boom".into(),
+            at: SystemTime::now(),
+        });
+        assert_eq!(header_content_rows(&state, now), 3);
+        state.next_rescan_at = Some(now + Duration::from_secs(60));
+        assert_eq!(header_content_rows(&state, now), 4);
     }
 }
 

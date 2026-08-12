@@ -642,6 +642,31 @@ impl FilterStatus {
     }
 }
 
+/// Summary of the most recently completed background rescan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RescanSummary {
+    found: usize,
+    best_score: Option<u8>,
+    duration_ms: u64,
+    switched: bool,
+}
+
+/// The most recent fatal connection error, shown in the header.
+#[derive(Debug, Clone)]
+struct LastError {
+    src_port: u16,
+    message: String,
+    at: SystemTime,
+}
+
+/// One aggregate-throughput sample for the sparkline strip.
+#[derive(Debug, Clone, Copy)]
+struct ThroughputSample {
+    at: Instant,
+    up_bps: f64,
+    down_bps: f64,
+}
+
 /// Per-connection record kept in the dashboard log.
 struct ConnectionRecord {
     /// Wall-clock time at which the connection was accepted (for display).
@@ -750,6 +775,26 @@ struct DashboardState {
     rescan_running: bool,
     /// Deadline for the next rescan cycle, set from `NextRescanScheduled`.
     next_rescan_at: Option<Instant>,
+    /// Highest number of simultaneously active connections seen so far.
+    peak_active: u64,
+    /// How many times the active target has been hot-swapped by a rescan.
+    target_switches: u64,
+    /// When the most recent target switch happened (for "Xs ago" display).
+    last_switch_at: Option<Instant>,
+    /// Number of completed background rescans.
+    rescan_count: u64,
+    /// Summary of the most recently completed rescan.
+    last_rescan: Option<RescanSummary>,
+    /// When the current rescan started (shown while running).
+    rescan_started_at: Option<Instant>,
+    /// Most recent ConnectionError, shown as a header line.
+    last_error: Option<LastError>,
+    /// Score of the active IP target (from `IpTargetChanged`).
+    active_ip_score: Option<u8>,
+    /// (mode, bound address) reported by `ListenerStarted`.
+    listener: Option<(String, SocketAddr)>,
+    /// Rolling aggregate throughput samples for the sparklines.
+    throughput_history: VecDeque<ThroughputSample>,
     start: Instant,
     channel_closed: bool,
 }
@@ -903,6 +948,16 @@ pub fn run_dashboard(
         low_ttl: None,
         rescan_running: false,
         next_rescan_at: None,
+        peak_active: 0,
+        target_switches: 0,
+        last_switch_at: None,
+        rescan_count: 0,
+        last_rescan: None,
+        rescan_started_at: None,
+        last_error: None,
+        active_ip_score: None,
+        listener: None,
+        throughput_history: VecDeque::new(),
         start: Instant::now(),
         channel_closed: false,
     };
@@ -1007,7 +1062,9 @@ pub fn run_dashboard(
 
 fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
     match event {
-        ProxyEvent::ListenerStarted { .. } => {}
+        ProxyEvent::ListenerStarted { mode, listen_addr } => {
+            state.listener = Some((mode, listen_addr));
+        }
         ProxyEvent::ConnectionAccepted {
             peer,
             src_port,
@@ -1015,6 +1072,7 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
         } => {
             state.total += 1;
             state.active += 1;
+            state.peak_active = state.peak_active.max(state.active);
             let now = Instant::now();
             let rec = ConnectionRecord {
                 started_at: SystemTime::now(),
@@ -1090,7 +1148,12 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
                 r.last_snapshot = Some((now, c2s_bytes, s2c_bytes));
             }
         }
-        ProxyEvent::ConnectionError { src_port, .. } => {
+        ProxyEvent::ConnectionError { src_port, error } => {
+            state.last_error = Some(LastError {
+                src_port,
+                message: error,
+                at: SystemTime::now(),
+            });
             state.bypasses_failed += 1;
             state.active = state.active.saturating_sub(1);
             if let Some(r) = find_record(&mut state.records, src_port) {
@@ -1101,9 +1164,14 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
         }
         ProxyEvent::SniTargetChanged { sni, ip, score } => {
             state.active_sni = Some((sni, ip, score));
+            state.target_switches += 1;
+            state.last_switch_at = Some(Instant::now());
         }
-        ProxyEvent::IpTargetChanged { ip, .. } => {
+        ProxyEvent::IpTargetChanged { ip, score } => {
             state.active_ip = Some(ip);
+            state.active_ip_score = Some(score);
+            state.target_switches += 1;
+            state.last_switch_at = Some(Instant::now());
         }
         ProxyEvent::LowTtlDiscovered { value } => {
             state.low_ttl = Some(value);
@@ -1113,9 +1181,24 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
         }
         ProxyEvent::RescanStarted { .. } => {
             state.rescan_running = true;
+            state.rescan_started_at = Some(Instant::now());
         }
-        ProxyEvent::RescanFinished { .. } => {
+        ProxyEvent::RescanFinished {
+            found,
+            best_score,
+            duration_ms,
+            switched,
+            ..
+        } => {
             state.rescan_running = false;
+            state.rescan_started_at = None;
+            state.rescan_count += 1;
+            state.last_rescan = Some(RescanSummary {
+                found,
+                best_score,
+                duration_ms,
+                switched,
+            });
         }
     }
 
@@ -2093,6 +2176,16 @@ mod tests {
             low_ttl: None,
             rescan_running: false,
             next_rescan_at: None,
+            peak_active: 0,
+            target_switches: 0,
+            last_switch_at: None,
+            rescan_count: 0,
+            last_rescan: None,
+            rescan_started_at: None,
+            last_error: None,
+            active_ip_score: None,
+            listener: None,
+            throughput_history: VecDeque::new(),
             start: Instant::now(),
             channel_closed: false,
         }
@@ -2267,6 +2360,121 @@ mod tests {
         state.next_rescan_at = None;
         state.rescan_running = true;
         assert_eq!(fixed_dashboard_rows(&state), 16);
+    }
+
+    #[test]
+    fn apply_event_tracks_peak_active_connections() {
+        let mut state = dashboard_state(vec![]);
+        for port in [1000u16, 2000, 3000] {
+            apply_event(
+                ProxyEvent::ConnectionAccepted {
+                    peer: "127.0.0.1:11111".parse().unwrap(),
+                    src_port: port,
+                    target_ip: "203.0.113.1".parse().unwrap(),
+                },
+                &mut state,
+            );
+        }
+        assert_eq!(state.active, 3);
+        assert_eq!(state.peak_active, 3);
+
+        apply_event(
+            ProxyEvent::RelayFinished {
+                src_port: 2000,
+                c2s_bytes: 0,
+                s2c_bytes: 0,
+                reason: RelayEndReason::Completed,
+            },
+            &mut state,
+        );
+        assert_eq!(state.active, 2);
+        assert_eq!(state.peak_active, 3);
+    }
+
+    #[test]
+    fn apply_event_counts_target_switches() {
+        let mut state = dashboard_state(vec![]);
+        apply_event(
+            ProxyEvent::SniTargetChanged {
+                sni: "example.com".into(),
+                ip: "203.0.113.1".parse().unwrap(),
+                score: 80,
+            },
+            &mut state,
+        );
+        apply_event(
+            ProxyEvent::IpTargetChanged {
+                ip: "203.0.113.2".parse().unwrap(),
+                score: 70,
+            },
+            &mut state,
+        );
+        assert_eq!(state.target_switches, 2);
+        assert!(state.last_switch_at.is_some());
+        assert_eq!(state.active_ip_score, Some(70));
+    }
+
+    #[test]
+    fn apply_event_records_last_connection_error() {
+        let mut state = dashboard_state(vec![]);
+        apply_event(
+            ProxyEvent::ConnectionError {
+                src_port: 99,
+                error: "connection refused".into(),
+            },
+            &mut state,
+        );
+        let err = state.last_error.as_ref().expect("last_error should be set");
+        assert_eq!(err.src_port, 99);
+        assert_eq!(err.message, "connection refused");
+    }
+
+    #[test]
+    fn apply_event_stores_rescan_summary() {
+        let mut state = dashboard_state(vec![]);
+        apply_event(
+            ProxyEvent::RescanStarted {
+                kind: RescanKind::Sni,
+            },
+            &mut state,
+        );
+        assert!(state.rescan_running);
+        apply_event(
+            ProxyEvent::RescanFinished {
+                kind: RescanKind::Sni,
+                found: 3,
+                best_score: Some(88),
+                duration_ms: 2100,
+                switched: true,
+            },
+            &mut state,
+        );
+        assert!(!state.rescan_running);
+        assert_eq!(state.rescan_count, 1);
+        assert_eq!(
+            state.last_rescan,
+            Some(RescanSummary {
+                found: 3,
+                best_score: Some(88),
+                duration_ms: 2100,
+                switched: true,
+            })
+        );
+    }
+
+    #[test]
+    fn apply_event_stores_target_ip_on_accept() {
+        let mut state = dashboard_state(vec![]);
+        apply_event(
+            ProxyEvent::ConnectionAccepted {
+                peer: "127.0.0.1:12345".parse().unwrap(),
+                src_port: 777,
+                target_ip: "203.0.113.7".parse().unwrap(),
+            },
+            &mut state,
+        );
+        let rec = state.records.front().expect("record should exist");
+        assert_eq!(rec.target_ip, "203.0.113.7".parse::<IpAddr>().unwrap());
     }
 }
 

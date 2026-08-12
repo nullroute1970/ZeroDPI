@@ -7,6 +7,7 @@ use serde::de;
 use serde::{Deserialize, Serialize};
 
 use crate::interceptor::LinuxFirewallBackend;
+use crate::methods::tls_padding::PaddingPosition;
 use crate::tls_template::MAX_SNI_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -193,6 +194,7 @@ pub const BASE_BYPASS_METHODS: &[&str] = &[
     "low_ttl",
     "tls_record_frag",
     "tls_frag",
+    "tls_padding",
     "urg_sni_split",
 ];
 
@@ -252,14 +254,22 @@ impl BypassMethodList {
         self.0.len()
     }
 
-    /// `true` when the list is exactly `["tls_frag"]` (socket-only relay).
+    /// `true` when the list contains only socket-side methods
+    /// (`["tls_frag"]`, `["tls_padding"]`, or both), which need no packet
+    /// interceptor.
     pub fn is_socket_only(&self) -> bool {
-        self.0.len() == 1 && self.0[0] == "tls_frag"
+        !self.0.is_empty()
+            && self
+                .0
+                .iter()
+                .all(|m| matches!(m.as_str(), "tls_frag" | "tls_padding"))
     }
 
     /// `true` when any listed method needs the WinDivert/NFQUEUE interceptor.
     pub fn requires_interceptor(&self) -> bool {
-        self.0.iter().any(|m| m != "tls_frag")
+        self.0
+            .iter()
+            .any(|m| !matches!(m.as_str(), "tls_frag" | "tls_padding"))
     }
 }
 
@@ -430,6 +440,15 @@ pub struct Config {
     ///   segments so DPI cannot reassemble the SNI from any single packet.
     ///   Does **not** inject fake packets or use WinDivert/NFQUEUE interception;
     ///   operates entirely inside the proxy via controlled socket writes.
+    /// - `"tls_padding"` — TLS ClientHello Padding Expansion (RFC 7685).
+    ///   Inserts a padding extension (type `0x0015`) of `TLS_PADDING_SIZE`
+    ///   zero bytes into the client's real ClientHello. With
+    ///   `TLS_PADDING_POSITION = "before"` (default) the padding is inserted
+    ///   immediately before the SNI extension, pushing the SNI past the DPI's
+    ///   inspection window (typically 512–1460 bytes); `"after"` appends it
+    ///   at the end of the extension list. Socket-side only: does not inject
+    ///   fake packets or use WinDivert/NFQUEUE interception; operates inside
+    ///   the proxy on the relayed ClientHello.
     /// - `"urg_sni_split"` — injects a 1-byte dummy payload into the middle of
     ///   the SNI inside the real ClientHello and sets the TCP URG flag so the
     ///   destination server strips the byte while byte-scanning DPI sees a
@@ -439,8 +458,9 @@ pub struct Config {
     /// Handshake-stage methods (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
     /// `wrong_md5`, `wrong_timestamp`, `low_ttl`) all inject the same fake
     /// ClientHello; several may be listed to merge their tricks onto one fake
-    /// packet. `tls_record_frag` and `tls_frag` add the data stage. See the
-    /// `BYPASS_METHOD` section of `config.toml` for the combination limits.
+    /// packet. `tls_record_frag`, `tls_frag`, and `tls_padding` add the data
+    /// stage. See the `BYPASS_METHOD` section of `config.toml` for the
+    /// combination limits.
     #[serde(default = "default_method")]
     pub BYPASS_METHOD: BypassMethodList,
     /// (Linux only) NFQUEUE queue number used to intercept packets. Must
@@ -745,6 +765,26 @@ pub struct Config {
     pub TCP_SEG_NODELAY: bool,
 
     // -----------------------------------------------------------------------
+    // tls_padding method parameters
+    // -----------------------------------------------------------------------
+    /// Zero-byte count of the RFC 7685 padding extension inserted into the
+    /// client's real TLS ClientHello. Accepts an integer or an inclusive
+    /// range string; a fresh value is sampled per connection and clamped at
+    /// runtime so the final TLS record never exceeds 16383 bytes.
+    /// Must be `>= 1` and `<= 16000`.  Default: `"1500-2500"`.
+    #[serde(default = "default_tls_padding_size")]
+    pub TLS_PADDING_SIZE: Int32Range,
+
+    /// Where the padding extension is inserted inside the ClientHello
+    /// extensions:
+    /// - `"before"` (default) — immediately before the SNI extension,
+    ///   pushing the SNI bytes past the DPI's inspection window.
+    /// - `"after"` — at the end of the extension list (canonical RFC 7685
+    ///   placement).
+    #[serde(default = "default_tls_padding_position")]
+    pub TLS_PADDING_POSITION: String,
+
+    // -----------------------------------------------------------------------
     // Proxy timing
     // -----------------------------------------------------------------------
     /// How many seconds the proxy waits for the intercept thread to confirm
@@ -973,6 +1013,12 @@ fn default_tls_frag_length() -> Option<Int32Range> {
 fn default_tls_frag_interval_ms() -> Int32Range {
     Int32Range { min: 10, max: 20 }
 }
+fn default_tls_padding_size() -> Int32Range {
+    Int32Range::parse("1500-2500").expect("static default TLS_PADDING_SIZE")
+}
+fn default_tls_padding_position() -> String {
+    "before".into()
+}
 fn default_tcp_seg_size() -> usize {
     1
 }
@@ -1172,6 +1218,13 @@ impl Config {
         if self.TCP_SEG_SIZE > i32::MAX as usize {
             anyhow::bail!("TCP_SEG_SIZE must be <= i32::MAX");
         }
+        self.TLS_PADDING_SIZE
+            .validate_at_least("TLS_PADDING_SIZE", 1)?;
+        if self.TLS_PADDING_SIZE.max > 16000 {
+            anyhow::bail!("TLS_PADDING_SIZE must be <= 16000");
+        }
+        PaddingPosition::parse(&self.TLS_PADDING_POSITION)
+            .map_err(|e| anyhow::anyhow!("TLS_PADDING_POSITION is invalid: {e}"))?;
         let _ = self.tls_frag_packets()?;
         self.tls_frag_length_range()?
             .validate_at_least("TLS_FRAG_LENGTH", 1)?;
@@ -1196,10 +1249,10 @@ impl Config {
             && !self
                 .BYPASS_METHOD
                 .iter()
-                .all(|m| matches!(m, "tls_record_frag" | "tls_frag"))
+                .all(|m| matches!(m, "tls_record_frag" | "tls_frag" | "tls_padding"))
         {
             anyhow::bail!(
-                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\" or \"tls_frag\""
+                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", or \"tls_padding\""
             );
         }
         if !(0.0..=1.0).contains(&self.PROXY_TEST_SNI_WEIGHT) {
@@ -1304,6 +1357,102 @@ mod tests {
         let single = BypassMethodList::from("wrong_seq");
         assert!(!single.is_socket_only());
         assert!(single.requires_interceptor());
+    }
+
+    #[test]
+    fn socket_only_and_interceptor_helpers_include_tls_padding() {
+        for name in ["tls_frag", "tls_padding"] {
+            let list = BypassMethodList::from(name);
+            assert!(list.is_socket_only(), "{name} should be socket-only");
+            assert!(
+                !list.requires_interceptor(),
+                "{name} should not require interceptor"
+            );
+        }
+        let both = BypassMethodList::from_delimited("tls_frag, tls_padding");
+        assert!(both.is_socket_only());
+        assert!(!both.requires_interceptor());
+
+        let combo = BypassMethodList::from_delimited("tls_padding, wrong_seq");
+        assert!(!combo.is_socket_only());
+        assert!(combo.requires_interceptor());
+    }
+
+    #[test]
+    fn tls_padding_fields_parse_and_default() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.TLS_PADDING_SIZE,
+            Int32Range::parse("1500-2500").unwrap()
+        );
+        assert_eq!(cfg.TLS_PADDING_POSITION, "before");
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_custom_tls_padding_values() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               TLS_PADDING_SIZE = "2000-3000"
+               TLS_PADDING_POSITION = "after""#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.TLS_PADDING_SIZE,
+            Int32Range::parse("2000-3000").unwrap()
+        );
+        assert_eq!(cfg.TLS_PADDING_POSITION, "after");
+    }
+
+    #[test]
+    fn rejects_invalid_tls_padding_size() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               TLS_PADDING_SIZE = 0"#,
+        )
+        .unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_tls_padding_size() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               TLS_PADDING_SIZE = 20000"#,
+        )
+        .unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_tls_padding_position() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               TLS_PADDING_POSITION = "middle""#,
+        )
+        .unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn ip_bypass_plus_accepts_tls_padding() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               MODE = "ip_bypass_plus"
+               BYPASS_METHOD = "tls_padding""#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]

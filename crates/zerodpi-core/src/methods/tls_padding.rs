@@ -72,6 +72,17 @@ pub struct TlsPadding {
 }
 
 impl TlsPadding {
+    /// Build parameters from the application config. Callers must run
+    /// `Config::validate` first (it rejects invalid `TLS_PADDING_SIZE` /
+    /// `TLS_PADDING_POSITION` values).
+    pub fn new(cfg: &crate::config::Config) -> Self {
+        Self {
+            size: cfg.TLS_PADDING_SIZE,
+            position: PaddingPosition::parse(&cfg.TLS_PADDING_POSITION)
+                .expect("Config::validate should reject invalid TLS_PADDING_POSITION"),
+        }
+    }
+
     /// Fixed-size constructor (used by tests and by callers that sample
     /// differently).
     pub fn exact(size: i32, position: PaddingPosition) -> Self {

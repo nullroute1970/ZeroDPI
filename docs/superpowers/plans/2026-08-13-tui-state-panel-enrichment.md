@@ -49,7 +49,7 @@
   - `ProxyEvent::RescanFinished { kind: RescanKind, found: usize, best_score: Option<u8>, duration_ms: u64, switched: bool }`
   - `RescanKind` unchanged.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `crates/zerodpi-core/src/proxy.rs`, in the existing `#[cfg(test)] mod tests`, update `rescan_events_construct_with_kind_and_interval` and add one new test.
 
@@ -107,12 +107,12 @@ Append this test to the module (before the closing `}` of `mod tests`):
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p zerodpi-core`
 Expected: FAIL — compile error: `ConnectionAccepted` lacks `target_ip`, `RescanFinished` lacks the new fields.
 
-- [ ] **Step 3: Update the enum definitions**
+- [x] **Step 3: Update the enum definitions**
 
 In `crates/zerodpi-core/src/proxy.rs`, find:
 ```rust
@@ -151,7 +151,7 @@ Replace with:
     },
 ```
 
-- [ ] **Step 4: Update the three emit sites**
+- [x] **Step 4: Update the three emit sites**
 
 All three sites look like:
 ```rust
@@ -195,12 +195,12 @@ Update each one:
 
 Note: `IpAddr` is already in scope in `proxy.rs` (used by `IpTargetChanged` and `run_ip_bypass_plus_proxy`).
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `cargo test -p zerodpi-core`
 Expected: PASS (the `zerodpi` crate will NOT compile yet — expected, fixed in Task 2).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/zerodpi-core/src/proxy.rs
@@ -219,7 +219,7 @@ git commit -m "feat: extend proxy events with target ip and rescan summary"
 - Consumes: Task 1's new `ProxyEvent` shapes.
 - Produces: working workspace build; `ConnectionRecord.target_ip: IpAddr` field (displayed in Task 7).
 
-- [ ] **Step 1: SNI background rescan emits real summary**
+- [x] **Step 1: SNI background rescan emits real summary**
 
 In `background_rescan`, find (after the `RescanStarted` send):
 ```rust
@@ -296,7 +296,7 @@ Replace with:
 }
 ```
 
-- [ ] **Step 2: IP background rescan emits real summary**
+- [x] **Step 2: IP background rescan emits real summary**
 
 In `background_ip_rescan`, find:
 ```rust
@@ -387,7 +387,7 @@ Replace with:
         );
 ```
 
-- [ ] **Step 3: Update the headless event logger**
+- [x] **Step 3: Update the headless event logger**
 
 In `log_headless_proxy_events`, find:
 ```rust
@@ -440,7 +440,7 @@ Replace with:
             }
 ```
 
-- [ ] **Step 4: Minimal tui.rs compile fixes (behavior added in later tasks)**
+- [x] **Step 4: Minimal tui.rs compile fixes (behavior added in later tasks)**
 
 In `crates/zerodpi/src/tui.rs`:
 
@@ -537,12 +537,12 @@ Replace each with:
             },
 ```
 
-- [ ] **Step 5: Verify the whole workspace compiles and tests pass**
+- [x] **Step 5: Verify the whole workspace compiles and tests pass**
 
 Run: `cargo test --workspace`
 Expected: PASS (all pre-existing tests, now with the updated event shapes).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/zerodpi/src/main.rs crates/zerodpi/src/tui.rs
@@ -564,7 +564,7 @@ git commit -m "feat: report rescan summary and per-connection target ip to dashb
   - `ThroughputSample { at: Instant, up_bps: f64, down_bps: f64 }` (`Debug, Clone, Copy`)
   - `DashboardState` fields: `peak_active: u64`, `target_switches: u64`, `last_switch_at: Option<Instant>`, `rescan_count: u64`, `last_rescan: Option<RescanSummary>`, `rescan_started_at: Option<Instant>`, `last_error: Option<LastError>`, `active_ip_score: Option<u8>`, `listener: Option<(String, SocketAddr)>`, `throughput_history: VecDeque<ThroughputSample>`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to the `#[cfg(test)] mod tests` in `tui.rs` (before its closing brace):
 
@@ -685,12 +685,12 @@ Append to the `#[cfg(test)] mod tests` in `tui.rs` (before its closing brace):
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p zerodpi apply_event_`
 Expected: FAIL — compile error: `RescanSummary`, `LastError`, `ThroughputSample` undefined; new `DashboardState` fields missing.
 
-- [ ] **Step 3: Add the new types**
+- [x] **Step 3: Add the new types**
 
 Insert after the `FilterStatus` impl block (before `/// Per-connection record kept in the dashboard log.`):
 
@@ -721,7 +721,7 @@ struct ThroughputSample {
 }
 ```
 
-- [ ] **Step 4: Add the new `DashboardState` fields**
+- [x] **Step 4: Add the new `DashboardState` fields**
 
 Find:
 ```rust
@@ -756,7 +756,7 @@ Replace with:
     throughput_history: VecDeque<ThroughputSample>,
 ```
 
-- [ ] **Step 5: Initialize the fields in `run_dashboard`**
+- [x] **Step 5: Initialize the fields in `run_dashboard`**
 
 Find:
 ```rust
@@ -786,7 +786,7 @@ Replace with:
 ```
 (`VecDeque::new()` is temporary — Task 6 Step 4 switches it to `VecDeque::with_capacity(THROUGHPUT_MAX_SAMPLES)`.)
 
-- [ ] **Step 6: Update `apply_event`**
+- [x] **Step 6: Update `apply_event`**
 
 Find:
 ```rust
@@ -887,7 +887,7 @@ Replace with:
         }
 ```
 
-- [ ] **Step 7: Update the `dashboard_state(...)` test helper**
+- [x] **Step 7: Update the `dashboard_state(...)` test helper**
 
 Find:
 ```rust
@@ -922,12 +922,12 @@ Replace with:
         }
 ```
 
-- [ ] **Step 8: Run tests to verify they pass**
+- [x] **Step 8: Run tests to verify they pass**
 
 Run: `cargo test -p zerodpi`
 Expected: PASS (new tests + all existing).
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add crates/zerodpi/src/tui.rs
@@ -945,7 +945,7 @@ git commit -m "feat: track peak, switches, errors, and rescan summary in dashboa
 - Consumes: Task 3's `DashboardState` fields.
 - Produces: `fn header_content_rows(state: &DashboardState, now: Instant) -> usize` (used by Tasks 5/6 layout + scroll math), `fn fmt_ago(d: Duration) -> String`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to the tests module in `tui.rs`:
 
@@ -999,12 +999,12 @@ Append to the tests module in `tui.rs`:
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p zerodpi header_content_rows rescan_status_line_shows_elapsed fmt_ago`
 Expected: FAIL — compile error: `fmt_ago`, `header_content_rows` undefined.
 
-- [ ] **Step 3: Add `fmt_ago`**
+- [x] **Step 3: Add `fmt_ago`**
 
 After `fn fmt_uptime(...)` add:
 ```rust
@@ -1021,7 +1021,7 @@ fn fmt_ago(d: Duration) -> String {
 }
 ```
 
-- [ ] **Step 4: Extend `rescan_status_line` and add `header_content_rows`**
+- [x] **Step 4: Extend `rescan_status_line` and add `header_content_rows`**
 
 Find:
 ```rust
@@ -1097,7 +1097,7 @@ fn header_content_rows(state: &DashboardState, now: Instant) -> usize {
 }
 ```
 
-- [ ] **Step 5: Header height from the helper; hoist `now`**
+- [x] **Step 5: Header height from the helper; hoist `now`**
 
 In `draw_dashboard`, find:
 ```rust
@@ -1131,7 +1131,7 @@ Replace with:
         // ── Connection log ───────────────────────────────────────────────────
 ```
 
-- [ ] **Step 6: SNI mode header — switches + listener + last-error line**
+- [x] **Step 6: SNI mode header — switches + listener + last-error line**
 
 Find the SniSpoof first line:
 ```rust
@@ -1208,7 +1208,7 @@ Replace with:
                             ),
 ```
 
-- [ ] **Step 7: IP modes header — score, switches, listener**
+- [x] **Step 7: IP modes header — score, switches, listener**
 
 Find the IP-mode first line:
 ```rust
@@ -1285,7 +1285,7 @@ Replace with:
                 ]
 ```
 
-- [ ] **Step 8: Last-error header line (both modes)**
+- [x] **Step 8: Last-error header line (both modes)**
 
 Find:
 ```rust
@@ -1315,12 +1315,12 @@ Replace with:
         }
 ```
 
-- [ ] **Step 9: Run tests to verify they pass**
+- [x] **Step 9: Run tests to verify they pass**
 
 Run: `cargo test -p zerodpi`
 Expected: PASS (existing `rescan_status_line_shows_running_indicator` still passes because its test state has no `rescan_started_at`; countdown test unchanged).
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add crates/zerodpi/src/tui.rs
@@ -1338,7 +1338,7 @@ git commit -m "feat: show switches, last error, and rescan results in dashboard 
 - Consumes: Task 3's `peak_active`, Task 4's `header_content_rows`.
 - Produces: `fn aggregate_throughput(records: &VecDeque<ConnectionRecord>) -> (f64, f64)` returning `(c2s_bps, s2c_bps)` (reused by Task 6).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the tests module:
 
@@ -1358,12 +1358,12 @@ Append to the tests module:
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p zerodpi aggregate_throughput`
 Expected: FAIL — compile error: `aggregate_throughput` undefined.
 
-- [ ] **Step 3: Add the helper**
+- [x] **Step 3: Add the helper**
 
 After `fn live_transfer_totals(...)` add:
 ```rust
@@ -1383,7 +1383,7 @@ fn aggregate_throughput(records: &VecDeque<ConnectionRecord>) -> (f64, f64) {
 }
 ```
 
-- [ ] **Step 4: Rewrite the stats section in `draw_dashboard`**
+- [x] **Step 4: Rewrite the stats section in `draw_dashboard`**
 
 Find:
 ```rust
@@ -1457,7 +1457,7 @@ Replace with:
             Span::styled("Download: ", label_style()),
 ```
 
-- [ ] **Step 5: Render two lines and grow the stats block**
+- [x] **Step 5: Render two lines and grow the stats block**
 
 Find:
 ```rust
@@ -1485,7 +1485,7 @@ Replace with:
                 Constraint::Length(4),                                         // stats bar (2 content lines + borders)
 ```
 
-- [ ] **Step 6: Update `fixed_dashboard_rows`**
+- [x] **Step 6: Update `fixed_dashboard_rows`**
 
 Find:
 ```rust
@@ -1533,12 +1533,12 @@ Replace with:
     }
 ```
 
-- [ ] **Step 7: Run tests to verify they pass**
+- [x] **Step 7: Run tests to verify they pass**
 
 Run: `cargo test -p zerodpi`
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/zerodpi/src/tui.rs
@@ -1556,7 +1556,7 @@ git commit -m "feat: add peak connections and split dashboard stats bar"
 - Consumes: `aggregate_throughput` (Task 5), `ThroughputSample` + `throughput_history` (Task 3).
 - Produces: `const THROUGHPUT_WINDOW: Duration`, `const THROUGHPUT_MAX_SAMPLES: usize`, `fn sample_throughput(state: &mut DashboardState)`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to the tests module:
 
@@ -1588,12 +1588,12 @@ Append to the tests module:
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p zerodpi sample_throughput`
 Expected: FAIL — compile error: `THROUGHPUT_WINDOW`, `sample_throughput` undefined.
 
-- [ ] **Step 3: Constants + sampling function**
+- [x] **Step 3: Constants + sampling function**
 
 After `const NON_RELAYING_TOP_GRACE: Duration = Duration::from_secs(4);` add:
 ```rust
@@ -1625,7 +1625,7 @@ fn sample_throughput(state: &mut DashboardState) {
 }
 ```
 
-- [ ] **Step 4: Call it each loop iteration**
+- [x] **Step 4: Call it each loop iteration**
 
 In `run_dashboard`, find:
 ```rust
@@ -1662,7 +1662,7 @@ Replace with:
         start: Instant::now(),
 ```
 
-- [ ] **Step 5: Add imports**
+- [x] **Step 5: Add imports**
 
 Find:
 ```rust
@@ -1675,7 +1675,7 @@ use ratatui::widgets::{
 };
 ```
 
-- [ ] **Step 6: Layout + strip rendering**
+- [x] **Step 6: Layout + strip rendering**
 
 In `draw_dashboard`, find:
 ```rust
@@ -1778,7 +1778,7 @@ Replace with:
         frame.render_widget(help, chunks[4]);
 ```
 
-- [ ] **Step 7: Update `fixed_dashboard_rows` + test**
+- [x] **Step 7: Update `fixed_dashboard_rows` + test**
 
 Find:
 ```rust
@@ -1816,12 +1816,12 @@ Update the test:
     }
 ```
 
-- [ ] **Step 8: Run tests to verify they pass**
+- [x] **Step 8: Run tests to verify they pass**
 
 Run: `cargo test -p zerodpi`
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add crates/zerodpi/src/tui.rs
@@ -1838,7 +1838,7 @@ git commit -m "feat: add throughput sparklines to dashboard"
 **Interfaces:**
 - Consumes: `ConnectionRecord.target_ip` (Task 2).
 
-- [ ] **Step 1: Add the cell**
+- [x] **Step 1: Add the cell**
 
 In the log-table row builder, find:
 ```rust
@@ -1856,7 +1856,7 @@ Replace with:
                     Cell::from(r.status.label()).style(r.status.style()),
 ```
 
-- [ ] **Step 2: Add the column widths + header**
+- [x] **Step 2: Add the column widths + header**
 
 Find:
 ```rust
@@ -1890,12 +1890,12 @@ Replace with:
                     "Status",
 ```
 
-- [ ] **Step 3: Run tests and lint**
+- [x] **Step 3: Run tests and lint**
 
 Run: `cargo test -p zerodpi && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
 Expected: all PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/zerodpi/src/tui.rs
@@ -1911,7 +1911,7 @@ git commit -m "feat: show per-connection target ip in dashboard log"
 
 **Interfaces:** none.
 
-- [ ] **Step 1: Update the dashboard description in README**
+- [x] **Step 1: Update the dashboard description in README**
 
 Find:
 ```markdown
@@ -1922,7 +1922,7 @@ Replace with:
 The running dashboard confirms the active SNI/IP pair (with score and hot-swap count), current bypass method, local listener, uptime, connection state, byte counters, peak concurrency, the latest connection error, background-rescan results, a 60-second throughput graph, and recent relay activity including each connection's outbound target IP. This is the main view for interactive desktop runs.
 ```
 
-- [ ] **Step 2: Full verification suite**
+- [x] **Step 2: Full verification suite**
 
 Run, in order:
 ```bash
@@ -1933,7 +1933,7 @@ cargo build --workspace --release
 ```
 Expected: all commands exit 0.
 
-- [ ] **Step 3: Manual smoke test (interactive)**
+- [x] **Step 3: Manual smoke test (interactive)**
 
 Run: `cargo run --bin zerodpi -- --config ./config.toml`
 Check, in the live dashboard:
@@ -1945,11 +1945,11 @@ Check, in the live dashboard:
 - To see the `Last error` line, temporarily point the target at an unreachable IP (e.g. an entry in `ip_list.txt`) and open a connection — the header shows the red error; revert the file afterwards.
 - Verify headless mode logs still work: run with `--no-tui` briefly and confirm the new `debug!` rescan-finished line (visible at `RUST_LOG=debug`).
 
-- [ ] **Step 4: Update screenshot (optional, manual)**
+- [x] **Step 4: Update screenshot (optional, manual)**
 
 `images/tui-dashboard.png` is now stale. If desired, capture a new screenshot of the enriched dashboard and replace the file. No code changes.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add README.md

@@ -104,6 +104,10 @@ impl PacketHandler for Handler {
                     return Verdict::Accept;
                 }
                 if pkt.is_bare_ack() {
+                    if state.fragment_all_data {
+                        // Fragment-all mode: only data packets are rewritten.
+                        return Verdict::Accept;
+                    }
                     if state.fake_sent || state.waiting_for_data {
                         return self.unexpected(
                             &entry,
@@ -189,20 +193,34 @@ impl PacketHandler for Handler {
                         }
                     }
                 }
-                // First outbound data packet when method deferred to this stage.
-                if pkt.payload_len > 0 && state.waiting_for_data && !state.first_data_modified {
+                // First outbound data packet when the method deferred to this
+                // stage, and every subsequent outbound data packet in
+                // fragment-all mode.
+                if pkt.payload_len > 0
+                    && ((state.waiting_for_data && !state.first_data_modified)
+                        || state.fragment_all_data)
+                {
                     match self.method.on_first_data_packet(&state, pkt) {
                         MethodAction::EmitFakeAndAccept {
                             complete_immediately,
-                            continue_with_data: _,
+                            continue_with_data,
                         } => {
                             state.first_data_modified = true;
                             state.waiting_for_data = false;
                             trace!(
                                 method = self.method.name(),
-                                "modified first data packet; signalling bypass complete"
+                                "modified outbound data packet"
                             );
-                            if complete_immediately {
+                            if continue_with_data {
+                                // Fragment-all mode (ip_frag with
+                                // IP_FRAG_ONLY_FIRST_PACKET = false): signal
+                                // bypass completion now but keep the flow
+                                // monitored; every subsequent outbound data
+                                // packet is re-staged below.
+                                state.fragment_all_data = true;
+                                drop(state);
+                                entry.signal_outcome(BypassOutcome::FakeDataAcked);
+                            } else if complete_immediately {
                                 // Signal completion immediately — no inbound ACK needed.
                                 drop(state);
                                 entry.finish(BypassOutcome::FakeDataAcked);
@@ -214,16 +232,25 @@ impl PacketHandler for Handler {
                         MethodAction::CompleteAndAccept => {
                             state.first_data_modified = true;
                             state.waiting_for_data = false;
-                            drop(state);
-                            entry.finish(BypassOutcome::FakeDataAcked);
+                            if !state.fragment_all_data {
+                                drop(state);
+                                entry.finish(BypassOutcome::FakeDataAcked);
+                            }
                             return Verdict::Accept;
                         }
                         MethodAction::PassThrough => return Verdict::Accept,
                         MethodAction::AbortAndAccept => {
                             state.first_data_modified = true;
                             state.waiting_for_data = false;
-                            drop(state);
-                            entry.finish(BypassOutcome::UnexpectedClose);
+                            if state.fragment_all_data {
+                                // The bypass outcome was already signalled at
+                                // the first data packet; just stop tracking.
+                                state.fragment_all_data = false;
+                                state.monitor = false;
+                            } else {
+                                drop(state);
+                                entry.finish(BypassOutcome::UnexpectedClose);
+                            }
                             return Verdict::Accept;
                         }
                     }
@@ -233,6 +260,19 @@ impl PacketHandler for Handler {
                 // (retransmissions or the forwarded original) pass while we
                 // wait for the server's ACK.
                 if state.waiting_for_first_data_ack {
+                    return Verdict::Accept;
+                }
+                if state.fragment_all_data {
+                    // Control packets (FIN, RST) pass through; stop tracking
+                    // when the connection starts to close so the proxy task's
+                    // scopeguard can release the flow entry.
+                    if pkt.flags.fin || pkt.flags.rst {
+                        state.monitor = false;
+                        trace!(
+                            method = self.method.name(),
+                            "connection closing; ending fragment-all tracking"
+                        );
+                    }
                     return Verdict::Accept;
                 }
                 self.unexpected(&entry, &mut state, pkt, "unexpected outbound packet")
@@ -245,6 +285,11 @@ impl PacketHandler for Handler {
                         pkt,
                         "inbound packet before any outbound SYN",
                     );
+                }
+                if state.fragment_all_data {
+                    // Fragment-all mode: inbound traffic passes through
+                    // untouched; only outbound data packets are rewritten.
+                    return Verdict::Accept;
                 }
                 if pkt.is_syn_ack() {
                     if pkt.ack != state.syn_seq.unwrap().wrapping_add(1) {
@@ -338,6 +383,7 @@ mod tests {
     use crate::interceptor::{Direction, PacketView, TcpFlags};
     use crate::methods::build_method;
     use crate::methods::fake_tls::FakeTls;
+    use crate::methods::ip_frag::IpFrag;
     use crate::methods::low_ttl::LowTtl;
     use crate::methods::tls_record_frag::TlsRecordFrag;
     use crate::methods::urg_sni_split::UrgSniSplit;
@@ -1574,5 +1620,280 @@ mod tests {
             Some(BypassOutcome::FakeDataAcked)
         );
         assert!(!entry.state.lock().waiting_for_first_data_ack);
+    }
+
+    fn ip_frag_fragment_all_cfg() -> Config {
+        toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               IP_FRAG_ONLY_FIRST_PACKET = false"#,
+        )
+        .unwrap()
+    }
+
+    fn drive_handshake(h: &mut Handler, entry: &Arc<FlowEntry>) {
+        let mut syn = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            1000,
+            0,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut syn), Verdict::Accept);
+        let mut syn_ack = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                syn: true,
+                ack: true,
+                ..Default::default()
+            },
+            2000,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut syn_ack), Verdict::Accept);
+        let mut ack = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            1001,
+            2001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut ack), Verdict::Accept);
+        assert!(entry.state.lock().waiting_for_data);
+    }
+
+    #[test]
+    fn ip_frag_fragment_all_keeps_flow_monitored_and_restages_data() {
+        let flows = new_flow_table();
+        let key = FlowKey {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            dst_port: 443,
+        };
+        let entry = FlowEntry::new(vec![0u8; 517], None);
+        flows.insert(key, entry.clone());
+        let mut h = Handler::new(flows, Arc::new(IpFrag::new(&ip_frag_fragment_all_cfg())));
+        drive_handshake(&mut h, &entry);
+
+        // First data packet: staged, outcome signalled, monitoring continues.
+        let mut data = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001,
+            2001,
+            517,
+        );
+        assert_eq!(h.on_packet(&mut data), Verdict::AcceptModified);
+        assert_eq!(data.ip_frag_payload_size, Some(24));
+        {
+            let s = entry.state.lock();
+            assert_eq!(s.outcome, Some(BypassOutcome::FakeDataAcked));
+            assert!(s.monitor);
+            assert!(s.fragment_all_data);
+            assert!(!s.waiting_for_data);
+        }
+
+        // Second outbound data packet: staged again.
+        let mut data2 = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001 + 517,
+            2001,
+            100,
+        );
+        assert_eq!(h.on_packet(&mut data2), Verdict::AcceptModified);
+        assert_eq!(data2.ip_frag_payload_size, Some(24));
+        assert!(entry.state.lock().fragment_all_data);
+
+        // Outbound bare ACK passes through without rewriting.
+        let mut bare = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            1001 + 517 + 100,
+            2001 + 50,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut bare), Verdict::Accept);
+        assert_eq!(bare.ip_frag_payload_size, None);
+        assert!(entry.state.lock().fragment_all_data);
+
+        // Inbound data passes through without closing the flow.
+        let mut inbound = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            2001,
+            1001 + 517 + 100,
+            50,
+        );
+        assert_eq!(h.on_packet(&mut inbound), Verdict::Accept);
+        assert!(entry.state.lock().fragment_all_data);
+
+        // Client FIN: passes through and stops tracking.
+        let mut fin = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                fin: true,
+                ..Default::default()
+            },
+            1001 + 517 + 100,
+            2001 + 50,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut fin), Verdict::Accept);
+        assert!(!entry.state.lock().monitor);
+    }
+
+    #[test]
+    fn ip_frag_only_first_finishes_flow_after_first_data() {
+        let flows = new_flow_table();
+        let key = FlowKey {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            dst_port: 443,
+        };
+        let entry = FlowEntry::new(vec![0u8; 517], None);
+        flows.insert(key, entry.clone());
+        let mut h = Handler::new(flows, Arc::new(IpFrag::new(&default_cfg())));
+        drive_handshake(&mut h, &entry);
+
+        let mut data = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001,
+            2001,
+            517,
+        );
+        assert_eq!(h.on_packet(&mut data), Verdict::AcceptModified);
+        assert_eq!(data.ip_frag_payload_size, Some(24));
+        {
+            let s = entry.state.lock();
+            assert_eq!(s.outcome, Some(BypassOutcome::FakeDataAcked));
+            assert!(!s.monitor);
+            assert!(!s.fragment_all_data);
+        }
+
+        // Subsequent packets pass through unmodified.
+        let mut data2 = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001 + 517,
+            2001,
+            100,
+        );
+        assert_eq!(h.on_packet(&mut data2), Verdict::Accept);
+        assert_eq!(data2.ip_frag_payload_size, None);
+    }
+
+    #[test]
+    fn wrong_seq_ip_frag_stages_fake_then_fragments_first_data() {
+        let flows = new_flow_table();
+        let key = FlowKey {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            dst_port: 443,
+        };
+        let entry = FlowEntry::new(vec![0xAA; 517], None);
+        flows.insert(key, entry.clone());
+
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = ["wrong_seq", "ip_frag"]"#,
+        )
+        .unwrap();
+        let mut h = Handler::new(flows, Arc::from(build_method(&cfg).unwrap()));
+
+        // Handshake ACK: wrong_seq stages the fake, composite defers to data.
+        let mut syn = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            1000,
+            0,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut syn), Verdict::Accept);
+        let mut syn_ack = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                syn: true,
+                ack: true,
+                ..Default::default()
+            },
+            2000,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut syn_ack), Verdict::Accept);
+        let mut ack = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            1001,
+            2001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut ack), Verdict::AcceptModified);
+        assert_eq!(ack.new_seq, Some(1001u32.wrapping_sub(517)));
+        assert!(entry.state.lock().fake_sent);
+        assert!(entry.state.lock().waiting_for_data);
+        assert!(entry.state.lock().outcome.is_none());
+
+        // First data packet: ip_frag stages the fragmentation.
+        let mut data = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001,
+            2001,
+            517,
+        );
+        assert_eq!(h.on_packet(&mut data), Verdict::AcceptModified);
+        assert_eq!(data.ip_frag_payload_size, Some(24));
+        assert_eq!(
+            entry.state.lock().outcome,
+            Some(BypassOutcome::FakeDataAcked)
+        );
+        assert!(!entry.state.lock().monitor);
     }
 }

@@ -80,6 +80,10 @@ pub enum MethodAction {
     /// confirms the fake packet path. `true` signals bypass completion as soon
     /// as the modified packet is emitted. `continue_with_data = true` keeps
     /// monitoring for a first outbound data packet after this modified packet.
+    /// Returned from the *data stage* it instead requests fragment-all mode:
+    /// the bypass outcome is signalled but the flow stays monitored and
+    /// `on_first_data_packet` is re-invoked for every subsequent outbound data
+    /// packet (used by `ip_frag` with `IP_FRAG_ONLY_FIRST_PACKET = false`).
     EmitFakeAndAccept {
         complete_immediately: bool,
         continue_with_data: bool,
@@ -198,6 +202,7 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
             "sni_boundary_frag" => {} // socket side; handled directly in proxy.rs
             "tls_record_frag" => data = Some(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
             "fake_tls" => data = Some(Box::new(fake_tls::FakeTls::new(cfg))),
+            "ip_frag" => data = Some(Box::new(ip_frag::IpFrag::new(cfg))),
             "wrong_seq" => handshake.push(Box::new(wrong_seq::WrongSeq::new(cfg))),
             "wrong_ack" => handshake.push(Box::new(wrong_ack::WrongAck::new(cfg))),
             "wrong_checksum" => handshake.push(Box::new(wrong_checksum::WrongChecksum::new(cfg))),

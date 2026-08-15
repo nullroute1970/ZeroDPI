@@ -47,6 +47,7 @@
 //! directly into `proxy.rs` instead.
 
 pub mod composite;
+pub mod fake_tls;
 pub mod low_ttl;
 pub mod mixed_case_sni;
 pub mod sni;

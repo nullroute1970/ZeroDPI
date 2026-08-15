@@ -29,6 +29,8 @@ pub struct FakeTls {
     bump_ip_ident: bool,
     /// Whether to signal bypass completion immediately after emission.
     complete_immediately: bool,
+    /// Whether to forward the original packet after the decoy (dual emission).
+    forward_real: bool,
 }
 
 impl FakeTls {
@@ -38,6 +40,7 @@ impl FakeTls {
             set_psh: cfg.FAKE_TLS_SET_PSH,
             bump_ip_ident: cfg.FAKE_TLS_BUMP_IP_IDENT,
             complete_immediately: cfg.FAKE_TLS_COMPLETE_IMMEDIATELY,
+            forward_real: cfg.FAKE_TLS_FORWARD_REAL,
         }
     }
 }
@@ -80,6 +83,7 @@ impl BypassMethod for FakeTls {
         pkt.new_flags = Some(flags);
         pkt.new_payload = Some(payload);
         pkt.bump_ipv4_ident = self.bump_ip_ident;
+        pkt.emit_original_after = self.forward_real;
 
         trace!(
             target = "zerodpi::fake_tls",
@@ -90,6 +94,7 @@ impl BypassMethod for FakeTls {
             set_psh = self.set_psh,
             bump_ip_ident = self.bump_ip_ident,
             complete_immediately = self.complete_immediately,
+            forward_real = self.forward_real,
             "staged decoy TLS record injection"
         );
 
@@ -274,5 +279,29 @@ mod tests {
                 continue_with_data: false,
             }
         );
+    }
+
+    #[test]
+    fn stages_forward_real_flag_by_default() {
+        let state = handshake_state();
+        let payload: &'static [u8] = Box::leak(vec![0u8; 517].into_boxed_slice());
+        let mut pkt = data_pkt(payload);
+
+        FakeTls::new(&default_cfg()).on_first_data_packet(&state, &mut pkt);
+
+        assert!(pkt.emit_original_after);
+    }
+
+    #[test]
+    fn forward_real_false_leaves_flag_unset() {
+        let mut cfg = default_cfg();
+        cfg.FAKE_TLS_FORWARD_REAL = false;
+        let state = handshake_state();
+        let payload: &'static [u8] = Box::leak(vec![0u8; 517].into_boxed_slice());
+        let mut pkt = data_pkt(payload);
+
+        FakeTls::new(&cfg).on_first_data_packet(&state, &mut pkt);
+
+        assert!(!pkt.emit_original_after);
     }
 }

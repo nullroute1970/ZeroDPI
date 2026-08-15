@@ -785,6 +785,14 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub FAKE_TLS_COMPLETE_IMMEDIATELY: bool,
 
+    /// Whether to forward the original first data packet (the real
+    /// ClientHello) immediately after the decoy record, instead of relying
+    /// on TCP retransmission. Requires backend dual-emission support
+    /// (WinDivert send; raw socket on Linux/Android); backends without it
+    /// fall back to single-packet emission.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub FAKE_TLS_FORWARD_REAL: bool,
+
     // -----------------------------------------------------------------------
     // urg_sni_split method parameters
     // -----------------------------------------------------------------------
@@ -2140,6 +2148,23 @@ mod tests {
         assert!(!cfg.FAKE_TLS_SET_PSH);
         assert!(!cfg.FAKE_TLS_BUMP_IP_IDENT);
         assert!(!cfg.FAKE_TLS_COMPLETE_IMMEDIATELY);
+    }
+
+    #[test]
+    fn parses_fake_tls_forward_real() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .unwrap();
+        assert!(cfg.FAKE_TLS_FORWARD_REAL);
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               FAKE_TLS_FORWARD_REAL = false"#,
+        )
+        .unwrap();
+        assert!(!cfg.FAKE_TLS_FORWARD_REAL);
     }
 
     #[test]

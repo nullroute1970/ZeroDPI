@@ -9,9 +9,10 @@
 //! replacing payload" path used by the `wrong_seq` bypass.
 
 use std::io::ErrorKind;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -27,9 +28,15 @@ use zerodpi_core::interceptor::{
 const HOOK_LOCAL_IN: u8 = 1;
 const HOOK_LOCAL_OUT: u8 = 3;
 
+static RAW_INJECTION_UNAVAILABLE_WARNED: AtomicBool = AtomicBool::new(false);
+
 pub struct NfqInterceptor {
     queue: Queue,
     _rules: FirewallGuard,
+    /// Raw IP socket for decoy injection (`fake_tls` dual emission).
+    /// `None` when injection is unavailable; the backend then falls back
+    /// to single modified emission.
+    raw_socket: Option<RawFd>,
 }
 
 impl PacketInterceptor for NfqInterceptor {
@@ -57,9 +64,16 @@ impl PacketInterceptor for NfqInterceptor {
             firewall_backend = filter.linux_firewall_backend.as_str(),
             "NFQUEUE bound"
         );
+        let raw_socket = open_raw_injection_socket();
+        if raw_socket.is_none() {
+            warn!(
+                "raw socket unavailable; fake_tls dual emission falls back to single-packet mode"
+            );
+        }
         Ok(Self {
             queue,
             _rules: rules,
+            raw_socket,
         })
     }
 
@@ -136,7 +150,29 @@ impl PacketInterceptor for NfqInterceptor {
                             continue;
                         }
                     };
-                    msg.set_payload(new_bytes);
+                    if view.emit_original_after {
+                        match &self.raw_socket {
+                            Some(fd) => {
+                                // Inject the decoy through the raw socket
+                                // first; the queued original is accepted
+                                // below, so the decoy is guaranteed to hit
+                                // the wire first.
+                                if let Err(e) = send_raw_packet(*fd, &new_bytes) {
+                                    warn!(error = %e, "raw decoy injection failed; emitting modified packet instead");
+                                    msg.set_payload(new_bytes);
+                                }
+                                // else: the original packet passes through as-is.
+                            }
+                            None => {
+                                if !RAW_INJECTION_UNAVAILABLE_WARNED.swap(true, Ordering::SeqCst) {
+                                    warn!("raw socket unavailable; fake_tls falling back to single-packet mode");
+                                }
+                                msg.set_payload(new_bytes);
+                            }
+                        }
+                    } else {
+                        msg.set_payload(new_bytes);
+                    }
                     msg.set_verdict(NfqVerdict::Accept);
                 }
             }
@@ -147,8 +183,80 @@ impl PacketInterceptor for NfqInterceptor {
     }
 }
 
+impl Drop for NfqInterceptor {
+    fn drop(&mut self) {
+        if let Some(fd) = self.raw_socket {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
 fn is_stale_nfq_recv_error(error: &std::io::Error) -> bool {
     error.kind() == ErrorKind::NotFound
+}
+
+/// Open a raw IPv4 socket with `IP_HDRINCL` for injecting decoy packets
+/// ahead of queued ones. Returns `None` when unavailable (no CAP_NET_RAW,
+/// SELinux policy, etc.) — callers then fall back to single emission.
+fn open_raw_injection_socket() -> Option<RawFd> {
+    unsafe {
+        let fd = libc::socket(
+            libc::AF_INET,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_RAW,
+        );
+        if fd < 0 {
+            return None;
+        }
+        let one: libc::c_int = 1;
+        if libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_HDRINCL,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) != 0
+        {
+            libc::close(fd);
+            return None;
+        }
+        Some(fd)
+    }
+}
+
+/// Send a fully crafted IPv4 packet (header included) through a raw socket.
+/// The destination is read from the IPv4 header itself (`bytes[16..20]`).
+fn send_raw_packet(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
+    if bytes.len() < 20 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "raw packet shorter than an IPv4 header",
+        ));
+    }
+    let dst_ip = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let addr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: dst_ip.to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    let sent = unsafe {
+        libc::sendto(
+            fd,
+            bytes.as_ptr() as *const libc::c_void,
+            bytes.len(),
+            0,
+            &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if sent < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(sent as usize)
+    }
 }
 
 /// Parsed offsets inside the captured IPv4+TCP buffer.
@@ -776,6 +884,53 @@ mod tests {
             emit_original_after: false,
             new_ipv4_ttl: None,
         }
+    }
+
+    #[test]
+    fn build_modified_carries_decoy_seq_and_payload_for_raw_injection() {
+        use etherparse::{IpNumber, Ipv4Header, TcpHeader};
+
+        let mut ip = Ipv4Header::new(20, 64, IpNumber::TCP, [10, 0, 0, 1], [1, 2, 3, 4]).unwrap();
+        ip.identification = 0x1234;
+        ip.header_checksum = ip.calc_header_checksum();
+        let mut tcp = TcpHeader::new(12345, 443, 1001, 65535);
+        tcp.acknowledgment_number = 5001;
+        tcp.ack = true;
+        tcp.checksum = tcp.calc_checksum_ipv4(&ip, &[]).unwrap();
+        let mut buf = Vec::new();
+        ip.write(&mut buf).unwrap();
+        tcp.write(&mut buf).unwrap();
+
+        let layout = PacketLayout {
+            ip_hdr_len: ip.header_len(),
+            tcp_hdr_len: tcp.header_len(),
+            payload_off: ip.header_len() + tcp.header_len(),
+            total_len: buf.len(),
+        };
+        let view = make_view(); // new_seq = 484, new_payload = [0xAB; 517]
+
+        let out = build_modified(&buf, &layout, &view).unwrap();
+
+        // Decoy payload follows the TCP header, at its full 517-byte length.
+        assert_eq!(out.len(), layout.payload_off + 517);
+        assert_eq!(&out[layout.payload_off..], &[0xAB; 517]);
+        // Sequence number field is at offset ip_hdr_len + 4.
+        let seq_off = layout.ip_hdr_len + 4;
+        assert_eq!(
+            u32::from_be_bytes([
+                out[seq_off],
+                out[seq_off + 1],
+                out[seq_off + 2],
+                out[seq_off + 3]
+            ]),
+            484
+        );
+        // The rebuilt packet carries a valid IP header checksum.
+        let parsed_ip = etherparse::Ipv4HeaderSlice::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed_ip.header_checksum(),
+            parsed_ip.to_header().calc_header_checksum()
+        );
     }
 
     fn make_filter(remote_ip: Option<Ipv4Addr>) -> FilterSpec {

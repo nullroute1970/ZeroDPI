@@ -22,6 +22,7 @@ parking_lot.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 nfq = { version = "0.2", optional = true }
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windivert = "0.6"

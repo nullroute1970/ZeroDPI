@@ -184,6 +184,58 @@ impl Serialize for SniSplitPosition {
     }
 }
 
+/// Where `sni_boundary_frag` cuts the first ClientHello TCP write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SniBoundarySplitPoint {
+    /// Cut right after the server_name extension's 2-byte length field:
+    /// segment 1 ends with the length field, segment 2 starts with the
+    /// extension body.
+    ExtensionLength,
+    /// Cut at the exact middle of the SNI domain string (`len / 2`).
+    Middle,
+    /// Cut after the Nth byte of the domain string (0-based), clamped to
+    /// `[0, name_len]`.
+    Index(u16),
+}
+
+impl<'de> Deserialize<'de> for SniBoundarySplitPoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Int(u16),
+            Text(String),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Int(value) => Ok(Self::Index(value)),
+            Repr::Text(value) => match value.to_ascii_lowercase().as_str() {
+                "extension_length" => Ok(Self::ExtensionLength),
+                "middle" => Ok(Self::Middle),
+                _ => Err(de::Error::custom(format!(
+                    "'{value}' is not a valid SNI_BOUNDARY_FRAG_SPLIT_POINT; valid values: \"extension_length\", \"middle\", or an integer"
+                ))),
+            },
+        }
+    }
+}
+
+impl Serialize for SniBoundarySplitPoint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::ExtensionLength => serializer.serialize_str("extension_length"),
+            Self::Middle => serializer.serialize_str("middle"),
+            Self::Index(n) => serializer.serialize_u16(*n),
+        }
+    }
+}
+
 /// Base bypass method names that can be combined in `BYPASS_METHOD`.
 pub const BASE_BYPASS_METHODS: &[&str] = &[
     "wrong_seq",
@@ -197,6 +249,7 @@ pub const BASE_BYPASS_METHODS: &[&str] = &[
     "tls_padding",
     "mixed_case_sni",
     "urg_sni_split",
+    "sni_boundary_frag",
 ];
 
 /// Expand a combo alias into its base method names; other names pass through.
@@ -256,21 +309,27 @@ impl BypassMethodList {
     }
 
     /// `true` when the list contains only socket-side methods
-    /// (`["tls_frag"]`, `["tls_padding"]`, `["mixed_case_sni"]`, or
-    /// combinations), which need no packet interceptor.
+    /// (`["tls_frag"]`, `["tls_padding"]`, `["mixed_case_sni"]`,
+    /// `["sni_boundary_frag"]`, or combinations), which need no packet
+    /// interceptor.
     pub fn is_socket_only(&self) -> bool {
         !self.0.is_empty()
-            && self
-                .0
-                .iter()
-                .all(|m| matches!(m.as_str(), "tls_frag" | "tls_padding" | "mixed_case_sni"))
+            && self.0.iter().all(|m| {
+                matches!(
+                    m.as_str(),
+                    "tls_frag" | "tls_padding" | "mixed_case_sni" | "sni_boundary_frag"
+                )
+            })
     }
 
     /// `true` when any listed method needs the WinDivert/NFQUEUE interceptor.
     pub fn requires_interceptor(&self) -> bool {
-        self.0
-            .iter()
-            .any(|m| !matches!(m.as_str(), "tls_frag" | "tls_padding" | "mixed_case_sni"))
+        self.0.iter().any(|m| {
+            !matches!(
+                m.as_str(),
+                "tls_frag" | "tls_padding" | "mixed_case_sni" | "sni_boundary_frag"
+            )
+        })
     }
 }
 
@@ -710,6 +769,23 @@ pub struct Config {
     pub SNI_SPLIT_POSITION: SniSplitPosition,
 
     // -----------------------------------------------------------------------
+    // sni_boundary_frag method parameters
+    // -----------------------------------------------------------------------
+    /// Where `sni_boundary_frag` cuts the first ClientHello TCP write.
+    /// Supported values: `"extension_length"` (default), `"middle"`, or a
+    /// 0-based integer index into the domain string (clamped to the domain
+    /// length).
+    #[serde(default = "default_sni_boundary_split_point")]
+    pub SNI_BOUNDARY_FRAG_SPLIT_POINT: SniBoundarySplitPoint,
+
+    /// Delay range, in milliseconds, between the two TCP segments of the
+    /// boundary-split ClientHello. Accepts either an integer (`5`) or an
+    /// inclusive range string (`"5-10"`). A fresh value is sampled per
+    /// connection. Must be `>= 0`. Default: `"5-10"`.
+    #[serde(default = "default_sni_boundary_delay_ms")]
+    pub SNI_BOUNDARY_FRAG_DELAY_MS: Int32Range,
+
+    // -----------------------------------------------------------------------
     // tls_frag method parameters
     // -----------------------------------------------------------------------
     /// Which client data should be fragmented by `tls_frag`,
@@ -1023,6 +1099,12 @@ fn default_sni_split_dummy_byte() -> u8 {
 fn default_sni_split_position() -> SniSplitPosition {
     SniSplitPosition::Middle
 }
+fn default_sni_boundary_split_point() -> SniBoundarySplitPoint {
+    SniBoundarySplitPoint::ExtensionLength
+}
+fn default_sni_boundary_delay_ms() -> Int32Range {
+    Int32Range { min: 5, max: 10 }
+}
 fn default_tls_frag_packets() -> String {
     "1-3".into()
 }
@@ -1203,6 +1285,28 @@ impl Config {
                     "BYPASS_METHOD \"urg_sni_split\" can only be combined with \"tls_frag\" or \"tls_record_frag\""
                 );
             }
+            if self.BYPASS_METHOD.contains("sni_boundary_frag")
+                && self.BYPASS_METHOD.len() > 1
+                && !self.BYPASS_METHOD.iter().all(|m| {
+                    m == "sni_boundary_frag"
+                        || matches!(
+                            m,
+                            "tls_frag"
+                                | "tls_padding"
+                                | "mixed_case_sni"
+                                | "wrong_seq"
+                                | "wrong_ack"
+                                | "wrong_checksum"
+                                | "wrong_md5"
+                                | "wrong_timestamp"
+                                | "low_ttl"
+                        )
+                })
+            {
+                anyhow::bail!(
+                    "BYPASS_METHOD \"sni_boundary_frag\" cannot be combined with \"tls_record_frag\" or \"urg_sni_split\""
+                );
+            }
         }
         if self.WRONG_CHECKSUM_DELTA == 0 {
             anyhow::bail!("WRONG_CHECKSUM_DELTA must be >= 1");
@@ -1249,6 +1353,8 @@ impl Config {
             .validate_at_least("TLS_FRAG_LENGTH", 1)?;
         self.TLS_FRAG_INTERVAL_MS
             .validate_at_least("TLS_FRAG_INTERVAL_MS", 0)?;
+        self.SNI_BOUNDARY_FRAG_DELAY_MS
+            .validate_at_least("SNI_BOUNDARY_FRAG_DELAY_MS", 0)?;
         if LinuxFirewallBackend::parse(&self.LINUX_FIREWALL_BACKEND).is_none() {
             anyhow::bail!(
                 "Unknown LINUX_FIREWALL_BACKEND '{}'. Valid values: \"iptables\", \"nftables\"",
@@ -1268,12 +1374,12 @@ impl Config {
             && !self.BYPASS_METHOD.iter().all(|m| {
                 matches!(
                     m,
-                    "tls_record_frag" | "tls_frag" | "tls_padding" | "mixed_case_sni"
+                    "tls_record_frag" | "tls_frag" | "tls_padding" | "mixed_case_sni" | "sni_boundary_frag"
                 )
             })
         {
             anyhow::bail!(
-                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", \"tls_padding\", or \"mixed_case_sni\""
+                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", \"tls_padding\", \"mixed_case_sni\", or \"sni_boundary_frag\""
             );
         }
         if !(0.0..=1.0).contains(&self.PROXY_TEST_SNI_WEIGHT) {
@@ -2870,5 +2976,111 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.MODE, "ip_bypass_plus");
         assert_eq!(cfg.BYPASS_METHOD, "mixed_case_sni");
+    }
+
+    #[test]
+    fn sni_boundary_frag_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "sni_boundary_frag""#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.SNI_BOUNDARY_FRAG_SPLIT_POINT,
+            SniBoundarySplitPoint::ExtensionLength
+        );
+        assert_eq!(cfg.SNI_BOUNDARY_FRAG_DELAY_MS, Int32Range { min: 5, max: 10 });
+        assert!(cfg.BYPASS_METHOD.is_socket_only());
+        assert!(!cfg.BYPASS_METHOD.requires_interceptor());
+    }
+
+    #[test]
+    fn sni_boundary_frag_custom_values() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = ["wrong_seq", "sni_boundary_frag"]
+               SNI_BOUNDARY_FRAG_SPLIT_POINT = 3
+               SNI_BOUNDARY_FRAG_DELAY_MS = "7-9""#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.SNI_BOUNDARY_FRAG_SPLIT_POINT,
+            SniBoundarySplitPoint::Index(3)
+        );
+        assert_eq!(cfg.SNI_BOUNDARY_FRAG_DELAY_MS, Int32Range { min: 7, max: 9 });
+        assert!(!cfg.BYPASS_METHOD.is_socket_only());
+    }
+
+    #[test]
+    fn sni_boundary_frag_rejects_invalid_split_point() {
+        let result: Result<Config, _> = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "sni_boundary_frag"
+               SNI_BOUNDARY_FRAG_SPLIT_POINT = "sideways""#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sni_boundary_frag_rejects_data_stage_combos() {
+        for method in ["tls_record_frag", "urg_sni_split"] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   BYPASS_METHOD = ["sni_boundary_frag", "{method}"]"#
+            ))
+            .unwrap();
+            assert!(
+                cfg.validate().is_err(),
+                "combo with {method} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sni_boundary_frag_accepts_handshake_fake_combos() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = ["wrong_seq", "sni_boundary_frag"]"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = ["sni_boundary_frag", "tls_frag", "tls_padding"]"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn sni_boundary_frag_rejects_negative_delay() {
+        // Negative values fail Int32Range parsing during TOML deserialization.
+        let result: Result<Config, _> = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "sni_boundary_frag"
+               SNI_BOUNDARY_FRAG_DELAY_MS = "-1-5""#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sni_boundary_frag_allowed_in_ip_bypass_plus() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               MODE = "ip_bypass_plus"
+               BYPASS_METHOD = "sni_boundary_frag""#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
     }
 }

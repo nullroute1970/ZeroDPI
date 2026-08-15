@@ -41,6 +41,7 @@ use tracing::{debug, info, warn};
 use crate::config::{Config, TlsFragPackets};
 use crate::flow::{BypassOutcome, FlowController, FlowEntry, FlowKey};
 use crate::methods::mixed_case_sni::MixedCaseSni;
+use crate::methods::sni_boundary_frag::{write_boundary_split, SniBoundaryFrag};
 use crate::methods::tcp_segmentation::{read_one_tls_record, write_fragmented, TcpSegmentation};
 use crate::methods::tls_padding::TlsPadding;
 use crate::tls_template::build_client_hello;
@@ -183,6 +184,7 @@ struct ConnectionSettings {
     segment_first_client_hello: bool,
     tls_padding: Option<TlsPadding>,
     mixed_case_sni: Option<MixedCaseSni>,
+    sni_boundary_frag: Option<SniBoundaryFrag>,
     tcp_segmentation: TcpSegmentation,
 }
 
@@ -201,6 +203,10 @@ impl ConnectionSettings {
                 .BYPASS_METHOD
                 .contains("mixed_case_sni")
                 .then(|| MixedCaseSni::new(cfg)),
+            sni_boundary_frag: cfg
+                .BYPASS_METHOD
+                .contains("sni_boundary_frag")
+                .then(|| SniBoundaryFrag::new(cfg)),
             tcp_segmentation,
         }
     }
@@ -650,7 +656,84 @@ async fn handle_intercept_connection(
             )?;
         }
         Some(BypassProgress::ReadyForData) => {
-            if settings.segment_first_client_hello {
+            if let Some(boundary) = settings.sni_boundary_frag {
+                // The boundary split needs two cleanly separated segments.
+                outgoing
+                    .set_nodelay(true)
+                    .context("combo sni_boundary_frag: set_nodelay on upstream socket")?;
+
+                let client_hello = read_client_tls_record_with_timeout(
+                    &mut incoming,
+                    settings.bypass_timeout,
+                    &entry,
+                    &event_tx,
+                    src_port,
+                )
+                .await?;
+                let client_hello = settings.apply_socket_transforms(&client_hello);
+
+                match boundary.split_offset(&client_hello) {
+                    Some(split) => {
+                        if let Err(e) = write_boundary_split(
+                            &mut outgoing,
+                            &client_hello,
+                            split,
+                            boundary.delay_ms,
+                        )
+                        .await
+                        {
+                            entry.finish(BypassOutcome::UnexpectedClose);
+                            emit(
+                                &event_tx,
+                                ProxyEvent::BypassComplete {
+                                    src_port,
+                                    outcome: BypassOutcome::UnexpectedClose,
+                                },
+                            );
+                            return Err(e).context(
+                                "combo sni_boundary_frag: writing boundary-split ClientHello",
+                            );
+                        }
+                    }
+                    None => {
+                        // Fail-open: no SNI boundary found; forward whole.
+                        if let Err(e) = outgoing.write_all(&client_hello).await {
+                            entry.finish(BypassOutcome::UnexpectedClose);
+                            emit(
+                                &event_tx,
+                                ProxyEvent::BypassComplete {
+                                    src_port,
+                                    outcome: BypassOutcome::UnexpectedClose,
+                                },
+                            );
+                            return Err(e).context(
+                                "combo sni_boundary_frag: writing ClientHello to upstream",
+                            );
+                        }
+                        if let Err(e) = outgoing.flush().await {
+                            entry.finish(BypassOutcome::UnexpectedClose);
+                            emit(
+                                &event_tx,
+                                ProxyEvent::BypassComplete {
+                                    src_port,
+                                    outcome: BypassOutcome::UnexpectedClose,
+                                },
+                            );
+                            return Err(e).context(
+                                "combo sni_boundary_frag: flushing ClientHello to upstream",
+                            );
+                        }
+                    }
+                }
+
+                // With tls_frag also listed, later client writes are
+                // segmented per its settings. Write index 1 was the
+                // ClientHello above, so the relay resumes at 2.
+                if settings.segment_first_client_hello {
+                    client_fragmentation_after_prefix =
+                        Some((settings.tcp_segmentation, 1));
+                }
+            } else if settings.segment_first_client_hello {
                 let segmentation = settings.tcp_segmentation;
                 if segmentation.nodelay {
                     outgoing
@@ -957,11 +1040,13 @@ async fn handle_tcp_seg_connection_with_ip(
         }
     };
 
-    // Enable TCP_NODELAY on the upstream socket if configured.
-    if method.nodelay {
+    // Enable TCP_NODELAY on the upstream socket if configured. The boundary
+    // split depends on two cleanly separated segments, so sni_boundary_frag
+    // always forces it.
+    if method.nodelay || cfg.BYPASS_METHOD.contains("sni_boundary_frag") {
         outgoing
             .set_nodelay(true)
-            .context("tls_frag: set_nodelay on upstream socket")?;
+            .context("set_nodelay on upstream socket")?;
     }
 
     // When tls_padding and/or mixed_case_sni are listed, read the first TLS
@@ -988,14 +1073,62 @@ async fn handle_tcp_seg_connection_with_ip(
         None
     };
 
-    let client_fragmentation = match method.packets {
-        TlsFragPackets::TlsHello if cfg.BYPASS_METHOD.contains("tls_frag") => {
-            let client_hello = match transformed_prefix {
-                Some(record) => record,
-                None => read_one_tls_record(&mut incoming)
-                    .await
-                    .context("tls_frag: reading ClientHello from client")?,
-            };
+    let boundary = cfg
+        .BYPASS_METHOD
+        .contains("sni_boundary_frag")
+        .then(|| SniBoundaryFrag::new(&cfg));
+    let segment_tlshello = cfg.BYPASS_METHOD.contains("tls_frag")
+        && method.packets == TlsFragPackets::TlsHello;
+    let needs_first_record = boundary.is_some() || segment_tlshello;
+
+    // One TLS record is read at most once, transformed first when
+    // tls_padding / mixed_case_sni are listed.
+    let first_record = if needs_first_record {
+        Some(match transformed_prefix {
+            Some(record) => record,
+            None => read_one_tls_record(&mut incoming)
+                .await
+                .context("socket path: reading ClientHello from client")?,
+        })
+    } else {
+        transformed_prefix
+    };
+
+    let client_fragmentation = match (boundary, first_record) {
+        (Some(boundary), Some(record)) => {
+            match boundary.split_offset(&record) {
+                Some(split) => {
+                    write_boundary_split(&mut outgoing, &record, split, boundary.delay_ms)
+                        .await
+                        .context("sni_boundary_frag: writing boundary-split ClientHello")?;
+                    debug!(
+                        split,
+                        delay_ms = %boundary.delay_ms,
+                        total_bytes = record.len(),
+                        "sni_boundary_frag: ClientHello written in two boundary segments; handing off to relay"
+                    );
+                }
+                None => {
+                    // Fail-open: no SNI boundary found; forward whole.
+                    outgoing
+                        .write_all(&record)
+                        .await
+                        .context("sni_boundary_frag: writing ClientHello whole (fail-open)")?;
+                    outgoing
+                        .flush()
+                        .await
+                        .context("sni_boundary_frag: flushing ClientHello")?;
+                }
+            }
+            // The first client write was consumed above; with tls_frag also
+            // listed, later writes are segmented per its settings.
+            if cfg.BYPASS_METHOD.contains("tls_frag") {
+                Some((method, 1))
+            } else {
+                None
+            }
+        }
+        (None, Some(client_hello)) if segment_tlshello => {
             write_fragmented(
                 &mut outgoing,
                 &client_hello,
@@ -1013,8 +1146,8 @@ async fn handle_tcp_seg_connection_with_ip(
             );
             None
         }
-        _ => {
-            if let Some(record) = transformed_prefix {
+        (None, first_record) => {
+            if let Some(record) = first_record {
                 outgoing
                     .write_all(&record)
                     .await
@@ -1037,6 +1170,9 @@ async fn handle_tcp_seg_connection_with_ip(
                 None
             }
         }
+        // `boundary.is_some()` implies `needs_first_record`, so the record is
+        // always present when a boundary method is configured.
+        (Some(_), None) => unreachable!("boundary method implies a first record"),
     };
 
     emit(
@@ -1714,5 +1850,38 @@ mod tests {
                 assert_eq!(got, orig, "non-alpha byte {i} must be untouched");
             }
         }
+    }
+
+    #[test]
+    fn sni_boundary_frag_in_list_populates_settings() {
+        let cfg = cfg_with(
+            r#"BYPASS_METHOD = ["wrong_seq", "sni_boundary_frag"]"#,
+            r#"SNI_BOUNDARY_FRAG_SPLIT_POINT = "middle"
+               SNI_BOUNDARY_FRAG_DELAY_MS = "7-9""#,
+        );
+        let settings = ConnectionSettings::from_config(&cfg);
+        let boundary = settings
+            .sni_boundary_frag
+            .expect("sni_boundary_frag is listed");
+        assert_eq!(
+            boundary.split_point,
+            crate::config::SniBoundarySplitPoint::Middle
+        );
+        assert_eq!(boundary.delay_ms, crate::config::Int32Range::parse("7-9").unwrap());
+        assert!(!settings.segment_first_client_hello);
+    }
+
+    #[test]
+    fn socket_only_list_keeps_sni_boundary_frag_settings() {
+        let cfg = cfg_with(r#"BYPASS_METHOD = "sni_boundary_frag""#, "");
+        let settings = ConnectionSettings::from_config(&cfg);
+        assert!(settings.sni_boundary_frag.is_some());
+    }
+
+    #[test]
+    fn other_lists_leave_sni_boundary_frag_unset() {
+        let cfg = cfg_with(r#"BYPASS_METHOD = "tls_frag""#, "");
+        let settings = ConnectionSettings::from_config(&cfg);
+        assert!(settings.sni_boundary_frag.is_none());
     }
 }

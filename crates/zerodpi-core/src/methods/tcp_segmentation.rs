@@ -176,12 +176,12 @@ where
 static RNG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
-struct FragmentRng {
+pub(crate) struct FragmentRng {
     state: u64,
 }
 
 impl FragmentRng {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -207,7 +207,7 @@ impl FragmentRng {
     }
 }
 
-fn sample_i32(range: Int32Range, rng: &mut FragmentRng) -> i32 {
+pub(crate) fn sample_i32(range: Int32Range, rng: &mut FragmentRng) -> i32 {
     if range.min == range.max {
         return range.min;
     }

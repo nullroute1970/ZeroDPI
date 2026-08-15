@@ -40,6 +40,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{Config, TlsFragPackets};
 use crate::flow::{BypassOutcome, FlowController, FlowEntry, FlowKey};
+use crate::methods::mixed_case_sni::MixedCaseSni;
 use crate::methods::tcp_segmentation::{read_one_tls_record, write_fragmented, TcpSegmentation};
 use crate::methods::tls_padding::TlsPadding;
 use crate::tls_template::build_client_hello;
@@ -181,6 +182,7 @@ struct ConnectionSettings {
     max_lifetime: Option<Duration>,
     segment_first_client_hello: bool,
     tls_padding: Option<TlsPadding>,
+    mixed_case_sni: Option<MixedCaseSni>,
     tcp_segmentation: TcpSegmentation,
 }
 
@@ -195,8 +197,26 @@ impl ConnectionSettings {
                 .BYPASS_METHOD
                 .contains("tls_padding")
                 .then(|| TlsPadding::new(cfg)),
+            mixed_case_sni: cfg
+                .BYPASS_METHOD
+                .contains("mixed_case_sni")
+                .then(|| MixedCaseSni::new(cfg)),
             tcp_segmentation,
         }
+    }
+
+    /// Apply the socket-side ClientHello transforms: `tls_padding` first,
+    /// then `mixed_case_sni`. Fail-open: a record that does not parse is
+    /// returned unchanged.
+    fn apply_socket_transforms(&self, record: &[u8]) -> Vec<u8> {
+        let mut out = record.to_vec();
+        if let Some(padding) = self.tls_padding {
+            out = padding.apply(&out).unwrap_or(out);
+        }
+        if let Some(mixed) = self.mixed_case_sni {
+            out = mixed.apply(&out).unwrap_or(out);
+        }
+        out
     }
 }
 
@@ -648,10 +668,7 @@ async fn handle_intercept_connection(
                             src_port,
                         )
                         .await?;
-                        let client_hello = settings
-                            .tls_padding
-                            .and_then(|p| p.apply(&client_hello))
-                            .unwrap_or(client_hello);
+                        let client_hello = settings.apply_socket_transforms(&client_hello);
                         if let Err(e) = write_fragmented(
                             &mut outgoing,
                             &client_hello,
@@ -681,12 +698,9 @@ async fn handle_intercept_connection(
                             src_port,
                         )
                         .await?;
-                        // Fail-open: pad only when the first write parses as a
+                        // Fail-open: transform only when the first write parses as a
                         // complete ClientHello record.
-                        let client_data = settings
-                            .tls_padding
-                            .and_then(|p| p.apply(&client_data))
-                            .unwrap_or(client_data);
+                        let client_data = settings.apply_socket_transforms(&client_data);
                         if let Err(e) =
                             write_client_data(&mut outgoing, &client_data, segmentation, 1).await
                         {
@@ -713,10 +727,7 @@ async fn handle_intercept_connection(
                 )
                 .await?;
 
-                let client_hello = settings
-                    .tls_padding
-                    .and_then(|p| p.apply(&client_hello))
-                    .unwrap_or(client_hello);
+                let client_hello = settings.apply_socket_transforms(&client_hello);
 
                 if let Err(e) = outgoing.write_all(&client_hello).await {
                     entry.finish(BypassOutcome::UnexpectedClose);
@@ -953,21 +964,33 @@ async fn handle_tcp_seg_connection_with_ip(
             .context("tls_frag: set_nodelay on upstream socket")?;
     }
 
-    // When tls_padding is listed, read the first TLS record and expand it
-    // with the RFC 7685 padding extension before any mode-specific handling.
-    // Fail-open: unparseable records are forwarded unchanged.
-    let padded_prefix = if cfg.BYPASS_METHOD.contains("tls_padding") {
+    // When tls_padding and/or mixed_case_sni are listed, read the first TLS
+    // record and transform it before any mode-specific handling. Fail-open:
+    // unparseable records are forwarded unchanged.
+    let transformed_prefix = if cfg.BYPASS_METHOD.contains("tls_padding")
+        || cfg.BYPASS_METHOD.contains("mixed_case_sni")
+    {
         let record = read_one_tls_record(&mut incoming)
             .await
-            .context("tls_padding: reading ClientHello from client")?;
-        Some(TlsPadding::new(&cfg).apply(&record).unwrap_or(record))
+            .context("socket transforms: reading ClientHello from client")?;
+        let record = if cfg.BYPASS_METHOD.contains("tls_padding") {
+            TlsPadding::new(&cfg).apply(&record).unwrap_or(record)
+        } else {
+            record
+        };
+        let record = if cfg.BYPASS_METHOD.contains("mixed_case_sni") {
+            MixedCaseSni::new(&cfg).apply(&record).unwrap_or(record)
+        } else {
+            record
+        };
+        Some(record)
     } else {
         None
     };
 
     let client_fragmentation = match method.packets {
         TlsFragPackets::TlsHello if cfg.BYPASS_METHOD.contains("tls_frag") => {
-            let client_hello = match padded_prefix {
+            let client_hello = match transformed_prefix {
                 Some(record) => record,
                 None => read_one_tls_record(&mut incoming)
                     .await
@@ -991,7 +1014,7 @@ async fn handle_tcp_seg_connection_with_ip(
             None
         }
         _ => {
-            if let Some(record) = padded_prefix {
+            if let Some(record) = transformed_prefix {
                 outgoing
                     .write_all(&record)
                     .await
@@ -1628,6 +1651,68 @@ mod tests {
                 assert_eq!(target_ip, target);
             }
             _ => panic!("expected ConnectionAccepted"),
+        }
+    }
+
+    fn cfg_with(method_line: &str, extra: &str) -> Config {
+        toml::from_str(&format!(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               {method_line}
+               {extra}"#
+        ))
+        .unwrap()
+    }
+
+    fn swap_case(b: u8) -> u8 {
+        if b.is_ascii_lowercase() {
+            b.to_ascii_uppercase()
+        } else {
+            b.to_ascii_lowercase()
+        }
+    }
+
+    #[test]
+    fn settings_include_mixed_case_sni_when_listed() {
+        let cfg = cfg_with(r#"BYPASS_METHOD = ["wrong_seq", "mixed_case_sni"]"#, "");
+        let s = ConnectionSettings::from_config(&cfg);
+        assert!(s.mixed_case_sni.is_some());
+        assert!(s.tls_padding.is_none());
+
+        let cfg = cfg_with(r#"BYPASS_METHOD = "tls_padding""#, "");
+        let s = ConnectionSettings::from_config(&cfg);
+        assert!(s.mixed_case_sni.is_none());
+        assert!(s.tls_padding.is_some());
+    }
+
+    #[test]
+    fn apply_socket_transforms_chains_padding_then_case_randomization() {
+        let cfg = cfg_with(
+            r#"BYPASS_METHOD = ["tls_padding", "mixed_case_sni"]"#,
+            r#"TLS_PADDING_SIZE = 4
+               MIXED_CASE_SNI_FLIP_ALL = true"#,
+        );
+        let settings = ConnectionSettings::from_config(&cfg);
+        let record = crate::tls_template::build_client_hello(
+            &[0u8; 32],
+            &[0u8; 32],
+            b"wikipedia.org",
+            &[0u8; 32],
+        );
+        let out = settings.apply_socket_transforms(&record);
+        // padding extension header (4 bytes) + 4 zero bytes
+        assert_eq!(out.len(), record.len() + 8);
+        // SNI was at offset 127; padding moved it by 8 bytes
+        let (start, len) =
+            crate::methods::sni::find_sni_range(&out).expect("transformed record must still parse");
+        assert_eq!((start, len), (127 + 8, 13));
+        for (i, &orig) in b"wikipedia.org".iter().enumerate() {
+            let got = out[start + i];
+            if orig.is_ascii_alphabetic() {
+                assert_eq!(got, swap_case(orig), "letter {i} must be case-inverted");
+            } else {
+                assert_eq!(got, orig, "non-alpha byte {i} must be untouched");
+            }
         }
     }
 }

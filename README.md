@@ -360,8 +360,9 @@ Combination limits:
 - `sni_boundary_frag` cannot be combined with `tls_record_frag` or
   `urg_sni_split`; it combines with the handshake fake-packet methods, and
   with `tls_frag`, `tls_padding`, and `mixed_case_sni`.
-- `MODE = "ip_bypass_plus"` supports only `tls_record_frag`, `tls_frag`, or
-  `tls_padding`, or `mixed_case_sni` so the VPN client's real SNI is preserved.
+- `MODE = "ip_bypass_plus"` supports only `tls_record_frag`, `tls_frag`,
+  `tls_padding`, `mixed_case_sni`, or `sni_boundary_frag` so the VPN client's
+  real SNI is preserved.
 - `LOW_TTL_DISCOVER` only takes effect when `low_ttl` is in the list;
   otherwise discovery is silently skipped.
 
@@ -378,11 +379,13 @@ How combinations behave:
 - `tls_record_frag` and/or `tls_frag` add the data stage after the fake
   packet. `tls_padding` adds a socket-side data stage that expands the real
   ClientHello with an RFC 7685 padding extension before it is written
-  upstream, and `mixed_case_sni` adds a socket-side data stage that
-  randomizes the SNI case in the real ClientHello. A list containing
-  `tls_frag` alongside other methods still uses packet interception; a list
-  containing only `tls_frag`, `tls_padding`, and/or `mixed_case_sni` skips
-  the interceptor entirely.
+  upstream, `mixed_case_sni` adds a socket-side data stage that randomizes
+  the SNI case in the real ClientHello, and `sni_boundary_frag` adds a
+  socket-side data stage that writes the real ClientHello as two TCP
+  segments cut at the SNI extension boundary. A list containing `tls_frag`
+  alongside other methods still uses packet interception; a list containing
+  only `tls_frag`, `tls_padding`, `mixed_case_sni`, and/or
+  `sni_boundary_frag` skips the interceptor entirely.
 
 ---
 
@@ -775,6 +778,15 @@ When `tls_frag` is combined with a handshake-stage method (e.g. `["wrong_seq", "
 | `TLS_PADDING_POSITION` | `string` | `"before"` | Where the padding extension is inserted: `"before"` (immediately before the SNI extension, pushing the SNI bytes past the DPI's inspection window) or `"after"` (end of the extension list, canonical RFC 7685 placement) |
 
 `tls_padding` combines with handshake-stage methods (e.g. `BYPASS_METHOD = ["wrong_seq", "tls_padding"]`) and with `tls_frag` (pad first, then fragment). A list containing only `tls_padding` and/or `tls_frag` skips the packet interceptor entirely.
+
+#### `sni_boundary_frag` Parameters
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `SNI_BOUNDARY_FRAG_SPLIT_POINT` | `string` or `int` | `"extension_length"` | Where the first ClientHello TCP write is cut: `"extension_length"` (right after the server_name extension's 2-byte length field; segment 2 starts with the extension body), `"middle"` (exact middle of the SNI domain string), or a 0-based index into the domain string (clamped) |
+| `SNI_BOUNDARY_FRAG_DELAY_MS` | `Int32Range` | `"5-10"` | Delay between the two TCP segments in ms; accepts `N` or `"A-B"` (>= 0); a fresh value is sampled per connection |
+
+`sni_boundary_frag` combines with handshake-stage methods (e.g. `BYPASS_METHOD = ["wrong_seq", "sni_boundary_frag"]`) and with `tls_frag`, `tls_padding`, and `mixed_case_sni`; it cannot be combined with `tls_record_frag` or `urg_sni_split`. A list containing only socket-side methods (`tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`) skips the packet interceptor entirely.
 
 ### 🔬 Proxy Scan Mode (`proxy_scan`)
 

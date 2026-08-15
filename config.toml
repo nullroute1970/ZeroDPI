@@ -258,6 +258,16 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     the name.  Digits, dots, and hyphens are never changed (safe for
 #     punycode SNIs).
 #
+#   "sni_boundary_frag"
+#     SNI Extension Boundary Fragmentation.  Does NOT inject fake packets
+#     and does NOT use WinDivert or NFQUEUE packet interception.  Parses the
+#     real TLS ClientHello down to the extension array and writes the first
+#     record as exactly two TCP segments cut at the SNI extension boundary
+#     (SNI_BOUNDARY_FRAG_SPLIT_POINT), with a small delay between them
+#     (SNI_BOUNDARY_FRAG_DELAY_MS) so inline DPI reassembly buffers do not
+#     stitch them back together.  The upstream server reassembles the
+#     segments into an identical ClientHello.
+#
 # Common combinations (written as lists):
 #
 #   ["wrong_seq", "wrong_md5"]        -> fake ClientHello with old TCP seq + TCP-MD5
@@ -284,8 +294,12 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   SNI case in the real ClientHello.  It combines with handshake-stage
 #   methods, with "tls_frag", and with "tls_padding" (pad first, then
 #   randomize).
-# - A list containing only "tls_frag", "tls_padding", and/or
-#   "mixed_case_sni" skips the packet interceptor entirely.
+# - "sni_boundary_frag" adds a socket-side data stage that writes the real
+#   ClientHello as exactly two TCP segments cut at the SNI extension
+#   boundary.  It combines with handshake-stage methods and with "tls_frag",
+#   "tls_padding", and "mixed_case_sni".
+# - A list containing only "tls_frag", "tls_padding", "mixed_case_sni",
+#   and/or "sni_boundary_frag" skips the packet interceptor entirely.
 #
 # Limitations:
 #
@@ -294,9 +308,12 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 # - "urg_sni_split" can only be used alone or together with "tls_frag" /
 #   "tls_record_frag"; it cannot be combined with other handshake-stage
 #   methods.
+# - "sni_boundary_frag" cannot be combined with "tls_record_frag" or
+#   "urg_sni_split"; it combines with the handshake fake-packet methods and
+#   with "tls_frag", "tls_padding", and "mixed_case_sni".
 # - MODE = "ip_bypass_plus" supports only "tls_record_frag", "tls_frag",
-#   "tls_padding", or "mixed_case_sni" so the upstream VPN client's real SNI
-#   is preserved.
+#   "tls_padding", "mixed_case_sni", or "sni_boundary_frag" so the upstream
+#   VPN client's real SNI is preserved.
 # - LOW_TTL_DISCOVER only takes effect when "low_ttl" is in the list;
 #   otherwise discovery is silently skipped.
 #

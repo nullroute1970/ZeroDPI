@@ -522,13 +522,20 @@ pub struct Config {
     ///   destination server strips the byte while byte-scanning DPI sees a
     ///   mangled SNI. No fake packet is injected; the server reassembles the
     ///   original handshake via BSD urgent-data semantics.
+    /// - `"sni_boundary_frag"` — SNI Extension Boundary Fragmentation.
+    ///   Parses the ClientHello down to the SNI extension and writes the
+    ///   first record as exactly two TCP segments cut at the extension
+    ///   boundary (or mid-domain), separated by a configurable delay, so
+    ///   inline DPI cannot reassemble the SNI. Socket-side only: does not
+    ///   inject fake packets or use WinDivert/NFQUEUE interception; operates
+    ///   inside the proxy on the relayed ClientHello.
     ///
     /// Handshake-stage methods (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
     /// `wrong_md5`, `wrong_timestamp`, `low_ttl`) all inject the same fake
     /// ClientHello; several may be listed to merge their tricks onto one fake
-    /// packet. `tls_record_frag`, `tls_frag`, `tls_padding`, and
-    /// `mixed_case_sni` add the data stage. See the `BYPASS_METHOD` section
-    /// of `config.toml` for the combination limits.
+    /// packet. `tls_record_frag`, `tls_frag`, `tls_padding`,
+    /// `mixed_case_sni`, and `sni_boundary_frag` add the data stage. See the
+    /// `BYPASS_METHOD` section of `config.toml` for the combination limits.
     #[serde(default = "default_method")]
     pub BYPASS_METHOD: BypassMethodList,
     /// (Linux only) NFQUEUE queue number used to intercept packets. Must

@@ -67,6 +67,11 @@ pub struct FlowState {
     /// with `complete_immediately = false` and we are waiting for the
     /// server's ACK of that packet's payload before finishing the flow.
     pub waiting_for_first_data_ack: bool,
+    /// True when a data-stage method (currently `ip_frag` with
+    /// `IP_FRAG_ONLY_FIRST_PACKET = false`) requested fragment-all mode: the
+    /// bypass outcome was already signalled but the flow stays monitored and
+    /// every subsequent outbound data packet is re-staged.
+    pub fragment_all_data: bool,
     /// Final outcome, set when [`Self::notify`] fires.
     pub outcome: Option<BypassOutcome>,
     /// Spoofed TLS ClientHello payload to inject. Built once per flow.
@@ -88,6 +93,7 @@ impl FlowState {
             waiting_for_data: false,
             first_data_modified: false,
             waiting_for_first_data_ack: false,
+            fragment_all_data: false,
             outcome: None,
             fake_data,
             low_ttl_override,
@@ -119,6 +125,19 @@ impl FlowEntry {
         if s.outcome.is_none() {
             s.outcome = Some(outcome);
             s.monitor = false;
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Mark the bypass phase complete with the given outcome and wake any
+    /// waiter, without stopping flow monitoring. Used by fragment-all data-
+    /// stage methods that keep rewriting packets after the initial
+    /// ClientHello. Idempotent on `outcome`: only the first call sets it and
+    /// notifies.
+    pub fn signal_outcome(&self, outcome: BypassOutcome) {
+        let mut s = self.state.lock();
+        if s.outcome.is_none() {
+            s.outcome = Some(outcome);
             self.notify.notify_waiters();
         }
     }
@@ -211,6 +230,29 @@ mod tests {
         assert_eq!(with_override.state.lock().low_ttl_override, Some(7));
         let without_override = FlowEntry::new(vec![1], None);
         assert_eq!(without_override.state.lock().low_ttl_override, None);
+    }
+
+    #[test]
+    fn flow_state_fragment_all_data_defaults_false() {
+        let entry = FlowEntry::new(vec![1], None);
+        assert!(!entry.state.lock().fragment_all_data);
+    }
+
+    #[test]
+    fn signal_outcome_sets_outcome_without_stopping_monitoring() {
+        let entry = FlowEntry::new(vec![1], None);
+        entry.signal_outcome(BypassOutcome::FakeDataAcked);
+        {
+            let s = entry.state.lock();
+            assert_eq!(s.outcome, Some(BypassOutcome::FakeDataAcked));
+            assert!(s.monitor);
+        }
+        // Idempotent: a second signal does not overwrite the first outcome.
+        entry.signal_outcome(BypassOutcome::UnexpectedClose);
+        assert_eq!(
+            entry.state.lock().outcome,
+            Some(BypassOutcome::FakeDataAcked)
+        );
     }
 
     #[tokio::test]

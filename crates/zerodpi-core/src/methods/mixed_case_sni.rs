@@ -182,7 +182,11 @@ mod tests {
             let out = MixedCaseSni::exact(false)
                 .apply_with_rng(&record, &mut rng)
                 .expect("template ClientHello must parse");
-            assert_eq!(out.len(), record.len(), "case randomization is length-preserving");
+            assert_eq!(
+                out.len(),
+                record.len(),
+                "case randomization is length-preserving"
+            );
             let mut flipped = false;
             for (i, &b) in sni.iter().enumerate() {
                 let got = out[SNI_OFFSET + i];
@@ -204,7 +208,9 @@ mod tests {
     fn flip_all_inverts_every_letter() {
         let sni = b"aBcD.XyZ-01";
         let record = client_hello(sni);
-        let out = MixedCaseSni::exact(true).apply(&record).expect("template ClientHello must parse");
+        let out = MixedCaseSni::exact(true)
+            .apply(&record)
+            .expect("template ClientHello must parse");
         assert_eq!(out.len(), record.len());
         for (i, &b) in sni.iter().enumerate() {
             let got = out[SNI_OFFSET + i];
@@ -224,7 +230,10 @@ mod tests {
             let out = MixedCaseSni::exact(false)
                 .apply_with_rng(&record, &mut rng)
                 .expect("template ClientHello must parse");
-            assert_ne!(out[SNI_OFFSET], b'a', "seed {seed} must flip the single letter");
+            assert_ne!(
+                out[SNI_OFFSET], b'a',
+                "seed {seed} must flip the single letter"
+            );
         }
     }
 

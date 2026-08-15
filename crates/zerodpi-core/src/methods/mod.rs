@@ -49,6 +49,7 @@
 
 pub mod composite;
 pub mod fake_tls;
+pub mod ip_frag;
 pub mod low_ttl;
 pub mod mixed_case_sni;
 pub mod sni;

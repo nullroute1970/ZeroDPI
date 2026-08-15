@@ -25,7 +25,9 @@ LISTEN_PORT = 44444
 # - "sni_spoof"     — DPI bypass via SNI spoofing (default).
 # - "ip_bypass"     — plain TCP relay through a scanned IP; no packet interception.
 # - "ip_bypass_plus" — IPv4 relay through a scanned IP plus real-SNI-preserving
-#                      BYPASS_METHOD ("tls_record_frag" or "tls_frag").
+#                      BYPASS_METHOD ("tls_record_frag", "tls_frag",
+#                      "tls_padding", "mixed_case_sni", "sni_boundary_frag",
+#                      or "ip_frag").
 # - "sni_scan"      — scan sni_list.txt and display/save results, then exit.
 # - "ip_scan"       — scan ip_list.txt and display/save results, then exit.
 # - "proxy_scan"    — scan sni_list.txt (Phase 1), then test each working SNI
@@ -227,6 +229,15 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     immediately after the decoy.  Requires WinDivert/NFQUEUE
 #     interception (Administrator/root, IPv4-only).
 #
+#   "ip_frag"
+#     IP-Layer Fragment.  Splits the first outbound data packet (the real
+#     ClientHello) into small IPv4 fragments.  The server's kernel
+#     reassembles them before TLS, so the handshake proceeds normally; DPIs
+#     that do not reassemble IP fragments never see the SNI.  With
+#     IP_FRAG_ONLY_FIRST_PACKET = false, every outbound data packet is
+#     fragmented.  Requires WinDivert/NFQUEUE interception
+#     (Administrator/root, IPv4-only).
+#
 #   "urg_sni_split"
 #     TCP Urgent + SNI byte splice.  Does NOT inject any fake packet.  Instead,
 #     it intercepts the first outbound data packet carrying the real TLS
@@ -301,6 +312,10 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   handshake-stage fake-packet methods and with the socket-side methods,
 #   but is mutually exclusive with "tls_record_frag" and "urg_sni_split"
 #   (all three own the first data packet).
+# - "ip_frag" adds a data-stage IP fragmentation.  It combines with
+#   handshake-stage fake-packet methods and with the socket-side methods,
+#   but is mutually exclusive with "tls_record_frag", "fake_tls", and
+#   "urg_sni_split" (all own the first data packet).
 # - "tls_padding" adds a socket-side data stage: the real ClientHello is
 #   expanded with an RFC 7685 padding extension before it is written to the
 #   upstream socket.  It combines with handshake-stage methods and with
@@ -328,9 +343,11 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   with "tls_frag", "tls_padding", and "mixed_case_sni".
 # - "fake_tls" cannot be combined with "tls_record_frag" or
 #   "urg_sni_split".
+# - "ip_frag" cannot be combined with "tls_record_frag", "fake_tls", or
+#   "urg_sni_split".
 # - MODE = "ip_bypass_plus" supports only "tls_record_frag", "tls_frag",
-#   "tls_padding", "mixed_case_sni", or "sni_boundary_frag" so the upstream
-#   VPN client's real SNI is preserved.
+#   "tls_padding", "mixed_case_sni", "sni_boundary_frag", or "ip_frag" so
+#   the upstream VPN client's real SNI is preserved.
 # - LOW_TTL_DISCOVER only takes effect when "low_ttl" is in the list;
 #   otherwise discovery is silently skipped.
 #
@@ -701,6 +718,37 @@ FAKE_TLS_COMPLETE_IMMEDIATELY = true
 #                   ClientHello reaches the server via TCP retransmission
 #                   (adds roughly one retransmission timeout, ~200 ms).
 FAKE_TLS_FORWARD_REAL = true
+
+# ---------------------------------------------------------------------------
+# ip_frag method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "ip_frag" (alone or combined
+# with handshake fake-packet methods or socket-side methods).
+#
+# ip_frag splits the outbound data packet carrying the ClientHello at the
+# IPv4 layer into fragments of at most IP_FRAG_SIZE payload bytes.  The
+# destination kernel reassembles the fragments before the TLS stack sees
+# the stream, so the handshake is unaffected; inline DPIs that do not
+# reassemble IP fragments never see a complete ClientHello.  The real
+# ClientHello bytes are untouched — the SNI is preserved.
+
+# Maximum IP payload bytes (TCP header + TCP payload) per fragment.
+#
+# Fragment offsets are expressed in 8-byte units, so this value must be a
+# multiple of 8 and at least 8.  Default: 24.
+IP_FRAG_SIZE = 24
+
+# Whether to fragment only the first outbound data packet of each
+# connection.
+#
+# true (default)  — fragment the packet carrying the ClientHello only; the
+#                   rest of the stream is untouched.
+# false           — fragment-all mode: every subsequent outbound data packet
+#                   is also fragmented until the connection closes.  Costs
+#                   CPU per packet and raises the chance a fragment-hostile
+#                   middlebox breaks the flow; use only when the DPI
+#                   reassembles only the first packet.
+IP_FRAG_ONLY_FIRST_PACKET = true
 
 # ---------------------------------------------------------------------------
 # urg_sni_split method parameters

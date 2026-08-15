@@ -53,7 +53,7 @@ It is not a replacement VPN client. It is a local TCP relay that your existing V
 
 | Feature | Description |
 |---------|-------------|
-| 🧩 **12 combinable bypass methods** | `wrong_seq`, `wrong_ack`, `wrong_checksum`, `wrong_md5`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `urg_sni_split`, `sni_boundary_frag` — combinable via `BYPASS_METHOD = ["wrong_seq", "tls_frag"]` |
+| 🧩 **13 combinable bypass methods** | `wrong_seq`, `wrong_ack`, `wrong_checksum`, `wrong_md5`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `fake_tls`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `urg_sni_split`, `sni_boundary_frag` — combinable via `BYPASS_METHOD = ["wrong_seq", "tls_frag"]` |
 | 🎯 **6 operating modes** | `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan` |
 | 🖥️ **TUI dashboard** | Ratatui-powered live progress, selection tables, and connection monitoring |
 | 🔄 **Auto-rescan** | Background re-scanning hot-swaps the best target without restart |
@@ -330,6 +330,7 @@ Results are blended using a configurable weight and displayed in the TUI.
 | `wrong_timestamp` | Injects fake ClientHello with backdated TCP Timestamp TSval | ✅ Yes | DPI that accepts forged data but servers enforce PAWS |
 | `low_ttl` | Injects fake ClientHello (whitelisted SNI) with a low IP TTL so only the DPI middlebox sees it | ✅ Yes | DPI sitting between client and server on TTL-visible networks |
 | `tls_record_frag` | TLS Record Fragment: splits the real ClientHello record body into multiple tiny TLS records | ✅ Yes | DPI that can't reassemble TLS records |
+| `fake_tls` | Decoy TLS Record Injection: emits a decoy ClientHello record (whitelisted SNI) with an out-of-window TCP sequence number at the first data packet; record-parsing DPI sees only the decoy | ✅ Yes (WinDivert/NFQUEUE) | DPI that tracks TCP correctly but parses only TLS records |
 | `urg_sni_split` | Splicing a dummy byte into the middle of the real SNI and marking it with the TCP URG flag, so the server strips the byte while DPI reads a mangled name | ✅ Yes | Byte-scanning stateless DPI that ignores TCP urgent data |
 | `tls_frag` | TLS Fragment: writes selected client data in small TCP chunks without changing TLS bytes | ❌ No | DPI that inspects individual TCP segments |
 | `tls_padding` | TLS ClientHello Padding Expansion: inserts an RFC 7685 padding extension into the real ClientHello so the SNI lands past the DPI's inspection window (before SNI by default) or the record exceeds its buffer (after) | ❌ No | DPI that inspects only the first N bytes of the stream |
@@ -360,6 +361,7 @@ Combination limits:
 - `sni_boundary_frag` cannot be combined with `tls_record_frag` or
   `urg_sni_split`; it combines with the handshake fake-packet methods, and
   with `tls_frag`, `tls_padding`, and `mixed_case_sni`.
+- `fake_tls` cannot be combined with `tls_record_frag` or `urg_sni_split`.
 - `MODE = "ip_bypass_plus"` supports only `tls_record_frag`, `tls_frag`,
   `tls_padding`, `mixed_case_sni`, or `sni_boundary_frag` so the VPN client's
   real SNI is preserved.
@@ -386,6 +388,11 @@ How combinations behave:
   alongside other methods still uses packet interception; a list containing
   only `tls_frag`, `tls_padding`, `mixed_case_sni`, and/or
   `sni_boundary_frag` skips the interceptor entirely.
+- `fake_tls` adds a data-stage decoy record injection.  It combines with the
+  handshake-stage fake-packet methods and with `tls_frag`, `tls_padding`,
+  `mixed_case_sni`, and `sni_boundary_frag`, but it is mutually exclusive
+  with `tls_record_frag` and `urg_sni_split` (all three own the first data
+  packet).
 
 ---
 
@@ -414,6 +421,9 @@ Method behavior in more detail:
 - `wrong_timestamp` is ZeroDPI's snake_case name for sing-box's `wrong-timestamp` spoof behavior. It requires TCP timestamps on the intercepted flow and backdates `TSval` so PAWS rejects the forged segment.
 - `low_ttl` sends a valid decoy ClientHello carrying the selected whitelisted SNI but stamps it with a low IP TTL (`LOW_TTL_VALUE`). The decoy reaches an inline DPI middlebox and then expires, so the server never receives it; the real handshake completes via TCP retransmission. Tune `LOW_TTL_VALUE` to the DPI's hop distance (typically 4–8), or enable `LOW_TTL_DISCOVER` and let ZeroDPI find the correct value automatically.
 - `tls_record_frag` rewrites the real first TLS record into many smaller TLS records. The server should reassemble the TLS handshake normally.
+- `fake_tls` requires Administrator/root (WinDivert/NFQUEUE) and is IPv4-only.
+  With `FAKE_TLS_FORWARD_REAL = false` every connection pays roughly one TCP
+  retransmission timeout (~200 ms) while the real ClientHello is retransmitted.
 - `urg_sni_split` rewrites the real first TLS record, splicing a configurable dummy byte into the middle of the SNI and setting the TCP URG flag. The destination server's TCP stack extracts the urgent byte, so its TLS stream is the original ClientHello; DPI that reads raw bytes sees a mangled SNI.
 - `sni_boundary_frag` keeps the TLS bytes unchanged and writes the first ClientHello as exactly two TCP segments cut at the SNI extension boundary (`SNI_BOUNDARY_FRAG_SPLIT_POINT`), with a configurable delay between them (`SNI_BOUNDARY_FRAG_DELAY_MS`). It needs no packet interception when combined only with other socket-side methods (`tls_frag`, `tls_padding`, `mixed_case_sni`).
 - `tls_frag` keeps the TLS bytes unchanged and writes selected client data in small TCP chunks from the proxy. It can fragment a 1-based range of client writes such as `TLS_FRAG_PACKETS = "1-3"` or the first TLS ClientHello with `TLS_FRAG_PACKETS = "tlshello"`.

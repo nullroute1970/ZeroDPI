@@ -627,6 +627,47 @@ SNI_SPLIT_DUMMY_BYTE = 0
 SNI_SPLIT_POSITION = "middle"
 
 # ---------------------------------------------------------------------------
+# sni_boundary_frag method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "sni_boundary_frag" (alone or
+# combined with tls_frag / tls_padding / mixed_case_sni or the handshake
+# fake-packet methods wrong_seq, wrong_ack, wrong_checksum, wrong_md5,
+# wrong_timestamp, low_ttl).
+#
+# Unlike wrong_seq and tls_record_frag, this method does NOT use the
+# WinDivert / NFQUEUE packet interceptor when combined only with other
+# socket-side methods.  In combos with fake-packet methods, the fake packet
+# stage still requires packet interception, while these settings control how
+# the real ClientHello is written after the fake packet stage.
+#
+# The proxy parses the ClientHello down to the extension array, computes the
+# exact byte offset of the SNI extension, and writes the ClientHello as two
+# TCP segments cut at that boundary, with a small delay between them so
+# inline DPI reassembly buffers do not stitch them back together.
+
+# Where to cut the first ClientHello TCP write.
+#   "extension_length" — right after the server_name extension's 2-byte
+#                        length field; segment 2 starts with the extension
+#                        body (default)
+#   "middle"           — exact middle of the SNI domain string
+#                        (e.g. https://you | tube.com)
+#   N                  — after the Nth byte of the domain string (0-based),
+#                        clamped to the domain length
+SNI_BOUNDARY_FRAG_SPLIT_POINT = "extension_length"
+
+# Delay between the two TCP segments, in milliseconds.
+#
+# Accepts either a fixed integer or an inclusive range string:
+#   5        — always wait 5 ms
+#   "5-10"   — randomly choose 5 through 10 ms per connection
+#   0        — send both segments back-to-back
+#
+# A fresh value is chosen per connection.
+#
+# Must be >= 0.  Default: "5-10".
+SNI_BOUNDARY_FRAG_DELAY_MS = "5-10"
+
+# ---------------------------------------------------------------------------
 # tls_frag method parameters
 # ---------------------------------------------------------------------------
 # These settings apply when BYPASS_METHOD = "tls_frag" or when "tls_frag" is

@@ -1295,7 +1295,7 @@ fn verify_data_plane_uid(_expected_uid: u32) -> Result<()> {
 
 fn root_required_message(cfg: &Config) -> String {
     format!(
-        "MODE = \"{}\" with BYPASS_METHOD = \"{}\" requires packet interception; on Android the app must start the packaged root helper while keeping the data plane under the app UID. Rootless alternatives are MODE = \"ip_bypass\", scan-only modes, or BYPASS_METHOD = \"tls_frag\" / \"tls_padding\" / \"mixed_case_sni\" where supported.",
+        "MODE = \"{}\" with BYPASS_METHOD = \"{}\" requires packet interception; on Android the app must start the packaged root helper while keeping the data plane under the app UID. Rootless alternatives are MODE = \"ip_bypass\", scan-only modes, or BYPASS_METHOD = \"tls_frag\" / \"tls_padding\" / \"mixed_case_sni\" / \"sni_boundary_frag\" where supported.",
         cfg.MODE, cfg.BYPASS_METHOD
     )
 }
@@ -1308,6 +1308,7 @@ fn rootless_alternatives() -> Vec<String> {
         "BYPASS_METHOD = \"tls_frag\" for supported relay modes".to_owned(),
         "BYPASS_METHOD = \"tls_padding\" for supported relay modes".to_owned(),
         "BYPASS_METHOD = \"mixed_case_sni\" for supported relay modes".to_owned(),
+        "BYPASS_METHOD = \"sni_boundary_frag\" for supported relay modes".to_owned(),
     ]
 }
 

@@ -759,6 +759,32 @@ pub struct Config {
     pub TLS_RECORD_FRAG_BUMP_IP_IDENT: bool,
 
     // -----------------------------------------------------------------------
+    // fake_tls method parameters
+    // -----------------------------------------------------------------------
+    /// Extra bytes subtracted from the decoy record's injected TCP sequence
+    /// number on top of the decoy payload length. The decoy is placed at
+    /// `syn_seq + 1 - payload_len - FAKE_TLS_EXTRA_OFFSET`, i.e. behind the
+    /// server's receive window.  Default: `0`.
+    #[serde(default)]
+    pub FAKE_TLS_EXTRA_OFFSET: u32,
+
+    /// Whether to set the TCP `PSH` flag on the decoy record packet.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub FAKE_TLS_SET_PSH: bool,
+
+    /// Whether to increment the IPv4 `Identification` field on the decoy
+    /// record packet.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub FAKE_TLS_BUMP_IP_IDENT: bool,
+
+    /// Whether to signal the bypass phase complete immediately after the
+    /// decoy record is emitted. When `false`, the flow waits for the server
+    /// to acknowledge the first data packet.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub FAKE_TLS_COMPLETE_IMMEDIATELY: bool,
+
+    // -----------------------------------------------------------------------
     // urg_sni_split method parameters
     // -----------------------------------------------------------------------
     /// The 1-byte dummy payload `urg_sni_split` inserts into the middle of the
@@ -2074,6 +2100,36 @@ mod tests {
         assert_eq!(cfg.TLS_RECORD_FRAG_SIZE, 5);
         assert!(!cfg.TLS_RECORD_FRAG_SET_PSH);
         assert!(!cfg.TLS_RECORD_FRAG_BUMP_IP_IDENT);
+    }
+
+    #[test]
+    fn parses_fake_tls_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.FAKE_TLS_EXTRA_OFFSET, 0);
+        assert!(cfg.FAKE_TLS_SET_PSH);
+        assert!(cfg.FAKE_TLS_BUMP_IP_IDENT);
+        assert!(cfg.FAKE_TLS_COMPLETE_IMMEDIATELY);
+    }
+
+    #[test]
+    fn parses_fake_tls_overrides() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               FAKE_TLS_EXTRA_OFFSET = 33
+               FAKE_TLS_SET_PSH = false
+               FAKE_TLS_BUMP_IP_IDENT = false
+               FAKE_TLS_COMPLETE_IMMEDIATELY = false"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.FAKE_TLS_EXTRA_OFFSET, 33);
+        assert!(!cfg.FAKE_TLS_SET_PSH);
+        assert!(!cfg.FAKE_TLS_BUMP_IP_IDENT);
+        assert!(!cfg.FAKE_TLS_COMPLETE_IMMEDIATELY);
     }
 
     #[test]

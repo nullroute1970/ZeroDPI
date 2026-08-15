@@ -785,6 +785,16 @@ pub struct Config {
     pub TLS_PADDING_POSITION: String,
 
     // -----------------------------------------------------------------------
+    // mixed_case_sni method parameters
+    // -----------------------------------------------------------------------
+    /// When `true`, every ASCII letter in the SNI hostname is case-inverted
+    /// (`a` → `A`, `A` → `a`).  When `false` (default), each letter is
+    /// randomly uppercased or lowercased per connection, with a guaranteed
+    /// minimum of one flipped letter.
+    #[serde(default)]
+    pub MIXED_CASE_SNI_FLIP_ALL: bool,
+
+    // -----------------------------------------------------------------------
     // Proxy timing
     // -----------------------------------------------------------------------
     /// How many seconds the proxy waits for the intercept thread to confirm

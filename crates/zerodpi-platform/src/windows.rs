@@ -99,6 +99,13 @@ impl PacketInterceptor for WinDivertInterceptor {
                     if let Err(e) = self.divert.send(&new_pkt) {
                         debug!(error = %e, "modified send failed");
                     }
+                    // Dual emission (fake_tls FAKE_TLS_FORWARD_REAL): after
+                    // the decoy, forward the original packet unchanged.
+                    if view.emit_original_after {
+                        if let Err(e) = self.divert.send(&packet) {
+                            debug!(error = %e, "original-after-modified send failed");
+                        }
+                    }
                 }
             }
         }

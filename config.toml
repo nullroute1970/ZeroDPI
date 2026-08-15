@@ -247,6 +247,17 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     extension.  "after" appends the padding at the end of the extension
 #     list instead.
 #
+#   "mixed_case_sni"
+#     SNI Case Randomization.  Does NOT inject fake packets and does NOT use
+#     WinDivert or NFQUEUE packet interception.  Randomizes the ASCII letter
+#     case of the hostname inside the SNI extension of the client's real TLS
+#     ClientHello (e.g. wikipedia.org -> wIkIpeDiA.oRg).  Per RFC 6066 the
+#     SNI hostname is case-insensitive: destination servers lowercase it
+#     during lookup, so the handshake completes normally, while DPI that
+#     matches blocklists with exact case-sensitive string comparisons misses
+#     the name.  Digits, dots, and hyphens are never changed (safe for
+#     punycode SNIs).
+#
 # Common combinations (written as lists):
 #
 #   ["wrong_seq", "wrong_md5"]        -> fake ClientHello with old TCP seq + TCP-MD5
@@ -269,8 +280,12 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   expanded with an RFC 7685 padding extension before it is written to the
 #   upstream socket.  It combines with handshake-stage methods and with
 #   "tls_frag" (pad first, then fragment).
-# - A list containing only "tls_frag" and/or "tls_padding" skips the packet
-#   interceptor entirely.
+# - "mixed_case_sni" adds a socket-side data stage that randomizes the
+#   SNI case in the real ClientHello.  It combines with handshake-stage
+#   methods, with "tls_frag", and with "tls_padding" (pad first, then
+#   randomize).
+# - A list containing only "tls_frag", "tls_padding", and/or
+#   "mixed_case_sni" skips the packet interceptor entirely.
 #
 # Limitations:
 #
@@ -279,8 +294,9 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 # - "urg_sni_split" can only be used alone or together with "tls_frag" /
 #   "tls_record_frag"; it cannot be combined with other handshake-stage
 #   methods.
-# - MODE = "ip_bypass_plus" supports only "tls_record_frag", "tls_frag", or
-#   "tls_padding" so the upstream VPN client's real SNI is preserved.
+# - MODE = "ip_bypass_plus" supports only "tls_record_frag", "tls_frag",
+#   "tls_padding", or "mixed_case_sni" so the upstream VPN client's real SNI
+#   is preserved.
 # - LOW_TTL_DISCOVER only takes effect when "low_ttl" is in the list;
 #   otherwise discovery is silently skipped.
 #
@@ -684,6 +700,18 @@ TLS_PADDING_SIZE = "1500-2500"
 #              past the DPI's inspection window (default)
 #   "after"  — at the end of the extension list (canonical RFC 7685 placement)
 TLS_PADDING_POSITION = "before"
+
+# ---------------------------------------------------------------------------
+# mixed_case_sni method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "mixed_case_sni" (alone or
+# combined).
+
+# When true, every ASCII letter in the SNI hostname is case-inverted
+# (a -> A, A -> a).  When false (default), each letter is randomly
+# uppercased or lowercased per connection, with at least one letter
+# guaranteed to differ from the original.
+MIXED_CASE_SNI_FLIP_ALL = false
 
 # Legacy fixed fragment length fallback.
 #

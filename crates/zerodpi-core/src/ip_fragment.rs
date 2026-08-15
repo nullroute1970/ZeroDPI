@@ -45,7 +45,7 @@ pub fn fragment_ipv4_packet(bytes: &[u8], frag_size: usize) -> Vec<Vec<u8>> {
     }
 
     let ident = [bytes[4], bytes[5]];
-    let mut fragments = Vec::with_capacity((payload.len() + chunk - 1) / chunk);
+    let mut fragments = Vec::with_capacity(payload.len().div_ceil(chunk));
     let mut offset = 0usize;
     for part in payload.chunks(chunk) {
         let mut frag = Vec::with_capacity(ihl + part.len());

@@ -207,10 +207,7 @@ impl PacketHandler for Handler {
                         } => {
                             state.first_data_modified = true;
                             state.waiting_for_data = false;
-                            trace!(
-                                method = self.method.name(),
-                                "modified outbound data packet"
-                            );
+                            trace!(method = self.method.name(), "modified outbound data packet");
                             if continue_with_data {
                                 // Fragment-all mode (ip_frag with
                                 // IP_FRAG_ONLY_FIRST_PACKET = false): signal

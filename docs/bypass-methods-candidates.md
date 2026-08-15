@@ -180,6 +180,12 @@ validation.
 
 ### 4.2 `ip_frag` — IP-layer fragmentation *(high value, medium effort)*
 
+**Status (2026-08-15):** Implemented (`ip_frag`, interceptor, data stage,
+multi-fragment emission via raw socket on Linux/Android NFQUEUE and
+WinDivert on Windows, with fragment-all mode via
+`IP_FRAG_ONLY_FIRST_PACKET = false`; requires the shared multi-packet
+emission plumbing, which `disorder` can now reuse).
+
 **Overview.** Fragment the first outbound data packet (the one carrying the
 ClientHello) at the IP layer into small fragments (e.g. 8–32 bytes).
 
@@ -428,9 +434,8 @@ Build in this order:
    stacks.
 2. **`ccs_prefix`** — a few hours of work, platform-neutral, and gives
    Termux/Android users a new non-root option.
-3. **`ip_frag`** — highest new-axis value; bundle it with the
-   multi-packet emission plumbing so `disorder` (4) becomes cheap
-   follow-up.
+3. **`ip_frag`** — ✅ implemented, including the multi-packet emission
+   plumbing, so `disorder` (4) becomes cheap follow-up.
 4. **`disorder`** — reuse the emission plumbing.
 5. **`tls_record_split`** / **`tcp_opt_pad`** — cheap additions once the
    pattern for socket-side and option-staging methods is established.

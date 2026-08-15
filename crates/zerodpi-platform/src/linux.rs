@@ -1518,7 +1518,10 @@ mod tests {
         // Every fragment header checksum is valid.
         for frag in &fragments {
             let parsed = etherparse::Ipv4HeaderSlice::from_slice(frag).unwrap();
-            assert_eq!(parsed.header_checksum(), parsed.calc_header_checksum());
+            assert_eq!(
+                parsed.header_checksum(),
+                parsed.to_header().calc_header_checksum()
+            );
         }
     }
 }

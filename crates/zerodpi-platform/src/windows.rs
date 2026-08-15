@@ -80,30 +80,54 @@ impl PacketInterceptor for WinDivertInterceptor {
                             continue;
                         }
                     };
-                    let mut new_pkt = WinDivertPacket::<NetworkLayer> {
-                        address: packet.address.clone(),
-                        data: Cow::Owned(new_bytes),
-                    };
-                    if let Err(e) = new_pkt.recalculate_checksums(ChecksumFlags::default()) {
-                        warn!(error = %e, "recalculate_checksums failed");
-                    }
-                    if let Some(delta) = view.corrupt_tcp_checksum_delta {
-                        if let Err(e) = corrupt_tcp_checksum(
-                            new_pkt.data.to_mut().as_mut_slice(),
-                            &layout,
-                            delta,
-                        ) {
-                            warn!(error = %e, "failed to corrupt TCP checksum");
+                    if let Some(frag_size) = view.ip_frag_payload_size {
+                        // Split the rebuilt packet into IPv4 fragments and
+                        // reinject each one; the original is dropped (never
+                        // reinjected) so the fragments replace it on the
+                        // wire. build_modified already computed valid IP/TCP
+                        // checksums and the fragmenter recomputes the
+                        // per-fragment IP header checksums —
+                        // recalculate_checksums must not run on fragments
+                        // (the TCP checksum lives inside fragment 1's
+                        // payload only).
+                        let fragments =
+                            zerodpi_core::ip_fragment::fragment_ipv4_packet(&new_bytes, frag_size);
+                        for frag in &fragments {
+                            let frag_pkt = WinDivertPacket::<NetworkLayer> {
+                                address: packet.address.clone(),
+                                data: Cow::Owned(frag.clone()),
+                            };
+                            if let Err(e) = self.divert.send(&frag_pkt) {
+                                debug!(error = %e, "fragment send failed");
+                            }
                         }
-                    }
-                    if let Err(e) = self.divert.send(&new_pkt) {
-                        debug!(error = %e, "modified send failed");
-                    }
-                    // Dual emission (fake_tls FAKE_TLS_FORWARD_REAL): after
-                    // the decoy, forward the original packet unchanged.
-                    if view.emit_original_after {
-                        if let Err(e) = self.divert.send(&packet) {
-                            debug!(error = %e, "original-after-modified send failed");
+                    } else {
+                        let mut new_pkt = WinDivertPacket::<NetworkLayer> {
+                            address: packet.address.clone(),
+                            data: Cow::Owned(new_bytes),
+                        };
+                        if let Err(e) = new_pkt.recalculate_checksums(ChecksumFlags::default()) {
+                            warn!(error = %e, "recalculate_checksums failed");
+                        }
+                        if let Some(delta) = view.corrupt_tcp_checksum_delta {
+                            if let Err(e) = corrupt_tcp_checksum(
+                                new_pkt.data.to_mut().as_mut_slice(),
+                                &layout,
+                                delta,
+                            ) {
+                                warn!(error = %e, "failed to corrupt TCP checksum");
+                            }
+                        }
+                        if let Err(e) = self.divert.send(&new_pkt) {
+                            debug!(error = %e, "modified send failed");
+                        }
+                        // Dual emission (fake_tls FAKE_TLS_FORWARD_REAL):
+                        // after the decoy, forward the original packet
+                        // unchanged.
+                        if view.emit_original_after {
+                            if let Err(e) = self.divert.send(&packet) {
+                                debug!(error = %e, "original-after-modified send failed");
+                            }
                         }
                     }
                 }
@@ -628,5 +652,51 @@ mod tests {
         tcp.set_options_raw(&[1; 24]).unwrap();
         let err = append_tcp_options(&mut tcp, &tcp_md5_signature_option()).unwrap_err();
         assert!(err.to_string().contains("TCP options would exceed"));
+    }
+
+    #[test]
+    fn build_modified_splits_into_ip_fragments() {
+        use etherparse::{IpNumber, Ipv4Header, TcpHeader};
+        use zerodpi_core::ip_fragment::fragment_ipv4_packet;
+
+        let mut ip = Ipv4Header::new(20, 64, IpNumber::TCP, [10, 0, 0, 1], [1, 2, 3, 4]).unwrap();
+        ip.identification = 0x1234;
+        ip.header_checksum = ip.calc_header_checksum();
+        let mut tcp = TcpHeader::new(12345, 443, 1001, 65535);
+        tcp.acknowledgment_number = 5001;
+        tcp.ack = true;
+        tcp.checksum = tcp.calc_checksum_ipv4(&ip, &[0xAB; 517]).unwrap();
+        let mut buf = Vec::new();
+        ip.write(&mut buf).unwrap();
+        tcp.write(&mut buf).unwrap();
+        buf.extend_from_slice(&[0xAB; 517]);
+
+        let layout = PacketLayout {
+            ip_hdr_len: ip.header_len(),
+            tcp_hdr_len: tcp.header_len(),
+            payload_off: ip.header_len() + tcp.header_len(),
+            total_len: buf.len(),
+        };
+        let mut view = make_view();
+        view.ip_frag_payload_size = Some(24);
+
+        let out = build_modified(&buf, &layout, &view).unwrap();
+        let fragments = fragment_ipv4_packet(&out, 24);
+        assert!(fragments.len() > 1);
+
+        let mut reassembled = Vec::new();
+        for frag in &fragments {
+            let ihl = usize::from(frag[0] & 0x0F) * 4;
+            reassembled.extend_from_slice(&frag[ihl..]);
+        }
+        assert_eq!(reassembled, out[20..]);
+
+        for frag in &fragments {
+            let parsed = etherparse::Ipv4HeaderSlice::from_slice(frag).unwrap();
+            assert_eq!(
+                parsed.header_checksum(),
+                parsed.to_header().calc_header_checksum()
+            );
+        }
     }
 }

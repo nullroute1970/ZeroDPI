@@ -118,8 +118,8 @@ lose) against implementation cost in ZeroDPI's architecture.
 ### 4.1 `fake_tls` — decoy TLS record injection *(high value, medium effort)*
 
 **Status (2026-08-16):** Variant A implemented (`fake_tls`, interceptor,
-data stage, with optional dual-packet emission). Variant B remains a
-not-implemented follow-up candidate.
+data stage, dual-packet emission with `FAKE_TLS_FORWARD_REAL`). Variant B
+remains a not-implemented follow-up candidate.
 
 **Overview.** Inject a decoy TLS record containing a ClientHello with a
 whitelisted/benign SNI so that the DPI keys its classification on the decoy,

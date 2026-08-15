@@ -424,6 +424,12 @@ Method behavior in more detail:
 - `fake_tls` requires Administrator/root (WinDivert/NFQUEUE) and is IPv4-only.
   With `FAKE_TLS_FORWARD_REAL = false` every connection pays roughly one TCP
   retransmission timeout (~200 ms) while the real ClientHello is retransmitted.
+  With `FAKE_TLS_FORWARD_REAL = true` (default) the decoy goes out first and
+  the real ClientHello is forwarded immediately after it — no added latency.
+  WinDivert sends both packets; on Linux/Android the decoy is injected
+  through a raw IP socket in the root helper.  If the raw socket is
+  unavailable, ZeroDPI logs a warning and falls back to single-packet mode
+  (retransmission path).
 - `urg_sni_split` rewrites the real first TLS record, splicing a configurable dummy byte into the middle of the SNI and setting the TCP URG flag. The destination server's TCP stack extracts the urgent byte, so its TLS stream is the original ClientHello; DPI that reads raw bytes sees a mangled SNI.
 - `sni_boundary_frag` keeps the TLS bytes unchanged and writes the first ClientHello as exactly two TCP segments cut at the SNI extension boundary (`SNI_BOUNDARY_FRAG_SPLIT_POINT`), with a configurable delay between them (`SNI_BOUNDARY_FRAG_DELAY_MS`). It needs no packet interception when combined only with other socket-side methods (`tls_frag`, `tls_padding`, `mixed_case_sni`).
 - `tls_frag` keeps the TLS bytes unchanged and writes selected client data in small TCP chunks from the proxy. It can fragment a 1-based range of client writes such as `TLS_FRAG_PACKETS = "1-3"` or the first TLS ClientHello with `TLS_FRAG_PACKETS = "tlshello"`.

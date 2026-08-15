@@ -688,6 +688,20 @@ FAKE_TLS_BUMP_IP_IDENT = true
 # before releasing the flow.
 FAKE_TLS_COMPLETE_IMMEDIATELY = true
 
+# Whether to forward the original first data packet (the real ClientHello)
+# immediately after the decoy record is emitted.
+#
+# true (default)  — dual emission: the decoy goes out, then the real
+#                   ClientHello follows immediately.  No added latency.
+#                   WinDivert sends both packets; on Linux/Android the decoy
+#                   is injected through a raw socket (root).  If the raw
+#                   socket is unavailable, ZeroDPI logs a warning and falls
+#                   back to single-packet mode.
+# false           — the first data packet itself becomes the decoy; the real
+#                   ClientHello reaches the server via TCP retransmission
+#                   (adds roughly one retransmission timeout, ~200 ms).
+FAKE_TLS_FORWARD_REAL = true
+
 # ---------------------------------------------------------------------------
 # urg_sni_split method parameters
 # ---------------------------------------------------------------------------

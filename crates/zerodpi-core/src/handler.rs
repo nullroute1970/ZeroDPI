@@ -200,12 +200,14 @@ impl PacketHandler for Handler {
                             state.waiting_for_data = false;
                             trace!(
                                 method = self.method.name(),
-                                "fragmented first data packet; signalling bypass complete"
+                                "modified first data packet; signalling bypass complete"
                             );
                             if complete_immediately {
                                 // Signal completion immediately — no inbound ACK needed.
                                 drop(state);
                                 entry.finish(BypassOutcome::FakeDataAcked);
+                            } else {
+                                state.waiting_for_first_data_ack = true;
                             }
                             return Verdict::AcceptModified;
                         }
@@ -225,6 +227,13 @@ impl PacketHandler for Handler {
                             return Verdict::Accept;
                         }
                     }
+                }
+                // A data-stage method emitted a modified first data packet with
+                // complete_immediately = false; let subsequent outbound data
+                // (retransmissions or the forwarded original) pass while we
+                // wait for the server's ACK.
+                if state.waiting_for_first_data_ack {
+                    return Verdict::Accept;
                 }
                 self.unexpected(&entry, &mut state, pkt, "unexpected outbound packet")
             }
@@ -288,6 +297,30 @@ impl PacketHandler for Handler {
                     entry.finish(BypassOutcome::FakeDataAcked);
                     return Verdict::Accept;
                 }
+                if state.waiting_for_first_data_ack && pkt.is_bare_ack() {
+                    let syn_ack_seq = state.syn_ack_seq.expect("checked above via syn_seq");
+                    if pkt.seq != syn_ack_seq.wrapping_add(1) {
+                        return self.unexpected(
+                            &entry,
+                            &mut state,
+                            pkt,
+                            "inbound first-data ACK seq mismatch",
+                        );
+                    }
+                    let syn_seq = state.syn_seq.expect("checked above via syn_seq");
+                    if pkt.ack.wrapping_sub(syn_seq.wrapping_add(1)) > 0 {
+                        trace!(
+                            method = self.method.name(),
+                            "server acknowledged the modified first data packet"
+                        );
+                        state.waiting_for_first_data_ack = false;
+                        drop(state);
+                        entry.finish(BypassOutcome::FakeDataAcked);
+                    }
+                    // A non-advancing duplicate ACK (the server discarding the
+                    // out-of-window decoy) keeps the flow waiting.
+                    return Verdict::Accept;
+                }
                 self.unexpected(&entry, &mut state, pkt, "unexpected inbound packet")
             }
         }
@@ -304,6 +337,7 @@ mod tests {
     use crate::flow::{new_flow_table, BypassOutcome, FlowEntry, FlowKey};
     use crate::interceptor::{Direction, PacketView, TcpFlags};
     use crate::methods::build_method;
+    use crate::methods::fake_tls::FakeTls;
     use crate::methods::low_ttl::LowTtl;
     use crate::methods::tls_record_frag::TlsRecordFrag;
     use crate::methods::urg_sni_split::UrgSniSplit;
@@ -1408,5 +1442,135 @@ mod tests {
             entry.state.lock().outcome,
             Some(BypassOutcome::UnexpectedClose)
         );
+    }
+
+    fn fake_tls_waiting_cfg() -> Config {
+        toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               FAKE_TLS_COMPLETE_IMMEDIATELY = false"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn data_stage_wait_for_ack_completes_on_advancing_ack() {
+        let flows = new_flow_table();
+        let key = FlowKey {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            dst_port: 443,
+        };
+        let entry = FlowEntry::new(vec![0u8; 517], None);
+        flows.insert(key, entry.clone());
+        let mut h = Handler::new(flows, Arc::new(FakeTls::new(&fake_tls_waiting_cfg())));
+
+        // SYN
+        let mut syn = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            1000,
+            0,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut syn), Verdict::Accept);
+        // SYN-ACK
+        let mut syn_ack = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                syn: true,
+                ack: true,
+                ..Default::default()
+            },
+            2000,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut syn_ack), Verdict::Accept);
+        // handshake-complete ACK: method defers to the data stage
+        let mut ack = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            1001,
+            2001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut ack), Verdict::Accept);
+        assert!(entry.state.lock().waiting_for_data);
+
+        // first data packet: decoy staged, complete_immediately = false
+        let mut data = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001,
+            2001,
+            517,
+        );
+        assert_eq!(h.on_packet(&mut data), Verdict::AcceptModified);
+        {
+            let s = entry.state.lock();
+            assert!(s.first_data_modified);
+            assert!(s.waiting_for_first_data_ack);
+            assert!(s.outcome.is_none());
+        }
+
+        // outbound retransmission of the real ClientHello must pass through
+        let mut retrans = pkt(
+            Direction::Outbound,
+            TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            1001,
+            2001,
+            517,
+        );
+        assert_eq!(h.on_packet(&mut retrans), Verdict::Accept);
+        assert!(entry.state.lock().outcome.is_none());
+
+        // server's dup-ACK for the discarded decoy (ack == syn_seq + 1):
+        // does not advance; keep waiting
+        let mut dup_ack = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            2001,
+            1001,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut dup_ack), Verdict::Accept);
+        assert!(entry.state.lock().outcome.is_none());
+
+        // advancing ACK (ack == syn_seq + 1 + 517): bypass complete
+        let mut advance = pkt(
+            Direction::Inbound,
+            TcpFlags {
+                ack: true,
+                ..Default::default()
+            },
+            2001,
+            1001 + 517,
+            0,
+        );
+        assert_eq!(h.on_packet(&mut advance), Verdict::Accept);
+        assert_eq!(
+            entry.state.lock().outcome,
+            Some(BypassOutcome::FakeDataAcked)
+        );
+        assert!(!entry.state.lock().waiting_for_first_data_ack);
     }
 }

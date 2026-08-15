@@ -63,6 +63,10 @@ pub struct FlowState {
     /// True once the first outbound data packet has been modified by a
     /// first-data-stage method.
     pub first_data_modified: bool,
+    /// True while a data-stage method emitted a modified first data packet
+    /// with `complete_immediately = false` and we are waiting for the
+    /// server's ACK of that packet's payload before finishing the flow.
+    pub waiting_for_first_data_ack: bool,
     /// Final outcome, set when [`Self::notify`] fires.
     pub outcome: Option<BypassOutcome>,
     /// Spoofed TLS ClientHello payload to inject. Built once per flow.
@@ -83,6 +87,7 @@ impl FlowState {
             fake_sent: false,
             waiting_for_data: false,
             first_data_modified: false,
+            waiting_for_first_data_ack: false,
             outcome: None,
             fake_data,
             low_ttl_override,

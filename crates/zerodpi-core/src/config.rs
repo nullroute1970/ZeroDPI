@@ -245,6 +245,7 @@ pub const BASE_BYPASS_METHODS: &[&str] = &[
     "wrong_timestamp",
     "low_ttl",
     "tls_record_frag",
+    "fake_tls",
     "tls_frag",
     "tls_padding",
     "mixed_case_sni",
@@ -1333,11 +1334,20 @@ impl Config {
                                 | "wrong_md5"
                                 | "wrong_timestamp"
                                 | "low_ttl"
+                                | "fake_tls"
                         )
                 })
             {
                 anyhow::bail!(
                     "BYPASS_METHOD \"sni_boundary_frag\" cannot be combined with \"tls_record_frag\" or \"urg_sni_split\""
+                );
+            }
+            if self.BYPASS_METHOD.contains("fake_tls")
+                && (self.BYPASS_METHOD.contains("tls_record_frag")
+                    || self.BYPASS_METHOD.contains("urg_sni_split"))
+            {
+                anyhow::bail!(
+                    "BYPASS_METHOD \"fake_tls\" cannot be combined with \"tls_record_frag\" or \"urg_sni_split\""
                 );
             }
         }
@@ -2141,6 +2151,62 @@ mod tests {
             TLS_RECORD_FRAG_SIZE = 0
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_fake_tls_with_tls_record_frag() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = ["fake_tls", "tls_record_frag"]"#,
+        )
+        .unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_fake_tls_with_urg_sni_split() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = ["fake_tls", "urg_sni_split"]"#,
+        )
+        .unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_fake_tls_combos() {
+        for method in [
+            r#""fake_tls""#,
+            r#"["fake_tls", "wrong_seq"]"#,
+            r#"["fake_tls", "low_ttl"]"#,
+            r#"["fake_tls", "tls_frag"]"#,
+            r#"["fake_tls", "tls_padding"]"#,
+            r#"["fake_tls", "mixed_case_sni"]"#,
+            r#"["fake_tls", "sni_boundary_frag"]"#,
+            r#"["fake_tls", "wrong_seq", "tls_padding"]"#,
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   BYPASS_METHOD = {method}"#
+            ))
+            .unwrap();
+            cfg.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn ip_bypass_plus_rejects_fake_tls() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               MODE = "ip_bypass_plus"
+               BYPASS_METHOD = "fake_tls""#,
+        )
+        .unwrap();
         assert!(cfg.validate().is_err());
     }
 

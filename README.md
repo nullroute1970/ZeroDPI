@@ -53,7 +53,7 @@ It is not a replacement VPN client. It is a local TCP relay that your existing V
 
 | Feature | Description |
 |---------|-------------|
-| 🧩 **13 combinable bypass methods** | `wrong_seq`, `wrong_ack`, `wrong_checksum`, `wrong_md5`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `fake_tls`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `urg_sni_split`, `sni_boundary_frag` — combinable via `BYPASS_METHOD = ["wrong_seq", "tls_frag"]` |
+| 🧩 **14 combinable bypass methods** | `wrong_seq`, `wrong_ack`, `wrong_checksum`, `wrong_md5`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `fake_tls`, `ip_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `urg_sni_split`, `sni_boundary_frag` — combinable via `BYPASS_METHOD = ["wrong_seq", "tls_frag"]` |
 | 🎯 **6 operating modes** | `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan` |
 | 🖥️ **TUI dashboard** | Ratatui-powered live progress, selection tables, and connection monitoring |
 | 🔄 **Auto-rescan** | Background re-scanning hot-swaps the best target without restart |
@@ -227,7 +227,7 @@ Copy or deploy the whole generated directory, not only the binary.
 |------|------------------|-------|
 | Bypass DPI for a TLS VPN behind a CDN | `sni_spoof` | Best default. Scans SNI candidates, selects an SNI/IP pair, then relays VPN traffic. |
 | Use a scanned relay IP without SNI spoofing | `ip_bypass` | No packet interception. Useful when you have IPs or CIDR ranges to test directly. |
-| Use a scanned IPv4 plus real-SNI fragmentation | `ip_bypass_plus` | Preserves the VPN client's real SNI; supports only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, or `sni_boundary_frag`. |
+| Use a scanned IPv4 plus real-SNI fragmentation | `ip_bypass_plus` | Preserves the VPN client's real SNI; supports only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, or `ip_frag`. |
 | Audit SNI candidates only | `sni_scan` | Runs the SNI scanner, displays or saves results, then exits. |
 | Audit IP/CIDR candidates only | `ip_scan` | Runs the IP scanner, displays or saves results, then exits. |
 | Measure real VPN performance through an existing SOCKS5 client | `proxy_scan` | Tests candidates through V2RayN/sing-box and blends scanner score with end-to-end proxy results. |
@@ -240,7 +240,7 @@ Mode-specific inputs:
 |------|:---:|:---:|:---:|:---:|
 | `sni_spoof` | Yes, unless `SELECTED_SNI` is set | No | Yes | Yes |
 | `ip_bypass` | No | Yes, unless `SELECTED_IP` is set | Yes | No |
-| `ip_bypass_plus` | No | Yes, unless `SELECTED_IP` is set | Yes | Yes, only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, or `sni_boundary_frag` |
+| `ip_bypass_plus` | No | Yes, unless `SELECTED_IP` is set | Yes | Yes, only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, or `ip_frag` |
 | `sni_scan` | Yes | No | No | No relay; scan only |
 | `ip_scan` | No | Yes | No | No |
 | `proxy_scan` | Yes | No | Temporary per-candidate tests | Yes, except standalone proxy scoring still depends on your SOCKS5 proxy |
@@ -279,7 +279,7 @@ No packet interception, no SNI manipulation. Scans a list of IPs (or CIDR ranges
 
 ### 3️⃣ `ip_bypass_plus` — IP Relay Plus Real-SNI Fragmentation
 
-Scans an IPv4 list, selects a target, then relays the VPN client's real TLS stream while applying a bypass method that does not inject or replace SNI. Use `BYPASS_METHOD = "tls_record_frag"` for TLS-record fragmentation with WinDivert/NFQUEUE, or `BYPASS_METHOD = "tls_frag"` / `BYPASS_METHOD = "tls_padding"` / `BYPASS_METHOD = "mixed_case_sni"` / `BYPASS_METHOD = "sni_boundary_frag"` for socket-only transforms.
+Scans an IPv4 list, selects a target, then relays the VPN client's real TLS stream while applying a bypass method that does not inject or replace SNI. Use `BYPASS_METHOD = "tls_record_frag"` for TLS-record fragmentation with WinDivert/NFQUEUE, `BYPASS_METHOD = "ip_frag"` for IP-layer fragmentation with WinDivert/NFQUEUE, or `BYPASS_METHOD = "tls_frag"` / `BYPASS_METHOD = "tls_padding"` / `BYPASS_METHOD = "mixed_case_sni"` / `BYPASS_METHOD = "sni_boundary_frag"` for socket-only transforms.
 
 ```
 🖥️ Local apps → 🌐 VPN App → 🔄 ZeroDPI (ip_bypass_plus) → 🌍 Selected IPv4 :443
@@ -331,6 +331,7 @@ Results are blended using a configurable weight and displayed in the TUI.
 | `low_ttl` | Injects fake ClientHello (whitelisted SNI) with a low IP TTL so only the DPI middlebox sees it | ✅ Yes | DPI sitting between client and server on TTL-visible networks |
 | `tls_record_frag` | TLS Record Fragment: splits the real ClientHello record body into multiple tiny TLS records | ✅ Yes | DPI that can't reassemble TLS records |
 | `fake_tls` | Decoy TLS Record Injection: emits a decoy ClientHello record (whitelisted SNI) with an out-of-window TCP sequence number at the first data packet; record-parsing DPI sees only the decoy | ✅ Yes (WinDivert/NFQUEUE) | DPI that tracks TCP correctly but parses only TLS records |
+| `ip_frag` | IP-Layer Fragment: splits the first outbound data packet (the real ClientHello) into small IPv4 fragments the server's kernel reassembles but fragmentation-blind DPI cannot read | ✅ Yes (WinDivert/NFQUEUE) | DPI that does not reassemble IP fragments |
 | `urg_sni_split` | Splicing a dummy byte into the middle of the real SNI and marking it with the TCP URG flag, so the server strips the byte while DPI reads a mangled name | ✅ Yes | Byte-scanning stateless DPI that ignores TCP urgent data |
 | `tls_frag` | TLS Fragment: writes selected client data in small TCP chunks without changing TLS bytes | ❌ No | DPI that inspects individual TCP segments |
 | `tls_padding` | TLS ClientHello Padding Expansion: inserts an RFC 7685 padding extension into the real ClientHello so the SNI lands past the DPI's inspection window (before SNI by default) or the record exceeds its buffer (after) | ❌ No | DPI that inspects only the first N bytes of the stream |
@@ -362,9 +363,11 @@ Combination limits:
   `urg_sni_split`; it combines with the handshake fake-packet methods, and
   with `tls_frag`, `tls_padding`, and `mixed_case_sni`.
 - `fake_tls` cannot be combined with `tls_record_frag` or `urg_sni_split`.
+- `ip_frag` cannot be combined with `tls_record_frag`, `fake_tls`, or
+  `urg_sni_split`.
 - `MODE = "ip_bypass_plus"` supports only `tls_record_frag`, `tls_frag`,
-  `tls_padding`, `mixed_case_sni`, or `sni_boundary_frag` so the VPN client's
-  real SNI is preserved.
+  `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, or `ip_frag` so the
+  VPN client's real SNI is preserved.
 - `LOW_TTL_DISCOVER` only takes effect when `low_ttl` is in the list;
   otherwise discovery is silently skipped.
 
@@ -393,6 +396,11 @@ How combinations behave:
   `mixed_case_sni`, and `sni_boundary_frag`, but it is mutually exclusive
   with `tls_record_frag` and `urg_sni_split` (all three own the first data
   packet).
+- `ip_frag` adds a data-stage IP fragmentation.  It combines with the
+  handshake-stage fake-packet methods and with `tls_frag`, `tls_padding`,
+  `mixed_case_sni`, and `sni_boundary_frag`, but it is mutually exclusive
+  with `tls_record_frag`, `fake_tls`, and `urg_sni_split` (all own the
+  first data packet).
 
 ---
 
@@ -409,7 +417,8 @@ Start with the least complex method that can run on your platform, then move to 
 | DPI middlebox is closer to you than the server and ignores invalid-packet tricks | `low_ttl` |
 | DPI sees through fake packets but fails with fragmented real handshakes | `tls_record_frag` |
 | DPI inspects only the first N bytes of the TLS stream | `tls_padding` |
-| You need a scanned IPv4 target but must preserve the VPN client's real SNI | `MODE = "ip_bypass_plus"` with `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, or `sni_boundary_frag` |
+| You need a scanned IPv4 target but must preserve the VPN client's real SNI | `MODE = "ip_bypass_plus"` with `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, or `ip_frag` |
+| DPI reassembles TLS records but not IP fragments | `ip_frag` (increase `IP_FRAG_SIZE` for DPI with a small reassembly budget) |
 | A first firewall layer is fooled, but another layer still blocks the real ClientHello | `["wrong_seq", "tls_frag"]`, `["wrong_md5", "tls_frag"]`, or `["wrong_seq", "tls_record_frag"]` |
 | You only need the fastest reachable IP and not SNI spoofing | `MODE = "ip_bypass"` |
 
@@ -426,6 +435,13 @@ Method behavior in more detail:
   retransmission timeout (~200 ms) while the real ClientHello is retransmitted.
   With `FAKE_TLS_FORWARD_REAL = true` (default) the decoy goes out first and
   the real ClientHello is forwarded immediately after it — no added latency.
+- `ip_frag` requires Administrator/root (WinDivert/NFQUEUE) and is IPv4-only.
+  The fragmenter clears the IPv4 DF bit so fragmentation is legal; some
+  middleboxes drop all IP fragments, in which case `ip_frag` connections
+  fail and the method should be removed from the list.  Fragment-all mode
+  (`IP_FRAG_ONLY_FIRST_PACKET = false`) rewrites every outbound data packet;
+  prefer the default `true`.  `ip_frag` is not available through the Android
+  root-helper protocol (desktop Linux/Windows only).
   WinDivert sends both packets; on Linux/Android the decoy is injected
   through a raw IP socket in the root helper.  If the raw socket is
   unavailable, ZeroDPI logs a warning and falls back to single-packet mode
@@ -544,7 +560,7 @@ IP_SCAN_SNI = "cloudflare.com"
 AUTO_SELECT = true
 ```
 
-For TLS-record fragmentation instead, set `BYPASS_METHOD = "tls_record_frag"` and run with packet interception privileges. For a socket-only padding transform, set `BYPASS_METHOD = "tls_padding"`.
+For TLS-record fragmentation instead, set `BYPASS_METHOD = "tls_record_frag"` and run with packet interception privileges. For IP-layer fragmentation, set `BYPASS_METHOD = "ip_frag"` and run with packet interception privileges. For a socket-only padding transform, set `BYPASS_METHOD = "tls_padding"`.
 
 ### 📌 Fixed Candidate After a Successful Scan
 
@@ -680,7 +696,7 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `BYPASS_METHOD` | `string` or array of strings | `["wrong_seq", "tls_frag"]` | One or more of `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `urg_sni_split`, `sni_boundary_frag`; combinations are written as lists (see "Combining Bypass Methods"); `ip_bypass_plus` allows only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, or `sni_boundary_frag` |
+| `BYPASS_METHOD` | `string` or array of strings | `["wrong_seq", "tls_frag"]` | One or more of `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `fake_tls`, `ip_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `urg_sni_split`, `sni_boundary_frag`; combinations are written as lists (see "Combining Bypass Methods"); `ip_bypass_plus` allows only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, or `ip_frag` |
 | `BYPASS_TIMEOUT_SECS` | `u64` | `20` | Time to wait for bypass setup before giving up |
 | `RELAY_MAX_LIFETIME_SECS` | `u64` | `0` | Rotate established relays after this many seconds (`0` = disabled/default) |
 | `NFQUEUE_NUM` | `u16` | `1` | (Linux) NFQUEUE queue number |
@@ -764,6 +780,18 @@ In a `["wrong_seq", "wrong_md5"]` combination, this group provides the TCP-MD5 o
 | `TLS_RECORD_FRAG_BUMP_IP_IDENT` | `bool` | `true` | Bump IPv4 Identification field |
 
 In a `["wrong_seq", "tls_record_frag"]` combination, both the `wrong_seq` and `tls_record_frag` parameter groups apply.
+
+#### `ip_frag` Parameters
+
+`IP_FRAG_SIZE` (default `24`) is the maximum IP payload bytes (TCP header +
+TCP payload) per fragment; it must be a multiple of 8 and at least 8.
+`IP_FRAG_ONLY_FIRST_PACKET` (default `true`) limits fragmentation to the
+packet carrying the ClientHello; `false` enables fragment-all mode, which
+fragments every subsequent outbound data packet until the connection closes
+and costs CPU per packet.
+
+In a `["wrong_seq", "ip_frag"]` combination, both the `wrong_seq` and
+`ip_frag` parameter groups apply.
 
 #### `urg_sni_split` Parameters
 
@@ -1396,7 +1424,7 @@ Unit tests cover:
 - 🗒️ ZeroDPI does not create candidate lists for you. Good results depend heavily on SNI/IP candidates that make sense for your network and upstream service.
 - ⏩ `SELECTED_SNI` skips probing. It can start faster, but it will not tell you whether the resolved edge is currently healthy.
 - 🛡️ `ip_bypass` does not spoof SNI. It relays the upstream VPN client's original TLS bytes to the selected IP.
-- ✂️ `ip_bypass_plus` also preserves the upstream VPN client's original SNI, but can fragment, pad, randomize the SNI case, or boundary-split the first real ClientHello with `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, or `sni_boundary_frag`.
+- ✂️ `ip_bypass_plus` also preserves the upstream VPN client's original SNI, but can fragment, pad, randomize the SNI case, or boundary-split the first real ClientHello with `tls_record_frag`, `ip_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, or `sni_boundary_frag`.
 - ⏱️ `wrong_timestamp` requires TCP timestamps to be negotiated by the host OS on the upstream connection. If the intercepted ACK has no Timestamp option, ZeroDPI aborts that bypass attempt.
 - ⚡ Very aggressive fragmentation (`TLS_FRAG_LENGTH = "1"` or `TLS_RECORD_FRAG_SIZE = 1`) can add overhead during connection setup.
 - 🧱 Firewall, antivirus, endpoint security, or kernel driver policy can block WinDivert/NFQUEUE even when ZeroDPI is configured correctly.

@@ -167,7 +167,8 @@ pub trait BypassMethod: Send + Sync + 'static {
     /// This hook is invoked only when [`on_handshake_complete_ack`] returned
     /// [`MethodAction::PassThrough`], putting the flow into `waiting_for_data`
     /// mode.  The default passes the packet through unchanged; methods that
-    /// operate at the data layer (e.g. `tls_record_frag`, `fake_tls`) override
+    /// operate at the data layer (e.g. `tls_record_frag`, `fake_tls`,
+    /// `ip_frag`) override
     /// this to stage their payload mutations and return [`MethodAction::EmitFakeAndAccept`],
     /// which causes the handler to signal bypass completion immediately.
     ///
@@ -182,7 +183,7 @@ pub trait BypassMethod: Send + Sync + 'static {
 /// Returns `Some(method)` when the configured list contains any
 /// interceptor-based method (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
 /// `wrong_md5`, `wrong_timestamp`, `low_ttl`, `urg_sni_split`,
-/// `tls_record_frag`, `fake_tls`) and `None` for socket-only lists (`["tls_frag"]`,
+/// `tls_record_frag`, `fake_tls`, `ip_frag`) and `None` for socket-only lists (`["tls_frag"]`,
 /// `["tls_padding"]`, `["mixed_case_sni"]`, `["sni_boundary_frag"]`, or
 /// combinations) or empty lists.
 /// Callers should validate the method list via
@@ -389,9 +390,23 @@ mod tests {
     }
 
     #[test]
-    fn build_fake_tls_with_socket_method() {
-        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["fake_tls", "tls_frag"]"#);
+    fn build_ip_frag_method() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "ip_frag""#);
         let method = build_method(&cfg).unwrap();
-        assert_eq!(method.name(), "fake_tls + tls_frag");
+        assert_eq!(method.name(), "ip_frag");
+    }
+
+    #[test]
+    fn build_wrong_seq_ip_frag_method() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["wrong_seq", "ip_frag"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "wrong_seq + ip_frag");
+    }
+
+    #[test]
+    fn build_ip_frag_with_socket_method() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["ip_frag", "tls_frag"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "ip_frag + tls_frag");
     }
 }

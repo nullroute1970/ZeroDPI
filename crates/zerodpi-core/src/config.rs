@@ -794,6 +794,26 @@ pub struct Config {
     pub FAKE_TLS_FORWARD_REAL: bool,
 
     // -----------------------------------------------------------------------
+    // ip_frag method parameters
+    // -----------------------------------------------------------------------
+    /// Maximum IP payload bytes (TCP header + TCP payload) per fragment when
+    /// using `ip_frag`.
+    ///
+    /// The outbound data packet is split at the IPv4 layer into fragments of
+    /// at most this many payload bytes. Fragment offsets are expressed in
+    /// 8-byte units, so the value must be a multiple of 8 and at least 8.
+    /// Default: `24`.
+    #[serde(default = "default_ip_frag_size")]
+    pub IP_FRAG_SIZE: usize,
+
+    /// Whether `ip_frag` rewrites only the first outbound data packet of
+    /// each connection. When `false`, every subsequent outbound data packet
+    /// is also fragmented until the connection closes (fragment-all mode).
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub IP_FRAG_ONLY_FIRST_PACKET: bool,
+
+    // -----------------------------------------------------------------------
     // urg_sni_split method parameters
     // -----------------------------------------------------------------------
     /// The 1-byte dummy payload `urg_sni_split` inserts into the middle of the
@@ -1134,6 +1154,9 @@ fn default_wrong_timestamp_offset() -> u32 {
 }
 fn default_tls_frag_size() -> usize {
     1
+}
+fn default_ip_frag_size() -> usize {
+    24
 }
 fn default_sni_split_dummy_byte() -> u8 {
     0
@@ -2165,6 +2188,30 @@ mod tests {
         )
         .unwrap();
         assert!(!cfg.FAKE_TLS_FORWARD_REAL);
+    }
+
+    #[test]
+    fn parses_ip_frag_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.IP_FRAG_SIZE, 24);
+        assert!(cfg.IP_FRAG_ONLY_FIRST_PACKET);
+    }
+
+    #[test]
+    fn parses_ip_frag_overrides() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               IP_FRAG_SIZE = 40
+               IP_FRAG_ONLY_FIRST_PACKET = false"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.IP_FRAG_SIZE, 40);
+        assert!(!cfg.IP_FRAG_ONLY_FIRST_PACKET);
     }
 
     #[test]

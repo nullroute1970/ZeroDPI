@@ -200,6 +200,7 @@ fn parse_view<'a>(direction: Direction, buf: &'a [u8]) -> Result<(PacketView<'a>
         append_tcp_options: Vec::new(),
         bump_ipv4_ident: false,
         corrupt_tcp_checksum_delta: None,
+        emit_original_after: false,
         new_ipv4_ttl: None,
     };
     let layout = PacketLayout {
@@ -772,6 +773,7 @@ mod tests {
             append_tcp_options: Vec::new(),
             bump_ipv4_ident: true,
             corrupt_tcp_checksum_delta: None,
+            emit_original_after: false,
             new_ipv4_ttl: None,
         }
     }

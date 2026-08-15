@@ -36,8 +36,8 @@ pub struct TcpFlags {
 /// Backends construct this from their native packet representation and apply
 /// the staged mutations (`new_*`, `replace_tcp_options`,
 /// `append_tcp_options`, `bump_ipv4_ident`, `new_ipv4_ttl`,
-/// `corrupt_tcp_checksum_delta`) when the handler returns
-/// [`Verdict::AcceptModified`].
+/// `corrupt_tcp_checksum_delta`, `emit_original_after`) when the handler
+/// returns [`Verdict::AcceptModified`].
 #[derive(Debug, Clone)]
 pub struct PacketView<'a> {
     pub direction: Direction,
@@ -80,6 +80,13 @@ pub struct PacketView<'a> {
     /// Add this value to the valid computed TCP checksum after normal packet
     /// rebuild/checksum calculation. `None` leaves the checksum valid.
     pub corrupt_tcp_checksum_delta: Option<u16>,
+    /// When the verdict is `AcceptModified`, also emit the original
+    /// unmodified packet after the modified one.
+    ///
+    /// Used by `fake_tls` (`FAKE_TLS_FORWARD_REAL`) to send the decoy record
+    /// ahead of the real ClientHello. Backends without dual-emission support
+    /// (e.g. no raw socket on Linux) fall back to single modified emission.
+    pub emit_original_after: bool,
     /// Override the IPv4 Time-To-Live (TTL) field.
     ///
     /// Used by decoy-injection methods that want a fake packet to reach an
@@ -222,11 +229,42 @@ pub trait FlowHandler: PacketHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
 
     #[test]
     fn tcp_flags_has_urg_and_defaults_to_false() {
         let flags = TcpFlags::default();
         assert!(!flags.urg);
+    }
+
+    #[test]
+    fn packet_view_emit_original_after_defaults_false() {
+        let view = PacketView {
+            direction: Direction::Outbound,
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            src_port: 12345,
+            dst_port: 443,
+            seq: 1001,
+            ack: 5001,
+            flags: TcpFlags::default(),
+            payload_len: 0,
+            payload: &[],
+            tcp_options: &[],
+            new_seq: None,
+            new_ack: None,
+            new_flags: None,
+            new_payload: None,
+            replace_tcp_options: None,
+            append_tcp_options: Vec::new(),
+            bump_ipv4_ident: false,
+            corrupt_tcp_checksum_delta: None,
+            emit_original_after: false,
+            new_ipv4_ttl: None,
+            new_urgent_pointer: None,
+        };
+        assert!(!view.emit_original_after);
     }
 }

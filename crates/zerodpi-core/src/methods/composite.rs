@@ -8,6 +8,8 @@
 //! signaled through [`CompositeMethod::segments_first_client_hello`] and
 //! `tls_padding` through [`CompositeMethod::pads_first_client_hello`] so the
 //! proxy enables the corresponding socket-side data-stage transforms.
+//! `mixed_case_sni` follows the same pattern via
+//! [`CompositeMethod::mixed_case_sni_first_hello`].
 //!
 //! Composition rules (provably reproduce the former hard-coded combos):
 //! - PSH / IP-ident settings come from the **first** handshake-stage member.
@@ -28,6 +30,7 @@ pub struct CompositeMethod {
     pub data_method: Option<Box<dyn BypassMethod>>,
     pub segments_first_client_hello: bool,
     pub pads_first_client_hello: bool,
+    pub mixed_case_sni_first_hello: bool,
 }
 
 impl CompositeMethod {
@@ -42,7 +45,15 @@ impl CompositeMethod {
             data_method,
             segments_first_client_hello,
             pads_first_client_hello,
+            mixed_case_sni_first_hello: false,
         }
+    }
+
+    /// Mark the composite as including the socket-side `mixed_case_sni`
+    /// transform so its name reflects the full method list.
+    pub fn with_mixed_case_sni(mut self, enabled: bool) -> Self {
+        self.mixed_case_sni_first_hello = enabled;
+        self
     }
 }
 
@@ -57,6 +68,9 @@ impl BypassMethod for CompositeMethod {
         }
         if self.pads_first_client_hello {
             parts.push("tls_padding".into());
+        }
+        if self.mixed_case_sni_first_hello {
+            parts.push("mixed_case_sni".into());
         }
         parts.join(" + ")
     }

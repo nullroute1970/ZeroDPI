@@ -33,6 +33,10 @@
 //!   `TLS_PADDING_SIZE` zero bytes (before the SNI extension by default),
 //!   and writes the expanded record to the upstream socket. The padding
 //!   pushes the SNI past DPI inspection windows (typically 512-1460 bytes).
+//! - `mixed_case_sni` — SNI Case Randomization. Randomizes the ASCII letter
+//!   case of the hostname inside the real ClientHello's SNI extension;
+//!   destination servers lowercase it per RFC 6066, so DPI doing
+//!   case-sensitive blocklist matching misses while the handshake succeeds.
 //!
 //! New interceptor-based methods only need to implement this trait and be
 //! registered in [`build_method`].  New socket-based methods must be wired
@@ -167,7 +171,8 @@ pub trait BypassMethod: Send + Sync + 'static {
 /// interceptor-based method (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
 /// `wrong_md5`, `wrong_timestamp`, `low_ttl`, `urg_sni_split`,
 /// `tls_record_frag`) and `None` for socket-only lists (`["tls_frag"]`,
-/// `["tls_padding"]`, `["tls_frag", "tls_padding"]`) or empty lists.
+/// `["tls_padding"]`, `["mixed_case_sni"]`, or combinations) or empty
+/// lists.
 /// Callers should validate the method list via
 /// [`crate::config::Config::validate`] before calling this function.
 pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
@@ -179,8 +184,9 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
     let mut data: Option<Box<dyn BypassMethod>> = None;
     for name in list.iter() {
         match name {
-            "tls_frag" => {}    // socket side; handled directly in proxy.rs
-            "tls_padding" => {} // socket side; handled directly in proxy.rs
+            "tls_frag" => {}       // socket side; handled directly in proxy.rs
+            "tls_padding" => {}    // socket side; handled directly in proxy.rs
+            "mixed_case_sni" => {} // socket side; handled directly in proxy.rs
             "tls_record_frag" => data = Some(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
             "wrong_seq" => handshake.push(Box::new(wrong_seq::WrongSeq::new(cfg))),
             "wrong_ack" => handshake.push(Box::new(wrong_ack::WrongAck::new(cfg))),
@@ -194,12 +200,15 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
             _ => return None,
         }
     }
-    Some(Box::new(composite::CompositeMethod::new(
-        handshake,
-        data,
-        list.contains("tls_frag"),
-        list.contains("tls_padding"),
-    )))
+    Some(Box::new(
+        composite::CompositeMethod::new(
+            handshake,
+            data,
+            list.contains("tls_frag"),
+            list.contains("tls_padding"),
+        )
+        .with_mixed_case_sni(list.contains("mixed_case_sni")),
+    ))
 }
 
 #[cfg(test)]
@@ -315,5 +324,18 @@ mod tests {
     fn socket_list_returns_none() {
         let cfg = cfg_with_method(r#"BYPASS_METHOD = ["tls_frag"]"#);
         assert!(build_method(&cfg).is_none());
+    }
+
+    #[test]
+    fn socket_mixed_case_method_returns_none() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "mixed_case_sni""#);
+        assert!(build_method(&cfg).is_none());
+    }
+
+    #[test]
+    fn builds_composite_with_mixed_case_sni() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["wrong_seq", "mixed_case_sni"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "wrong_seq + mixed_case_sni");
     }
 }

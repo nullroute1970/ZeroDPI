@@ -195,6 +195,7 @@ pub const BASE_BYPASS_METHODS: &[&str] = &[
     "tls_record_frag",
     "tls_frag",
     "tls_padding",
+    "mixed_case_sni",
     "urg_sni_split",
 ];
 
@@ -255,21 +256,21 @@ impl BypassMethodList {
     }
 
     /// `true` when the list contains only socket-side methods
-    /// (`["tls_frag"]`, `["tls_padding"]`, or both), which need no packet
-    /// interceptor.
+    /// (`["tls_frag"]`, `["tls_padding"]`, `["mixed_case_sni"]`, or
+    /// combinations), which need no packet interceptor.
     pub fn is_socket_only(&self) -> bool {
         !self.0.is_empty()
             && self
                 .0
                 .iter()
-                .all(|m| matches!(m.as_str(), "tls_frag" | "tls_padding"))
+                .all(|m| matches!(m.as_str(), "tls_frag" | "tls_padding" | "mixed_case_sni"))
     }
 
     /// `true` when any listed method needs the WinDivert/NFQUEUE interceptor.
     pub fn requires_interceptor(&self) -> bool {
         self.0
             .iter()
-            .any(|m| !matches!(m.as_str(), "tls_frag" | "tls_padding"))
+            .any(|m| !matches!(m.as_str(), "tls_frag" | "tls_padding" | "mixed_case_sni"))
     }
 }
 
@@ -449,6 +450,14 @@ pub struct Config {
     ///   at the end of the extension list. Socket-side only: does not inject
     ///   fake packets or use WinDivert/NFQUEUE interception; operates inside
     ///   the proxy on the relayed ClientHello.
+    /// - `"mixed_case_sni"` — SNI Case Randomization. Randomizes the ASCII
+    ///   letter case of the hostname in the SNI extension of the client's
+    ///   real ClientHello (e.g. `wikipedia.org` → `wIkIpeDiA.oRg`).
+    ///   Destination servers lowercase the hostname during lookup (RFC 6066
+    ///   hostnames are case-insensitive), while DPI using case-sensitive
+    ///   blocklist matching misses. Socket-side only: does not inject fake
+    ///   packets or use WinDivert/NFQUEUE interception; operates inside the
+    ///   proxy on the relayed ClientHello.
     /// - `"urg_sni_split"` — injects a 1-byte dummy payload into the middle of
     ///   the SNI inside the real ClientHello and sets the TCP URG flag so the
     ///   destination server strips the byte while byte-scanning DPI sees a
@@ -458,9 +467,9 @@ pub struct Config {
     /// Handshake-stage methods (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
     /// `wrong_md5`, `wrong_timestamp`, `low_ttl`) all inject the same fake
     /// ClientHello; several may be listed to merge their tricks onto one fake
-    /// packet. `tls_record_frag`, `tls_frag`, and `tls_padding` add the data
-    /// stage. See the `BYPASS_METHOD` section of `config.toml` for the
-    /// combination limits.
+    /// packet. `tls_record_frag`, `tls_frag`, `tls_padding`, and
+    /// `mixed_case_sni` add the data stage. See the `BYPASS_METHOD` section
+    /// of `config.toml` for the combination limits.
     #[serde(default = "default_method")]
     pub BYPASS_METHOD: BypassMethodList,
     /// (Linux only) NFQUEUE queue number used to intercept packets. Must
@@ -1256,13 +1265,15 @@ impl Config {
             );
         }
         if self.MODE == "ip_bypass_plus"
-            && !self
-                .BYPASS_METHOD
-                .iter()
-                .all(|m| matches!(m, "tls_record_frag" | "tls_frag" | "tls_padding"))
+            && !self.BYPASS_METHOD.iter().all(|m| {
+                matches!(
+                    m,
+                    "tls_record_frag" | "tls_frag" | "tls_padding" | "mixed_case_sni"
+                )
+            })
         {
             anyhow::bail!(
-                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", or \"tls_padding\""
+                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", \"tls_padding\", or \"mixed_case_sni\""
             );
         }
         if !(0.0..=1.0).contains(&self.PROXY_TEST_SNI_WEIGHT) {
@@ -2809,5 +2820,55 @@ mod tests {
             let cfg: Config = toml::from_str(&toml_str).unwrap();
             assert!(cfg.validate().is_err(), "accepted {server_line:?}");
         }
+    }
+
+    #[test]
+    fn mixed_case_sni_flag_defaults_to_false() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .unwrap();
+        assert!(!cfg.MIXED_CASE_SNI_FLIP_ALL);
+    }
+
+    #[test]
+    fn mixed_case_sni_flag_parses_true() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               MIXED_CASE_SNI_FLIP_ALL = true"#,
+        )
+        .unwrap();
+        assert!(cfg.MIXED_CASE_SNI_FLIP_ALL);
+    }
+
+    #[test]
+    fn validate_accepts_mixed_case_sni() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "mixed_case_sni""#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.BYPASS_METHOD.is_socket_only());
+        assert!(!cfg.BYPASS_METHOD.requires_interceptor());
+    }
+
+    #[test]
+    fn ip_bypass_plus_accepts_mixed_case_sni() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            MODE = "ip_bypass_plus"
+            BYPASS_METHOD = "mixed_case_sni"
+            LOW_TTL_DISCOVER = false
+            SELECTED_IP = "1.2.3.4"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.MODE, "ip_bypass_plus");
+        assert_eq!(cfg.BYPASS_METHOD, "mixed_case_sni");
     }
 }

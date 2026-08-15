@@ -37,6 +37,10 @@
 //!   case of the hostname inside the real ClientHello's SNI extension;
 //!   destination servers lowercase it per RFC 6066, so DPI doing
 //!   case-sensitive blocklist matching misses while the handshake succeeds.
+//! - `sni_boundary_frag` — SNI Extension Boundary Fragmentation. Parses the
+//!   ClientHello down to the SNI extension and writes the first record as two
+//!   TCP segments cut at the extension boundary (or mid-domain), separated by
+//!   a configurable delay, so inline DPI cannot reassemble the SNI.
 //!
 //! New interceptor-based methods only need to implement this trait and be
 //! registered in [`build_method`].  New socket-based methods must be wired
@@ -46,6 +50,7 @@ pub mod composite;
 pub mod low_ttl;
 pub mod mixed_case_sni;
 pub mod sni;
+pub mod sni_boundary_frag;
 pub mod tcp_segmentation;
 pub mod tls_padding;
 pub mod tls_record_frag;
@@ -171,8 +176,8 @@ pub trait BypassMethod: Send + Sync + 'static {
 /// interceptor-based method (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
 /// `wrong_md5`, `wrong_timestamp`, `low_ttl`, `urg_sni_split`,
 /// `tls_record_frag`) and `None` for socket-only lists (`["tls_frag"]`,
-/// `["tls_padding"]`, `["mixed_case_sni"]`, or combinations) or empty
-/// lists.
+/// `["tls_padding"]`, `["mixed_case_sni"]`, `["sni_boundary_frag"]`, or
+/// combinations) or empty lists.
 /// Callers should validate the method list via
 /// [`crate::config::Config::validate`] before calling this function.
 pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
@@ -187,6 +192,7 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
             "tls_frag" => {}       // socket side; handled directly in proxy.rs
             "tls_padding" => {}    // socket side; handled directly in proxy.rs
             "mixed_case_sni" => {} // socket side; handled directly in proxy.rs
+            "sni_boundary_frag" => {} // socket side; handled directly in proxy.rs
             "tls_record_frag" => data = Some(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
             "wrong_seq" => handshake.push(Box::new(wrong_seq::WrongSeq::new(cfg))),
             "wrong_ack" => handshake.push(Box::new(wrong_ack::WrongAck::new(cfg))),
@@ -207,7 +213,8 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
             list.contains("tls_frag"),
             list.contains("tls_padding"),
         )
-        .with_mixed_case_sni(list.contains("mixed_case_sni")),
+        .with_mixed_case_sni(list.contains("mixed_case_sni"))
+        .with_sni_boundary_split(list.contains("sni_boundary_frag")),
     ))
 }
 
@@ -337,5 +344,24 @@ mod tests {
         let cfg = cfg_with_method(r#"BYPASS_METHOD = ["wrong_seq", "mixed_case_sni"]"#);
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "wrong_seq + mixed_case_sni");
+    }
+
+    #[test]
+    fn build_wrong_seq_sni_boundary_frag_method() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["wrong_seq", "sni_boundary_frag"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "wrong_seq + sni_boundary_frag");
+    }
+
+    #[test]
+    fn socket_sni_boundary_frag_method_returns_none() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "sni_boundary_frag""#);
+        assert!(build_method(&cfg).is_none());
+    }
+
+    #[test]
+    fn socket_list_with_sni_boundary_frag_returns_none() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["sni_boundary_frag", "tls_padding"]"#);
+        assert!(build_method(&cfg).is_none());
     }
 }

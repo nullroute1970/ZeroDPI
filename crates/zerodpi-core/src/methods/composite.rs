@@ -9,7 +9,8 @@
 //! `tls_padding` through [`CompositeMethod::pads_first_client_hello`] so the
 //! proxy enables the corresponding socket-side data-stage transforms.
 //! `mixed_case_sni` follows the same pattern via
-//! [`CompositeMethod::mixed_case_sni_first_hello`].
+//! [`CompositeMethod::mixed_case_sni_first_hello`], and `sni_boundary_frag`
+//! via [`CompositeMethod::splits_first_client_hello`].
 //!
 //! Composition rules (provably reproduce the former hard-coded combos):
 //! - PSH / IP-ident settings come from the **first** handshake-stage member.
@@ -31,6 +32,7 @@ pub struct CompositeMethod {
     pub segments_first_client_hello: bool,
     pub pads_first_client_hello: bool,
     pub mixed_case_sni_first_hello: bool,
+    pub splits_first_client_hello: bool,
 }
 
 impl CompositeMethod {
@@ -46,6 +48,7 @@ impl CompositeMethod {
             segments_first_client_hello,
             pads_first_client_hello,
             mixed_case_sni_first_hello: false,
+            splits_first_client_hello: false,
         }
     }
 
@@ -53,6 +56,14 @@ impl CompositeMethod {
     /// transform so its name reflects the full method list.
     pub fn with_mixed_case_sni(mut self, enabled: bool) -> Self {
         self.mixed_case_sni_first_hello = enabled;
+        self
+    }
+
+    /// Mark the composite as including the socket-side `sni_boundary_frag`
+    /// transform so its name reflects the full method list and the
+    /// handshake stage waits for the data stage.
+    pub fn with_sni_boundary_split(mut self, enabled: bool) -> Self {
+        self.splits_first_client_hello = enabled;
         self
     }
 }
@@ -71,6 +82,9 @@ impl BypassMethod for CompositeMethod {
         }
         if self.mixed_case_sni_first_hello {
             parts.push("mixed_case_sni".into());
+        }
+        if self.splits_first_client_hello {
+            parts.push("sni_boundary_frag".into());
         }
         parts.join(" + ")
     }
@@ -114,6 +128,7 @@ impl BypassMethod for CompositeMethod {
         if self.data_method.is_some()
             || self.segments_first_client_hello
             || self.pads_first_client_hello
+            || self.splits_first_client_hello
         {
             tracing::trace!(
                 target = "zerodpi::composite",
@@ -289,6 +304,33 @@ mod tests {
         assert_eq!(packet.new_seq, Some(1001u32.wrapping_sub(517)));
         assert_eq!(packet.new_ipv4_ttl, Some(5));
         assert_eq!(packet.new_payload.as_ref().unwrap().len(), 517);
+    }
+
+    #[test]
+    fn wrong_seq_plus_sni_boundary_frag_waits_for_data_stage() {
+        let cfg = cfg_with("");
+        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, false, false)
+            .with_sni_boundary_split(true);
+
+        let mut packet = pkt(&[], 0);
+        let action = m.on_handshake_complete_ack(&handshake_state(), &mut packet);
+        assert_eq!(action, MethodAction::emit_and_wait_for_data());
+        assert_eq!(m.name(), "wrong_seq + sni_boundary_frag");
+
+        // Data stage: no data-stage method, so the first data packet
+        // (the first boundary segment) passes through and completes.
+        let payload: &'static [u8] = &[0x16, 0x03, 0x03, 0x00, 0x03, 0x01, 0x02, 0x03];
+        let mut packet = pkt(payload, payload.len());
+        let action = m.on_first_data_packet(&handshake_state(), &mut packet);
+        assert_eq!(action, MethodAction::complete_and_accept());
+        assert!(packet.new_payload.is_none());
+    }
+
+    #[test]
+    fn name_omits_sni_boundary_frag_when_not_set() {
+        let cfg = cfg_with("");
+        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, false, false);
+        assert_eq!(m.name(), "wrong_seq");
     }
 
     #[test]

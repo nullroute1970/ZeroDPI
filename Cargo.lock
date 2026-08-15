@@ -1965,6 +1965,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "etherparse 0.20.1",
+ "libc",
  "nfq",
  "parking_lot",
  "thiserror 2.0.18",

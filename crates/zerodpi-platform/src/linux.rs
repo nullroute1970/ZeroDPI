@@ -33,7 +33,8 @@ static RAW_INJECTION_UNAVAILABLE_WARNED: AtomicBool = AtomicBool::new(false);
 pub struct NfqInterceptor {
     queue: Queue,
     _rules: FirewallGuard,
-    /// Raw IP socket for decoy injection (`fake_tls` dual emission).
+    /// Raw IP socket for decoy / fragment injection (`fake_tls` dual
+    /// emission, `ip_frag` fragments).
     /// `None` when injection is unavailable; the backend then falls back
     /// to single modified emission.
     raw_socket: Option<RawFd>,
@@ -66,9 +67,7 @@ impl PacketInterceptor for NfqInterceptor {
         );
         let raw_socket = open_raw_injection_socket();
         if raw_socket.is_none() {
-            warn!(
-                "raw socket unavailable; fake_tls dual emission falls back to single-packet mode"
-            );
+            warn!("raw socket unavailable; fake_tls/ip_frag fall back to single-packet mode");
         }
         Ok(Self {
             queue,
@@ -150,7 +149,41 @@ impl PacketInterceptor for NfqInterceptor {
                             continue;
                         }
                     };
-                    if view.emit_original_after {
+                    if let Some(frag_size) = view.ip_frag_payload_size {
+                        let fragments =
+                            zerodpi_core::ip_fragment::fragment_ipv4_packet(&new_bytes, frag_size);
+                        match &self.raw_socket {
+                            Some(fd) if fragments.len() > 1 => {
+                                // Inject every fragment through the raw
+                                // socket; the queued original is dropped so
+                                // the fragments replace it on the wire.
+                                let mut injected = true;
+                                for frag in &fragments {
+                                    if let Err(e) = send_raw_packet(*fd, frag) {
+                                        warn!(error = %e, "raw fragment injection failed; emitting unfragmented packet");
+                                        injected = false;
+                                        break;
+                                    }
+                                }
+                                if injected {
+                                    msg.set_verdict(NfqVerdict::Drop);
+                                } else {
+                                    msg.set_payload(new_bytes);
+                                    msg.set_verdict(NfqVerdict::Accept);
+                                }
+                            }
+                            _ => {
+                                if fragments.len() > 1
+                                    && !RAW_INJECTION_UNAVAILABLE_WARNED
+                                        .swap(true, Ordering::SeqCst)
+                                {
+                                    warn!("raw socket unavailable; ip_frag falling back to unfragmented packets");
+                                }
+                                msg.set_payload(new_bytes);
+                                msg.set_verdict(NfqVerdict::Accept);
+                            }
+                        }
+                    } else if view.emit_original_after {
                         match &self.raw_socket {
                             Some(fd) => {
                                 // Inject the decoy through the raw socket
@@ -170,10 +203,11 @@ impl PacketInterceptor for NfqInterceptor {
                                 msg.set_payload(new_bytes);
                             }
                         }
+                        msg.set_verdict(NfqVerdict::Accept);
                     } else {
                         msg.set_payload(new_bytes);
+                        msg.set_verdict(NfqVerdict::Accept);
                     }
-                    msg.set_verdict(NfqVerdict::Accept);
                 }
             }
             if let Err(e) = self.queue.verdict(msg) {
@@ -1440,5 +1474,51 @@ mod tests {
         tcp.set_options_raw(&[1; 24]).unwrap();
         let err = append_tcp_options(&mut tcp, &tcp_md5_signature_option()).unwrap_err();
         assert!(err.to_string().contains("TCP options would exceed"));
+    }
+
+    #[test]
+    fn build_modified_splits_into_ip_fragments() {
+        use etherparse::{IpNumber, Ipv4Header, TcpHeader};
+        use zerodpi_core::ip_fragment::fragment_ipv4_packet;
+
+        let mut ip = Ipv4Header::new(20, 64, IpNumber::TCP, [10, 0, 0, 1], [1, 2, 3, 4]).unwrap();
+        ip.identification = 0x1234;
+        ip.header_checksum = ip.calc_header_checksum();
+        let mut tcp = TcpHeader::new(12345, 443, 1001, 65535);
+        tcp.acknowledgment_number = 5001;
+        tcp.ack = true;
+        tcp.checksum = tcp.calc_checksum_ipv4(&ip, &[0xAB; 517]).unwrap();
+        let mut buf = Vec::new();
+        ip.write(&mut buf).unwrap();
+        tcp.write(&mut buf).unwrap();
+        buf.extend_from_slice(&[0xAB; 517]);
+
+        let layout = PacketLayout {
+            ip_hdr_len: ip.header_len(),
+            tcp_hdr_len: tcp.header_len(),
+            payload_off: ip.header_len() + tcp.header_len(),
+            total_len: buf.len(),
+        };
+        let mut view = make_view();
+        view.ip_frag_payload_size = Some(24);
+
+        let out = build_modified(&buf, &layout, &view).unwrap();
+        let fragments = fragment_ipv4_packet(&out, 24);
+        assert!(fragments.len() > 1);
+
+        // Reassembling the fragment payloads yields the rebuilt packet's IP
+        // payload (TCP header + payload) byte-for-byte.
+        let mut reassembled = Vec::new();
+        for frag in &fragments {
+            let ihl = usize::from(frag[0] & 0x0F) * 4;
+            reassembled.extend_from_slice(&frag[ihl..]);
+        }
+        assert_eq!(reassembled, out[20..]);
+
+        // Every fragment header checksum is valid.
+        for frag in &fragments {
+            let parsed = etherparse::Ipv4HeaderSlice::from_slice(frag).unwrap();
+            assert_eq!(parsed.header_checksum(), parsed.calc_header_checksum());
+        }
     }
 }

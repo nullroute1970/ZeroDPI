@@ -16,6 +16,7 @@ pub mod dns;
 pub mod flow;
 pub mod handler;
 pub mod interceptor;
+pub mod ip_fragment;
 pub mod ip_scanner;
 pub mod low_ttl_discover;
 pub mod methods;

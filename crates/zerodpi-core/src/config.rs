@@ -246,6 +246,7 @@ pub const BASE_BYPASS_METHODS: &[&str] = &[
     "low_ttl",
     "tls_record_frag",
     "fake_tls",
+    "ip_frag",
     "tls_frag",
     "tls_padding",
     "mixed_case_sni",
@@ -496,6 +497,7 @@ pub struct Config {
     ///   Splits the real ClientHello into multiple small TLS records so no
     ///   single record contains the full SNI. No fake packet is injected; the
     ///   server reassembles normally.
+    /// - `"ip_frag"` — IP-Layer Fragment (real ClientHello split into IPv4 fragments).
     /// - `"tls_frag"` — TLS Fragment / TCP-level fragmentation.
     ///   Splits a normal, intact TLS ClientHello record into multiple tiny TCP
     ///   segments so DPI cannot reassemble the SNI from any single packet.
@@ -1366,6 +1368,7 @@ impl Config {
                                 | "wrong_timestamp"
                                 | "low_ttl"
                                 | "fake_tls"
+                                | "ip_frag"
                         )
                 })
             {
@@ -1379,6 +1382,15 @@ impl Config {
             {
                 anyhow::bail!(
                     "BYPASS_METHOD \"fake_tls\" cannot be combined with \"tls_record_frag\" or \"urg_sni_split\""
+                );
+            }
+            if self.BYPASS_METHOD.contains("ip_frag")
+                && (self.BYPASS_METHOD.contains("tls_record_frag")
+                    || self.BYPASS_METHOD.contains("fake_tls")
+                    || self.BYPASS_METHOD.contains("urg_sni_split"))
+            {
+                anyhow::bail!(
+                    "BYPASS_METHOD \"ip_frag\" cannot be combined with \"tls_record_frag\", \"fake_tls\", or \"urg_sni_split\""
                 );
             }
         }
@@ -1408,6 +1420,14 @@ impl Config {
         }
         if self.TLS_RECORD_FRAG_SIZE == 0 {
             anyhow::bail!("TLS_RECORD_FRAG_SIZE must be >= 1");
+        }
+        if self.IP_FRAG_SIZE < 8 {
+            anyhow::bail!("IP_FRAG_SIZE must be >= 8");
+        }
+        if self.IP_FRAG_SIZE % 8 != 0 {
+            anyhow::bail!(
+                "IP_FRAG_SIZE must be a multiple of 8 (fragment offsets use 8-byte units)"
+            );
         }
         if self.TCP_SEG_SIZE == 0 {
             anyhow::bail!("TCP_SEG_SIZE must be >= 1");
@@ -1453,11 +1473,12 @@ impl Config {
                         | "tls_padding"
                         | "mixed_case_sni"
                         | "sni_boundary_frag"
+                        | "ip_frag"
                 )
             })
         {
             anyhow::bail!(
-                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", \"tls_padding\", \"mixed_case_sni\", or \"sni_boundary_frag\""
+                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", \"tls_padding\", \"mixed_case_sni\", \"sni_boundary_frag\", or \"ip_frag\""
             );
         }
         if !(0.0..=1.0).contains(&self.PROXY_TEST_SNI_WEIGHT) {
@@ -2224,6 +2245,76 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_ip_frag_with_other_data_stage_methods() {
+        for combo in [
+            r#"["ip_frag", "tls_record_frag"]"#,
+            r#"["ip_frag", "fake_tls"]"#,
+            r#"["ip_frag", "urg_sni_split"]"#,
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   BYPASS_METHOD = {combo}"#
+            ))
+            .unwrap();
+            assert!(cfg.validate().is_err(), "combo {combo} should be rejected");
+        }
+    }
+
+    #[test]
+    fn accepts_ip_frag_combos() {
+        for method in [
+            r#""ip_frag""#,
+            r#"["ip_frag", "wrong_seq"]"#,
+            r#"["ip_frag", "wrong_ack"]"#,
+            r#"["ip_frag", "low_ttl"]"#,
+            r#"["ip_frag", "tls_frag"]"#,
+            r#"["ip_frag", "tls_padding"]"#,
+            r#"["ip_frag", "mixed_case_sni"]"#,
+            r#"["ip_frag", "sni_boundary_frag"]"#,
+            r#"["ip_frag", "wrong_seq", "tls_padding"]"#,
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   BYPASS_METHOD = {method}"#
+            ))
+            .unwrap();
+            cfg.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn validates_ip_frag_size() {
+        let mut cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "ip_frag"
+               IP_FRAG_SIZE = 8"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        cfg.IP_FRAG_SIZE = 40;
+        cfg.validate().unwrap();
+        cfg.IP_FRAG_SIZE = 4;
+        assert!(cfg.validate().is_err());
+        cfg.IP_FRAG_SIZE = 30; // not a multiple of 8
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn ip_bypass_plus_accepts_ip_frag() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               MODE = "ip_bypass_plus"
+               BYPASS_METHOD = "ip_frag""#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]

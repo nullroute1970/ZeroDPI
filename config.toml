@@ -216,6 +216,17 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     TLS records across fragment boundaries will fail to extract the SNI.  The
 #     upstream TLS server reassembles the fragments normally.
 #
+#   "fake_tls"
+#     Decoy TLS Record Injection.  Injects a decoy TLS record containing a
+#     ClientHello with the whitelisted SNI as the first record a
+#     record-parsing DPI sees on the data stage.  The decoy is emitted with
+#     an out-of-window TCP sequence number, so the upstream server discards
+#     it while a TLS-record-parsing DPI inspects it and classifies the flow
+#     benign.  The real ClientHello reaches the server via retransmission
+#     or, with FAKE_TLS_FORWARD_REAL = true (default), is forwarded
+#     immediately after the decoy.  Requires WinDivert/NFQUEUE
+#     interception (Administrator/root, IPv4-only).
+#
 #   "urg_sni_split"
 #     TCP Urgent + SNI byte splice.  Does NOT inject any fake packet.  Instead,
 #     it intercepts the first outbound data packet carrying the real TLS
@@ -286,6 +297,10 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   packet: TLS-record fragmentation inside the interceptor and TCP-level
 #   write segmentation inside the proxy respectively.  A list containing
 #   "tls_frag" alongside other methods still uses packet interception.
+# - "fake_tls" adds a data-stage decoy injection.  It combines with
+#   handshake-stage fake-packet methods and with the socket-side methods,
+#   but is mutually exclusive with "tls_record_frag" and "urg_sni_split"
+#   (all three own the first data packet).
 # - "tls_padding" adds a socket-side data stage: the real ClientHello is
 #   expanded with an RFC 7685 padding extension before it is written to the
 #   upstream socket.  It combines with handshake-stage methods and with
@@ -311,6 +326,8 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 # - "sni_boundary_frag" cannot be combined with "tls_record_frag" or
 #   "urg_sni_split"; it combines with the handshake fake-packet methods and
 #   with "tls_frag", "tls_padding", and "mixed_case_sni".
+# - "fake_tls" cannot be combined with "tls_record_frag" or
+#   "urg_sni_split".
 # - MODE = "ip_bypass_plus" supports only "tls_record_frag", "tls_frag",
 #   "tls_padding", "mixed_case_sni", or "sni_boundary_frag" so the upstream
 #   VPN client's real SNI is preserved.
@@ -625,6 +642,53 @@ TLS_RECORD_FRAG_SET_PSH = true
 TLS_RECORD_FRAG_BUMP_IP_IDENT = true
 
 # ---------------------------------------------------------------------------
+# fake_tls method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "fake_tls" (alone or combined
+# with handshake fake-packet methods or socket-side methods).
+#
+# fake_tls injects a decoy TLS record carrying the whitelisted SNI at the
+# first outbound data packet, with a TCP sequence number placed behind the
+# server's receive window.  A record-parsing DPI inspects the decoy and
+# classifies the flow benign; the real server discards the out-of-window
+# segment and processes the genuine ClientHello (delivered by TCP
+# retransmission, or forwarded immediately after the decoy when
+# FAKE_TLS_FORWARD_REAL is true).
+
+# Extra bytes subtracted from the decoy's injected TCP sequence number in
+# addition to the decoy payload length.
+#
+# The default formula is:
+#   injected_seq = syn_seq + 1 - payload_len - FAKE_TLS_EXTRA_OFFSET
+#
+# With the default value of 0, the decoy is placed exactly one payload
+# length behind the server's expected receive sequence.  A positive value
+# pushes the decoy farther behind the receive window.  Start with 0.
+FAKE_TLS_EXTRA_OFFSET = 0
+
+# Whether to set the TCP PSH flag on the decoy record packet.
+#
+# Keep this enabled for normal use.  Many DPI implementations treat
+# PSH-marked packets as application data that should be inspected
+# immediately.
+FAKE_TLS_SET_PSH = true
+
+# Whether to increment the IPv4 Identification field on the decoy packet.
+#
+# Bumping the ID makes the injected packet look like a fresh IPv4 datagram
+# rather than a retransmission.  This only affects IPv4 packets.
+FAKE_TLS_BUMP_IP_IDENT = true
+
+# Whether to signal the bypass phase complete immediately after the decoy
+# record is emitted.
+#
+# The default is true: the out-of-window decoy is never acknowledged by the
+# real server, so waiting for an ACK would only delay the relay.  Set this
+# to false to wait for the server to acknowledge the first data packet
+# before releasing the flow.
+FAKE_TLS_COMPLETE_IMMEDIATELY = true
+
+# ---------------------------------------------------------------------------
 # urg_sni_split method parameters
 # ---------------------------------------------------------------------------
 # These settings apply when BYPASS_METHOD = "urg_sni_split".
@@ -647,9 +711,9 @@ SNI_SPLIT_POSITION = "middle"
 # sni_boundary_frag method parameters
 # ---------------------------------------------------------------------------
 # These settings apply when BYPASS_METHOD = "sni_boundary_frag" (alone or
-# combined with tls_frag / tls_padding / mixed_case_sni or the handshake
-# fake-packet methods wrong_seq, wrong_ack, wrong_checksum, wrong_md5,
-# wrong_timestamp, low_ttl).
+# combined with tls_frag / tls_padding / mixed_case_sni / fake_tls or the
+# handshake fake-packet methods wrong_seq, wrong_ack, wrong_checksum,
+# wrong_md5, wrong_timestamp, low_ttl).
 #
 # Unlike wrong_seq and tls_record_frag, this method does NOT use the
 # WinDivert / NFQUEUE packet interceptor when combined only with other

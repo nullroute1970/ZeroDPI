@@ -14,10 +14,11 @@
 //!   `wrong_timestamp`, and the first stage of combo methods act here (fake
 //!   injection).
 //! - [`BypassMethod::on_first_data_packet`] — fires on the first outbound
-//!   data packet.  `tls_record_frag` and the second stage of
-//!   `wrong_seq_tls_record_frag` act here (TLS record fragmentation). The
-//!   second stage of `wrong_seq_tls_frag` and `wrong_md5_tls_frag` completes
-//!   when it observes the first TCP-segmented data packet.
+//!   data packet.  `tls_record_frag`, `fake_tls` and the second stage of
+//!   `wrong_seq_tls_record_frag` act here (TLS record fragmentation / decoy
+//!   injection).  The second stage of `wrong_seq_tls_frag` and
+//!   `wrong_md5_tls_frag` completes when it observes the first
+//!   TCP-segmented data packet.
 //!
 //! ## Socket-based methods
 //!
@@ -161,8 +162,8 @@ pub trait BypassMethod: Send + Sync + 'static {
     /// This hook is invoked only when [`on_handshake_complete_ack`] returned
     /// [`MethodAction::PassThrough`], putting the flow into `waiting_for_data`
     /// mode.  The default passes the packet through unchanged; methods that
-    /// operate at the data layer (e.g. `tls_record_frag`) override this to
-    /// stage their payload mutations and return [`MethodAction::EmitFakeAndAccept`],
+    /// operate at the data layer (e.g. `tls_record_frag`, `fake_tls`) override
+    /// this to stage their payload mutations and return [`MethodAction::EmitFakeAndAccept`],
     /// which causes the handler to signal bypass completion immediately.
     ///
     /// [`on_handshake_complete_ack`]: BypassMethod::on_handshake_complete_ack
@@ -176,7 +177,7 @@ pub trait BypassMethod: Send + Sync + 'static {
 /// Returns `Some(method)` when the configured list contains any
 /// interceptor-based method (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
 /// `wrong_md5`, `wrong_timestamp`, `low_ttl`, `urg_sni_split`,
-/// `tls_record_frag`) and `None` for socket-only lists (`["tls_frag"]`,
+/// `tls_record_frag`, `fake_tls`) and `None` for socket-only lists (`["tls_frag"]`,
 /// `["tls_padding"]`, `["mixed_case_sni"]`, `["sni_boundary_frag"]`, or
 /// combinations) or empty lists.
 /// Callers should validate the method list via
@@ -195,6 +196,7 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
             "mixed_case_sni" => {}    // socket side; handled directly in proxy.rs
             "sni_boundary_frag" => {} // socket side; handled directly in proxy.rs
             "tls_record_frag" => data = Some(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
+            "fake_tls" => data = Some(Box::new(fake_tls::FakeTls::new(cfg))),
             "wrong_seq" => handshake.push(Box::new(wrong_seq::WrongSeq::new(cfg))),
             "wrong_ack" => handshake.push(Box::new(wrong_ack::WrongAck::new(cfg))),
             "wrong_checksum" => handshake.push(Box::new(wrong_checksum::WrongChecksum::new(cfg))),
@@ -364,5 +366,26 @@ mod tests {
     fn socket_list_with_sni_boundary_frag_returns_none() {
         let cfg = cfg_with_method(r#"BYPASS_METHOD = ["sni_boundary_frag", "tls_padding"]"#);
         assert!(build_method(&cfg).is_none());
+    }
+
+    #[test]
+    fn build_fake_tls_method() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "fake_tls""#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "fake_tls");
+    }
+
+    #[test]
+    fn build_wrong_seq_fake_tls_method() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["wrong_seq", "fake_tls"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "wrong_seq + fake_tls");
+    }
+
+    #[test]
+    fn build_fake_tls_with_socket_method() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["fake_tls", "tls_frag"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "fake_tls + tls_frag");
     }
 }

@@ -117,6 +117,10 @@ lose) against implementation cost in ZeroDPI's architecture.
 
 ### 4.1 `fake_tls` — decoy TLS record injection *(high value, medium effort)*
 
+**Status (2026-08-16):** Variant A implemented (`fake_tls`, interceptor,
+data stage, with optional dual-packet emission). Variant B remains a
+not-implemented follow-up candidate.
+
 **Overview.** Inject a decoy TLS record containing a ClientHello with a
 whitelisted/benign SNI so that the DPI keys its classification on the decoy,
 while the upstream server processes the genuine ClientHello. This is
@@ -419,9 +423,9 @@ interceptor (prerequisite shared by `ip_frag` and `disorder`).
 
 Build in this order:
 
-1. **`fake_tls` (variant A)** — the proven ByeDPI weapon ZeroDPI lacks,
-   and it slots into the existing `wrong_seq` staging pattern with almost
-   no new infrastructure.
+1. **`fake_tls` (variant A)** — ✅ implemented. Variant B (socket-side forged
+   length) remains follow-up work, validated empirically against real TLS
+   stacks.
 2. **`ccs_prefix`** — a few hours of work, platform-neutral, and gives
    Termux/Android users a new non-root option.
 3. **`ip_frag`** — highest new-axis value; bundle it with the

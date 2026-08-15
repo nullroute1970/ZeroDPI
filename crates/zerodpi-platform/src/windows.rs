@@ -180,6 +180,7 @@ fn parse_view<'a>(direction: Direction, buf: &'a [u8]) -> Result<(PacketView<'a>
         bump_ipv4_ident: false,
         corrupt_tcp_checksum_delta: None,
         emit_original_after: false,
+        ip_frag_payload_size: None,
         new_ipv4_ttl: None,
     };
     Ok((
@@ -320,6 +321,7 @@ mod tests {
             bump_ipv4_ident: true,
             corrupt_tcp_checksum_delta: Some(11),
             emit_original_after: false,
+            ip_frag_payload_size: None,
             new_ipv4_ttl: None,
         }
     }

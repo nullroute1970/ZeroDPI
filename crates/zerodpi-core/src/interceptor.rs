@@ -36,7 +36,8 @@ pub struct TcpFlags {
 /// Backends construct this from their native packet representation and apply
 /// the staged mutations (`new_*`, `replace_tcp_options`,
 /// `append_tcp_options`, `bump_ipv4_ident`, `new_ipv4_ttl`,
-/// `corrupt_tcp_checksum_delta`, `emit_original_after`) when the handler
+/// `corrupt_tcp_checksum_delta`, `emit_original_after`,
+/// `ip_frag_payload_size`) when the handler
 /// returns [`Verdict::AcceptModified`].
 #[derive(Debug, Clone)]
 pub struct PacketView<'a> {
@@ -87,6 +88,14 @@ pub struct PacketView<'a> {
     /// ahead of the real ClientHello. Backends without dual-emission support
     /// (e.g. no raw socket on Linux) fall back to single modified emission.
     pub emit_original_after: bool,
+    /// When the verdict is `AcceptModified`, split the rebuilt packet into
+    /// IPv4 fragments whose IP payload (TCP header + TCP payload) is at most
+    /// this many bytes, and emit the fragments instead of the whole packet.
+    ///
+    /// Used by `ip_frag` (IP-layer fragmentation). The value must be a
+    /// multiple of 8. Backends without multi-fragment emission (e.g. no raw
+    /// socket on Linux) fall back to emitting the unfragmented packet.
+    pub ip_frag_payload_size: Option<usize>,
     /// Override the IPv4 Time-To-Live (TTL) field.
     ///
     /// Used by decoy-injection methods that want a fake packet to reach an
@@ -262,9 +271,11 @@ mod tests {
             bump_ipv4_ident: false,
             corrupt_tcp_checksum_delta: None,
             emit_original_after: false,
+            ip_frag_payload_size: None,
             new_ipv4_ttl: None,
             new_urgent_pointer: None,
         };
         assert!(!view.emit_original_after);
+        assert_eq!(view.ip_frag_payload_size, None);
     }
 }

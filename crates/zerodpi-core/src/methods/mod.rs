@@ -189,9 +189,9 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
     let mut data: Option<Box<dyn BypassMethod>> = None;
     for name in list.iter() {
         match name {
-            "tls_frag" => {}       // socket side; handled directly in proxy.rs
-            "tls_padding" => {}    // socket side; handled directly in proxy.rs
-            "mixed_case_sni" => {} // socket side; handled directly in proxy.rs
+            "tls_frag" => {}          // socket side; handled directly in proxy.rs
+            "tls_padding" => {}       // socket side; handled directly in proxy.rs
+            "mixed_case_sni" => {}    // socket side; handled directly in proxy.rs
             "sni_boundary_frag" => {} // socket side; handled directly in proxy.rs
             "tls_record_frag" => data = Some(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
             "wrong_seq" => handshake.push(Box::new(wrong_seq::WrongSeq::new(cfg))),

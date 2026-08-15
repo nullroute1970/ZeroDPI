@@ -125,7 +125,10 @@ mod tests {
         assert_eq!(b.ext_len_field_end, 122);
         assert_eq!(b.name_start, 127);
         assert_eq!(b.name_len, 15);
-        assert_eq!(&ch[b.name_start..b.name_start + b.name_len], b"auth.vercel.com");
+        assert_eq!(
+            &ch[b.name_start..b.name_start + b.name_len],
+            b"auth.vercel.com"
+        );
     }
 
     #[test]

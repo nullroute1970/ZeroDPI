@@ -95,13 +95,18 @@ pub async fn write_boundary_split<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    assert!(split > 0 && split < data.len(), "split must produce two non-empty parts");
+    assert!(
+        split > 0 && split < data.len(),
+        "split must produce two non-empty parts"
+    );
     assert!(delay_ms.min >= 0, "delay range must be >= 0");
 
     dst.write_all(&data[..split])
         .await
         .context("writing first boundary segment")?;
-    dst.flush().await.context("flushing first boundary segment")?;
+    dst.flush()
+        .await
+        .context("flushing first boundary segment")?;
 
     let delay_ms = super::tcp_segmentation::sample_i32(
         delay_ms,
@@ -115,7 +120,9 @@ where
     dst.write_all(&data[split..])
         .await
         .context("writing second boundary segment")?;
-    dst.flush().await.context("flushing second boundary segment")?;
+    dst.flush()
+        .await
+        .context("flushing second boundary segment")?;
     Ok(())
 }
 
@@ -151,14 +158,17 @@ mod tests {
         let body_len = 2usize + 32 + 1 + 2 + 1 + 2 + ext_total as usize;
         let hs_len = 4usize + body_len;
         let mut rec = vec![
-            0x16, 0x03, 0x03, // record header: handshake, version
+            0x16,
+            0x03,
+            0x03, // record header: handshake, version
             ((5 + hs_len) >> 8) as u8,
             (5 + hs_len) as u8, // record length
-            0x01, // handshake type: ClientHello
+            0x01,               // handshake type: ClientHello
             (hs_len >> 16) as u8,
             (hs_len >> 8) as u8,
             hs_len as u8, // handshake length
-            0x03, 0x03, // client version
+            0x03,
+            0x03, // client version
         ];
         rec.extend_from_slice(&[0u8; 32]); // random
         rec.push(0); // session id length
@@ -264,9 +274,12 @@ mod tests {
         // Second part must NOT arrive before the 150 ms delay elapses.
         let mut early = [0u8; 8];
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), reader.read_exact(&mut early))
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                reader.read_exact(&mut early)
+            )
+            .await
+            .is_err(),
             "second segment must be delayed"
         );
 

@@ -730,8 +730,7 @@ async fn handle_intercept_connection(
                 // segmented per its settings. Write index 1 was the
                 // ClientHello above, so the relay resumes at 2.
                 if settings.segment_first_client_hello {
-                    client_fragmentation_after_prefix =
-                        Some((settings.tcp_segmentation, 1));
+                    client_fragmentation_after_prefix = Some((settings.tcp_segmentation, 1));
                 }
             } else if settings.segment_first_client_hello {
                 let segmentation = settings.tcp_segmentation;
@@ -1077,8 +1076,8 @@ async fn handle_tcp_seg_connection_with_ip(
         .BYPASS_METHOD
         .contains("sni_boundary_frag")
         .then(|| SniBoundaryFrag::new(&cfg));
-    let segment_tlshello = cfg.BYPASS_METHOD.contains("tls_frag")
-        && method.packets == TlsFragPackets::TlsHello;
+    let segment_tlshello =
+        cfg.BYPASS_METHOD.contains("tls_frag") && method.packets == TlsFragPackets::TlsHello;
     let needs_first_record = boundary.is_some() || segment_tlshello;
 
     // One TLS record is read at most once, transformed first when
@@ -1867,7 +1866,10 @@ mod tests {
             boundary.split_point,
             crate::config::SniBoundarySplitPoint::Middle
         );
-        assert_eq!(boundary.delay_ms, crate::config::Int32Range::parse("7-9").unwrap());
+        assert_eq!(
+            boundary.delay_ms,
+            crate::config::Int32Range::parse("7-9").unwrap()
+        );
         assert!(!settings.segment_first_client_hello);
     }
 

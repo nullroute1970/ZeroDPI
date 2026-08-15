@@ -1374,7 +1374,11 @@ impl Config {
             && !self.BYPASS_METHOD.iter().all(|m| {
                 matches!(
                     m,
-                    "tls_record_frag" | "tls_frag" | "tls_padding" | "mixed_case_sni" | "sni_boundary_frag"
+                    "tls_record_frag"
+                        | "tls_frag"
+                        | "tls_padding"
+                        | "mixed_case_sni"
+                        | "sni_boundary_frag"
                 )
             })
         {
@@ -2990,7 +2994,10 @@ mod tests {
             cfg.SNI_BOUNDARY_FRAG_SPLIT_POINT,
             SniBoundarySplitPoint::ExtensionLength
         );
-        assert_eq!(cfg.SNI_BOUNDARY_FRAG_DELAY_MS, Int32Range { min: 5, max: 10 });
+        assert_eq!(
+            cfg.SNI_BOUNDARY_FRAG_DELAY_MS,
+            Int32Range { min: 5, max: 10 }
+        );
         assert!(cfg.BYPASS_METHOD.is_socket_only());
         assert!(!cfg.BYPASS_METHOD.requires_interceptor());
     }
@@ -3010,7 +3017,10 @@ mod tests {
             cfg.SNI_BOUNDARY_FRAG_SPLIT_POINT,
             SniBoundarySplitPoint::Index(3)
         );
-        assert_eq!(cfg.SNI_BOUNDARY_FRAG_DELAY_MS, Int32Range { min: 7, max: 9 });
+        assert_eq!(
+            cfg.SNI_BOUNDARY_FRAG_DELAY_MS,
+            Int32Range { min: 7, max: 9 }
+        );
         assert!(!cfg.BYPASS_METHOD.is_socket_only());
     }
 

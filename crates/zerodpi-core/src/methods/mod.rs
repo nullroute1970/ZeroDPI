@@ -40,6 +40,8 @@
 
 pub mod composite;
 pub mod low_ttl;
+pub mod mixed_case_sni;
+pub mod sni;
 pub mod tcp_segmentation;
 pub mod tls_padding;
 pub mod tls_record_frag;

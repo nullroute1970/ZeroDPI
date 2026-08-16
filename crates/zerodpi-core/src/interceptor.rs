@@ -31,13 +31,32 @@ pub struct TcpFlags {
     pub urg: bool,
 }
 
+/// Staged out-of-order TCP segmentation request (`disorder` method).
+///
+/// The backend splits the rebuilt packet's TCP payload into `segments`
+/// non-empty equal chunks, advances each chunk's TCP sequence number by its
+/// in-stream byte offset, and emits the resulting segments in reverse order
+/// when `reverse` is set. The first segment is emitted synchronously from
+/// the capture loop; the remaining segments are injected by a short-lived
+/// background thread sleeping `delay_ms` between sends, so the capture loop
+/// never blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisorderSpec {
+    /// Number of segments to split the payload into (2 or 3).
+    pub segments: usize,
+    /// Emit segments in reverse (non-monotonic sequence-number) order.
+    pub reverse: bool,
+    /// Delay in milliseconds between consecutive segment emissions.
+    pub delay_ms: u64,
+}
+
 /// A read/write view of a captured TCP/IPv4 packet.
 ///
 /// Backends construct this from their native packet representation and apply
 /// the staged mutations (`new_*`, `replace_tcp_options`,
 /// `append_tcp_options`, `bump_ipv4_ident`, `new_ipv4_ttl`,
 /// `corrupt_tcp_checksum_delta`, `emit_original_after`,
-/// `ip_frag_payload_size`) when the handler
+/// `ip_frag_payload_size`, `disorder_spec`) when the handler
 /// returns [`Verdict::AcceptModified`].
 #[derive(Debug, Clone)]
 pub struct PacketView<'a> {
@@ -96,6 +115,14 @@ pub struct PacketView<'a> {
     /// multiple of 8. Backends without multi-fragment emission (e.g. no raw
     /// socket on Linux) fall back to emitting the unfragmented packet.
     pub ip_frag_payload_size: Option<usize>,
+    /// When the verdict is `AcceptModified`, split the rebuilt packet's TCP
+    /// payload into out-of-order segments and emit them instead of the whole
+    /// packet.
+    ///
+    /// Used by `disorder` (out-of-order TCP segmentation). Backends without
+    /// multi-segment emission (e.g. no raw socket on Linux) fall back to
+    /// emitting the unsegmented packet.
+    pub disorder_spec: Option<DisorderSpec>,
     /// Override the IPv4 Time-To-Live (TTL) field.
     ///
     /// Used by decoy-injection methods that want a fake packet to reach an
@@ -272,10 +299,12 @@ mod tests {
             corrupt_tcp_checksum_delta: None,
             emit_original_after: false,
             ip_frag_payload_size: None,
+            disorder_spec: None,
             new_ipv4_ttl: None,
             new_urgent_pointer: None,
         };
         assert!(!view.emit_original_after);
         assert_eq!(view.ip_frag_payload_size, None);
+        assert_eq!(view.disorder_spec, None);
     }
 }

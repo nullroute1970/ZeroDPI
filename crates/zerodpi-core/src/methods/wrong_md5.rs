@@ -129,6 +129,7 @@ mod tests {
             corrupt_tcp_checksum_delta: None,
             emit_original_after: false,
             ip_frag_payload_size: None,
+            disorder_spec: None,
             new_ipv4_ttl: None,
             new_urgent_pointer: None,
         }

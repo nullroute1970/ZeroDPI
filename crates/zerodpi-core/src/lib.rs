@@ -19,6 +19,7 @@ pub mod interceptor;
 pub mod ip_fragment;
 pub mod ip_scanner;
 pub mod low_ttl_discover;
+pub mod method_scanner;
 pub mod methods;
 pub mod net;
 pub mod proxy;

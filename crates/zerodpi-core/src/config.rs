@@ -1067,6 +1067,32 @@ pub struct Config {
     pub SCAN_OUTPUT: Option<String>,
 
     // -----------------------------------------------------------------------
+    // Method-scan modes
+    // -----------------------------------------------------------------------
+    /// Bypass methods to test in `sni_method_scan` / `ip_method_scan` modes.
+    /// Defaults to every base method; trim the list to test a subset.
+    #[serde(default = "default_method_scan_methods")]
+    pub METHOD_SCAN_METHODS: BypassMethodList,
+
+    /// Number of probe samples per method. Default: `10`.
+    #[serde(default = "default_method_scan_samples")]
+    pub METHOD_SCAN_SAMPLES: usize,
+
+    /// Interval between samples in milliseconds. Default: `1000`.
+    #[serde(default = "default_method_scan_interval_ms")]
+    pub METHOD_SCAN_INTERVAL_MS: u64,
+
+    /// Per-sample probe timeout in seconds. Default: `10`.
+    #[serde(default = "default_method_scan_timeout_secs")]
+    pub METHOD_SCAN_TIMEOUT_SECS: u64,
+
+    /// Optional path to write the method-scan report as a JSON file after a
+    /// method-scan run (`MODE = "sni_method_scan"` or `MODE = "ip_method_scan"`).
+    /// Relative paths are resolved from the directory containing `config.toml`.
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub METHOD_SCAN_OUTPUT: Option<String>,
+
+    // -----------------------------------------------------------------------
     // Scanner tuning
     // -----------------------------------------------------------------------
     /// Max concurrent SNI probes.
@@ -1181,6 +1207,21 @@ fn default_sni_list() -> String {
 }
 fn default_scan_timeout() -> u64 {
     5
+}
+fn default_method_scan_methods() -> BypassMethodList {
+    BypassMethodList::from_delimited(&BASE_BYPASS_METHODS.join(","))
+}
+
+fn default_method_scan_samples() -> usize {
+    10
+}
+
+fn default_method_scan_interval_ms() -> u64 {
+    1000
+}
+
+fn default_method_scan_timeout_secs() -> u64 {
+    10
 }
 fn default_rescan_interval_secs() -> u64 {
     600
@@ -1353,6 +1394,30 @@ impl Config {
         }
         if self.SCAN_TIMEOUT_SECS == 0 {
             anyhow::bail!("SCAN_TIMEOUT_SECS must be > 0");
+        }
+        if self.METHOD_SCAN_SAMPLES == 0 {
+            anyhow::bail!("METHOD_SCAN_SAMPLES must be >= 1");
+        }
+        if self.METHOD_SCAN_TIMEOUT_SECS == 0 {
+            anyhow::bail!("METHOD_SCAN_TIMEOUT_SECS must be > 0");
+        }
+        if self.METHOD_SCAN_METHODS.is_empty() {
+            anyhow::bail!("METHOD_SCAN_METHODS must not be empty");
+        }
+        {
+            let mut seen = std::collections::HashSet::new();
+            for method in self.METHOD_SCAN_METHODS.iter() {
+                if !BASE_BYPASS_METHODS.contains(&method) {
+                    anyhow::bail!(
+                        "Unknown METHOD_SCAN_METHODS entry '{}'. Valid base methods: {:?}",
+                        method,
+                        BASE_BYPASS_METHODS
+                    );
+                }
+                if !seen.insert(method) {
+                    anyhow::bail!("Duplicate METHOD_SCAN_METHODS entry '{method}'");
+                }
+            }
         }
         if self.BYPASS_TIMEOUT_SECS == 0 {
             anyhow::bail!("BYPASS_TIMEOUT_SECS must be > 0");
@@ -1543,10 +1608,17 @@ impl Config {
         }
         if !matches!(
             self.MODE.as_str(),
-            "sni_spoof" | "ip_bypass" | "ip_bypass_plus" | "sni_scan" | "ip_scan" | "proxy_scan"
+            "sni_spoof"
+                | "ip_bypass"
+                | "ip_bypass_plus"
+                | "sni_scan"
+                | "ip_scan"
+                | "proxy_scan"
+                | "sni_method_scan"
+                | "ip_method_scan"
         ) {
             anyhow::bail!(
-                "Unknown MODE '{}'. Valid values: \"sni_spoof\", \"ip_bypass\", \"ip_bypass_plus\", \"sni_scan\", \"ip_scan\", \"proxy_scan\"",
+                "Unknown MODE '{}'. Valid values: \"sni_spoof\", \"ip_bypass\", \"ip_bypass_plus\", \"sni_scan\", \"ip_scan\", \"proxy_scan\", \"sni_method_scan\", \"ip_method_scan\"",
                 self.MODE
             );
         }
@@ -3050,6 +3122,108 @@ mod tests {
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.SCAN_OUTPUT.as_deref(), Some("results.json"));
+    }
+
+    #[test]
+    fn method_scan_defaults_apply() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            MODE = "sni_method_scan"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.METHOD_SCAN_SAMPLES, 10);
+        assert_eq!(cfg.METHOD_SCAN_INTERVAL_MS, 1000);
+        assert_eq!(cfg.METHOD_SCAN_TIMEOUT_SECS, 10);
+        assert_eq!(
+            cfg.METHOD_SCAN_METHODS.iter().count(),
+            BASE_BYPASS_METHODS.len()
+        );
+        assert!(cfg.METHOD_SCAN_OUTPUT.is_none());
+    }
+
+    #[test]
+    fn method_scan_accepts_custom_values() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            MODE = "ip_method_scan"
+            METHOD_SCAN_SAMPLES = 5
+            METHOD_SCAN_INTERVAL_MS = 250
+            METHOD_SCAN_TIMEOUT_SECS = 20
+            METHOD_SCAN_METHODS = ["wrong_seq", "tls_frag"]
+            METHOD_SCAN_OUTPUT = "method_report.json"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.METHOD_SCAN_SAMPLES, 5);
+        assert_eq!(cfg.METHOD_SCAN_INTERVAL_MS, 250);
+        assert_eq!(cfg.METHOD_SCAN_TIMEOUT_SECS, 20);
+        assert!(cfg.METHOD_SCAN_METHODS.contains("wrong_seq"));
+        assert!(cfg.METHOD_SCAN_METHODS.contains("tls_frag"));
+        assert_eq!(cfg.METHOD_SCAN_METHODS.iter().count(), 2);
+        assert_eq!(cfg.METHOD_SCAN_OUTPUT.as_deref(), Some("method_report.json"));
+    }
+
+    #[test]
+    fn method_scan_rejects_zero_samples() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            MODE = "sni_method_scan"
+            METHOD_SCAN_SAMPLES = 0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn method_scan_rejects_zero_timeout() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            MODE = "sni_method_scan"
+            METHOD_SCAN_TIMEOUT_SECS = 0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn method_scan_rejects_unknown_method() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            MODE = "sni_method_scan"
+            METHOD_SCAN_METHODS = ["turbo_frag"]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn method_scan_rejects_duplicate_methods() {
+        let toml_str = r#"
+            LISTEN_HOST = "0.0.0.0"
+            LISTEN_PORT = 40443
+            MODE = "sni_method_scan"
+            METHOD_SCAN_METHODS = ["wrong_seq", "wrong_seq"]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn method_scan_modes_validate() {
+        for mode in ["sni_method_scan", "ip_method_scan"] {
+            let toml_str = format!(
+                "LISTEN_HOST = \"0.0.0.0\"\nLISTEN_PORT = 40443\nMODE = \"{mode}\"\n"
+            );
+            let cfg: Config = toml::from_str(&toml_str).unwrap();
+            cfg.validate().unwrap();
+            assert_eq!(cfg.MODE, mode);
+        }
     }
 
     #[test]

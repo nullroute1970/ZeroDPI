@@ -194,6 +194,42 @@ class ZeroDpiConfigSchemaTest {
         assertTrue(state.canStart)
     }
 
+    @Test
+    fun schemaCoversEveryRustConfigField() {
+        // existing schemaFieldsMatchRustConfigFields already asserts exact equality;
+        // this duplicates it so the two new-field tasks have a scoped gate.
+        val rustConfig = findRepoFile("crates/zerodpi-core/src/config.rs")
+        val configBody = Regex("""(?s)pub struct Config\s*\{(.*?)\n\}""")
+            .find(rustConfig.readText())!!.groupValues[1]
+        val rustFields = Regex("""(?m)^\s+pub\s+([A-Z0-9_]+):""")
+            .findAll(configBody).map { it.groupValues[1] }.toSet()
+        val androidFields = ZeroDpiConfigSchema.fields.map { it.name }.toSet()
+        val missing = rustFields - androidFields
+        assertTrue("Android schema missing Rust fields: ${missing.sorted()}", missing.isEmpty())
+    }
+
+    @Test
+    fun methodScanDefaultsMatchCore() {
+        val state = ZeroDpiConfigToml.analyze("")
+        assertEquals(16, state.config.methodList("METHOD_SCAN_METHODS").size)
+        assertEquals("3", state.valueFor("METHOD_SCAN_SAMPLES"))
+        assertEquals("1000", state.valueFor("METHOD_SCAN_INTERVAL_MS"))
+        assertEquals("10", state.valueFor("METHOD_SCAN_TIMEOUT_SECS"))
+        assertEquals("", state.valueFor("METHOD_SCAN_OUTPUT"))
+        assertEquals("0x0303", state.valueFor("CCS_PREFIX_RECORD_VERSION"))
+        assertEquals("5", state.valueFor("LOW_TTL_VALUE"))
+        assertEquals("5000", state.valueFor("LOW_TTL_DISCOVER_TIMEOUT_MS"))
+        assertEquals("24", state.valueFor("IP_FRAG_SIZE"))
+        assertEquals("2", state.valueFor("DISORDER_SEGMENTS"))
+        assertEquals("middle", state.valueFor("SNI_SPLIT_POSITION"))
+        assertEquals("extension_length", state.valueFor("SNI_BOUNDARY_FRAG_SPLIT_POINT"))
+        assertEquals("5-10", state.valueFor("SNI_BOUNDARY_FRAG_DELAY_MS"))
+        assertEquals("1500-2500", state.valueFor("TLS_PADDING_SIZE"))
+        assertEquals("before", state.valueFor("TLS_PADDING_POSITION"))
+        assertEquals("false", state.valueFor("MIXED_CASE_SNI_FLIP_ALL"))
+        assertTrue(ZeroDpiConfigSchema.methodScanModes.contains("sni_method_scan"))
+    }
+
     private fun findRepoFile(relativePath: String): File {
         var current = File("").absoluteFile
         while (true) {

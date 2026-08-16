@@ -3163,7 +3163,10 @@ mod tests {
         assert!(cfg.METHOD_SCAN_METHODS.contains("wrong_seq"));
         assert!(cfg.METHOD_SCAN_METHODS.contains("tls_frag"));
         assert_eq!(cfg.METHOD_SCAN_METHODS.iter().count(), 2);
-        assert_eq!(cfg.METHOD_SCAN_OUTPUT.as_deref(), Some("method_report.json"));
+        assert_eq!(
+            cfg.METHOD_SCAN_OUTPUT.as_deref(),
+            Some("method_report.json")
+        );
     }
 
     #[test]
@@ -3217,9 +3220,8 @@ mod tests {
     #[test]
     fn method_scan_modes_validate() {
         for mode in ["sni_method_scan", "ip_method_scan"] {
-            let toml_str = format!(
-                "LISTEN_HOST = \"0.0.0.0\"\nLISTEN_PORT = 40443\nMODE = \"{mode}\"\n"
-            );
+            let toml_str =
+                format!("LISTEN_HOST = \"0.0.0.0\"\nLISTEN_PORT = 40443\nMODE = \"{mode}\"\n");
             let cfg: Config = toml::from_str(&toml_str).unwrap();
             cfg.validate().unwrap();
             assert_eq!(cfg.MODE, mode);

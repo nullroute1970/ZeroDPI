@@ -202,7 +202,11 @@ fn parse_http_status(head: &str) -> Option<u16> {
 }
 
 /// Read an HTTP response up to `cap` bytes. Returns (TTFB ms, status, body bytes).
-async fn read_http_response<S>(stream: &mut S, cap: usize, timeout: Duration) -> (Option<u64>, Option<u16>, usize)
+async fn read_http_response<S>(
+    stream: &mut S,
+    cap: usize,
+    timeout: Duration,
+) -> (Option<u64>, Option<u16>, usize)
 where
     S: AsyncRead + Unpin,
 {
@@ -296,32 +300,31 @@ pub async fn direct_probe(
     };
     let connector = make_tls_connector();
     let tls_start = Instant::now();
-    let mut stream = match tokio::time::timeout(timeout, connector.connect(server_name, tcp_stream))
-        .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            debug!(error = %e, "method probe: TLS handshake failed");
-            return MethodSampleResult {
-                ok: false,
-                tls_ms: None,
-                ttfb_ms: None,
-                speed_bps: None,
-                http_status: None,
-                error: Some(format!("TLS handshake failed: {e}")),
-            };
-        }
-        Err(_) => {
-            return MethodSampleResult {
-                ok: false,
-                tls_ms: None,
-                ttfb_ms: None,
-                speed_bps: None,
-                http_status: None,
-                error: Some("TLS handshake timed out".into()),
-            };
-        }
-    };
+    let mut stream =
+        match tokio::time::timeout(timeout, connector.connect(server_name, tcp_stream)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                debug!(error = %e, "method probe: TLS handshake failed");
+                return MethodSampleResult {
+                    ok: false,
+                    tls_ms: None,
+                    ttfb_ms: None,
+                    speed_bps: None,
+                    http_status: None,
+                    error: Some(format!("TLS handshake failed: {e}")),
+                };
+            }
+            Err(_) => {
+                return MethodSampleResult {
+                    ok: false,
+                    tls_ms: None,
+                    ttfb_ms: None,
+                    speed_bps: None,
+                    http_status: None,
+                    error: Some("TLS handshake timed out".into()),
+                };
+            }
+        };
     let tls_ms = tls_start.elapsed().as_millis() as u64;
 
     // --- HTTP GET ---
@@ -429,6 +432,7 @@ where
 }
 
 /// One method: engine up, `METHOD_SCAN_SAMPLES` probes, engine down.
+#[allow(clippy::too_many_arguments)]
 async fn run_one_method<F, I>(
     config: &Arc<Config>,
     target: &MethodScanTarget,
@@ -455,7 +459,8 @@ where
     )));
 
     let flows = new_flow_table();
-    let flow_controller: Arc<dyn FlowController> = Arc::new(LocalFlowController::new(flows.clone()));
+    let flow_controller: Arc<dyn FlowController> =
+        Arc::new(LocalFlowController::new(flows.clone()));
 
     // Packet interceptor — only when this method needs one.
     let mut interceptor_guard: Option<(InterceptorShutdown, tokio::sync::oneshot::Receiver<()>)> =
@@ -464,8 +469,15 @@ where
         let method_box = match build_method(&cfg) {
             Some(m) => m,
             None => {
-                warn!(method, "build_method returned None — marking all samples failed");
-                return failed_entry(method, samples_total, "build_method returned None".to_owned());
+                warn!(
+                    method,
+                    "build_method returned None — marking all samples failed"
+                );
+                return failed_entry(
+                    method,
+                    samples_total,
+                    "build_method returned None".to_owned(),
+                );
             }
         };
         let method_arc: Arc<dyn crate::methods::BypassMethod> = Arc::from(method_box);
@@ -481,7 +493,11 @@ where
             Ok(i) => i,
             Err(e) => {
                 warn!(method, error = %e, "failed to open packet interceptor — marking all samples failed");
-                return failed_entry(method, samples_total, format!("interceptor open failed: {e}"));
+                return failed_entry(
+                    method,
+                    samples_total,
+                    format!("interceptor open failed: {e}"),
+                );
             }
         };
         let handler = Handler::new(flows.clone(), method_arc);
@@ -565,7 +581,12 @@ fn failed_entry(method: &str, samples_total: usize, error: String) -> MethodScan
 mod tests {
     use super::*;
 
-    fn sample(ok: bool, ttfb: Option<u64>, tls: Option<u64>, status: Option<u16>) -> MethodSampleResult {
+    fn sample(
+        ok: bool,
+        ttfb: Option<u64>,
+        tls: Option<u64>,
+        status: Option<u16>,
+    ) -> MethodSampleResult {
         MethodSampleResult {
             ok,
             tls_ms: tls,
@@ -699,7 +720,14 @@ mod tests {
                LISTEN_PORT = 44444"#,
         )
         .unwrap();
-        let result = direct_probe(&cfg, addr, "example.com", "/", std::time::Duration::from_secs(1)).await;
+        let result = direct_probe(
+            &cfg,
+            addr,
+            "example.com",
+            "/",
+            std::time::Duration::from_secs(1),
+        )
+        .await;
         assert!(!result.ok);
         assert!(result.error.is_some());
         assert_eq!(result.tls_ms, None);

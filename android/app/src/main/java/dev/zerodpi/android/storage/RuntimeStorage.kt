@@ -62,6 +62,7 @@ data class ResolvedRuntimeConfigPaths(
     val sniList: File,
     val ipList: File,
     val scanOutput: File?,
+    val methodScanOutput: File?,
 )
 
 class RuntimeStorage(context: Context) {
@@ -87,6 +88,15 @@ class RuntimeStorage(context: Context) {
                 sniListText = currentFiles.sniListFile.readText(StandardCharsets.UTF_8),
                 ipListText = currentFiles.ipListFile.readText(StandardCharsets.UTF_8),
             )
+        }
+
+    suspend fun readMethodScanOutput(profileId: String, configText: String): String? =
+        withContext(Dispatchers.IO) {
+            val currentFiles = ensureInitializedForProfile(profileId)
+            val resolved = resolveConfigPaths(configText, currentFiles.runtimeDir)
+            resolved.methodScanOutput
+                ?.takeIf { it.isFile }
+                ?.readText(StandardCharsets.UTF_8)
         }
 
     suspend fun save(profileId: String, kind: RuntimeFileKind, content: String) {
@@ -147,6 +157,7 @@ class RuntimeStorage(context: Context) {
             val configText = currentFiles.configFile.readText(StandardCharsets.UTF_8)
             val resolvedPaths = resolveConfigPaths(configText, currentFiles.runtimeDir)
             resolvedPaths.scanOutput?.parentFile?.let(RuntimeFileOps::ensureDirectory)
+            resolvedPaths.methodScanOutput?.parentFile?.let(RuntimeFileOps::ensureDirectory)
             resolvedPaths
         }
 
@@ -169,6 +180,7 @@ class RuntimeStorage(context: Context) {
 
             val resolvedPaths = resolveConfigPaths(runConfigText, currentFiles.runtimeDir)
             resolvedPaths.scanOutput?.parentFile?.let(RuntimeFileOps::ensureDirectory)
+            resolvedPaths.methodScanOutput?.parentFile?.let(RuntimeFileOps::ensureDirectory)
 
             RuntimeRunConfig(
                 files = currentFiles,
@@ -263,6 +275,9 @@ class RuntimeStorage(context: Context) {
                 runtimeDir,
             ),
             scanOutput = readTomlString(configText, "SCAN_OUTPUT")
+                ?.takeIf { it.isNotBlank() }
+                ?.let { resolveRuntimePath(it, runtimeDir) },
+            methodScanOutput = readTomlString(configText, "METHOD_SCAN_OUTPUT")
                 ?.takeIf { it.isNotBlank() }
                 ?.let { resolveRuntimePath(it, runtimeDir) },
         )

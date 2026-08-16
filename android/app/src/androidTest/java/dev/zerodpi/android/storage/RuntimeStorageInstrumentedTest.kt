@@ -9,6 +9,8 @@ import dev.zerodpi.android.profile.ZeroDpiProfile
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -139,6 +141,29 @@ class RuntimeStorageInstrumentedTest {
         val freshLogs = files.logsDir.listFiles().orEmpty().filter { it.extension == "log" }
         assertEquals(1, freshLogs.size)
         assertTrue(freshLogs.single().readText().contains("fresh entry"))
+    }
+
+    @Test
+    fun resolvesAndReadsMethodScanOutput() = runBlocking {
+        val storage = RuntimeStorage(context)
+        val profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID
+        val configText = """
+            LISTEN_HOST = "127.0.0.1"
+            LISTEN_PORT = 44444
+            MODE = "sni_method_scan"
+            METHOD_SCAN_OUTPUT = "method_scan_output.json"
+        """.trimIndent()
+        storage.save(profileId, RuntimeFileKind.Config, configText)
+        val runtimeDir = storage.readAll(profileId).files.runtimeDir
+        val paths = storage.resolveConfigPaths(configText, runtimeDir)
+        assertNotNull(paths.methodScanOutput)
+        assertEquals("method_scan_output.json", paths.methodScanOutput?.name)
+
+        assertNull(storage.readMethodScanOutput(profileId, configText)) // null: file not written yet
+        val target = paths.methodScanOutput!!
+        target.parentFile?.mkdirs()
+        target.writeText("""{"mode":"sni_method_scan"}""")
+        assertEquals("""{"mode":"sni_method_scan"}""", storage.readMethodScanOutput(profileId, configText))
     }
 
     private fun String.replaceField(fieldName: String, value: String): String =

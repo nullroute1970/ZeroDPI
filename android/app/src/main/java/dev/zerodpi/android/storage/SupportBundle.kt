@@ -11,6 +11,7 @@ object SupportBundleSanitizer {
         "SNI_LIST",
         "IP_LIST",
         "SCAN_OUTPUT",
+        "METHOD_SCAN_OUTPUT",
         "SCAN_UPLOAD_PATH",
         "IP_SCAN_SNI",
         "PROXY_TEST_SOCKS5_HOST",

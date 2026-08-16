@@ -2,10 +2,17 @@
 //!
 //! See the module-level docs added in later tasks.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tracing::debug;
 
 use crate::config::Config;
+use crate::sni_scanner::make_tls_connector;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -177,6 +184,191 @@ pub fn cfg_with_method(base: &Config, method: &str) -> Arc<Config> {
     Arc::new(cfg)
 }
 
+// ---------------------------------------------------------------------------
+// Direct probe
+// ---------------------------------------------------------------------------
+
+/// Parse the status code out of an HTTP response head.
+fn parse_http_status(head: &str) -> Option<u16> {
+    let rest = head.strip_prefix("HTTP/")?;
+    rest.split_once(' ')?.1.get(0..3)?.parse().ok()
+}
+
+/// Read an HTTP response up to `cap` bytes. Returns (TTFB ms, status, body bytes).
+async fn read_http_response<S>(stream: &mut S, cap: usize, timeout: Duration) -> (Option<u64>, Option<u16>, usize)
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buf = vec![0u8; cap];
+    let mut total_read = 0usize;
+    let mut ttfb_ms: Option<u64> = None;
+    let mut http_status: Option<u16> = None;
+    let mut header_end: Option<usize> = None;
+    let start = Instant::now();
+    loop {
+        let remaining = cap - total_read;
+        if remaining == 0 {
+            break;
+        }
+        match tokio::time::timeout(timeout, stream.read(&mut buf[total_read..])).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                if ttfb_ms.is_none() {
+                    ttfb_ms = Some(start.elapsed().as_millis() as u64);
+                }
+                total_read += n;
+                if header_end.is_none() {
+                    if let Some(pos) = find_header_end(&buf[..total_read]) {
+                        header_end = Some(pos);
+                        if let Ok(head) = std::str::from_utf8(&buf[..pos]) {
+                            http_status = parse_http_status(head);
+                        }
+                    }
+                }
+            }
+            Ok(Err(_)) => break,
+        }
+    }
+    let body_bytes = header_end.map_or(0, |end| total_read.saturating_sub(end));
+    (ttfb_ms, http_status, body_bytes)
+}
+
+/// Index just past the first `\r\n\r\n` (end of the HTTP response head).
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+/// One probe through ZeroDPI's engine: TCP to the listen port, TLS handshake
+/// with `sni`, HTTP GET of `http_path`, bounded by `timeout`.
+pub async fn direct_probe(
+    config: &Config,
+    connect_addr: SocketAddr,
+    sni: &str,
+    http_path: &str,
+    timeout: Duration,
+) -> MethodSampleResult {
+    // --- TCP connect to the engine's listen port ---
+    let tcp_stream = match tokio::time::timeout(timeout, TcpStream::connect(connect_addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            debug!(error = %e, %connect_addr, "method probe: TCP connect failed");
+            return MethodSampleResult {
+                ok: false,
+                tls_ms: None,
+                ttfb_ms: None,
+                speed_bps: None,
+                http_status: None,
+                error: Some(format!("TCP connect to {connect_addr} failed: {e}")),
+            };
+        }
+        Err(_) => {
+            return MethodSampleResult {
+                ok: false,
+                tls_ms: None,
+                ttfb_ms: None,
+                speed_bps: None,
+                http_status: None,
+                error: Some(format!("TCP connect to {connect_addr} timed out")),
+            };
+        }
+    };
+
+    // --- TLS handshake with the target SNI ---
+    let server_name = match ServerName::try_from(sni).map(|sn| sn.to_owned()) {
+        Ok(sn) => sn,
+        Err(e) => {
+            return MethodSampleResult {
+                ok: false,
+                tls_ms: None,
+                ttfb_ms: None,
+                speed_bps: None,
+                http_status: None,
+                error: Some(format!("invalid SNI '{sni}': {e}")),
+            };
+        }
+    };
+    let connector = make_tls_connector();
+    let tls_start = Instant::now();
+    let mut stream = match tokio::time::timeout(timeout, connector.connect(server_name, tcp_stream))
+        .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            debug!(error = %e, "method probe: TLS handshake failed");
+            return MethodSampleResult {
+                ok: false,
+                tls_ms: None,
+                ttfb_ms: None,
+                speed_bps: None,
+                http_status: None,
+                error: Some(format!("TLS handshake failed: {e}")),
+            };
+        }
+        Err(_) => {
+            return MethodSampleResult {
+                ok: false,
+                tls_ms: None,
+                ttfb_ms: None,
+                speed_bps: None,
+                http_status: None,
+                error: Some("TLS handshake timed out".into()),
+            };
+        }
+    };
+    let tls_ms = tls_start.elapsed().as_millis() as u64;
+
+    // --- HTTP GET ---
+    let req = format!(
+        "GET {http_path} HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\nUser-Agent: zerodpi-method-scan/0.1\r\n\r\n"
+    );
+    let req_start = Instant::now();
+    let write_ok = tokio::time::timeout(timeout, async {
+        stream.write_all(req.as_bytes()).await?;
+        stream.flush().await?;
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .is_ok_and(|r| r.is_ok());
+    if !write_ok {
+        return MethodSampleResult {
+            ok: false,
+            tls_ms: Some(tls_ms),
+            ttfb_ms: None,
+            speed_bps: None,
+            http_status: None,
+            error: Some("HTTP request write failed or timed out".into()),
+        };
+    }
+
+    let (ttfb_ms, http_status, total_read) =
+        read_http_response(&mut stream, config.SCAN_DOWNLOAD_CAP, timeout).await;
+
+    let speed_bps = if total_read > 0 {
+        let elapsed = req_start.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            Some(total_read as f64 / elapsed)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let ok = http_status.is_some() && total_read > 0;
+    MethodSampleResult {
+        ok,
+        tls_ms: Some(tls_ms),
+        ttfb_ms,
+        speed_bps,
+        http_status,
+        error: if ok {
+            None
+        } else {
+            Some("no HTTP response received through the relay".into())
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +466,50 @@ mod tests {
         let cfg = cfg_with_method(&base, "tls_padding");
         assert_eq!(cfg.BYPASS_METHOD.to_string(), "tls_padding");
         assert_eq!(base.BYPASS_METHOD.to_string(), "wrong_seq + tls_frag");
+    }
+
+    #[test]
+    fn parses_http_status_line() {
+        assert_eq!(parse_http_status("HTTP/1.1 200 OK\r\n"), Some(200));
+        assert_eq!(parse_http_status("HTTP/1.0 404 Not Found\r\n"), Some(404));
+        assert_eq!(parse_http_status("garbage"), None);
+        assert_eq!(parse_http_status(""), None);
+    }
+
+    #[tokio::test]
+    async fn reads_status_ttfb_and_body_bytes() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
+            // Dropping `sock` here closes the connection -> the reader sees EOF.
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (ttfb, status, total) =
+            read_http_response(&mut stream, 1024, std::time::Duration::from_secs(5)).await;
+        assert!(ttfb.is_some());
+        assert_eq!(status, Some(200));
+        assert_eq!(total, 5);
+    }
+
+    #[tokio::test]
+    async fn probe_fails_on_closed_port() {
+        // Bind, then drop, so the address is guaranteed to refuse connections.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .unwrap();
+        let result = direct_probe(&cfg, addr, "example.com", "/", std::time::Duration::from_secs(1)).await;
+        assert!(!result.ok);
+        assert!(result.error.is_some());
+        assert_eq!(result.tls_ms, None);
     }
 }

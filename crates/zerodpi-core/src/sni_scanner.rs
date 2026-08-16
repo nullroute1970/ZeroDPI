@@ -243,7 +243,7 @@ pub async fn scan_sni_list(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn make_tls_connector() -> TlsConnector {
+pub fn make_tls_connector() -> TlsConnector {
     let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = tokio_rustls::rustls::ClientConfig::builder()

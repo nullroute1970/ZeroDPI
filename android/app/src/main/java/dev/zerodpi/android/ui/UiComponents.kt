@@ -23,6 +23,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -38,6 +39,8 @@ import dev.zerodpi.android.R
 import dev.zerodpi.android.config.ConfigEditorState
 import dev.zerodpi.android.config.ConfigFieldSchema
 import dev.zerodpi.android.config.ConfigFieldType
+import dev.zerodpi.android.config.canonicalMethodArray
+import dev.zerodpi.android.config.parseTomlStringArray
 import dev.zerodpi.android.service.RuntimeStatus
 
 @Composable
@@ -239,6 +242,13 @@ internal fun ConfigFieldControl(
                 }
             }
 
+            ConfigFieldType.MultiSelect -> MethodSelectControl(
+                field = field,
+                value = value,
+                enabled = enabled,
+                onChanged = onChanged,
+            )
+
             else -> {
                 OutlinedTextField(
                     value = value,
@@ -264,6 +274,47 @@ internal fun ConfigFieldControl(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelSmall,
             )
+        }
+    }
+}
+
+@Composable
+private fun MethodSelectControl(
+    field: ConfigFieldSchema,
+    value: String,
+    enabled: Boolean,
+    onChanged: (String, String) -> Unit,
+) {
+    val selected = remember(value) { parseTomlStringArray(value).orEmpty().toSet() }
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        field.options.forEach { option ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = option,
+                    modifier = Modifier.weight(1f),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+                Switch(
+                    checked = option in selected,
+                    onCheckedChange = { checked ->
+                        val updated = (
+                            if (checked) selected + option else selected - option
+                            ).sortedBy { field.options.indexOf(it) }
+                        onChanged(field.name, canonicalMethodArray(updated))
+                    },
+                    enabled = enabled,
+                    modifier = Modifier.testTag("method_select_$option"),
+                )
+            }
         }
     }
 }

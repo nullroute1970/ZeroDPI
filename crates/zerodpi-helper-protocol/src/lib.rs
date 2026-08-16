@@ -148,10 +148,15 @@ impl MethodConfig {
             "wrong_timestamp",
             "low_ttl",
             "tls_record_frag",
+            "fake_tls",
+            "ip_frag",
+            "disorder",
             "tls_frag",
-            "tls_padding",
             "ccs_prefix",
+            "tls_padding",
+            "mixed_case_sni",
             "urg_sni_split",
+            "sni_boundary_frag",
         ];
         if self.methods.is_empty()
             || self
@@ -808,6 +813,39 @@ mod tests {
         let mut key = flow_key();
         key.dst_ip = Ipv4Addr::BROADCAST;
         assert!(key.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_every_core_base_bypass_method() {
+        // Parity with `zerodpi_core::config::BASE_BYPASS_METHODS` so the wire
+        // protocol never rejects a method that the data plane can build.
+        // Keep in sync with that constant when new methods are added.
+        const CORE_BASE_METHODS: &[&str] = &[
+            "wrong_seq",
+            "wrong_ack",
+            "wrong_checksum",
+            "wrong_md5",
+            "wrong_timestamp",
+            "low_ttl",
+            "tls_record_frag",
+            "fake_tls",
+            "ip_frag",
+            "disorder",
+            "tls_frag",
+            "ccs_prefix",
+            "tls_padding",
+            "mixed_case_sni",
+            "urg_sni_split",
+            "sni_boundary_frag",
+        ];
+        for name in CORE_BASE_METHODS {
+            let mut config = method();
+            config.methods = vec![(*name).to_owned()];
+            assert!(
+                config.validate().is_ok(),
+                "helper protocol rejects core method {name:?}"
+            );
+        }
     }
 
     #[test]

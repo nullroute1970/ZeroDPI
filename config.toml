@@ -28,7 +28,7 @@ LISTEN_PORT = 44444
 #                      BYPASS_METHOD ("tls_record_frag", "tls_frag",
 #                      "tls_padding", "mixed_case_sni", "sni_boundary_frag",
 #                      "ccs_prefix",
-#                      or "ip_frag").
+#                      "ip_frag", or "disorder").
 # - "sni_scan"      — scan sni_list.txt and display/save results, then exit.
 # - "ip_scan"       — scan ip_list.txt and display/save results, then exit.
 # - "proxy_scan"    — scan sni_list.txt (Phase 1), then test each working SNI
@@ -240,6 +240,19 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     fragmented.  Requires WinDivert/NFQUEUE interception
 #     (Administrator/root, IPv4-only).
 #
+#   "disorder"
+#     Out-of-Order TCP Segmentation.  Does NOT inject any fake packet.
+#     Instead, it intercepts the first outbound data packet carrying the
+#     real TLS ClientHello, splits its TCP payload into DISORDER_SEGMENTS
+#     equal segments with correct sequence numbers, and emits them in
+#     reverse order, optionally with DISORDER_DELAY_MS between them.  The
+#     server's kernel reassembles the segments before TLS, so the handshake
+#     proceeds normally; DPIs that track per-flow sequence state see
+#     non-monotonic segments and never a complete ClientHello in one
+#     segment.  With DISORDER_ONLY_FIRST_PACKET = false, every outbound
+#     data packet is re-chunked.  Requires WinDivert/NFQUEUE interception
+#     (Administrator/root, IPv4-only).
+#
 #   "urg_sni_split"
 #     TCP Urgent + SNI byte splice.  Does NOT inject any fake packet.  Instead,
 #     it intercepts the first outbound data packet carrying the real TLS
@@ -329,6 +342,11 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   handshake-stage fake-packet methods and with the socket-side methods,
 #   but is mutually exclusive with "tls_record_frag", "fake_tls", and
 #   "urg_sni_split" (all own the first data packet).
+# - "disorder" adds a data-stage out-of-order TCP segmentation.  It
+#   combines with handshake-stage fake-packet methods and with the
+#   socket-side methods, but is mutually exclusive with "tls_record_frag",
+#   "fake_tls", "ip_frag", and "urg_sni_split" (all own the first data
+#   packet).
 # - "tls_padding" adds a socket-side data stage: the real ClientHello is
 #   expanded with an RFC 7685 padding extension before it is written to the
 #   upstream socket.  It combines with handshake-stage methods and with
@@ -362,9 +380,12 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   "urg_sni_split".
 # - "ip_frag" cannot be combined with "tls_record_frag", "fake_tls", or
 #   "urg_sni_split".
+# - "disorder" cannot be combined with "tls_record_frag", "fake_tls",
+#   "ip_frag", or "urg_sni_split".
 # - MODE = "ip_bypass_plus" supports only "tls_record_frag", "tls_frag",
 #   "tls_padding", "mixed_case_sni", "sni_boundary_frag", "ccs_prefix",
-#   or "ip_frag" so the upstream VPN client's real SNI is preserved.
+#   "ip_frag", or "disorder" so the upstream VPN client's real SNI is
+#   preserved.
 # - LOW_TTL_DISCOVER only takes effect when "low_ttl" is in the list;
 #   otherwise discovery is silently skipped.
 #
@@ -766,6 +787,53 @@ IP_FRAG_SIZE = 24
 #                   middlebox breaks the flow; use only when the DPI
 #                   reassembles only the first packet.
 IP_FRAG_ONLY_FIRST_PACKET = true
+
+# ---------------------------------------------------------------------------
+# disorder method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "disorder" (alone or combined
+# with handshake fake-packet methods or socket-side methods).
+#
+# disorder splits the outbound data packet carrying the ClientHello into
+# DISORDER_SEGMENTS TCP segments of equal size, each with the correct TCP
+# sequence number, and emits them in reverse order.  The destination kernel
+# reassembles the segments before TLS, so the handshake is unaffected;
+# sequence-tracking DPI sees non-monotonic segments and no complete
+# ClientHello.  The real ClientHello bytes are untouched — the SNI is
+# preserved.
+
+# Number of segments to split each rewritten data packet into.
+# Valid values: 2 or 3.  Default: 2.
+DISORDER_SEGMENTS = 2
+
+# Delay in milliseconds between consecutive segment emissions.
+#
+# The first segment is emitted synchronously; the remaining segments are
+# injected from a short-lived background thread, so packet interception is
+# never blocked.  Larger values widen the window in which the DPI sees only
+# part of the stream, at the cost of connection-setup latency.
+# 0 (default)  — emit all segments back-to-back.
+DISORDER_DELAY_MS = 0
+
+# Whether to emit the segments in reverse (non-monotonic sequence-number)
+# order.
+#
+# true (default)  — reverse order: the DPI's first-seen segment is the
+#                   payload tail and carries no SNI.
+# false           — in-order chunks (degenerate ordered segmentation).
+DISORDER_REVERSE = true
+
+# Whether to re-chunk only the first outbound data packet of each
+# connection.
+#
+# true (default)  — re-chunk the packet carrying the ClientHello only; the
+#                   rest of the stream is untouched.
+# false           — fragment-all mode: every subsequent outbound data packet
+#                   is also re-chunked and reordered until the connection
+#                   closes.  Costs CPU per packet and raises the chance a
+#                   segment-hostile middlebox breaks the flow; use only when
+#                   the DPI inspects more than the first packet.
+DISORDER_ONLY_FIRST_PACKET = true
 
 # ---------------------------------------------------------------------------
 # urg_sni_split method parameters

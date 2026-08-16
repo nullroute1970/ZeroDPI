@@ -94,6 +94,7 @@ Windows, no NFQUEUE on Linux). Current members: `tls_frag`, `tls_padding`,
 | `mixed_case_sni` | socket | randomize SNI letter case (servers lowercase per RFC 6066, case-sensitive DPI misses) |
 | `sni_boundary_frag` | socket | split first record into two TCP segments cut at the SNI extension boundary, with delay |
 | `ccs_prefix` | socket | dummy ChangeCipherSpec record before the ClientHello; first-record DPIs see no SNI (RFC 8446 §4.1.3) |
+| `disorder` | interceptor, data stage | split the first data packet's payload into 2–3 TCP segments with correct sequence numbers and emit them in reverse order (optionally delayed); the server's kernel reassembles, sequence-tracking DPI sees non-monotonic segments |
 
 Composites: `wrong_seq_wrong_md5`, `wrong_seq_tls_frag`,
 `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, `wrong_seq_tls_padding`,
@@ -103,9 +104,8 @@ Composites: `wrong_seq_wrong_md5`, `wrong_seq_tls_frag`,
 **Gap summary:** the fake-packet injection family (ByeDPI `--wrong-seq`
 etc.) is fully covered; TCP segmentation (`tls_frag`), padding, and
 boundary splitting are covered. What is missing versus the comparable tools
-is `fake_tls` variant B (socket-side forged record length), out-of-order
-delivery (`disorder`), and record-level tricks such as `tls_record_split`
-and `tcp_opt_pad`.
+is `fake_tls` variant B (socket-side forged record length) and record-level
+tricks such as `tls_record_split` and `tcp_opt_pad`.
 
 ---
 
@@ -277,6 +277,13 @@ first-record-only DPIs, not a universal bypass.
 
 ### 4.4 `disorder` — out-of-order TCP segmentation *(moderate value, higher effort)*
 
+**Status (2026-08-16):** Implemented (`disorder`, interceptor, data stage,
+reusing the `ip_frag` multi-packet emission plumbing; segments emitted in
+reverse order via the backend emission loops with `DISORDER_SEGMENTS`,
+`DISORDER_DELAY_MS` (delayed segments injected from a short-lived
+background thread so the capture loop never blocks), `DISORDER_REVERSE`,
+and `DISORDER_ONLY_FIRST_PACKET` fragment-all mode).
+
 **Overview.** Split the ClientHello into two or three TCP segments and
 emit them in reverse order (with correct sequence numbers), optionally with
 delays between them.
@@ -421,12 +428,12 @@ composite lists, not a headline method.
 | `fake_tls` (variant A) | decoy record injection | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | medium | high |
 | `ip_frag` | IP-layer fragmentation | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | medium* | high |
 | `ccs_prefix` | TLS middlebox compat | socket | everywhere | small — ✅ implemented | moderate |
-| `disorder` | out-of-order segmentation | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | medium–large* | moderate |
+| `disorder` | out-of-order segmentation | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | medium–large* — ✅ implemented | moderate |
 | `tls_record_split` | record-level handshake split | socket | everywhere | small–medium | moderate |
 | `tcp_opt_pad` | TCP option junk | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | small | low |
 
-\* Requires the multi-packet emission infrastructure change in the
-interceptor (prerequisite shared by `ip_frag` and `disorder`).
+\* Requires the multi-packet emission infrastructure in the interceptor
+(implemented with `ip_frag`, reused by `disorder`).
 
 ---
 
@@ -440,7 +447,7 @@ Build in this order:
 2. **`ccs_prefix`** — ✅ implemented.
 3. **`ip_frag`** — ✅ implemented, including the multi-packet emission
    plumbing, so `disorder` (4) becomes cheap follow-up.
-4. **`disorder`** — reuse the emission plumbing.
+4. **`disorder`** — ✅ implemented (reuses the emission plumbing).
 5. **`tls_record_split`** / **`tcp_opt_pad`** — cheap additions once the
    pattern for socket-side and option-staging methods is established.
 

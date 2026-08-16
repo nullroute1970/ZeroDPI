@@ -40,6 +40,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{Config, TlsFragPackets};
 use crate::flow::{BypassOutcome, FlowController, FlowEntry, FlowKey};
+use crate::methods::ccs_prefix::CcsPrefix;
 use crate::methods::mixed_case_sni::MixedCaseSni;
 use crate::methods::sni_boundary_frag::{write_boundary_split, SniBoundaryFrag};
 use crate::methods::tcp_segmentation::{read_one_tls_record, write_fragmented, TcpSegmentation};
@@ -183,6 +184,7 @@ struct ConnectionSettings {
     max_lifetime: Option<Duration>,
     segment_first_client_hello: bool,
     tls_padding: Option<TlsPadding>,
+    ccs_prefix: Option<CcsPrefix>,
     mixed_case_sni: Option<MixedCaseSni>,
     sni_boundary_frag: Option<SniBoundaryFrag>,
     tcp_segmentation: TcpSegmentation,
@@ -203,6 +205,10 @@ impl ConnectionSettings {
                 .BYPASS_METHOD
                 .contains("tls_padding")
                 .then(|| TlsPadding::new(cfg)),
+            ccs_prefix: cfg
+                .BYPASS_METHOD
+                .contains("ccs_prefix")
+                .then(|| CcsPrefix::new(cfg)),
             mixed_case_sni: cfg
                 .BYPASS_METHOD
                 .contains("mixed_case_sni")
@@ -290,6 +296,20 @@ where
         dst.flush().await.context("flushing client data")?;
         Ok(())
     }
+}
+
+/// Write the dummy ChangeCipherSpec record of `ccs_prefix` as the very first
+/// bytes of the upstream stream, flushed so it leaves as its own segment.
+async fn write_ccs_prefix<W>(dst: &mut W, ccs: CcsPrefix) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    dst.write_all(&ccs.record())
+        .await
+        .context("ccs_prefix: writing dummy ChangeCipherSpec record")?;
+    dst.flush()
+        .await
+        .context("ccs_prefix: flushing dummy ChangeCipherSpec record")
 }
 
 async fn read_client_tls_record_with_timeout(
@@ -662,6 +682,24 @@ async fn handle_intercept_connection(
             )?;
         }
         Some(BypassProgress::ReadyForData) => {
+            // `ccs_prefix`: the dummy ChangeCipherSpec must be the very first
+            // bytes written upstream, before any ClientHello write below.
+            if let Some(ccs) = settings.ccs_prefix {
+                outgoing
+                    .set_nodelay(true)
+                    .context("ccs_prefix: set_nodelay on upstream socket")?;
+                if let Err(e) = write_ccs_prefix(&mut outgoing, ccs).await {
+                    entry.finish(BypassOutcome::UnexpectedClose);
+                    emit(
+                        &event_tx,
+                        ProxyEvent::BypassComplete {
+                            src_port,
+                            outcome: BypassOutcome::UnexpectedClose,
+                        },
+                    );
+                    return Err(e).context("ccs_prefix: writing ChangeCipherSpec prefix");
+                }
+            }
             if let Some(boundary) = settings.sni_boundary_frag {
                 // The boundary split needs two cleanly separated segments.
                 outgoing
@@ -1054,10 +1092,20 @@ async fn handle_tcp_seg_connection_with_ip(
     // Enable TCP_NODELAY on the upstream socket if configured. The boundary
     // split depends on two cleanly separated segments, so sni_boundary_frag
     // always forces it.
-    if method.nodelay || cfg.BYPASS_METHOD.contains("sni_boundary_frag") {
+    if method.nodelay || cfg.BYPASS_METHOD.contains("sni_boundary_frag") || cfg.BYPASS_METHOD.contains("ccs_prefix") {
         outgoing
             .set_nodelay(true)
             .context("set_nodelay on upstream socket")?;
+    }
+
+    // `ccs_prefix`: write the dummy ChangeCipherSpec as the very first
+    // upstream bytes; every ClientHello write below follows it.  When
+    // `ccs_prefix` is listed alone, the relay then forwards the client's
+    // stream untouched — the CCS is still the first record on the wire.
+    if cfg.BYPASS_METHOD.contains("ccs_prefix") {
+        write_ccs_prefix(&mut outgoing, CcsPrefix::new(&cfg))
+            .await
+            .context("ccs_prefix: writing ChangeCipherSpec prefix")?;
     }
 
     // When tls_padding and/or mixed_case_sni are listed, read the first TLS
@@ -1935,5 +1983,33 @@ mod tests {
         let cfg = cfg_with(r#"BYPASS_METHOD = "tls_frag""#, "");
         let settings = ConnectionSettings::from_config(&cfg);
         assert!(settings.sni_boundary_frag.is_none());
+    }
+
+    #[test]
+    fn connection_settings_enable_ccs_prefix_from_config() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "ccs_prefix""#,
+        )
+        .unwrap();
+        let settings = ConnectionSettings::from_config(&cfg);
+        assert_eq!(settings.ccs_prefix, Some(CcsPrefix::exact(0x0303)));
+
+        let plain: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .unwrap();
+        assert!(ConnectionSettings::from_config(&plain).ccs_prefix.is_none());
+    }
+
+    #[tokio::test]
+    async fn ccs_prefix_write_emits_the_six_byte_record() {
+        let mut writer = RecordingWriter::default();
+        write_ccs_prefix(&mut writer, CcsPrefix::exact(0x0303))
+            .await
+            .unwrap();
+        assert_eq!(writer.writes, vec![vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01]]);
     }
 }

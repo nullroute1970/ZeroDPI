@@ -1096,7 +1096,10 @@ async fn handle_tcp_seg_connection_with_ip(
     // Enable TCP_NODELAY on the upstream socket if configured. The boundary
     // split depends on two cleanly separated segments, so sni_boundary_frag
     // always forces it.
-    if method.nodelay || cfg.BYPASS_METHOD.contains("sni_boundary_frag") || cfg.BYPASS_METHOD.contains("ccs_prefix") {
+    if method.nodelay
+        || cfg.BYPASS_METHOD.contains("sni_boundary_frag")
+        || cfg.BYPASS_METHOD.contains("ccs_prefix")
+    {
         outgoing
             .set_nodelay(true)
             .context("set_nodelay on upstream socket")?;
@@ -2014,6 +2017,9 @@ mod tests {
         write_ccs_prefix(&mut writer, CcsPrefix::exact(0x0303))
             .await
             .unwrap();
-        assert_eq!(writer.writes, vec![vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01]]);
+        assert_eq!(
+            writer.writes,
+            vec![vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01]]
+        );
     }
 }

@@ -123,10 +123,7 @@ mod tests {
     #[test]
     fn rejects_malformed_record_versions() {
         for bad in ["0x03GG", "0x03", "0x03033", "0x030", "", "xyz"] {
-            assert!(
-                parse_record_version(bad).is_err(),
-                "should reject '{bad}'"
-            );
+            assert!(parse_record_version(bad).is_err(), "should reject '{bad}'");
         }
     }
 }

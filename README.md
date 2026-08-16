@@ -1201,7 +1201,7 @@ Runtime behavior to know:
 
 - ZeroDPI currently relays to upstream port `443`.
 - Interceptor-based methods inspect IPv4 TCP packets in the current backends.
-- `tls_frag` and `tls_padding` do not open WinDivert/NFQUEUE because they operate inside the proxy: `tls_frag` controls socket writes, `tls_padding` rewrites the first ClientHello record.
+- `tls_frag`, `tls_padding`, and `ccs_prefix` do not open WinDivert/NFQUEUE because they operate inside the proxy: `tls_frag` controls socket writes, `tls_padding` rewrites the first ClientHello record, and `ccs_prefix` writes a dummy ChangeCipherSpec record before it.
 - Scan-only modes do not start the local proxy and do not need your VPN client to be running.
 - `proxy_scan` requires the configured SOCKS5 proxy to be running before ZeroDPI starts Phase 2.
 
@@ -1285,7 +1285,7 @@ If Windows blocks the driver or DLL, unblock the downloaded archive before extra
 
 Requires root, a supported firewall backend command (`iptables` by default, or `nft` with `LINUX_FIREWALL_BACKEND = "nftables"`), and a kernel with NFQUEUE support.
 
-On Android, `tls_frag` or `tls_padding` are the simplest methods to try first because they do not require NFQUEUE interception. Interceptor-based methods still need root and a compatible kernel.
+On Android, `tls_frag`, `tls_padding`, or `ccs_prefix` are the simplest methods to try first because they do not require NFQUEUE interception. Interceptor-based methods still need root and a compatible kernel.
 
 ---
 

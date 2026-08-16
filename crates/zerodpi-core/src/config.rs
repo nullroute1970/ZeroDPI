@@ -321,7 +321,11 @@ impl BypassMethodList {
             && self.0.iter().all(|m| {
                 matches!(
                     m.as_str(),
-                    "tls_frag" | "ccs_prefix" | "tls_padding" | "mixed_case_sni" | "sni_boundary_frag"
+                    "tls_frag"
+                        | "ccs_prefix"
+                        | "tls_padding"
+                        | "mixed_case_sni"
+                        | "sni_boundary_frag"
                 )
             })
     }

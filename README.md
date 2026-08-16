@@ -1454,6 +1454,20 @@ Requires root, a supported firewall backend command (`iptables` by default, or `
 
 On Android, `tls_frag`, `tls_padding`, or `ccs_prefix` are the simplest methods to try first because they do not require NFQUEUE interception. Interceptor-based methods still need root and a compatible kernel.
 
+### 📱 Android app
+
+The Android app exposes the full core configuration: all eight operating
+modes (including `sni_method_scan` / `ip_method_scan`), all sixteen base
+bypass methods as a multi-select list (`BYPASS_METHOD`), and every
+per-method parameter group (`low_ttl`, `fake_tls`, `ip_frag`, `disorder`,
+`urg_sni_split`, `sni_boundary_frag`, `tls_padding`, `mixed_case_sni`,
+`ccs_prefix`) under Configure → Advanced. When a method-scan mode is
+selected, the Home tab shows live progress and a ranked results table
+read from `METHOD_SCAN_OUTPUT` (auto-filled to `method_scan_output.json`
+in the profile runtime directory when left blank). Socket-only methods
+(`tls_frag`, `ccs_prefix`, `tls_padding`, `mixed_case_sni`,
+`sni_boundary_frag`) run without root.
+
 ---
 
 ## 🔨 Building from Source

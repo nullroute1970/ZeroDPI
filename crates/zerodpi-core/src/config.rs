@@ -7,6 +7,7 @@ use serde::de;
 use serde::{Deserialize, Serialize};
 
 use crate::interceptor::LinuxFirewallBackend;
+use crate::methods::ccs_prefix::parse_record_version;
 use crate::methods::tls_padding::PaddingPosition;
 use crate::tls_template::MAX_SNI_LEN;
 
@@ -248,6 +249,7 @@ pub const BASE_BYPASS_METHODS: &[&str] = &[
     "fake_tls",
     "ip_frag",
     "tls_frag",
+    "ccs_prefix",
     "tls_padding",
     "mixed_case_sni",
     "urg_sni_split",
@@ -319,7 +321,7 @@ impl BypassMethodList {
             && self.0.iter().all(|m| {
                 matches!(
                     m.as_str(),
-                    "tls_frag" | "tls_padding" | "mixed_case_sni" | "sni_boundary_frag"
+                    "tls_frag" | "ccs_prefix" | "tls_padding" | "mixed_case_sni" | "sni_boundary_frag"
                 )
             })
     }
@@ -329,7 +331,7 @@ impl BypassMethodList {
         self.0.iter().any(|m| {
             !matches!(
                 m.as_str(),
-                "tls_frag" | "tls_padding" | "mixed_case_sni" | "sni_boundary_frag"
+                "tls_frag" | "ccs_prefix" | "tls_padding" | "mixed_case_sni" | "sni_boundary_frag"
             )
         })
     }
@@ -944,6 +946,18 @@ pub struct Config {
     pub MIXED_CASE_SNI_FLIP_ALL: bool,
 
     // -----------------------------------------------------------------------
+    // ccs_prefix method parameters
+    // -----------------------------------------------------------------------
+    /// The two TLS record-version bytes of the dummy ChangeCipherSpec record
+    /// written by `ccs_prefix`, as a hex string. TLS 1.3's middlebox
+    /// compatibility mode (RFC 8446 §4.1.3) uses `0x0303`; vary this only
+    /// when a DPI fingerprints on the record version.
+    /// Must be exactly two bytes (e.g. `"0x0303"` or `"0303"`).
+    /// Default: `"0x0303"`.
+    #[serde(default = "default_ccs_prefix_record_version")]
+    pub CCS_PREFIX_RECORD_VERSION: String,
+
+    // -----------------------------------------------------------------------
     // Proxy timing
     // -----------------------------------------------------------------------
     /// How many seconds the proxy waits for the intercept thread to confirm
@@ -1187,6 +1201,9 @@ fn default_tls_padding_size() -> Int32Range {
 fn default_tls_padding_position() -> String {
     "before".into()
 }
+fn default_ccs_prefix_record_version() -> String {
+    "0x0303".into()
+}
 fn default_tcp_seg_size() -> usize {
     1
 }
@@ -1369,6 +1386,7 @@ impl Config {
                                 | "low_ttl"
                                 | "fake_tls"
                                 | "ip_frag"
+                                | "ccs_prefix"
                         )
                 })
             {
@@ -1442,6 +1460,8 @@ impl Config {
         }
         PaddingPosition::parse(&self.TLS_PADDING_POSITION)
             .map_err(|e| anyhow::anyhow!("TLS_PADDING_POSITION is invalid: {e}"))?;
+        parse_record_version(&self.CCS_PREFIX_RECORD_VERSION)
+            .map_err(|e| anyhow::anyhow!("CCS_PREFIX_RECORD_VERSION is invalid: {e}"))?;
         let _ = self.tls_frag_packets()?;
         self.tls_frag_length_range()?
             .validate_at_least("TLS_FRAG_LENGTH", 1)?;
@@ -1473,12 +1493,13 @@ impl Config {
                         | "tls_padding"
                         | "mixed_case_sni"
                         | "sni_boundary_frag"
+                        | "ccs_prefix"
                         | "ip_frag"
                 )
             })
         {
             anyhow::bail!(
-                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", \"tls_padding\", \"mixed_case_sni\", \"sni_boundary_frag\", or \"ip_frag\""
+                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", \"tls_padding\", \"mixed_case_sni\", \"sni_boundary_frag\", \"ccs_prefix\", or \"ip_frag\""
             );
         }
         if !(0.0..=1.0).contains(&self.PROXY_TEST_SNI_WEIGHT) {
@@ -1587,7 +1608,7 @@ mod tests {
 
     #[test]
     fn socket_only_and_interceptor_helpers_include_tls_padding() {
-        for name in ["tls_frag", "tls_padding"] {
+        for name in ["tls_frag", "tls_padding", "ccs_prefix"] {
             let list = BypassMethodList::from(name);
             assert!(list.is_socket_only(), "{name} should be socket-only");
             assert!(
@@ -3384,5 +3405,94 @@ mod tests {
         )
         .unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn ccs_prefix_record_version_defaults_and_parses() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.CCS_PREFIX_RECORD_VERSION, "0x0303");
+
+        let overridden: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               CCS_PREFIX_RECORD_VERSION = "0x0301""#,
+        )
+        .unwrap();
+        assert_eq!(overridden.CCS_PREFIX_RECORD_VERSION, "0x0301");
+        overridden.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_ccs_prefix_record_version() {
+        for bad in ["0x03GG", "0x03", "0x03033", "xyz"] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   CCS_PREFIX_RECORD_VERSION = "{bad}""#
+            ))
+            .unwrap();
+            assert!(cfg.validate().is_err(), "should reject {bad}");
+        }
+    }
+
+    #[test]
+    fn ccs_prefix_is_socket_only() {
+        let single = BypassMethodList::from("ccs_prefix");
+        assert!(single.is_socket_only());
+        assert!(!single.requires_interceptor());
+
+        let combo = BypassMethodList::from_delimited("ccs_prefix, wrong_seq");
+        assert!(!combo.is_socket_only());
+        assert!(combo.requires_interceptor());
+    }
+
+    #[test]
+    fn validates_ccs_prefix_combos() {
+        let ok: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = ["wrong_seq", "ccs_prefix"]"#,
+        )
+        .unwrap();
+        ok.validate().unwrap();
+
+        let with_boundary: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = ["sni_boundary_frag", "ccs_prefix"]"#,
+        )
+        .unwrap();
+        with_boundary.validate().unwrap();
+
+        let plus_mode: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               MODE = "ip_bypass_plus"
+               BYPASS_METHOD = "ccs_prefix""#,
+        )
+        .unwrap();
+        plus_mode.validate().unwrap();
+
+        // The existing urg_sni_split restriction is unchanged.
+        let urg_combo: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = ["urg_sni_split", "ccs_prefix"]"#,
+        )
+        .unwrap();
+        assert!(urg_combo.validate().is_err());
+
+        // Unknown names still fail.
+        let unknown: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "ccs_prefixx""#,
+        )
+        .unwrap();
+        assert!(unknown.validate().is_err());
     }
 }

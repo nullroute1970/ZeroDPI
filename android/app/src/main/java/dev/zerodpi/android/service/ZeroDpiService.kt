@@ -62,6 +62,13 @@ enum class RootStatus(val label: String) {
     Unsupported("Unsupported"),
 }
 
+data class ScanProgressInfo(
+    val scan: String,
+    val phase: String? = null,
+    val completed: Int? = null,
+    val total: Int? = null,
+)
+
 data class ZeroDpiServiceState(
     val status: RuntimeStatus = RuntimeStatus.Stopped,
     val rootStatus: RootStatus = RootStatus.Needed,
@@ -70,6 +77,7 @@ data class ZeroDpiServiceState(
     val listener: String = "127.0.0.1:44444",
     val activeTarget: String = "None",
     val activeTargetScore: Int? = null,
+    val scanProgress: ScanProgressInfo? = null,
     val nextScanAtElapsedRealtimeMs: Long? = null,
     val connectionCount: Int = 0,
     val relayBytes: Long = 0L,
@@ -175,6 +183,7 @@ class ZeroDpiService : Service() {
                     status = RuntimeStatus.Starting,
                     activeTarget = "None",
                     activeTargetScore = null,
+                    scanProgress = null,
                     nextScanAtElapsedRealtimeMs = null,
                     connectionCount = 0,
                     relayBytes = 0L,
@@ -229,6 +238,7 @@ class ZeroDpiService : Service() {
                 listener = "$listenHost:$listenPort",
                 activeTarget = "None",
                 activeTargetScore = null,
+                scanProgress = null,
                 nextScanAtElapsedRealtimeMs = null,
                 connectionCount = 0,
                 relayBytes = 0L,
@@ -369,6 +379,7 @@ class ZeroDpiService : Service() {
                 status = RuntimeStatus.Restarting,
                 activeTarget = "None",
                 activeTargetScore = null,
+                scanProgress = null,
                 nextScanAtElapsedRealtimeMs = null,
                 connectionCount = 0,
                 relayBytes = 0L,
@@ -457,6 +468,7 @@ class ZeroDpiService : Service() {
                         status = RuntimeStatus.Scanning,
                         activeTarget = "Scanning ${event.scan}$total",
                         activeTargetScore = null,
+                        scanProgress = ScanProgressInfo(scan = event.scan, total = event.total),
                     )
                 }
                 appendLog("Started ${event.scan} scan$total.")
@@ -468,11 +480,18 @@ class ZeroDpiService : Service() {
                         status = RuntimeStatus.Scanning,
                         activeTarget = displayTarget(event.sni, event.ip).ifBlank { "Scanning ${event.scan}" },
                         activeTargetScore = event.score,
+                        scanProgress = ScanProgressInfo(
+                            scan = event.scan,
+                            phase = event.phase,
+                            completed = event.completed,
+                            total = event.total,
+                        ),
                     )
                 }
                 appendLog("${event.scan} scan progress: $progress.")
             }
             is ZeroDpiRunnerEvent.ScanCompleted -> {
+                state.update { it.copy(scanProgress = null) }
                 appendLog("${event.scan} scan completed with ${event.results} result(s).")
             }
             is ZeroDpiRunnerEvent.NextScanScheduled -> {

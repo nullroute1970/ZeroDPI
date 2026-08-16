@@ -84,11 +84,13 @@ data class RuntimeFilesUiState(
             "sni_scan",
             "sni_spoof",
             "proxy_scan",
+            "sni_method_scan",
             -> sniListValidation.issues
 
             "ip_scan",
             "ip_bypass",
             "ip_bypass_plus",
+            "ip_method_scan",
             -> ipListValidation.issues
 
             else -> emptyList()
@@ -257,6 +259,20 @@ class MainViewModel(
                     )
                 }
                 return@launch
+            }
+
+            val startConfigText = ZeroDpiConfigToml.methodScanStartConfigText(
+                _runtimeFilesState.value.configText,
+            )
+            if (startConfigText != _runtimeFilesState.value.configText) {
+                _runtimeFilesState.update { current ->
+                    current
+                        .withText(RuntimeFileKind.Config, startConfigText)
+                        .copy(
+                            configEditor = ZeroDpiConfigToml.analyze(startConfigText),
+                            dirtyFiles = current.dirtyFiles + RuntimeFileKind.Config,
+                        )
+                }
             }
 
             _runtimeFilesState.update {
@@ -1152,7 +1168,9 @@ class MainViewModel(
             }
 
             val mode = configEditor.valueFor("MODE").ifBlank { current.mode }
-            val bypassMethod = configEditor.valueFor("BYPASS_METHOD").ifBlank { current.bypassMethod }
+            val bypassMethod = ZeroDpiConfigToml.displayMethodList(
+                configEditor.valueFor("BYPASS_METHOD"),
+            ).ifBlank { current.bypassMethod }
             val listenHost = configEditor.valueFor("LISTEN_HOST").ifBlank { "127.0.0.1" }
             val listenPort = configEditor.valueFor("LISTEN_PORT").ifBlank { "44444" }
 

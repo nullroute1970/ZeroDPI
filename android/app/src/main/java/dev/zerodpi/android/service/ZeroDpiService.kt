@@ -226,7 +226,9 @@ class ZeroDpiService : Service() {
         val mode = runConfig.modeOverride ?: editorState.valueFor("MODE").ifBlank { "unknown" }
         val listenHost = editorState.valueFor("LISTEN_HOST").ifBlank { "127.0.0.1" }
         val listenPort = editorState.valueFor("LISTEN_PORT").ifBlank { "1080" }
-        val bypassMethod = editorState.valueFor("BYPASS_METHOD").ifBlank { "unknown" }
+        val bypassMethod = ZeroDpiConfigToml.displayMethodList(
+            editorState.valueFor("BYPASS_METHOD"),
+        ).ifBlank { "unknown" }
         val rootRequired = editorState.rootRequirement.requiresRoot
         resetRuntimeCounters()
         state.update {

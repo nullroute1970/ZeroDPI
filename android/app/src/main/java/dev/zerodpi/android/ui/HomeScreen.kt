@@ -411,11 +411,13 @@ private fun blockingListKind(state: RuntimeFilesUiState): RuntimeFileKind? =
         "sni_scan",
         "sni_spoof",
         "proxy_scan",
+        "sni_method_scan",
         -> RuntimeFileKind.SniList.takeIf { !state.sniListValidation.isValid }
 
         "ip_scan",
         "ip_bypass",
         "ip_bypass_plus",
+        "ip_method_scan",
         -> RuntimeFileKind.IpList.takeIf { !state.ipListValidation.isValid }
 
         else -> null

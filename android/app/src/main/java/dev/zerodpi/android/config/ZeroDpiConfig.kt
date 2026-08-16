@@ -1015,6 +1015,17 @@ object ZeroDpiConfigToml {
         )
     }
 
+    fun methodScanStartConfigText(configText: String): String {
+        val editor = analyze(configText)
+        val mode = editor.valueFor("MODE")
+        if (mode !in ZeroDpiConfigSchema.methodScanModes) return configText
+        return if (editor.valueFor("METHOD_SCAN_OUTPUT").isBlank()) {
+            replaceOrAppendField(configText, "METHOD_SCAN_OUTPUT", "method_scan_output.json")
+        } else {
+            configText
+        }
+    }
+
     fun replaceOrAppendField(text: String, fieldName: String, value: String): String {
         val schema = ZeroDpiConfigSchema.fieldsByName[fieldName] ?: return text
         val replacementValue = toTomlLiteral(schema, value)

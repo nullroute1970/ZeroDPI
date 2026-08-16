@@ -321,6 +321,30 @@ class ZeroDpiConfigSchemaTest {
         assertEquals(listOf("wrong_seq", "tls_frag"), editorState.config.methodList("BYPASS_METHOD"))
     }
 
+    @Test
+    fun methodScanStartConfigTextInjectsOutputPathOnlyForMethodScanModes() {
+        val base = """
+            LISTEN_HOST = "127.0.0.1"
+            LISTEN_PORT = 44444
+            MODE = "sni_method_scan"
+            """.trimIndent()
+        val injected = ZeroDpiConfigToml.methodScanStartConfigText(base)
+        assertTrue(injected.contains("""METHOD_SCAN_OUTPUT = "method_scan_output.json"""))
+        assertEquals(listOf("wrong_seq", "tls_frag"), ZeroDpiConfigToml.analyze(injected).config.methodList("BYPASS_METHOD"))
+
+        val withPath = base + "\nMETHOD_SCAN_OUTPUT = \"custom.json\"\n"
+        assertEquals(withPath, ZeroDpiConfigToml.methodScanStartConfigText(withPath))
+
+        val spoof = base.replace("sni_method_scan", "sni_spoof")
+        assertEquals(spoof, ZeroDpiConfigToml.methodScanStartConfigText(spoof))
+    }
+
+    @Test
+    fun displayMethodListJoinsMethods() {
+        assertEquals("wrong_seq + tls_frag", ZeroDpiConfigToml.displayMethodList("""["wrong_seq", "tls_frag"]"""))
+        assertEquals("bogus", ZeroDpiConfigToml.displayMethodList("bogus"))
+    }
+
     private fun findRepoFile(relativePath: String): File {
         var current = File("").absoluteFile
         while (true) {

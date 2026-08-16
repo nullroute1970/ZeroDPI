@@ -199,6 +199,15 @@ internal fun parseTomlStringArray(raw: String): List<String>? {
     return items
 }
 
+internal fun validateSniPosition(value: String, allowedWords: Set<String>): String? {
+    val trimmed = value.trim()
+    return when {
+        trimmed in allowedWords -> null
+        trimmed.toLongOrNull()?.let { it >= 0 } == true -> null
+        else -> "must be one of ${allowedWords.joinToString()} or a non-negative index."
+    }
+}
+
 object ZeroDpiConfigSchema {
     val modeOptions = listOf(
         "sni_spoof",
@@ -1036,8 +1045,34 @@ object ZeroDpiConfigToml {
         return lines.joinToString("\n")
     }
 
-    fun requiresPacketInterception(mode: String, bypassMethod: String): Boolean =
-        mode in setOf("sni_spoof", "proxy_scan", "ip_bypass_plus") && bypassMethod != "tls_frag"
+    fun requiresPacketInterception(mode: String, bypassMethods: Set<String>): Boolean {
+        val needsInterceptor = bypassMethods.any { it !in socketOnlyMethods }
+        return when (mode) {
+            "sni_spoof", "proxy_scan", "ip_bypass_plus", "sni_method_scan", "ip_method_scan" -> needsInterceptor
+            else -> false
+        }
+    }
+
+    fun validateMethodCombination(methods: List<String>): String? {
+        fun has(vararg names: String) = names.any { it in methods }
+        return when {
+            has("urg_sni_split") && methods.size > 1 &&
+                methods.any { it != "urg_sni_split" && it !in setOf("tls_frag", "tls_record_frag") } ->
+                "BYPASS_METHOD \"urg_sni_split\" can only be combined with \"tls_frag\" or \"tls_record_frag\"."
+            has("sni_boundary_frag") && methods.size > 1 &&
+                methods.any { it == "tls_record_frag" || it == "urg_sni_split" } ->
+                "BYPASS_METHOD \"sni_boundary_frag\" cannot be combined with \"tls_record_frag\" or \"urg_sni_split\"."
+            has("fake_tls") && (has("tls_record_frag") || has("urg_sni_split")) ->
+                "BYPASS_METHOD \"fake_tls\" cannot be combined with \"tls_record_frag\" or \"urg_sni_split\"."
+            has("ip_frag") && (has("tls_record_frag") || has("fake_tls") || has("urg_sni_split")) ->
+                "BYPASS_METHOD \"ip_frag\" cannot be combined with \"tls_record_frag\", \"fake_tls\", or \"urg_sni_split\"."
+            has("disorder") && (has("tls_record_frag") || has("fake_tls") || has("ip_frag") || has("urg_sni_split")) ->
+                "BYPASS_METHOD \"disorder\" cannot be combined with \"tls_record_frag\", \"fake_tls\", \"ip_frag\", or \"urg_sni_split\"."
+            else -> null
+        }
+    }
+
+    val socketOnlyMethods = setOf("tls_frag", "ccs_prefix", "tls_padding", "mixed_case_sni", "sni_boundary_frag")
 
     fun displayMethodList(value: String): String =
         parseTomlStringArray(value)?.joinToString(" + ") ?: value
@@ -1351,12 +1386,101 @@ object ZeroDpiConfigToml {
         }
         if ("MODE" !in invalidFields && "BYPASS_METHOD" !in invalidFields) {
             val mode = config.text("MODE")
-            val bypassMethod = config.text("BYPASS_METHOD")
-            if (mode == "ip_bypass_plus" && bypassMethod !in setOf("tls_record_frag", "tls_frag")) {
-                issues += ConfigValidationIssue(
-                    "BYPASS_METHOD",
-                    "MODE = \"ip_bypass_plus\" supports only \"tls_record_frag\" or \"tls_frag\".",
+            val methods = config.methodList("BYPASS_METHOD")
+            if (mode == "ip_bypass_plus") {
+                val allowed = setOf(
+                    "tls_record_frag", "tls_frag", "tls_padding", "mixed_case_sni",
+                    "sni_boundary_frag", "ccs_prefix", "ip_frag", "disorder",
                 )
+                val rejected = methods.filter { it !in allowed }
+                if (rejected.isNotEmpty()) {
+                    issues += ConfigValidationIssue(
+                        "BYPASS_METHOD",
+                        "MODE = \"ip_bypass_plus\" does not support: ${rejected.joinToString()} (real-SNI-preserving methods only).",
+                    )
+                }
+            }
+        }
+        whenValid("BYPASS_METHOD") {
+            validateMethodCombination(config.methodList("BYPASS_METHOD"))?.let {
+                issues += ConfigValidationIssue("BYPASS_METHOD", it)
+            }
+        }
+        whenValid("METHOD_SCAN_METHODS") {
+            val methods = config.methodList("METHOD_SCAN_METHODS")
+            requireField("METHOD_SCAN_METHODS", methods.isNotEmpty(), "METHOD_SCAN_METHODS must not be empty.")
+        }
+        whenValid("METHOD_SCAN_SAMPLES") {
+            requireField("METHOD_SCAN_SAMPLES", config.integer("METHOD_SCAN_SAMPLES") >= 1, "METHOD_SCAN_SAMPLES must be >= 1.")
+        }
+        whenValid("METHOD_SCAN_TIMEOUT_SECS") {
+            requireField("METHOD_SCAN_TIMEOUT_SECS", config.integer("METHOD_SCAN_TIMEOUT_SECS") > 0, "METHOD_SCAN_TIMEOUT_SECS must be > 0.")
+        }
+        whenValid("LOW_TTL_VALUE") {
+            val value = config.integer("LOW_TTL_VALUE")
+            requireField("LOW_TTL_VALUE", value in 1..64, "LOW_TTL_VALUE must be from 1 through 64.")
+        }
+        whenValid("LOW_TTL_DISCOVER_MAX") {
+            val value = config.integer("LOW_TTL_DISCOVER_MAX")
+            requireField("LOW_TTL_DISCOVER_MAX", value in 1..64, "LOW_TTL_DISCOVER_MAX must be from 1 through 64.")
+        }
+        whenValid("LOW_TTL_DISCOVER_TIMEOUT_MS") {
+            requireField(
+                "LOW_TTL_DISCOVER_TIMEOUT_MS",
+                config.integer("LOW_TTL_DISCOVER_TIMEOUT_MS") >= 100,
+                "LOW_TTL_DISCOVER_TIMEOUT_MS must be >= 100.",
+            )
+        }
+        whenValid("IP_FRAG_SIZE") {
+            val size = config.integer("IP_FRAG_SIZE")
+            requireField("IP_FRAG_SIZE", size >= 8, "IP_FRAG_SIZE must be >= 8.")
+            requireField("IP_FRAG_SIZE", size % 8 == 0L, "IP_FRAG_SIZE must be a multiple of 8.")
+        }
+        whenValid("DISORDER_SEGMENTS") {
+            val segments = config.integer("DISORDER_SEGMENTS")
+            requireField("DISORDER_SEGMENTS", segments == 2L || segments == 3L, "DISORDER_SEGMENTS must be 2 or 3.")
+        }
+        whenValid("DISORDER_DELAY_MS") {
+            requireField("DISORDER_DELAY_MS", config.integer("DISORDER_DELAY_MS") <= 1000, "DISORDER_DELAY_MS must be <= 1000.")
+        }
+        whenValid("TLS_PADDING_SIZE") {
+            validateIntegerRange(config.text("TLS_PADDING_SIZE"), min = 1)?.let {
+                issues += ConfigValidationIssue("TLS_PADDING_SIZE", "TLS_PADDING_SIZE $it")
+            }
+            val match = integerRangePattern.matchEntire(config.text("TLS_PADDING_SIZE").trim())
+            if (match != null) {
+                val end = match.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() }?.toLong()
+                    ?: match.groupValues[1].toLong()
+                requireField("TLS_PADDING_SIZE", end <= 16000, "TLS_PADDING_SIZE maximum must be <= 16000.")
+            }
+        }
+        whenValid("TLS_PADDING_POSITION") {
+            requireField(
+                "TLS_PADDING_POSITION",
+                config.text("TLS_PADDING_POSITION") in setOf("before", "after"),
+                "TLS_PADDING_POSITION must be \"before\" or \"after\".",
+            )
+        }
+        whenValid("CCS_PREFIX_RECORD_VERSION") {
+            requireField(
+                "CCS_PREFIX_RECORD_VERSION",
+                Regex("""^(0x)?[0-9a-fA-F]{4}$""").matches(config.text("CCS_PREFIX_RECORD_VERSION").trim()),
+                "CCS_PREFIX_RECORD_VERSION must be two hex bytes (e.g. \"0x0303\").",
+            )
+        }
+        whenValid("SNI_SPLIT_POSITION") {
+            validateSniPosition(config.text("SNI_SPLIT_POSITION"), setOf("middle", "start", "end"))?.let {
+                issues += ConfigValidationIssue("SNI_SPLIT_POSITION", "SNI_SPLIT_POSITION $it")
+            }
+        }
+        whenValid("SNI_BOUNDARY_FRAG_SPLIT_POINT") {
+            validateSniPosition(config.text("SNI_BOUNDARY_FRAG_SPLIT_POINT"), setOf("extension_length", "middle"))?.let {
+                issues += ConfigValidationIssue("SNI_BOUNDARY_FRAG_SPLIT_POINT", "SNI_BOUNDARY_FRAG_SPLIT_POINT $it")
+            }
+        }
+        whenValid("SNI_BOUNDARY_FRAG_DELAY_MS") {
+            validateIntegerRange(config.text("SNI_BOUNDARY_FRAG_DELAY_MS"), min = 0)?.let {
+                issues += ConfigValidationIssue("SNI_BOUNDARY_FRAG_DELAY_MS", "SNI_BOUNDARY_FRAG_DELAY_MS $it")
             }
         }
         whenValid("PROXY_TEST_SNI_WEIGHT") {
@@ -1398,33 +1522,37 @@ object ZeroDpiConfigToml {
         config: ZeroDpiConfig,
         issues: List<ConfigValidationIssue>,
     ): RootRequirementInfo {
-        if (issues.any { it.fieldName == "MODE" || it.fieldName == "BYPASS_METHOD" }) {
+        if (issues.any { it.fieldName == "MODE" || it.fieldName == "BYPASS_METHOD" || it.fieldName == "METHOD_SCAN_METHODS" }) {
             return RootRequirementInfo(
                 requiresRoot = false,
-                message = "Fix MODE and BYPASS_METHOD before root impact can be determined.",
+                message = "Fix MODE and bypass-method fields before root impact can be determined.",
                 alternatives = emptyList(),
             )
         }
 
         val mode = config.text("MODE")
-        val bypassMethod = config.text("BYPASS_METHOD")
-        val requiresRoot = requiresPacketInterception(mode, bypassMethod)
+        val methods = if (mode in ZeroDpiConfigSchema.methodScanModes) {
+            config.methodList("METHOD_SCAN_METHODS")
+        } else {
+            config.methodList("BYPASS_METHOD")
+        }
+        val requiresRoot = requiresPacketInterception(mode, methods.toSet())
 
         return if (requiresRoot) {
             RootRequirementInfo(
                 requiresRoot = true,
-                message = "MODE = \"$mode\" with BYPASS_METHOD = \"$bypassMethod\" uses Android/Linux packet interception and will require root through su.",
+                message = "MODE = \"$mode\" with method(s) ${methods.joinToString(" + ")} uses Android/Linux packet interception and will require root through su.",
                 alternatives = listOf(
                     "MODE = \"ip_bypass\"",
                     "MODE = \"sni_scan\"",
                     "MODE = \"ip_scan\"",
-                    "BYPASS_METHOD = \"tls_frag\" where the selected mode supports it",
+                    "Socket-only methods only: tls_frag, ccs_prefix, tls_padding, mixed_case_sni, sni_boundary_frag",
                 ),
             )
         } else {
             RootRequirementInfo(
                 requiresRoot = false,
-                message = "This MODE/BYPASS_METHOD combination is rootless for the Android app.",
+                message = "This MODE/method combination is rootless for the Android app.",
                 alternatives = emptyList(),
             )
         }

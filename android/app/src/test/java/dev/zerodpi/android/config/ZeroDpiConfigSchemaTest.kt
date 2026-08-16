@@ -153,15 +153,22 @@ class ZeroDpiConfigSchemaTest {
 
     @Test
     fun rootRequirementMatchesAndroidMatrix() {
-        assertTrue(ZeroDpiConfigToml.requiresPacketInterception("sni_spoof", "wrong_seq"))
-        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("sni_spoof", "tls_frag"))
-        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("ip_bypass", "wrong_seq"))
-        assertTrue(ZeroDpiConfigToml.requiresPacketInterception("ip_bypass_plus", "tls_record_frag"))
-        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("ip_bypass_plus", "tls_frag"))
-        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("sni_scan", "wrong_seq"))
-        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("ip_scan", "wrong_seq"))
-        assertTrue(ZeroDpiConfigToml.requiresPacketInterception("proxy_scan", "wrong_seq"))
-        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("proxy_scan", "tls_frag"))
+        assertTrue(ZeroDpiConfigToml.requiresPacketInterception("sni_spoof", setOf("wrong_seq")))
+        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("sni_spoof", setOf("tls_frag")))
+        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("sni_spoof", setOf("ccs_prefix")))
+        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("sni_spoof", setOf("tls_frag", "ccs_prefix")))
+        assertTrue(ZeroDpiConfigToml.requiresPacketInterception("sni_spoof", setOf("wrong_seq", "ccs_prefix")))
+        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("ip_bypass", setOf("wrong_seq")))
+        assertTrue(ZeroDpiConfigToml.requiresPacketInterception("ip_bypass_plus", setOf("tls_record_frag")))
+        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("ip_bypass_plus", setOf("tls_frag")))
+        assertTrue(ZeroDpiConfigToml.requiresPacketInterception("ip_bypass_plus", setOf("disorder")))
+        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("sni_scan", setOf("wrong_seq")))
+        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("ip_scan", setOf("wrong_seq")))
+        assertTrue(ZeroDpiConfigToml.requiresPacketInterception("proxy_scan", setOf("wrong_seq")))
+        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("proxy_scan", setOf("tls_frag")))
+        assertTrue(ZeroDpiConfigToml.requiresPacketInterception("sni_method_scan", setOf("wrong_seq")))
+        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("sni_method_scan", setOf("tls_frag", "ccs_prefix")))
+        assertFalse(ZeroDpiConfigToml.requiresPacketInterception("ip_method_scan", setOf("tls_padding")))
     }
 
     @Test
@@ -228,6 +235,81 @@ class ZeroDpiConfigSchemaTest {
         assertEquals("before", state.valueFor("TLS_PADDING_POSITION"))
         assertEquals("false", state.valueFor("MIXED_CASE_SNI_FLIP_ALL"))
         assertTrue(ZeroDpiConfigSchema.methodScanModes.contains("sni_method_scan"))
+    }
+
+    @Test
+    fun rejectsDisorderCombinedWithIpFrag() {
+        val state = ZeroDpiConfigToml.analyze(
+            """
+            LISTEN_HOST = "127.0.0.1"
+            LISTEN_PORT = 44444
+            MODE = "sni_spoof"
+            BYPASS_METHOD = ["disorder", "ip_frag"]
+            """.trimIndent(),
+        )
+        assertFalse(state.canStart)
+        assertTrue(state.issues.any { it.fieldName == "BYPASS_METHOD" && "disorder" in it.message })
+    }
+
+    @Test
+    fun acceptsCcsPrefixCombinedWithWrongSeq() {
+        val state = ZeroDpiConfigToml.analyze(
+            """
+            LISTEN_HOST = "127.0.0.1"
+            LISTEN_PORT = 44444
+            MODE = "sni_spoof"
+            BYPASS_METHOD = ["wrong_seq", "ccs_prefix"]
+            """.trimIndent(),
+        )
+        assertTrue("Unexpected issues: ${state.issues}", state.canStart)
+    }
+
+    @Test
+    fun enforcesIpBypassPlusMethodAllowlist() {
+        val state = ZeroDpiConfigToml.analyze(
+            """
+            LISTEN_HOST = "127.0.0.1"
+            LISTEN_PORT = 44444
+            MODE = "ip_bypass_plus"
+            BYPASS_METHOD = ["wrong_seq"]
+            """.trimIndent(),
+        )
+        assertFalse(state.canStart)
+        assertTrue(state.issues.any { it.fieldName == "BYPASS_METHOD" && "ip_bypass_plus" in it.message })
+    }
+
+    @Test
+    fun validatesNewMethodParameters() {
+        fun issuesFor(config: String) = ZeroDpiConfigToml.analyze(config).issues.map { it.fieldName }
+        fun base(method: String) = """
+            LISTEN_HOST = "127.0.0.1"
+            LISTEN_PORT = 44444
+            MODE = "sni_spoof"
+            BYPASS_METHOD = ["$method"]
+            """.trimIndent() + "\n"
+        assertTrue("IP_FRAG_SIZE" in issuesFor(base("ip_frag") + "IP_FRAG_SIZE = 26\n"))
+        assertTrue("DISORDER_SEGMENTS" in issuesFor(base("disorder") + "DISORDER_SEGMENTS = 4\n"))
+        assertTrue("DISORDER_DELAY_MS" in issuesFor(base("disorder") + "DISORDER_DELAY_MS = 2000\n"))
+        assertTrue("LOW_TTL_VALUE" in issuesFor(base("low_ttl") + "LOW_TTL_VALUE = 0\n"))
+        assertTrue("LOW_TTL_DISCOVER_TIMEOUT_MS" in issuesFor(base("low_ttl") + "LOW_TTL_DISCOVER_TIMEOUT_MS = 50\n"))
+        assertTrue("TLS_PADDING_SIZE" in issuesFor(base("tls_padding") + "TLS_PADDING_SIZE = \"20000-30000\"\n"))
+        assertTrue("TLS_PADDING_POSITION" in issuesFor(base("tls_padding") + "TLS_PADDING_POSITION = \"sideways\"\n"))
+        assertTrue("CCS_PREFIX_RECORD_VERSION" in issuesFor(base("ccs_prefix") + "CCS_PREFIX_RECORD_VERSION = \"0x03\"\n"))
+        assertTrue("SNI_SPLIT_POSITION" in issuesFor(base("urg_sni_split") + "SNI_SPLIT_POSITION = \"nope\"\n"))
+        assertTrue("SNI_BOUNDARY_FRAG_SPLIT_POINT" in issuesFor(base("sni_boundary_frag") + "SNI_BOUNDARY_FRAG_SPLIT_POINT = \"nope\"\n"))
+        assertTrue("SNI_BOUNDARY_FRAG_DELAY_MS" in issuesFor(base("sni_boundary_frag") + "SNI_BOUNDARY_FRAG_DELAY_MS = \"-5-10\"\n"))
+        assertTrue("METHOD_SCAN_SAMPLES" in issuesFor(base("wrong_seq") + "METHOD_SCAN_SAMPLES = 0\n"))
+        assertTrue("METHOD_SCAN_TIMEOUT_SECS" in issuesFor(base("wrong_seq") + "METHOD_SCAN_TIMEOUT_SECS = 0\n"))
+        assertTrue("METHOD_SCAN_METHODS" in issuesFor(base("wrong_seq") + "METHOD_SCAN_METHODS = [\"bogus\"]\n"))
+    }
+
+    @Test
+    fun validatesSniPositions() {
+        assertNull(validateSniPosition("middle", setOf("middle", "start", "end")))
+        assertNull(validateSniPosition("12", setOf("extension_length", "middle")))
+        assertNull(validateSniPosition("0", setOf("extension_length", "middle")))
+        assertNotNull(validateSniPosition("nope", setOf("middle", "start", "end")))
+        assertNotNull(validateSniPosition("-1", setOf("middle", "start", "end")))
     }
 
     private fun findRepoFile(relativePath: String): File {

@@ -26,6 +26,10 @@
 //!    write it to the upstream socket in configured chunks.
 //! 4. In packet-range mode, let the relay fragment selected client writes.
 //! 5. Relay the rest of the session normally.
+//!
+//! For `ccs_prefix` (TLS 1.3 middlebox-compat ChangeCipherSpec prefix), a
+//! 6-byte dummy ChangeCipherSpec record is written as the very first
+//! upstream bytes before the ClientHello; the TLS bytes are not modified.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};

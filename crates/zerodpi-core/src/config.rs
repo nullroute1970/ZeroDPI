@@ -534,12 +534,22 @@ pub struct Config {
     ///   inline DPI cannot reassemble the SNI. Socket-side only: does not
     ///   inject fake packets or use WinDivert/NFQUEUE interception; operates
     ///   inside the proxy on the relayed ClientHello.
+    /// - `"ccs_prefix"` — TLS 1.3 Middlebox-Compat ChangeCipherSpec Prefix.
+    ///   Writes a dummy ChangeCipherSpec record (`14 03 03 00 01 01`,
+    ///   version configurable via `CCS_PREFIX_RECORD_VERSION`) as the very
+    ///   first upstream bytes, before the (possibly transformed)
+    ///   ClientHello. TLS 1.3 servers ignore the early CCS (RFC 8446
+    ///   §5.5); DPI that classifies on the first TLS record sees a benign
+    ///   CCS instead of the ClientHello. Socket-side only: does not inject
+    ///   fake packets or use WinDivert/NFQUEUE interception; operates
+    ///   inside the proxy before the first ClientHello write.
     ///
     /// Handshake-stage methods (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
     /// `wrong_md5`, `wrong_timestamp`, `low_ttl`) all inject the same fake
     /// ClientHello; several may be listed to merge their tricks onto one fake
     /// packet. `tls_record_frag`, `tls_frag`, `tls_padding`,
-    /// `mixed_case_sni`, and `sni_boundary_frag` add the data stage. See the
+    /// `mixed_case_sni`, and `sni_boundary_frag` add the data stage;
+    /// `ccs_prefix` adds a socket-side prefix stage. See the
     /// `BYPASS_METHOD` section of `config.toml` for the combination limits.
     #[serde(default = "default_method")]
     pub BYPASS_METHOD: BypassMethodList,

@@ -93,6 +93,7 @@ Windows, no NFQUEUE on Linux). Current members: `tls_frag`, `tls_padding`,
 | `tls_padding` | socket | RFC 7685 ClientHello padding extension pushes SNI past DPI inspection windows |
 | `mixed_case_sni` | socket | randomize SNI letter case (servers lowercase per RFC 6066, case-sensitive DPI misses) |
 | `sni_boundary_frag` | socket | split first record into two TCP segments cut at the SNI extension boundary, with delay |
+| `ccs_prefix` | socket | dummy ChangeCipherSpec record before the ClientHello; first-record DPIs see no SNI (RFC 8446 §4.1.3) |
 
 Composites: `wrong_seq_wrong_md5`, `wrong_seq_tls_frag`,
 `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, `wrong_seq_tls_padding`,
@@ -102,9 +103,9 @@ Composites: `wrong_seq_wrong_md5`, `wrong_seq_tls_frag`,
 **Gap summary:** the fake-packet injection family (ByeDPI `--wrong-seq`
 etc.) is fully covered; TCP segmentation (`tls_frag`), padding, and
 boundary splitting are covered. What is missing versus the comparable tools
-is decoy-TLS-record injection (`fake_tls`), out-of-order delivery
-(`disorder`), IP-layer fragmentation, and a handful of header/record-level
-tricks.
+is `fake_tls` variant B (socket-side forged record length), out-of-order
+delivery (`disorder`), and record-level tricks such as `tls_record_split`
+and `tcp_opt_pad`.
 
 ---
 
@@ -228,6 +229,10 @@ plumbing; the fragmentation math itself is ~100 LOC plus tests.
 ---
 
 ### 4.3 `ccs_prefix` — TLS 1.3 middlebox-compat ChangeCipherSpec *(moderate value, trivial effort)*
+
+**Status (2026-08-16):** Implemented (`ccs_prefix`, socket-side, writes the
+dummy CCS record `14 03 03 00 01 01` as the first upstream bytes, version
+configurable via `CCS_PREFIX_RECORD_VERSION`).
 
 **Overview.** Write a dummy ChangeCipherSpec record
 (`14 03 03 00 01 01`) as the very first bytes of the upstream stream,
@@ -415,7 +420,7 @@ composite lists, not a headline method.
 |---|---|---|---|---|---|
 | `fake_tls` (variant A) | decoy record injection | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | medium | high |
 | `ip_frag` | IP-layer fragmentation | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | medium* | high |
-| `ccs_prefix` | TLS middlebox compat | socket | everywhere | small | moderate |
+| `ccs_prefix` | TLS middlebox compat | socket | everywhere | small — ✅ implemented | moderate |
 | `disorder` | out-of-order segmentation | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | medium–large* | moderate |
 | `tls_record_split` | record-level handshake split | socket | everywhere | small–medium | moderate |
 | `tcp_opt_pad` | TCP option junk | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | small | low |
@@ -432,8 +437,7 @@ Build in this order:
 1. **`fake_tls` (variant A)** — ✅ implemented. Variant B (socket-side forged
    length) remains follow-up work, validated empirically against real TLS
    stacks.
-2. **`ccs_prefix`** — a few hours of work, platform-neutral, and gives
-   Termux/Android users a new non-root option.
+2. **`ccs_prefix`** — ✅ implemented.
 3. **`ip_frag`** — ✅ implemented, including the multi-packet emission
    plumbing, so `disorder` (4) becomes cheap follow-up.
 4. **`disorder`** — reuse the emission plumbing.

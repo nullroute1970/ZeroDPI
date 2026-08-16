@@ -86,7 +86,7 @@ pub fn ensure_packet_interception_access() -> Result<()> {
 fn packet_interception_access_error() -> &'static str {
     "ZeroDPI needs Administrator privileges for packet interception via WinDivert. \
      Start PowerShell or Command Prompt with \"Run as administrator\" and run ZeroDPI again. \
-     To run without Administrator privileges, use BYPASS_METHOD = \"tls_frag\" \
+     To run without Administrator privileges, use BYPASS_METHOD = \"tls_frag\" / \"ccs_prefix\" \
      or MODE = \"ip_bypass\"."
 }
 
@@ -97,7 +97,7 @@ fn packet_interception_access_error() -> &'static str {
 fn packet_interception_access_error() -> &'static str {
     "ZeroDPI needs root privileges or CAP_NET_ADMIN for packet interception via NFQUEUE. \
      Run ZeroDPI with sudo/root, grant CAP_NET_ADMIN to the binary, or use \
-     BYPASS_METHOD = \"tls_frag\" or MODE = \"ip_bypass\"."
+     BYPASS_METHOD = \"tls_frag\" / \"ccs_prefix\" or MODE = \"ip_bypass\"."
 }
 
 #[cfg(all(
@@ -107,7 +107,7 @@ fn packet_interception_access_error() -> &'static str {
 fn packet_interception_access_error() -> &'static str {
     "This ZeroDPI artifact was built without packet interception support. \
      It can run rootless modes such as MODE = \"ip_bypass\", scan-only modes, \
-     or BYPASS_METHOD = \"tls_frag\" where supported. NFQUEUE modes need an \
+     or BYPASS_METHOD = \"tls_frag\" / \"ccs_prefix\" where supported. NFQUEUE modes need an \
      artifact built with the packet-interception feature and root/CAP_NET_ADMIN."
 }
 

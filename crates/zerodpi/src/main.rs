@@ -1295,7 +1295,7 @@ fn verify_data_plane_uid(_expected_uid: u32) -> Result<()> {
 
 fn root_required_message(cfg: &Config) -> String {
     format!(
-        "MODE = \"{}\" with BYPASS_METHOD = \"{}\" requires packet interception; on Android the app must start the packaged root helper while keeping the data plane under the app UID. Rootless alternatives are MODE = \"ip_bypass\", scan-only modes, or BYPASS_METHOD = \"tls_frag\" / \"tls_padding\" / \"mixed_case_sni\" / \"sni_boundary_frag\" where supported.",
+        "MODE = \"{}\" with BYPASS_METHOD = \"{}\" requires packet interception; on Android the app must start the packaged root helper while keeping the data plane under the app UID. Rootless alternatives are MODE = \"ip_bypass\", scan-only modes, or BYPASS_METHOD = \"tls_frag\" / \"tls_padding\" / \"mixed_case_sni\" / \"sni_boundary_frag\" / \"ccs_prefix\" where supported.",
         cfg.MODE, cfg.BYPASS_METHOD
     )
 }
@@ -1309,6 +1309,7 @@ fn rootless_alternatives() -> Vec<String> {
         "BYPASS_METHOD = \"tls_padding\" for supported relay modes".to_owned(),
         "BYPASS_METHOD = \"mixed_case_sni\" for supported relay modes".to_owned(),
         "BYPASS_METHOD = \"sni_boundary_frag\" for supported relay modes".to_owned(),
+        "BYPASS_METHOD = \"ccs_prefix\" for supported relay modes".to_owned(),
     ]
 }
 
@@ -2988,6 +2989,10 @@ mod tests {
             &method_list("mixed_case_sni")
         ));
         assert!(!mode_requires_packet_interception(
+            "sni_spoof",
+            &method_list("ccs_prefix")
+        ));
+        assert!(!mode_requires_packet_interception(
             "ip_bypass",
             &method_list("wrong_seq")
         ));
@@ -3018,6 +3023,10 @@ mod tests {
         assert!(!mode_requires_packet_interception(
             "ip_bypass_plus",
             &method_list("mixed_case_sni")
+        ));
+        assert!(!mode_requires_packet_interception(
+            "ip_bypass_plus",
+            &method_list("ccs_prefix")
         ));
     }
 

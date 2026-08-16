@@ -19,18 +19,27 @@ LISTEN_PORT = 44444
 # ---------------------------------------------------------------------------
 # Operating Mode
 # ---------------------------------------------------------------------------
-
 # Operating mode. Valid values: "sni_spoof" (default), "ip_bypass",
-# "ip_bypass_plus", "sni_scan", "ip_scan", "proxy_scan".
+# "ip_bypass_plus", "sni_scan", "ip_scan", "proxy_scan",
+# "sni_method_scan", "ip_method_scan".
 # - "sni_spoof"     — DPI bypass via SNI spoofing (default).
 # - "ip_bypass"     — plain TCP relay through a scanned IP; no packet interception.
 # - "ip_bypass_plus" — IPv4 relay through a scanned IP plus real-SNI-preserving
-#                      BYPASS_METHOD ("tls_record_frag" or "tls_frag").
+#                      BYPASS_METHOD ("tls_record_frag", "tls_frag",
+#                      "tls_padding", "mixed_case_sni", "sni_boundary_frag",
+#                      "ccs_prefix",
+#                      "ip_frag", or "disorder").
 # - "sni_scan"      — scan sni_list.txt and display/save results, then exit.
 # - "ip_scan"       — scan ip_list.txt and display/save results, then exit.
 # - "proxy_scan"    — scan sni_list.txt (Phase 1), then test each working SNI
 #                     through your V2RayN SOCKS5 mixed port (Phase 2); display
 #                     blended results and exit.  Requires V2RayN to be running.
+# - "sni_method_scan" — scan sni_list.txt, pick the top candidate, then test
+#                       every METHOD_SCAN_METHODS bypass method against it
+#                       and report which works best; then exit.
+# - "ip_method_scan"   — scan ip_list.txt, pick the top IPv4 candidate, then
+#                       test every METHOD_SCAN_METHODS bypass method against
+#                       it (TLS SNI = IP_SCAN_SNI) and report; then exit.
 MODE = "sni_spoof"
 
 # When true, ZeroDPI automatically picks the highest-ranked candidate
@@ -99,6 +108,35 @@ SNI_SWITCH_MIN_SCORE = 1
 SCAN_OUTPUT = ""
 
 # ---------------------------------------------------------------------------
+# Method Scan Modes
+# ---------------------------------------------------------------------------
+# These settings apply when MODE = "sni_method_scan" or "ip_method_scan".
+# These modes first run the normal scan internally (sni_scan / ip_scan),
+# pick the single top-scoring candidate, then test every bypass method
+# against it to find which method works best. Method parameters are taken
+# from this config file unchanged.
+
+# Bypass methods to test, in any order. Defaults to every base method;
+# trim the list to test only a subset.
+#METHOD_SCAN_METHODS = ["wrong_seq", "tls_frag"]
+
+# Number of probe samples per method. Must be >= 1. Default: 3.
+METHOD_SCAN_SAMPLES = 3
+
+# Interval between samples in milliseconds. 0 = back-to-back.
+# Default: 1000.
+METHOD_SCAN_INTERVAL_MS = 1000
+
+# Per-sample probe timeout in seconds (TCP + TLS + HTTP). Must be > 0.
+# Default: 10.
+METHOD_SCAN_TIMEOUT_SECS = 10
+
+# Optional path to write the method-scan report as a JSON file.
+# Relative paths are resolved from the directory containing config.toml.
+# Leave as an empty string ("") to disable saving.
+METHOD_SCAN_OUTPUT = ""
+
+# ---------------------------------------------------------------------------
 # Scanner Tuning
 # ---------------------------------------------------------------------------
 
@@ -155,6 +193,7 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #
 #   BYPASS_METHOD = "wrong_seq"
 #   BYPASS_METHOD = ["wrong_seq", "tls_frag"]
+#   BYPASS_METHOD = "ccs_prefix"
 #
 # Base methods:
 #
@@ -216,6 +255,39 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     TLS records across fragment boundaries will fail to extract the SNI.  The
 #     upstream TLS server reassembles the fragments normally.
 #
+#   "fake_tls"
+#     Decoy TLS Record Injection.  Injects a decoy TLS record containing a
+#     ClientHello with the whitelisted SNI as the first record a
+#     record-parsing DPI sees on the data stage.  The decoy is emitted with
+#     an out-of-window TCP sequence number, so the upstream server discards
+#     it while a TLS-record-parsing DPI inspects it and classifies the flow
+#     benign.  The real ClientHello reaches the server via retransmission
+#     or, with FAKE_TLS_FORWARD_REAL = true (default), is forwarded
+#     immediately after the decoy.  Requires WinDivert/NFQUEUE
+#     interception (Administrator/root, IPv4-only).
+#
+#   "ip_frag"
+#     IP-Layer Fragment.  Splits the first outbound data packet (the real
+#     ClientHello) into small IPv4 fragments.  The server's kernel
+#     reassembles them before TLS, so the handshake proceeds normally; DPIs
+#     that do not reassemble IP fragments never see the SNI.  With
+#     IP_FRAG_ONLY_FIRST_PACKET = false, every outbound data packet is
+#     fragmented.  Requires WinDivert/NFQUEUE interception
+#     (Administrator/root, IPv4-only).
+#
+#   "disorder"
+#     Out-of-Order TCP Segmentation.  Does NOT inject any fake packet.
+#     Instead, it intercepts the first outbound data packet carrying the
+#     real TLS ClientHello, splits its TCP payload into DISORDER_SEGMENTS
+#     equal segments with correct sequence numbers, and emits them in
+#     reverse order, optionally with DISORDER_DELAY_MS between them.  The
+#     server's kernel reassembles the segments before TLS, so the handshake
+#     proceeds normally; DPIs that track per-flow sequence state see
+#     non-monotonic segments and never a complete ClientHello in one
+#     segment.  With DISORDER_ONLY_FIRST_PACKET = false, every outbound
+#     data packet is re-chunked.  Requires WinDivert/NFQUEUE interception
+#     (Administrator/root, IPv4-only).
+#
 #   "urg_sni_split"
 #     TCP Urgent + SNI byte splice.  Does NOT inject any fake packet.  Instead,
 #     it intercepts the first outbound data packet carrying the real TLS
@@ -247,6 +319,38 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     extension.  "after" appends the padding at the end of the extension
 #     list instead.
 #
+#   "mixed_case_sni"
+#     SNI Case Randomization.  Does NOT inject fake packets and does NOT use
+#     WinDivert or NFQUEUE packet interception.  Randomizes the ASCII letter
+#     case of the hostname inside the SNI extension of the client's real TLS
+#     ClientHello (e.g. wikipedia.org -> wIkIpeDiA.oRg).  Per RFC 6066 the
+#     SNI hostname is case-insensitive: destination servers lowercase it
+#     during lookup, so the handshake completes normally, while DPI that
+#     matches blocklists with exact case-sensitive string comparisons misses
+#     the name.  Digits, dots, and hyphens are never changed (safe for
+#     punycode SNIs).
+#
+#   "sni_boundary_frag"
+#     SNI Extension Boundary Fragmentation.  Does NOT inject fake packets
+#     and does NOT use WinDivert or NFQUEUE packet interception.  Parses the
+#     real TLS ClientHello down to the extension array and writes the first
+#     record as exactly two TCP segments cut at the SNI extension boundary
+#     (SNI_BOUNDARY_FRAG_SPLIT_POINT), with a small delay between them
+#     (SNI_BOUNDARY_FRAG_DELAY_MS) so inline DPI reassembly buffers do not
+#     stitch them back together.  The upstream server reassembles the
+#     segments into an identical ClientHello.
+#
+#   "ccs_prefix"
+#     TLS 1.3 Middlebox-Compat ChangeCipherSpec Prefix.  Does NOT inject fake
+#     packets and does NOT use WinDivert or NFQUEUE packet interception.
+#     Writes a dummy ChangeCipherSpec record (14 03 03 00 01 01, version
+#     bytes configurable via CCS_PREFIX_RECORD_VERSION) as the very first
+#     bytes of the upstream stream, before the real ClientHello.  TLS 1.3
+#     servers treat a ChangeCipherSpec received before their first Finished
+#     as a no-op (RFC 8446 §4.1.3, §5.5), so the handshake proceeds; DPIs
+#     that classify on the first TLS record see a benign CCS instead of the
+#     ClientHello.  TLS 1.2 servers are not required to tolerate the prefix.
+#
 # Common combinations (written as lists):
 #
 #   ["wrong_seq", "wrong_md5"]        -> fake ClientHello with old TCP seq + TCP-MD5
@@ -265,12 +369,37 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   packet: TLS-record fragmentation inside the interceptor and TCP-level
 #   write segmentation inside the proxy respectively.  A list containing
 #   "tls_frag" alongside other methods still uses packet interception.
+# - "fake_tls" adds a data-stage decoy injection.  It combines with
+#   handshake-stage fake-packet methods and with the socket-side methods,
+#   but is mutually exclusive with "tls_record_frag" and "urg_sni_split"
+#   (all three own the first data packet).
+# - "ip_frag" adds a data-stage IP fragmentation.  It combines with
+#   handshake-stage fake-packet methods and with the socket-side methods,
+#   but is mutually exclusive with "tls_record_frag", "fake_tls", and
+#   "urg_sni_split" (all own the first data packet).
+# - "disorder" adds a data-stage out-of-order TCP segmentation.  It
+#   combines with handshake-stage fake-packet methods and with the
+#   socket-side methods, but is mutually exclusive with "tls_record_frag",
+#   "fake_tls", "ip_frag", and "urg_sni_split" (all own the first data
+#   packet).
 # - "tls_padding" adds a socket-side data stage: the real ClientHello is
 #   expanded with an RFC 7685 padding extension before it is written to the
 #   upstream socket.  It combines with handshake-stage methods and with
 #   "tls_frag" (pad first, then fragment).
-# - A list containing only "tls_frag" and/or "tls_padding" skips the packet
-#   interceptor entirely.
+# - "mixed_case_sni" adds a socket-side data stage that randomizes the
+#   SNI case in the real ClientHello.  It combines with handshake-stage
+#   methods, with "tls_frag", and with "tls_padding" (pad first, then
+#   randomize).
+# - "sni_boundary_frag" adds a socket-side data stage that writes the real
+#   ClientHello as exactly two TCP segments cut at the SNI extension
+#   boundary.  It combines with handshake-stage methods and with "tls_frag",
+#   "tls_padding", and "mixed_case_sni".
+# - "ccs_prefix" adds a socket-side prefix stage that writes a dummy
+#   ChangeCipherSpec record as the very first upstream bytes.  It combines
+#   with handshake-stage methods and with every socket-side method.
+# - A list containing only "tls_frag", "tls_padding", "mixed_case_sni",
+#   "sni_boundary_frag", and/or "ccs_prefix" skips the packet interceptor
+#   entirely.
 #
 # Limitations:
 #
@@ -279,8 +408,19 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 # - "urg_sni_split" can only be used alone or together with "tls_frag" /
 #   "tls_record_frag"; it cannot be combined with other handshake-stage
 #   methods.
-# - MODE = "ip_bypass_plus" supports only "tls_record_frag", "tls_frag", or
-#   "tls_padding" so the upstream VPN client's real SNI is preserved.
+# - "sni_boundary_frag" cannot be combined with "tls_record_frag" or
+#   "urg_sni_split"; it combines with the handshake fake-packet methods and
+#   with "tls_frag", "tls_padding", and "mixed_case_sni".
+# - "fake_tls" cannot be combined with "tls_record_frag" or
+#   "urg_sni_split".
+# - "ip_frag" cannot be combined with "tls_record_frag", "fake_tls", or
+#   "urg_sni_split".
+# - "disorder" cannot be combined with "tls_record_frag", "fake_tls",
+#   "ip_frag", or "urg_sni_split".
+# - MODE = "ip_bypass_plus" supports only "tls_record_frag", "tls_frag",
+#   "tls_padding", "mixed_case_sni", "sni_boundary_frag", "ccs_prefix",
+#   "ip_frag", or "disorder" so the upstream VPN client's real SNI is
+#   preserved.
 # - LOW_TTL_DISCOVER only takes effect when "low_ttl" is in the list;
 #   otherwise discovery is silently skipped.
 #
@@ -288,7 +428,7 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 # "proxy_scan").  The "ip_bypass" and "ip_scan" modes do not use a bypass
 # method.
 #
-BYPASS_METHOD = "wrong_seq"
+BYPASS_METHOD = "wrong_seq_tls_frag"
 
 # Seconds the proxy waits for the intercept thread to confirm that the spoofed
 # packet was acknowledged and the bypass phase completed.
@@ -443,7 +583,7 @@ LOW_TTL_COMPLETE_IMMEDIATELY = true
 # LOW_TTL_DISCOVER_TIMEOUT_MS.
 #
 # Default: true.
-LOW_TTL_DISCOVER = false
+LOW_TTL_DISCOVER = true
 
 # Upper bound of the LOW_TTL_DISCOVER search range, bounding the worst-case
 # discovery delay (startup or rescan).  Must be between 1 and 64.  Default: 32.
@@ -452,7 +592,7 @@ LOW_TTL_DISCOVER_MAX = 32
 # Per-candidate timeout in milliseconds used while discovering LOW_TTL_VALUE.
 # Lower values speed up discovery but may cause false negatives on slow links.
 # Must be at least 100.  Default: 5000.
-LOW_TTL_DISCOVER_TIMEOUT_MS = 1500
+LOW_TTL_DISCOVER_TIMEOUT_MS = 5000
 
 # ---------------------------------------------------------------------------
 # wrong_md5 method parameters
@@ -590,7 +730,142 @@ TLS_RECORD_FRAG_SET_PSH = true
 # rather than a retransmission.  This only affects IPv4 packets; IPv6 has
 # no IPv4 Identification field.
 TLS_RECORD_FRAG_BUMP_IP_IDENT = true
+# ---------------------------------------------------------------------------
+# fake_tls method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "fake_tls" (alone or combined
+# with handshake fake-packet methods or socket-side methods).
+#
+# fake_tls injects a decoy TLS record carrying the whitelisted SNI at the
+# first outbound data packet, with a TCP sequence number placed behind the
+# server's receive window.  A record-parsing DPI inspects the decoy and
+# classifies the flow benign; the real server discards the out-of-window
+# segment and processes the genuine ClientHello (delivered by TCP
+# retransmission, or forwarded immediately after the decoy when
+# FAKE_TLS_FORWARD_REAL is true).
 
+# Extra bytes subtracted from the decoy's injected TCP sequence number in
+# addition to the decoy payload length.
+#
+# The default formula is:
+#   injected_seq = syn_seq + 1 - payload_len - FAKE_TLS_EXTRA_OFFSET
+#
+# With the default value of 0, the decoy is placed exactly one payload
+# length behind the server's expected receive sequence.  A positive value
+# pushes the decoy farther behind the receive window.  Start with 0.
+FAKE_TLS_EXTRA_OFFSET = 0
+
+# Whether to set the TCP PSH flag on the decoy record packet.
+#
+# Keep this enabled for normal use.  Many DPI implementations treat
+# PSH-marked packets as application data that should be inspected
+# immediately.
+FAKE_TLS_SET_PSH = true
+
+# Whether to increment the IPv4 Identification field on the decoy packet.
+#
+# Bumping the ID makes the injected packet look like a fresh IPv4 datagram
+# rather than a retransmission.  This only affects IPv4 packets.
+FAKE_TLS_BUMP_IP_IDENT = true
+
+# Whether to signal the bypass phase complete immediately after the decoy
+# record is emitted.
+#
+# The default is true: the out-of-window decoy is never acknowledged by the
+# real server, so waiting for an ACK would only delay the relay.  Set this
+# to false to wait for the server to acknowledge the first data packet
+# before releasing the flow.
+FAKE_TLS_COMPLETE_IMMEDIATELY = true
+
+# Whether to forward the original first data packet (the real ClientHello)
+# immediately after the decoy record is emitted.
+#
+# true (default)  — dual emission: the decoy goes out, then the real
+#                   ClientHello follows immediately.  No added latency.
+#                   WinDivert sends both packets; on Linux/Android the decoy
+#                   is injected through a raw socket (root).  If the raw
+#                   socket is unavailable, ZeroDPI logs a warning and falls
+#                   back to single-packet mode.
+# false           — the first data packet itself becomes the decoy; the real
+#                   ClientHello reaches the server via TCP retransmission
+#                   (adds roughly one retransmission timeout, ~200 ms).
+FAKE_TLS_FORWARD_REAL = true
+# ---------------------------------------------------------------------------
+# ip_frag method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "ip_frag" (alone or combined
+# with handshake fake-packet methods or socket-side methods).
+#
+# ip_frag splits the outbound data packet carrying the ClientHello at the
+# IPv4 layer into fragments of at most IP_FRAG_SIZE payload bytes.  The
+# destination kernel reassembles the fragments before the TLS stack sees
+# the stream, so the handshake is unaffected; inline DPIs that do not
+# reassemble IP fragments never see a complete ClientHello.  The real
+# ClientHello bytes are untouched — the SNI is preserved.
+
+# Maximum IP payload bytes (TCP header + TCP payload) per fragment.
+#
+# Fragment offsets are expressed in 8-byte units, so this value must be a
+# multiple of 8 and at least 8.  Default: 24.
+IP_FRAG_SIZE = 24
+
+# Whether to fragment only the first outbound data packet of each
+# connection.
+#
+# true (default)  — fragment the packet carrying the ClientHello only; the
+#                   rest of the stream is untouched.
+# false           — fragment-all mode: every subsequent outbound data packet
+#                   is also fragmented until the connection closes.  Costs
+#                   CPU per packet and raises the chance a fragment-hostile
+#                   middlebox breaks the flow; use only when the DPI
+#                   reassembles only the first packet.
+IP_FRAG_ONLY_FIRST_PACKET = true
+# ---------------------------------------------------------------------------
+# disorder method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "disorder" (alone or combined
+# with handshake fake-packet methods or socket-side methods).
+#
+# disorder splits the outbound data packet carrying the ClientHello into
+# DISORDER_SEGMENTS TCP segments of equal size, each with the correct TCP
+# sequence number, and emits them in reverse order.  The destination kernel
+# reassembles the segments before TLS, so the handshake is unaffected;
+# sequence-tracking DPI sees non-monotonic segments and no complete
+# ClientHello.  The real ClientHello bytes are untouched — the SNI is
+# preserved.
+
+# Number of segments to split each rewritten data packet into.
+# Valid values: 2 or 3.  Default: 2.
+DISORDER_SEGMENTS = 2
+
+# Delay in milliseconds between consecutive segment emissions.
+#
+# The first segment is emitted synchronously; the remaining segments are
+# injected from a short-lived background thread, so packet interception is
+# never blocked.  Larger values widen the window in which the DPI sees only
+# part of the stream, at the cost of connection-setup latency.
+# 0 (default)  — emit all segments back-to-back.
+DISORDER_DELAY_MS = 0
+
+# Whether to emit the segments in reverse (non-monotonic sequence-number)
+# order.
+#
+# true (default)  — reverse order: the DPI's first-seen segment is the
+#                   payload tail and carries no SNI.
+# false           — in-order chunks (degenerate ordered segmentation).
+DISORDER_REVERSE = true
+
+# Whether to re-chunk only the first outbound data packet of each
+# connection.
+#
+# true (default)  — re-chunk the packet carrying the ClientHello only; the
+#                   rest of the stream is untouched.
+# false           — fragment-all mode: every subsequent outbound data packet
+#                   is also re-chunked and reordered until the connection
+#                   closes.  Costs CPU per packet and raises the chance a
+#                   segment-hostile middlebox breaks the flow; use only when
+#                   the DPI inspects more than the first packet.
+DISORDER_ONLY_FIRST_PACKET = true
 # ---------------------------------------------------------------------------
 # urg_sni_split method parameters
 # ---------------------------------------------------------------------------
@@ -609,7 +884,46 @@ SNI_SPLIT_DUMMY_BYTE = 0
 #   "end"    — before the last name byte
 #   N        — 0-based index into the name, clamped to the last byte
 SNI_SPLIT_POSITION = "middle"
+# ---------------------------------------------------------------------------
+# sni_boundary_frag method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "sni_boundary_frag" (alone or
+# combined with tls_frag / tls_padding / mixed_case_sni / fake_tls or the
+# handshake fake-packet methods wrong_seq, wrong_ack, wrong_checksum,
+# wrong_md5, wrong_timestamp, low_ttl).
+#
+# Unlike wrong_seq and tls_record_frag, this method does NOT use the
+# WinDivert / NFQUEUE packet interceptor when combined only with other
+# socket-side methods.  In combos with fake-packet methods, the fake packet
+# stage still requires packet interception, while these settings control how
+# the real ClientHello is written after the fake packet stage.
+#
+# The proxy parses the ClientHello down to the extension array, computes the
+# exact byte offset of the SNI extension, and writes the ClientHello as two
+# TCP segments cut at that boundary, with a small delay between them so
+# inline DPI reassembly buffers do not stitch them back together.
 
+# Where to cut the first ClientHello TCP write.
+#   "extension_length" — right after the server_name extension's 2-byte
+#                        length field; segment 2 starts with the extension
+#                        body (default)
+#   "middle"           — exact middle of the SNI domain string
+#                        (e.g. https://you | tube.com)
+#   N                  — after the Nth byte of the domain string (0-based),
+#                        clamped to the domain length
+SNI_BOUNDARY_FRAG_SPLIT_POINT = "extension_length"
+
+# Delay between the two TCP segments, in milliseconds.
+#
+# Accepts either a fixed integer or an inclusive range string:
+#   5        — always wait 5 ms
+#   "5-10"   — randomly choose 5 through 10 ms per connection
+#   0        — send both segments back-to-back
+#
+# A fresh value is chosen per connection.
+#
+# Must be >= 0.  Default: "5-10".
+SNI_BOUNDARY_FRAG_DELAY_MS = "5-10"
 # ---------------------------------------------------------------------------
 # tls_frag method parameters
 # ---------------------------------------------------------------------------
@@ -684,6 +998,26 @@ TLS_PADDING_SIZE = "1500-2500"
 #              past the DPI's inspection window (default)
 #   "after"  — at the end of the extension list (canonical RFC 7685 placement)
 TLS_PADDING_POSITION = "before"
+# ---------------------------------------------------------------------------
+# mixed_case_sni method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "mixed_case_sni" (alone or
+# combined).
+
+# When true, every ASCII letter in the SNI hostname is case-inverted
+# (a -> A, A -> a).  When false (default), each letter is randomly
+# uppercased or lowercased per connection, with at least one letter
+# guaranteed to differ from the original.
+MIXED_CASE_SNI_FLIP_ALL = false
+# ---------------------------------------------------------------------------
+# ccs_prefix method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "ccs_prefix" (alone or combined).
+
+# The two TLS record-version bytes of the dummy ChangeCipherSpec record, as a
+# hex string.  TLS 1.3's middlebox compatibility mode uses 0x0303; change
+# this only when a DPI fingerprints on the record version.
+CCS_PREFIX_RECORD_VERSION = "0x0303"
 
 # Legacy fixed fragment length fallback.
 #

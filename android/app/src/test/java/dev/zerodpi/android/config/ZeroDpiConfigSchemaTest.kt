@@ -312,6 +312,15 @@ class ZeroDpiConfigSchemaTest {
         assertNotNull(validateSniPosition("-1", setOf("middle", "start", "end")))
     }
 
+    @Test
+    fun bundledAndroidConfigParsesCleanly() {
+        val bundled = findRepoFile("android/app/src/main/assets/zerodpi/config.toml")
+        assertTrue("Missing bundled config at ${bundled.absolutePath}", bundled.isFile)
+        val editorState = ZeroDpiConfigToml.analyze(bundled.readText())
+        assertTrue("Bundled config has issues: ${editorState.issues}", editorState.canStart)
+        assertEquals(listOf("wrong_seq", "tls_frag"), editorState.config.methodList("BYPASS_METHOD"))
+    }
+
     private fun findRepoFile(relativePath: String): File {
         var current = File("").absoluteFile
         while (true) {

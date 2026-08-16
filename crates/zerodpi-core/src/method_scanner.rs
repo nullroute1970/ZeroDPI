@@ -6,12 +6,19 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_rustls::rustls::pki_types::ServerName;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::config::Config;
+use crate::flow::{new_flow_table, FlowController, LocalFlowController};
+use crate::handler::Handler;
+use crate::interceptor::{FilterSpec, InterceptorShutdown, PacketInterceptor};
+use crate::methods::build_method;
+use crate::proxy::{run_proxy, ActiveSniTarget, CONNECT_PORT};
 use crate::sni_scanner::make_tls_connector;
 
 // ---------------------------------------------------------------------------
@@ -366,6 +373,191 @@ pub async fn direct_probe(
         } else {
             Some("no HTTP response received through the relay".into())
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Engine loop
+// ---------------------------------------------------------------------------
+
+/// Run every method in `methods` against `target` and return ranked entries.
+///
+/// Each method gets a fresh engine (proxy task + interceptor when the method
+/// needs one) and `METHOD_SCAN_SAMPLES` probes spaced by
+/// `METHOD_SCAN_INTERVAL_MS`. `interceptor_factory` opens the platform
+/// interceptor exactly like `proxy_tester::test_candidate_full` expects.
+pub async fn run_method_tests<F, I>(
+    config: Arc<Config>,
+    target: MethodScanTarget,
+    methods: Vec<String>,
+    interface_ip: std::net::Ipv4Addr,
+    progress_tx: Option<mpsc::UnboundedSender<MethodScanEvent>>,
+    interceptor_factory: F,
+) -> anyhow::Result<Vec<MethodScanEntry>>
+where
+    F: Fn(FilterSpec) -> anyhow::Result<I> + Send + 'static,
+    I: PacketInterceptor,
+{
+    let listen_addr: SocketAddr = format!("{}:{}", config.LISTEN_HOST, config.LISTEN_PORT)
+        .parse()
+        .context("invalid LISTEN_HOST/LISTEN_PORT")?;
+    let connect_addr = if listen_addr.ip().is_unspecified() {
+        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, listen_addr.port()))
+    } else {
+        listen_addr
+    };
+
+    let mut entries = Vec::with_capacity(methods.len());
+    for (index, method) in methods.iter().enumerate() {
+        let entry = run_one_method(
+            &config,
+            &target,
+            method,
+            index,
+            interface_ip,
+            progress_tx.as_ref(),
+            connect_addr,
+            &interceptor_factory,
+        )
+        .await;
+        entries.push(entry);
+        // Small gap so the previous interceptor thread can exit before the
+        // next one opens (same rationale as proxy_scan).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(rank_entries(entries))
+}
+
+/// One method: engine up, `METHOD_SCAN_SAMPLES` probes, engine down.
+async fn run_one_method<F, I>(
+    config: &Arc<Config>,
+    target: &MethodScanTarget,
+    method: &str,
+    method_index: usize,
+    interface_ip: std::net::Ipv4Addr,
+    progress_tx: Option<&mpsc::UnboundedSender<MethodScanEvent>>,
+    connect_addr: SocketAddr,
+    interceptor_factory: &F,
+) -> MethodScanEntry
+where
+    F: Fn(FilterSpec) -> anyhow::Result<I> + Send + 'static,
+    I: PacketInterceptor,
+{
+    let cfg = cfg_with_method(config, method);
+    let samples_total = cfg.METHOD_SCAN_SAMPLES;
+    let interval = Duration::from_millis(cfg.METHOD_SCAN_INTERVAL_MS);
+    let timeout = Duration::from_secs(cfg.METHOD_SCAN_TIMEOUT_SECS);
+
+    let active_target = Arc::new(std::sync::RwLock::new(ActiveSniTarget::new(
+        target.sni.clone(),
+        target.ip,
+        target.score,
+    )));
+
+    let flows = new_flow_table();
+    let flow_controller: Arc<dyn FlowController> = Arc::new(LocalFlowController::new(flows.clone()));
+
+    // Packet interceptor — only when this method needs one.
+    let mut interceptor_guard: Option<(InterceptorShutdown, tokio::sync::oneshot::Receiver<()>)> =
+        None;
+    if !cfg.BYPASS_METHOD.is_socket_only() {
+        let method_box = match build_method(&cfg) {
+            Some(m) => m,
+            None => {
+                warn!(method, "build_method returned None — marking all samples failed");
+                return failed_entry(method, samples_total, "build_method returned None".to_owned());
+            }
+        };
+        let method_arc: Arc<dyn crate::methods::BypassMethod> = Arc::from(method_box);
+        let filter = FilterSpec {
+            interface_ip,
+            remote_ip: Some(target.ip),
+            remote_port: CONNECT_PORT,
+            queue_num: cfg.NFQUEUE_NUM,
+            linux_firewall_backend: cfg.linux_firewall_backend(),
+            firewall_owner: None,
+        };
+        let interceptor = match interceptor_factory(filter) {
+            Ok(i) => i,
+            Err(e) => {
+                warn!(method, error = %e, "failed to open packet interceptor — marking all samples failed");
+                return failed_entry(method, samples_total, format!("interceptor open failed: {e}"));
+            }
+        };
+        let handler = Handler::new(flows.clone(), method_arc);
+        let shutdown = InterceptorShutdown::default();
+        let thread_shutdown = shutdown.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let method_owned = method.to_owned();
+        let _thread = std::thread::Builder::new()
+            .name(format!("zerodpi-method-scan-{method_owned}"))
+            .spawn(move || {
+                if let Err(e) = interceptor.run_until(handler, thread_shutdown) {
+                    debug!(error = %e, method = %method_owned, "method-scan intercept thread ended");
+                }
+                let _ = done_tx.send(());
+            });
+        interceptor_guard = Some((shutdown, done_rx));
+    }
+
+    // Proxy task on LISTEN_HOST:LISTEN_PORT relaying to the target.
+    let proxy_cfg = cfg.clone();
+    let proxy_target = active_target.clone();
+    let proxy_fc = flow_controller.clone();
+    let proxy_task = tokio::spawn(async move {
+        let _ = run_proxy(proxy_cfg, proxy_target, interface_ip, proxy_fc, None).await;
+    });
+    // Give the listener a moment to bind before connecting.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Samples.
+    let mut samples = Vec::with_capacity(samples_total);
+    for i in 0..samples_total {
+        if i > 0 && interval > Duration::ZERO {
+            tokio::time::sleep(interval).await;
+        }
+        let result = direct_probe(&cfg, connect_addr, &target.sni, target.http_path, timeout).await;
+        if let Some(tx) = progress_tx {
+            let _ = tx.send(MethodScanEvent::SampleDone {
+                method: method.to_owned(),
+                sample: i + 1,
+                ok: result.ok,
+            });
+        }
+        samples.push(result);
+    }
+
+    // Teardown.
+    proxy_task.abort();
+    if let Some((shutdown, done_rx)) = interceptor_guard {
+        shutdown.request();
+        let _ = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
+    }
+
+    let entry = entry_from_samples(method, &samples);
+    if let Some(tx) = progress_tx {
+        let _ = tx.send(MethodScanEvent::MethodDone {
+            method: method.to_owned(),
+            completed: method_index + 1,
+            entry: entry.clone(),
+        });
+    }
+    entry
+}
+
+/// Entry for a method whose engine could not start: every sample failed.
+fn failed_entry(method: &str, samples_total: usize, error: String) -> MethodScanEntry {
+    MethodScanEntry {
+        method: method.to_owned(),
+        samples_total,
+        samples_ok: 0,
+        success_rate: 0.0,
+        avg_ttfb_ms: None,
+        min_ttfb_ms: None,
+        max_ttfb_ms: None,
+        avg_tls_ms: None,
+        http_status: None,
+        last_error: Some(error),
     }
 }
 

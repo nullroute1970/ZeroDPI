@@ -89,8 +89,8 @@ pub fn fragment_ipv4_packet(bytes: &[u8], frag_size: usize) -> Vec<Vec<u8>> {
 /// RFC 1071 one's-complement checksum over an IPv4 header (the checksum
 /// field itself must be zeroed by the caller). Summing the header again
 /// *with* the checksum field populated yields `0` when the checksum is
-/// valid.
-fn ipv4_header_checksum(header: &[u8]) -> u16 {
+/// valid. Shared with `tcp_segment`.
+pub(crate) fn ipv4_header_checksum(header: &[u8]) -> u16 {
     let mut sum = 0u32;
     let mut chunks = header.chunks_exact(2);
     for word in &mut chunks {

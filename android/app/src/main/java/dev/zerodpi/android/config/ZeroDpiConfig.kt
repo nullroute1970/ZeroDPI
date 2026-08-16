@@ -36,6 +36,7 @@ enum class ConfigFieldType(val label: String) {
     Enum("choice"),
     IntegerRange("integer or range"),
     PacketSelector("packet selector"),
+    MultiSelect("method list"),
 }
 
 enum class ConfigRootImpact(val label: String) {
@@ -83,6 +84,9 @@ data class ZeroDpiConfig(
     fun text(name: String): String =
         (values[name] as? TextConfigValue)?.value.orEmpty()
 
+    fun methodList(name: String): List<String> =
+        parseTomlStringArray(text(name)) ?: emptyList()
+
     fun boolean(name: String): Boolean =
         (values[name] as? BooleanConfigValue)?.value ?: false
 
@@ -118,6 +122,71 @@ data class ConfigEditorState(
 
     fun issuesFor(fieldName: String): List<ConfigValidationIssue> =
         issues.filter { it.fieldName == fieldName }
+}
+
+internal fun expandMethodAlias(name: String): List<String> =
+    when (name) {
+        "wrong_seq_wrong_md5" -> listOf("wrong_seq", "wrong_md5")
+        "wrong_seq_tls_frag" -> listOf("wrong_seq", "tls_frag")
+        "wrong_md5_tls_frag" -> listOf("wrong_md5", "tls_frag")
+        "wrong_seq_tls_record_frag" -> listOf("wrong_seq", "tls_record_frag")
+        else -> listOf(name)
+    }
+
+internal fun canonicalMethodArray(methods: List<String>): String =
+    methods.joinToString(prefix = "[", separator = ", ", postfix = "]") { "\"$it\"" }
+
+internal fun parseTomlStringArray(raw: String): List<String>? {
+    val trimmed = raw.trim()
+    if (!trimmed.startsWith('[') || !trimmed.endsWith(']')) return null
+    val body = trimmed.substring(1, trimmed.length - 1)
+    val items = mutableListOf<String>()
+    var index = 0
+    while (true) {
+        while (index < body.length && body[index].isWhitespace()) index += 1
+        if (index >= body.length) break
+        if (body[index] != '"') return null
+        index += 1
+        val builder = StringBuilder()
+        var closed = false
+        while (index < body.length) {
+            when (val char = body[index]) {
+                '"' -> {
+                    closed = true
+                    index += 1
+                    break
+                }
+                '\\' -> {
+                    if (index + 1 >= body.length) return null
+                    builder.append(
+                        when (body[index + 1]) {
+                            'n' -> '\n'
+                            't' -> '\t'
+                            'r' -> '\r'
+                            '"' -> '"'
+                            '\\' -> '\\'
+                            else -> return null
+                        },
+                    )
+                    index += 2
+                }
+                else -> {
+                    builder.append(char)
+                    index += 1
+                }
+            }
+        }
+        if (!closed) return null
+        items += builder.toString()
+        while (index < body.length && body[index].isWhitespace()) index += 1
+        if (index >= body.length) break
+        if (body[index] != ',') return null
+        index += 1
+        var next = index
+        while (next < body.length && body[next].isWhitespace()) next += 1
+        if (next >= body.length) return null
+    }
+    return items
 }
 
 object ZeroDpiConfigSchema {
@@ -369,10 +438,10 @@ object ZeroDpiConfigSchema {
         ),
         field(
             name = "BYPASS_METHOD",
-            type = ConfigFieldType.Enum,
-            defaultValue = "wrong_seq_tls_frag",
+            type = ConfigFieldType.MultiSelect,
+            defaultValue = canonicalMethodArray(listOf("wrong_seq", "tls_frag")),
             section = ConfigSection.BypassEngine,
-            validationRule = "Must be one of the supported bypass method strings.",
+            validationRule = "One or more methods; see combo restrictions in config.toml.",
             rootImpact = ConfigRootImpact.ControlsRootRequirement,
             helpText = "Bypass engine used by SNI and proxy modes.",
             options = bypassMethodOptions,
@@ -828,6 +897,9 @@ object ZeroDpiConfigToml {
     fun requiresPacketInterception(mode: String, bypassMethod: String): Boolean =
         mode in setOf("sni_spoof", "proxy_scan", "ip_bypass_plus") && bypassMethod != "tls_frag"
 
+    fun displayMethodList(value: String): String =
+        parseTomlStringArray(value)?.joinToString(" + ") ?: value
+
     private fun parseFieldText(text: String): ParsedFieldText {
         val values = ZeroDpiConfigSchema.fields.associate { it.name to it.defaultValue }.toMutableMap()
         val issues = mutableListOf<ConfigValidationIssue>()
@@ -895,6 +967,17 @@ object ZeroDpiConfigToml {
 
     private fun rawTomlToDisplay(schema: ConfigFieldSchema, rawValue: String): String? =
         when (schema.type) {
+            ConfigFieldType.MultiSelect -> {
+                if (rawValue.trim().startsWith('[')) {
+                    parseTomlStringArray(rawValue)
+                        ?.let { canonicalMethodArray(it.flatMap(::expandMethodAlias)) }
+                } else if (rawValue.startsWith('"')) {
+                    decodeTomlString(rawValue)?.let { canonicalMethodArray(expandMethodAlias(it)) }
+                } else {
+                    null
+                }
+            }
+
             ConfigFieldType.Text,
             ConfigFieldType.OptionalText,
             ConfigFieldType.Enum,
@@ -947,6 +1030,25 @@ object ZeroDpiConfigToml {
             ConfigFieldType.IntegerRange -> {
                 val issue = validateIntegerRange(text, min = Long.MIN_VALUE)
                 ParsedConfigValue(if (issue == null) TextConfigValue(text) else null, issue)
+            }
+
+            ConfigFieldType.MultiSelect -> {
+                val methods = parseTomlStringArray(text)
+                if (methods == null) {
+                    ParsedConfigValue(null, "${schema.name} must be a TOML array of method names.")
+                } else {
+                    val invalid = methods.filter { it !in schema.options }
+                    val duplicates = methods.groupingBy { it }.eachCount().filterValues { it > 1 }.keys
+                    when {
+                        methods.isEmpty() ->
+                            ParsedConfigValue(null, "${schema.name} must not be empty.")
+                        invalid.isNotEmpty() ->
+                            ParsedConfigValue(null, "${schema.name} has unknown method(s): ${invalid.joinToString()}.")
+                        duplicates.isNotEmpty() ->
+                            ParsedConfigValue(null, "${schema.name} has duplicate method(s): ${duplicates.joinToString()}.")
+                        else -> ParsedConfigValue(TextConfigValue(canonicalMethodArray(methods)), null)
+                    }
+                }
             }
 
             ConfigFieldType.Boolean -> {
@@ -1216,6 +1318,8 @@ object ZeroDpiConfigToml {
 
     private fun toTomlLiteral(schema: ConfigFieldSchema, value: String): String =
         when (schema.type) {
+            ConfigFieldType.MultiSelect -> value.trim()
+
             ConfigFieldType.Text,
             ConfigFieldType.OptionalText,
             ConfigFieldType.Enum,

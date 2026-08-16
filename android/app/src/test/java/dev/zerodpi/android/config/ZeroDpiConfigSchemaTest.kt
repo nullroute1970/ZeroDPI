@@ -2,6 +2,8 @@ package dev.zerodpi.android.config
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -160,6 +162,36 @@ class ZeroDpiConfigSchemaTest {
         assertFalse(ZeroDpiConfigToml.requiresPacketInterception("ip_scan", "wrong_seq"))
         assertTrue(ZeroDpiConfigToml.requiresPacketInterception("proxy_scan", "wrong_seq"))
         assertFalse(ZeroDpiConfigToml.requiresPacketInterception("proxy_scan", "tls_frag"))
+    }
+
+    @Test
+    fun parsesTomlStringArrays() {
+        assertEquals(listOf("wrong_seq", "tls_frag"), parseTomlStringArray("""["wrong_seq", "tls_frag"]"""))
+        assertEquals(listOf("a\"b"), parseTomlStringArray("""["a\"b"]"""))
+        assertNull(parseTomlStringArray("""["wrong_seq" "tls_frag"]"""))
+        assertNull(parseTomlStringArray("""wrong_seq"""))
+        assertNull(parseTomlStringArray("""["a", "b",]""")) // trailing comma invalid
+        assertNull(parseTomlStringArray("""["unterminated]"""))
+    }
+
+    @Test
+    fun expandsComboAliases() {
+        assertEquals(listOf("wrong_seq", "wrong_md5"), expandMethodAlias("wrong_seq_wrong_md5"))
+        assertEquals(listOf("tls_frag"), expandMethodAlias("tls_frag"))
+    }
+
+    @Test
+    fun methodListAccessorReadsCanonicalArray() {
+        val state = ZeroDpiConfigToml.analyze(
+            """
+            LISTEN_HOST = "127.0.0.1"
+            LISTEN_PORT = 44444
+            MODE = "sni_spoof"
+            BYPASS_METHOD = ["wrong_seq", "tls_frag"]
+            """.trimIndent(),
+        )
+        assertEquals(listOf("wrong_seq", "tls_frag"), state.config.methodList("BYPASS_METHOD"))
+        assertTrue(state.canStart)
     }
 
     private fun findRepoFile(relativePath: String): File {

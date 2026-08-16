@@ -37,6 +37,9 @@ use zerodpi_core::handler::Handler;
 use zerodpi_core::interceptor::{FilterSpec, InterceptorShutdown, PacketInterceptor};
 use zerodpi_core::ip_scanner::{load_ip_list, scan_ip_list, IpProbeEntry, IpScanEvent};
 use zerodpi_core::low_ttl_discover::{discover_low_ttl, LowTtlDiscovery};
+use zerodpi_core::method_scanner::{
+    rank_entries, run_method_tests, MethodScanEvent, MethodScanReport, MethodScanTarget,
+};
 use zerodpi_core::methods::build_method;
 use zerodpi_core::net::default_interface_ipv4;
 use zerodpi_core::proxy::{
@@ -359,6 +362,22 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
             .enable_all()
             .build()?;
         return proxy_scan_main(cfg_clone, cfg_path_clone, rt, no_tui, events, remote_helper);
+    }
+    if cfg.MODE == "sni_method_scan" {
+        let cfg_clone = cfg.clone();
+        let cfg_path_clone = cfg_path.clone();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return sni_method_scan_main(cfg_clone, cfg_path_clone, rt, no_tui, events);
+    }
+    if cfg.MODE == "ip_method_scan" {
+        let cfg_clone = cfg.clone();
+        let cfg_path_clone = cfg_path.clone();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return ip_method_scan_main(cfg_clone, cfg_path_clone, rt, no_tui, events);
     }
 
     // ---- resolve SNI list path relative to the config file ----
@@ -2445,6 +2464,402 @@ fn ip_scan_main(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// sni_method_scan / ip_method_scan modes
+// ---------------------------------------------------------------------------
+
+/// `sni_method_scan`: Phase 0 scans the SNI list, then Phase 1 tests every
+/// configured bypass method against the top candidate.
+fn sni_method_scan_main(
+    cfg: Arc<Config>,
+    cfg_path: PathBuf,
+    rt: tokio::runtime::Runtime,
+    no_tui: bool,
+    events: RuntimeEventEmitter,
+) -> Result<()> {
+    let sni_list_path = {
+        let raw = PathBuf::from(&cfg.SNI_LIST);
+        if raw.is_absolute() {
+            raw
+        } else {
+            cfg_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(raw)
+        }
+    };
+
+    let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+    info!(path = %sni_list_path.display(), "sni_method_scan: Phase 0 — scanning SNI list");
+
+    let sorted = if no_tui {
+        rt.block_on(scan_sni_list_headless(
+            cfg.clone(),
+            &sni_list_path,
+            scan_timeout,
+            &events,
+            ScanKind::Sni,
+        ))?
+    } else {
+        let total_hostnames = count_hostnames(&sni_list_path);
+        let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
+        let path = sni_list_path.clone();
+        let cfg_clone = cfg.clone();
+        let scan_handle =
+            rt.spawn(async move { scan_sni_list(&path, scan_timeout, cfg_clone, Some(tx)).await });
+
+        let mut terminal = tui::enter_tui()?;
+        let (arrived, aborted) = tui::run_scan_progress(&mut terminal, &mut rx, total_hostnames)?;
+        tui::leave_tui(terminal)?;
+
+        if scan_handle.is_finished() {
+            rt.block_on(scan_handle)
+                .context("scanner task panicked")??
+        } else {
+            scan_handle.abort();
+            if aborted {
+                info!(
+                    "sni_method_scan: Phase 0 aborted — using {} results collected so far",
+                    arrived.len()
+                );
+            }
+            let mut e = arrived;
+            e.sort_by(|a, b| {
+                b.score.cmp(&a.score).then(
+                    a.tcp_latency_ms
+                        .unwrap_or(u64::MAX)
+                        .cmp(&b.tcp_latency_ms.unwrap_or(u64::MAX)),
+                )
+            });
+            e
+        }
+    };
+
+    let top = sorted.into_iter().next().ok_or_else(|| {
+        anyhow::anyhow!("sni_method_scan: no SNI candidates — cannot test bypass methods")
+    })?;
+    info!(
+        sni = %top.sni,
+        ip = %top.ip,
+        score = top.score,
+        "sni_method_scan: top candidate selected"
+    );
+
+    let target = MethodScanTarget {
+        sni: top.sni.clone(),
+        ip: top.ip,
+        score: top.score,
+        http_path: "/",
+    };
+    method_scan_phase1(
+        cfg,
+        &cfg_path,
+        &rt,
+        no_tui,
+        &events,
+        target,
+        "sni_method_scan",
+    )
+}
+
+/// `ip_method_scan`: Phase 0 scans the IP list, then Phase 1 tests every
+/// configured bypass method against the top IPv4 candidate (TLS SNI =
+/// `IP_SCAN_SNI`, matching `ip_scan`).
+fn ip_method_scan_main(
+    cfg: Arc<Config>,
+    cfg_path: PathBuf,
+    rt: tokio::runtime::Runtime,
+    no_tui: bool,
+    events: RuntimeEventEmitter,
+) -> Result<()> {
+    let ip_list_path = {
+        let raw = PathBuf::from(&cfg.IP_LIST);
+        if raw.is_absolute() {
+            raw
+        } else {
+            cfg_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(raw)
+        }
+    };
+
+    let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+    let ips = load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS)
+        .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
+    if ips.is_empty() {
+        anyhow::bail!(
+            "ip_list '{}' is empty — add at least one IP or CIDR",
+            ip_list_path.display()
+        );
+    }
+    let total_ips = ips.len();
+    info!(total_ips, "ip_method_scan: Phase 0 — scanning IP list");
+
+    let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
+    let cfg_clone = cfg.clone();
+    let sorted = if no_tui {
+        rt.block_on(scan_ip_list_headless(
+            ips,
+            scan_sni,
+            scan_timeout,
+            cfg_clone,
+            &events,
+            Some(&ip_list_path),
+        ))
+    } else {
+        let (tx, mut rx) = mpsc::unbounded_channel::<IpScanEvent>();
+        let scan_handle = rt.spawn(async move {
+            scan_ip_list(ips, scan_sni, scan_timeout, cfg_clone, Some(tx)).await
+        });
+
+        let mut terminal = tui::enter_tui()?;
+        let (arrived, aborted) = tui::run_ip_scan_progress(&mut terminal, &mut rx, total_ips)?;
+        tui::leave_tui(terminal)?;
+
+        if scan_handle.is_finished() {
+            rt.block_on(scan_handle).context("scanner task panicked")?
+        } else {
+            scan_handle.abort();
+            if aborted {
+                info!(
+                    "ip_method_scan: Phase 0 aborted — using {} results collected so far",
+                    arrived.len()
+                );
+            }
+            let mut e = arrived;
+            e.sort_by(|a, b| {
+                b.score.cmp(&a.score).then(
+                    a.tcp_latency_ms
+                        .unwrap_or(u64::MAX)
+                        .cmp(&b.tcp_latency_ms.unwrap_or(u64::MAX)),
+                )
+            });
+            e
+        }
+    };
+
+    let top = sorted
+        .iter()
+        .find(|e| e.ip.is_ipv4())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "ip_method_scan: no IPv4 candidate in scan results — method testing requires an IPv4 target"
+            )
+        })?;
+    let target_ip = match top.ip {
+        IpAddr::V4(v4) => v4,
+        IpAddr::V6(_) => unreachable!("filtered by is_ipv4 above"),
+    };
+    info!(
+        ip = %target_ip,
+        sni = %cfg.IP_SCAN_SNI,
+        score = top.score,
+        "ip_method_scan: top IPv4 candidate selected"
+    );
+
+    let target = MethodScanTarget {
+        sni: cfg.IP_SCAN_SNI.clone(),
+        ip: target_ip,
+        score: top.score,
+        http_path: "/cdn-cgi/trace",
+    };
+    method_scan_phase1(
+        cfg,
+        &cfg_path,
+        &rt,
+        no_tui,
+        &events,
+        target,
+        "ip_method_scan",
+    )
+}
+
+/// Phase 1 shared by both method-scan modes: test every method in
+/// `METHOD_SCAN_METHODS` against `target`, then report.
+fn method_scan_phase1(
+    cfg: Arc<Config>,
+    cfg_path: &Path,
+    rt: &tokio::runtime::Runtime,
+    no_tui: bool,
+    events: &RuntimeEventEmitter,
+    target: MethodScanTarget,
+    mode_name: &str,
+) -> Result<()> {
+    let interface_ip = default_interface_ipv4(target.ip)
+        .context("method scan: could not determine local interface IP")?;
+
+    let methods: Vec<String> = cfg.METHOD_SCAN_METHODS.iter().map(str::to_owned).collect();
+    let total_methods = methods.len();
+    info!(
+        methods = ?methods,
+        samples = cfg.METHOD_SCAN_SAMPLES,
+        interval_ms = cfg.METHOD_SCAN_INTERVAL_MS,
+        "{mode_name}: Phase 1 — testing bypass methods"
+    );
+
+    let (tx, rx) = mpsc::unbounded_channel::<MethodScanEvent>();
+    let cfg_for_phase1 = cfg.clone();
+    let target_for_phase1 = target.clone();
+    let methods_for_phase1 = methods.clone();
+
+    // Each method spins up an OS thread (WinDivert/NFQUEUE), so run the
+    // loop inside spawn_blocking like proxy_scan does.
+    let phase_handle = rt.spawn_blocking(move || {
+        let rt2 = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("method scan: failed to build Phase 1 runtime");
+        rt2.block_on(async move {
+            run_method_tests(
+                cfg_for_phase1,
+                target_for_phase1,
+                methods_for_phase1,
+                interface_ip,
+                Some(tx),
+                DefaultInterceptor::open,
+            )
+            .await
+        })
+    });
+
+    let entries = if no_tui {
+        events.emit(RuntimeEvent::ScanStarted {
+            scan: ScanKind::Proxy,
+            path: None,
+            total: Some(total_methods),
+        });
+        let progress_events = events.clone();
+        let progress_sni = target.sni.clone();
+        let mut rx = rx;
+        let progress_handle = rt.spawn(async move {
+            let mut completed = 0usize;
+            while let Some(ev) = rx.recv().await {
+                if let MethodScanEvent::MethodDone { entry, .. } = ev {
+                    completed += 1;
+                    progress_events.emit(RuntimeEvent::ScanProgress {
+                        scan: ScanKind::Proxy,
+                        phase: Some("method_test".to_owned()),
+                        completed,
+                        total: Some(total_methods),
+                        sni: Some(progress_sni.clone()),
+                        ip: Some(target.ip.to_string()),
+                        score: Some(entry.success_rate.round() as u8),
+                    });
+                }
+            }
+        });
+        let results = rt
+            .block_on(phase_handle)
+            .context("method scan Phase 1 task panicked")??;
+        let _ = rt.block_on(progress_handle);
+        events.emit(RuntimeEvent::ScanCompleted {
+            scan: ScanKind::Proxy,
+            results: results.len(),
+        });
+        results
+    } else {
+        let mut rx = rx;
+        let mut terminal = tui::enter_tui()?;
+        let (arrived, aborted) = tui::run_method_scan_progress(
+            &mut terminal,
+            &mut rx,
+            total_methods,
+            cfg.METHOD_SCAN_SAMPLES,
+        )?;
+        tui::leave_tui(terminal)?;
+
+        if phase_handle.is_finished() {
+            rt.block_on(phase_handle)
+                .context("method scan Phase 1 task panicked")??
+        } else {
+            phase_handle.abort();
+            if aborted {
+                info!(
+                    "{mode_name}: Phase 1 aborted — using {} results collected so far",
+                    arrived.len()
+                );
+            }
+            rank_entries(arrived)
+        }
+    };
+
+    let report = MethodScanReport {
+        mode: mode_name.to_owned(),
+        target_sni: target.sni.clone(),
+        target_ip: target.ip,
+        target_score: target.score,
+        samples_per_method: cfg.METHOD_SCAN_SAMPLES,
+        interval_ms: cfg.METHOD_SCAN_INTERVAL_MS,
+        methods: entries,
+    };
+
+    info!(
+        "{mode_name} complete — {} methods tested",
+        report.methods.len()
+    );
+    for e in &report.methods {
+        info!("{}", e.summary_line());
+    }
+
+    let output_path = resolve_method_output_path(&cfg, cfg_path);
+    let saved_path_str: Option<String> = if let Some(ref p) = output_path {
+        save_method_report(p, &report)?;
+        Some(p.display().to_string())
+    } else {
+        None
+    };
+
+    if no_tui {
+        print_method_scan_report(&report);
+    } else {
+        let mut terminal = tui::enter_tui()?;
+        tui::run_method_results_view(&mut terminal, &report, saved_path_str.as_deref())?;
+        tui::leave_tui(terminal)?;
+    }
+
+    Ok(())
+}
+
+/// Resolve `METHOD_SCAN_OUTPUT` relative to the config file directory.
+fn resolve_method_output_path(cfg: &Config, cfg_path: &Path) -> Option<PathBuf> {
+    let raw = cfg.METHOD_SCAN_OUTPUT.as_deref()?;
+    let raw_path = PathBuf::from(raw);
+    if raw_path.is_absolute() {
+        Some(raw_path)
+    } else {
+        Some(
+            cfg_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(raw_path),
+        )
+    }
+}
+
+fn save_method_report(path: &Path, report: &MethodScanReport) -> Result<()> {
+    let json = serde_json::to_string_pretty(report).context("serialising method-scan report")?;
+    std::fs::write(path, json)
+        .with_context(|| format!("writing method-scan report to '{}'", path.display()))?;
+    info!(path = %path.display(), "method scan: report saved");
+    Ok(())
+}
+
+/// Print the ranked report to stdout — the headless on-screen display.
+fn print_method_scan_report(report: &MethodScanReport) {
+    println!(
+        "method scan complete — {} methods tested against {} ({}), {} samples each, {} ms interval",
+        report.methods.len(),
+        report.target_sni,
+        report.target_ip,
+        report.samples_per_method,
+        report.interval_ms,
+    );
+    for (rank, e) in report.methods.iter().enumerate() {
+        println!("  #{:<3} {}", rank + 1, e.summary_line());
+    }
 }
 
 // ---------------------------------------------------------------------------

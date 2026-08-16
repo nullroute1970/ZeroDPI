@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 use zerodpi_core::config::Config;
 use zerodpi_core::flow::BypassOutcome;
 use zerodpi_core::ip_scanner::{IpProbeEntry, IpScanEvent};
+use zerodpi_core::method_scanner::{MethodScanEntry, MethodScanEvent, MethodScanReport};
 #[cfg(test)]
 use zerodpi_core::proxy::RescanKind;
 use zerodpi_core::proxy::{ProxyEvent, RelayEndReason};
@@ -3149,4 +3150,334 @@ fn draw_proxy_scan_results(
     ]);
     let help = Paragraph::new(help_line).block(Block::default().borders(Borders::ALL));
     frame.render_widget(help, chunks[2]);
+}
+
+// ---------------------------------------------------------------------------
+// Method-scan Phase 1 progress view
+// ---------------------------------------------------------------------------
+
+/// Live progress view for method-scan Phase 1. Returns entries collected so
+/// far and whether the user aborted.
+pub fn run_method_scan_progress(
+    terminal: &mut Term,
+    rx: &mut mpsc::UnboundedReceiver<MethodScanEvent>,
+    total_methods: usize,
+    samples_per_method: usize,
+) -> anyhow::Result<(Vec<MethodScanEntry>, bool)> {
+    let mut state = MethodScanProgressState {
+        done: Vec::new(),
+        current_method: None,
+        current_sample: 0,
+        ok_in_current: 0,
+    };
+
+    loop {
+        // Drain all currently available events.
+        loop {
+            match rx.try_recv() {
+                Ok(MethodScanEvent::SampleDone { method, sample, ok }) => {
+                    state.current_method = Some(method);
+                    state.current_sample = sample;
+                    if ok {
+                        state.ok_in_current += 1;
+                    }
+                }
+                Ok(MethodScanEvent::MethodDone { entry, .. }) => {
+                    state.done.push(entry);
+                    state.current_method = None;
+                    state.current_sample = 0;
+                    state.ok_in_current = 0;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // Engine finished - draw one final frame and return.
+                    draw_method_scan_progress(terminal, &state, total_methods, samples_per_method)?;
+                    return Ok((state.done, false));
+                }
+            }
+        }
+
+        draw_method_scan_progress(terminal, &state, total_methods, samples_per_method)?;
+
+        // Poll for user input (Ctrl-C / q to abort).
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(k) = event::read()? {
+                if k.kind == KeyEventKind::Press
+                    && (matches!(k.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+                        || k.code == KeyCode::Esc)
+                {
+                    return Ok((state.done, true));
+                }
+            }
+        }
+    }
+}
+
+struct MethodScanProgressState {
+    done: Vec<MethodScanEntry>,
+    current_method: Option<String>,
+    current_sample: usize,
+    ok_in_current: usize,
+}
+
+fn draw_method_scan_progress(
+    terminal: &mut Term,
+    state: &MethodScanProgressState,
+    total_methods: usize,
+    samples_per_method: usize,
+) -> anyhow::Result<()> {
+    let completed = state.done.len();
+    terminal.draw(|frame| {
+        let area = frame.area();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(3), // header
+                Constraint::Length(3), // methods gauge
+                Constraint::Length(3), // current sample line
+                Constraint::Min(5),    // results so far
+            ])
+            .split(area);
+
+        let header = Paragraph::new("ZeroDPI — Testing Bypass Methods…")
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(Block::default().borders(Borders::ALL));
+        frame.render_widget(header, chunks[0]);
+
+        let ratio = if total_methods == 0 {
+            0.0
+        } else {
+            (completed as f64 / total_methods as f64).min(1.0)
+        };
+        let gauge = Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title(" Methods "))
+            .gauge_style(Style::default().fg(Color::Green))
+            .ratio(ratio)
+            .label(format!("{completed}/{total_methods} methods tested"));
+        frame.render_widget(gauge, chunks[1]);
+
+        let current_line = match &state.current_method {
+            Some(m) => format!(
+                "Testing {m}: sample {}/{samples_per_method} ({} ok so far)",
+                state.current_sample, state.ok_in_current
+            ),
+            None => "—".to_owned(),
+        };
+        let current = Paragraph::new(current_line)
+            .block(Block::default().borders(Borders::ALL).title(" Current "));
+        frame.render_widget(current, chunks[2]);
+
+        let rows: Vec<Row> = state
+            .done
+            .iter()
+            .rev()
+            .take(8)
+            .map(|e| {
+                Row::new(vec![
+                    Cell::from(format!("{:.1}%", e.success_rate)),
+                    Cell::from(e.method.clone()),
+                    Cell::from(format!("{}/{}", e.samples_ok, e.samples_total)),
+                    Cell::from(
+                        e.avg_ttfb_ms
+                            .map(|v| format!("{v:.0}ms"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                    Cell::from(e.last_error.clone().unwrap_or_default()),
+                ])
+            })
+            .collect();
+
+        let widths = [
+            Constraint::Length(8),
+            Constraint::Length(24),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Min(20),
+        ];
+        let table = Table::new(rows, widths)
+            .header(
+                Row::new(vec!["Rate", "Method", "OK", "Avg TTFB", "Error"]).style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Results so far "),
+            );
+        frame.render_widget(table, chunks[3]);
+    })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Method-scan results view
+// ---------------------------------------------------------------------------
+
+/// Interactive results table: ranked methods with the best on top.
+pub fn run_method_results_view(
+    terminal: &mut Term,
+    report: &MethodScanReport,
+    output_path: Option<&str>,
+) -> anyhow::Result<()> {
+    if report.methods.is_empty() {
+        return Ok(());
+    }
+
+    let mut state = TableState::default();
+    state.select(Some(0));
+
+    loop {
+        terminal.draw(|frame| draw_method_results_view(frame, report, &mut state, output_path))?;
+
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(k) = event::read()? {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match k.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let i = state.selected().unwrap_or(0);
+                        state.select(Some(i.saturating_sub(1)));
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let i = state.selected().unwrap_or(0);
+                        state.select(Some((i + 1).min(report.methods.len() - 1)));
+                    }
+                    _ => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+fn draw_method_results_view(
+    frame: &mut ratatui::Frame,
+    report: &MethodScanReport,
+    state: &mut TableState,
+    output_path: Option<&str>,
+) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(3), // header
+            Constraint::Length(2), // sub-header
+            Constraint::Min(5),    // table
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+
+    let header = Paragraph::new(format!(
+        "ZeroDPI — Best bypass method for {} ({})",
+        report.target_sni, report.target_ip
+    ))
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(header, chunks[0]);
+
+    let sub = Paragraph::new(format!(
+        "{} methods × {} samples, interval {} ms — ranked by success rate, then avg TTFB",
+        report.methods.len(),
+        report.samples_per_method,
+        report.interval_ms
+    ));
+    frame.render_widget(sub, chunks[1]);
+
+    let rows: Vec<Row> = report
+        .methods
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let rate_style = if e.success_rate >= 100.0 {
+                Style::default().fg(Color::Green)
+            } else if e.success_rate >= 50.0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Red)
+            };
+            Row::new(vec![
+                Cell::from((i + 1).to_string()),
+                Cell::from(e.method.clone()).style(if i == 0 {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                }),
+                Cell::from(format!("{}/{}", e.samples_ok, e.samples_total)),
+                Cell::from(format!("{:.1}%", e.success_rate)).style(rate_style),
+                Cell::from(
+                    e.avg_ttfb_ms
+                        .map(|v| format!("{v:.0}ms"))
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                Cell::from(
+                    e.min_ttfb_ms
+                        .map(|v| format!("{v}ms"))
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                Cell::from(
+                    e.max_ttfb_ms
+                        .map(|v| format!("{v}ms"))
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                Cell::from(
+                    e.avg_tls_ms
+                        .map(|v| format!("{v:.0}ms"))
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                Cell::from(
+                    e.http_status
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                Cell::from(e.last_error.clone().unwrap_or_default()),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(4),
+        Constraint::Length(24),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Length(6),
+        Constraint::Min(20),
+    ];
+    let table = Table::new(rows, widths)
+        .header(
+            Row::new(vec![
+                "#", "Method", "OK", "Rate", "Avg TTFB", "Min", "Max", "Avg TLS", "HTTP", "Error",
+            ])
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .block(Block::default().borders(Borders::ALL))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(table, chunks[2], state);
+
+    let footer = Paragraph::new(match output_path {
+        Some(p) => format!("Report saved to {p} — press any key to exit"),
+        None => "METHOD_SCAN_OUTPUT not set — press any key to exit".to_owned(),
+    });
+    frame.render_widget(footer, chunks[3]);
 }

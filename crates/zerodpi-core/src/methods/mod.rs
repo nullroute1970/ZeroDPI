@@ -47,6 +47,7 @@
 //! registered in [`build_method`].  New socket-based methods must be wired
 //! directly into `proxy.rs` instead.
 
+pub mod ccs_prefix;
 pub mod composite;
 pub mod fake_tls;
 pub mod ip_frag;

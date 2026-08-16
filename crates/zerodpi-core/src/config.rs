@@ -248,6 +248,7 @@ pub const BASE_BYPASS_METHODS: &[&str] = &[
     "tls_record_frag",
     "fake_tls",
     "ip_frag",
+    "disorder",
     "tls_frag",
     "ccs_prefix",
     "tls_padding",
@@ -832,6 +833,38 @@ pub struct Config {
     pub IP_FRAG_ONLY_FIRST_PACKET: bool,
 
     // -----------------------------------------------------------------------
+    // disorder method parameters
+    // -----------------------------------------------------------------------
+    /// Number of TCP segments `disorder` splits each rewritten outbound data
+    /// packet into. Valid values: `2` or `3`. Default: `2`.
+    #[serde(default = "default_disorder_segments")]
+    pub DISORDER_SEGMENTS: usize,
+
+    /// Delay in milliseconds between consecutive segment emissions.
+    ///
+    /// The first segment is emitted synchronously from the capture loop;
+    /// the remaining segments are injected from a short-lived background
+    /// thread so the loop never blocks. Larger values widen the window in
+    /// which the DPI sees only part of the stream, at the cost of
+    /// connection-setup latency. Default: `0` (all segments emitted
+    /// back-to-back).
+    #[serde(default)]
+    pub DISORDER_DELAY_MS: u64,
+
+    /// Whether `disorder` emits the segments in reverse (non-monotonic
+    /// sequence-number) order. When `false`, segments are emitted as
+    /// in-order chunks (degenerate ordered segmentation). Default: `true`.
+    #[serde(default = "default_true")]
+    pub DISORDER_REVERSE: bool,
+
+    /// Whether `disorder` rewrites only the first outbound data packet of
+    /// each connection. When `false`, every subsequent outbound data packet
+    /// is also re-chunked and reordered until the connection closes
+    /// (fragment-all mode). Default: `true`.
+    #[serde(default = "default_true")]
+    pub DISORDER_ONLY_FIRST_PACKET: bool,
+
+    // -----------------------------------------------------------------------
     // urg_sni_split method parameters
     // -----------------------------------------------------------------------
     /// The 1-byte dummy payload `urg_sni_split` inserts into the middle of the
@@ -1188,6 +1221,9 @@ fn default_tls_frag_size() -> usize {
 fn default_ip_frag_size() -> usize {
     24
 }
+fn default_disorder_segments() -> usize {
+    2
+}
 fn default_sni_split_dummy_byte() -> u8 {
     0
 }
@@ -1425,6 +1461,16 @@ impl Config {
                     "BYPASS_METHOD \"ip_frag\" cannot be combined with \"tls_record_frag\", \"fake_tls\", or \"urg_sni_split\""
                 );
             }
+            if self.BYPASS_METHOD.contains("disorder")
+                && (self.BYPASS_METHOD.contains("tls_record_frag")
+                    || self.BYPASS_METHOD.contains("fake_tls")
+                    || self.BYPASS_METHOD.contains("ip_frag")
+                    || self.BYPASS_METHOD.contains("urg_sni_split"))
+            {
+                anyhow::bail!(
+                    "BYPASS_METHOD \"disorder\" cannot be combined with \"tls_record_frag\", \"fake_tls\", \"ip_frag\", or \"urg_sni_split\""
+                );
+            }
         }
         if self.WRONG_CHECKSUM_DELTA == 0 {
             anyhow::bail!("WRONG_CHECKSUM_DELTA must be >= 1");
@@ -1460,6 +1506,12 @@ impl Config {
             anyhow::bail!(
                 "IP_FRAG_SIZE must be a multiple of 8 (fragment offsets use 8-byte units)"
             );
+        }
+        if self.DISORDER_SEGMENTS < 2 || self.DISORDER_SEGMENTS > 3 {
+            anyhow::bail!("DISORDER_SEGMENTS must be 2 or 3");
+        }
+        if self.DISORDER_DELAY_MS > 1000 {
+            anyhow::bail!("DISORDER_DELAY_MS must be <= 1000");
         }
         if self.TCP_SEG_SIZE == 0 {
             anyhow::bail!("TCP_SEG_SIZE must be >= 1");
@@ -1509,11 +1561,12 @@ impl Config {
                         | "sni_boundary_frag"
                         | "ccs_prefix"
                         | "ip_frag"
+                        | "disorder"
                 )
             })
         {
             anyhow::bail!(
-                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", \"tls_padding\", \"mixed_case_sni\", \"sni_boundary_frag\", \"ccs_prefix\", or \"ip_frag\""
+                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", \"tls_padding\", \"mixed_case_sni\", \"sni_boundary_frag\", \"ccs_prefix\", \"ip_frag\", or \"disorder\""
             );
         }
         if !(0.0..=1.0).contains(&self.PROXY_TEST_SNI_WEIGHT) {
@@ -2347,6 +2400,104 @@ mod tests {
                LISTEN_PORT = 44444
                MODE = "ip_bypass_plus"
                BYPASS_METHOD = "ip_frag""#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_disorder_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.DISORDER_SEGMENTS, 2);
+        assert_eq!(cfg.DISORDER_DELAY_MS, 0);
+        assert!(cfg.DISORDER_REVERSE);
+        assert!(cfg.DISORDER_ONLY_FIRST_PACKET);
+    }
+
+    #[test]
+    fn parses_disorder_overrides() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               DISORDER_SEGMENTS = 3
+               DISORDER_DELAY_MS = 15
+               DISORDER_REVERSE = false
+               DISORDER_ONLY_FIRST_PACKET = false"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.DISORDER_SEGMENTS, 3);
+        assert_eq!(cfg.DISORDER_DELAY_MS, 15);
+        assert!(!cfg.DISORDER_REVERSE);
+        assert!(!cfg.DISORDER_ONLY_FIRST_PACKET);
+    }
+
+    #[test]
+    fn rejects_invalid_disorder_segments() {
+        for bad in ["1", "4"] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   DISORDER_SEGMENTS = {bad}"#
+            ))
+            .unwrap();
+            assert!(
+                cfg.validate().is_err(),
+                "DISORDER_SEGMENTS = {bad} should fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_excessive_disorder_delay() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               DISORDER_DELAY_MS = 1001"#,
+        )
+        .unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_disorder_with_other_data_stage_methods() {
+        for combo in [
+            r#"["disorder", "ip_frag"]"#,
+            r#"["disorder", "fake_tls"]"#,
+            r#"["disorder", "tls_record_frag"]"#,
+            r#"["disorder", "urg_sni_split"]"#,
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   BYPASS_METHOD = {combo}"#
+            ))
+            .unwrap();
+            assert!(cfg.validate().is_err(), "combo {combo} should fail validation");
+        }
+    }
+
+    #[test]
+    fn disorder_combines_with_handshake_and_socket_methods() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = ["wrong_seq", "disorder", "tls_frag"]"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn ip_bypass_plus_accepts_disorder() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               MODE = "ip_bypass_plus"
+               BYPASS_METHOD = "disorder""#,
         )
         .unwrap();
         cfg.validate().unwrap();

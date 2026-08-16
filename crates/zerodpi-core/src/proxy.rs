@@ -192,9 +192,10 @@ struct ConnectionSettings {
     mixed_case_sni: Option<MixedCaseSni>,
     sni_boundary_frag: Option<SniBoundaryFrag>,
     tcp_segmentation: TcpSegmentation,
-    /// `ip_frag` with `IP_FRAG_ONLY_FIRST_PACKET = false`: the interceptor
-    /// keeps rewriting outbound data packets for the connection's lifetime,
-    /// so the flow stays registered after bypass completion.
+    /// `ip_frag` with `IP_FRAG_ONLY_FIRST_PACKET = false`, or `disorder`
+    /// with `DISORDER_ONLY_FIRST_PACKET = false`: the interceptor keeps
+    /// rewriting outbound data packets for the connection's lifetime, so
+    /// the flow stays registered after bypass completion.
     fragment_all_data: bool,
 }
 
@@ -221,8 +222,10 @@ impl ConnectionSettings {
                 .BYPASS_METHOD
                 .contains("sni_boundary_frag")
                 .then(|| SniBoundaryFrag::new(cfg)),
-            fragment_all_data: cfg.BYPASS_METHOD.contains("ip_frag")
-                && !cfg.IP_FRAG_ONLY_FIRST_PACKET,
+            fragment_all_data: (cfg.BYPASS_METHOD.contains("ip_frag")
+                && !cfg.IP_FRAG_ONLY_FIRST_PACKET)
+                || (cfg.BYPASS_METHOD.contains("disorder")
+                    && !cfg.DISORDER_ONLY_FIRST_PACKET),
             tcp_segmentation,
         }
     }
@@ -900,8 +903,8 @@ async fn handle_intercept_connection(
     debug!(?key, "bypass complete");
 
     // Release the flow before relaying so any further packets pass through.
-    // Fragment-all mode (ip_frag with IP_FRAG_ONLY_FIRST_PACKET = false)
-    // keeps the flow registered: the interceptor continues fragmenting
+    // Fragment-all mode (ip_frag / disorder with *_ONLY_FIRST_PACKET =
+    // false) keeps the flow registered: the interceptor continues rewriting
     // outbound data packets, and the scopeguard removes the entry when this
     // task exits after the relay ends.
     if !settings.fragment_all_data {
@@ -1831,6 +1834,31 @@ mod tests {
             r#"LISTEN_HOST = "127.0.0.1"
                LISTEN_PORT = 44444
                BYPASS_METHOD = "ip_frag""#,
+        )
+        .unwrap();
+        let settings = ConnectionSettings::from_config(&cfg);
+        assert!(!settings.fragment_all_data);
+    }
+
+    #[test]
+    fn disorder_fragment_all_populates_settings() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "disorder"
+               DISORDER_ONLY_FIRST_PACKET = false"#,
+        )
+        .unwrap();
+        let settings = ConnectionSettings::from_config(&cfg);
+        assert!(settings.fragment_all_data);
+    }
+
+    #[test]
+    fn disorder_only_first_leaves_settings_false() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "disorder""#,
         )
         .unwrap();
         let settings = ConnectionSettings::from_config(&cfg);

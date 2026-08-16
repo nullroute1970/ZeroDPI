@@ -128,4 +128,18 @@
     <string name="label_firewall">Firewall backend</string>
     <string name="label_last_exit">Last exit code</string>
     <string name="label_storage_path">Storage path</string>
+    <string name="method_scan_title">Method scan</string>
+    <string name="method_scan_idle">Mode %1$s is selected. Press Start to test every configured method against the best candidate.</string>
+    <string name="method_scan_running">Testing bypass methods…</string>
+    <string name="method_scan_progress">Method %1$s of %2$s</string>
+    <string name="method_scan_completed">Tested %1$d methods against %2$s (%3$s, score %4$d).</string>
+    <string name="method_scan_failed">Method scan finished without results.</string>
+    <string name="method_scan_column_rank">#</string>
+    <string name="method_scan_column_method">Method</string>
+    <string name="method_scan_column_success">Success</string>
+    <string name="method_scan_column_samples">Samples</string>
+    <string name="method_scan_column_ttfb">Avg TTFB</string>
+    <string name="method_scan_column_tls">Avg TLS</string>
+    <string name="method_scan_column_http">HTTP</string>
+    <string name="method_scan_value_na">—</string>
 </resources>

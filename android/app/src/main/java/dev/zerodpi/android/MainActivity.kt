@@ -63,12 +63,14 @@ class MainActivity : ComponentActivity() {
             val runtimeFilesState by viewModel.runtimeFilesState.collectAsState()
             val profileState by viewModel.profileState.collectAsState()
             val diagnosticsState by viewModel.diagnosticsState.collectAsState()
+            val methodScanState by viewModel.methodScanState.collectAsState()
             ZeroDpiTheme {
                 DashboardScreen(
                     state = state,
                     runtimeFilesState = runtimeFilesState,
                     profileState = profileState,
                     diagnosticsState = diagnosticsState,
+                    methodScanState = methodScanState,
                     onStart = viewModel::start,
                     onStop = viewModel::stop,
                     onForceStop = viewModel::forceStop,

@@ -55,7 +55,7 @@ class MainViewModelInstrumentedTest {
 
         assertEquals(RootStatus.Needed, state.rootStatus)
         assertEquals("sni_spoof", state.mode)
-        assertEquals("wrong_seq", state.bypassMethod)
+        assertEquals("wrong_seq + tls_frag", state.bypassMethod)
         assertEquals("127.0.0.1:44444", state.listener)
     }
 

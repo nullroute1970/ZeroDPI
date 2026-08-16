@@ -48,6 +48,7 @@ internal fun HomeScreen(
     serviceState: ZeroDpiServiceState,
     runtimeFilesState: RuntimeFilesUiState,
     profileState: ProfileUiState,
+    methodScanState: MethodScanUiState,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onForceStop: () -> Unit,
@@ -76,6 +77,8 @@ internal fun HomeScreen(
             onStop = onStop,
             onForceStop = onForceStop,
         )
+
+        MethodScanCard(state = methodScanState)
 
         ActiveProfileCard(
             profileState = profileState,

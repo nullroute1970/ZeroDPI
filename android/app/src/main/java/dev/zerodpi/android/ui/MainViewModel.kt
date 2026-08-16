@@ -10,12 +10,15 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.zerodpi.android.config.ConfigEditorState
+import dev.zerodpi.android.config.ZeroDpiConfigSchema
 import dev.zerodpi.android.config.ZeroDpiConfigToml
 import dev.zerodpi.android.diagnostics.AndroidDiagnosticsProvider
 import dev.zerodpi.android.diagnostics.DeviceDiagnostics
 import dev.zerodpi.android.list.RuntimeListIssue
 import dev.zerodpi.android.list.RuntimeListValidation
 import dev.zerodpi.android.list.RuntimeListValidator
+import dev.zerodpi.android.methodscan.MethodScanReportModel
+import dev.zerodpi.android.methodscan.MethodScanReportParser
 import dev.zerodpi.android.profile.ProfileAutoUpdateScheduler
 import dev.zerodpi.android.profile.ProfileIndex
 import dev.zerodpi.android.profile.ProfileRemoteSettings
@@ -28,6 +31,7 @@ import dev.zerodpi.android.profile.ProfileValidationResult
 import dev.zerodpi.android.profile.ZeroDpiProfile
 import dev.zerodpi.android.service.RootStatus
 import dev.zerodpi.android.service.RuntimeStatus
+import dev.zerodpi.android.service.ScanProgressInfo
 import dev.zerodpi.android.service.ZeroDpiRuntimeStateStore
 import dev.zerodpi.android.service.ZeroDpiService
 import dev.zerodpi.android.service.ZeroDpiServiceState
@@ -153,6 +157,21 @@ data class DiagnosticsUiState(
     val errorMessage: String? = null,
 )
 
+sealed interface MethodScanPhase {
+    data object Hidden : MethodScanPhase
+    data object Idle : MethodScanPhase
+    data object Running : MethodScanPhase
+    data object Completed : MethodScanPhase
+    data class Failed(val message: String) : MethodScanPhase
+}
+
+data class MethodScanUiState(
+    val phase: MethodScanPhase = MethodScanPhase.Hidden,
+    val mode: String? = null,
+    val progress: ScanProgressInfo? = null,
+    val report: MethodScanReportModel? = null,
+)
+
 class MainViewModel(
     application: Application,
     private val profileRepository: ProfileRepository = ProfileRepository(application.applicationContext),
@@ -179,6 +198,10 @@ class MainViewModel(
     val profileState: StateFlow<ProfileUiState> = _profileState.asStateFlow()
     private val _diagnosticsState = MutableStateFlow(DiagnosticsUiState())
     val diagnosticsState: StateFlow<DiagnosticsUiState> = _diagnosticsState.asStateFlow()
+    private val _methodScanState = MutableStateFlow(MethodScanUiState())
+    val methodScanState: StateFlow<MethodScanUiState> = _methodScanState.asStateFlow()
+
+    private var lastServiceStatus: RuntimeStatus? = null
 
     private var service: ZeroDpiService? = null
     private var serviceStateJob: Job? = null
@@ -199,6 +222,7 @@ class MainViewModel(
                 service?.state()?.collect { state ->
                     _uiState.value = state
                     syncIdleRuntimeStateFromConfig()
+                    updateMethodScanState(state)
                 }
             }
             if (startWhenConnected) {
@@ -218,6 +242,7 @@ class MainViewModel(
             isBound = false
             _uiState.value = _uiState.value.copy(status = RuntimeStatus.Stopped)
             syncIdleRuntimeStateFromConfig()
+            updateMethodScanState(_uiState.value)
         }
     }
 
@@ -1185,6 +1210,59 @@ class MainViewModel(
                 listener = "$listenHost:$listenPort",
             )
         }
+        updateMethodScanState(_uiState.value)
+    }
+
+    private fun updateMethodScanState(serviceState: ZeroDpiServiceState) {
+        val mode = _runtimeFilesState.value.configEditor.valueFor("MODE")
+        val visible = mode in ZeroDpiConfigSchema.methodScanModes
+        if (!visible) {
+            lastServiceStatus = serviceState.status
+            _methodScanState.value = MethodScanUiState()
+            return
+        }
+
+        val previous = lastServiceStatus
+        lastServiceStatus = serviceState.status
+        val transient = serviceState.status in setOf(
+            RuntimeStatus.Starting, RuntimeStatus.Scanning, RuntimeStatus.Restarting,
+        )
+        if (transient) {
+            _methodScanState.value = MethodScanUiState(
+                phase = MethodScanPhase.Running,
+                mode = mode,
+                progress = serviceState.scanProgress,
+            )
+            return
+        }
+
+        if (previous != null && previous in setOf(
+                RuntimeStatus.Starting, RuntimeStatus.Scanning, RuntimeStatus.Restarting,
+            )
+        ) {
+            val profileId = _runtimeFilesState.value.activeProfileId
+            val configText = _runtimeFilesState.value.configText
+            viewModelScope.launch {
+                val raw = runCatching { runtimeStorage.readMethodScanOutput(profileId, configText) }.getOrNull()
+                val report = raw?.let { MethodScanReportParser.parse(it) }
+                _methodScanState.value = MethodScanUiState(
+                    phase = if (report != null) {
+                        MethodScanPhase.Completed
+                    } else {
+                        MethodScanPhase.Failed(
+                            serviceState.lastError
+                                ?.let { "Method scan failed: $it" }
+                                ?: "Method scan finished without a report.",
+                        )
+                    },
+                    mode = mode,
+                    report = report,
+                )
+            }
+            return
+        }
+
+        _methodScanState.value = MethodScanUiState(phase = MethodScanPhase.Idle, mode = mode)
     }
 
     private fun reportProfileError(error: Throwable, fallbackMessage: String) {

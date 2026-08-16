@@ -158,6 +158,7 @@ private fun TestDashboard(
     runtimeFilesState: RuntimeFilesUiState = RuntimeFilesUiState(isLoading = false),
     profileState: ProfileUiState = ProfileUiState(isProfileLoading = false),
     diagnosticsState: DiagnosticsUiState = DiagnosticsUiState(),
+    methodScanState: MethodScanUiState = MethodScanUiState(),
     onClearLogs: () -> Unit = {},
 ) {
     ZeroDpiTheme {
@@ -166,6 +167,7 @@ private fun TestDashboard(
             runtimeFilesState = runtimeFilesState,
             profileState = profileState,
             diagnosticsState = diagnosticsState,
+            methodScanState = methodScanState,
             onStart = {},
             onStop = {},
             onForceStop = {},

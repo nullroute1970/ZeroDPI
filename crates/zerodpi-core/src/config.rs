@@ -2476,7 +2476,10 @@ mod tests {
                    BYPASS_METHOD = {combo}"#
             ))
             .unwrap();
-            assert!(cfg.validate().is_err(), "combo {combo} should fail validation");
+            assert!(
+                cfg.validate().is_err(),
+                "combo {combo} should fail validation"
+            );
         }
     }
 

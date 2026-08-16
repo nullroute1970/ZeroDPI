@@ -224,8 +224,7 @@ impl ConnectionSettings {
                 .then(|| SniBoundaryFrag::new(cfg)),
             fragment_all_data: (cfg.BYPASS_METHOD.contains("ip_frag")
                 && !cfg.IP_FRAG_ONLY_FIRST_PACKET)
-                || (cfg.BYPASS_METHOD.contains("disorder")
-                    && !cfg.DISORDER_ONLY_FIRST_PACKET),
+                || (cfg.BYPASS_METHOD.contains("disorder") && !cfg.DISORDER_ONLY_FIRST_PACKET),
             tcp_segmentation,
         }
     }

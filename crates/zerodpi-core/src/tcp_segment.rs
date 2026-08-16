@@ -146,12 +146,7 @@ mod tests {
 
     /// Build the same packet with extra TCP option bytes (`options` must be
     /// a multiple of 4; the caller is responsible for the data offset).
-    fn tcp_packet_with_options(
-        payload: &[u8],
-        seq: u32,
-        psh: bool,
-        options: &[u8],
-    ) -> Vec<u8> {
+    fn tcp_packet_with_options(payload: &[u8], seq: u32, psh: bool, options: &[u8]) -> Vec<u8> {
         assert_eq!(options.len() % 4, 0);
         let tcp_hdr_len = 20 + options.len();
         let total = (20 + tcp_hdr_len + payload.len()) as u16;

@@ -150,6 +150,7 @@ impl MethodConfig {
             "tls_record_frag",
             "tls_frag",
             "tls_padding",
+            "ccs_prefix",
             "urg_sni_split",
         ];
         if self.methods.is_empty()
@@ -807,6 +808,13 @@ mod tests {
         let mut key = flow_key();
         key.dst_ip = Ipv4Addr::BROADCAST;
         assert!(key.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_ccs_prefix_in_mixed_list() {
+        let mut config = method();
+        config.methods = vec!["wrong_seq".into(), "ccs_prefix".into()];
+        config.validate().unwrap();
     }
 
     #[test]

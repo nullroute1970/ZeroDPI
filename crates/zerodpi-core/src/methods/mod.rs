@@ -42,6 +42,10 @@
 //!   ClientHello down to the SNI extension and writes the first record as two
 //!   TCP segments cut at the extension boundary (or mid-domain), separated by
 //!   a configurable delay, so inline DPI cannot reassemble the SNI.
+//! - `ccs_prefix` — TLS 1.3 Middlebox-Compat ChangeCipherSpec Prefix. Writes
+//!   a dummy ChangeCipherSpec record (`14 03 03 00 01 01`) as the very first
+//!   upstream bytes before the ClientHello, so DPIs that classify on the
+//!   first TLS record see a benign CCS (RFC 8446 §4.1.3, §5.5).
 //!
 //! New interceptor-based methods only need to implement this trait and be
 //! registered in [`build_method`].  New socket-based methods must be wired
@@ -185,7 +189,7 @@ pub trait BypassMethod: Send + Sync + 'static {
 /// interceptor-based method (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
 /// `wrong_md5`, `wrong_timestamp`, `low_ttl`, `urg_sni_split`,
 /// `tls_record_frag`, `fake_tls`, `ip_frag`) and `None` for socket-only lists (`["tls_frag"]`,
-/// `["tls_padding"]`, `["mixed_case_sni"]`, `["sni_boundary_frag"]`, or
+/// `["tls_padding"]`, `["mixed_case_sni"]`, `["sni_boundary_frag"]`, `["ccs_prefix"]`, or
 /// combinations) or empty lists.
 /// Callers should validate the method list via
 /// [`crate::config::Config::validate`] before calling this function.
@@ -199,6 +203,7 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
     for name in list.iter() {
         match name {
             "tls_frag" => {}          // socket side; handled directly in proxy.rs
+            "ccs_prefix" => {}        // socket side; handled directly in proxy.rs
             "tls_padding" => {}       // socket side; handled directly in proxy.rs
             "mixed_case_sni" => {}    // socket side; handled directly in proxy.rs
             "sni_boundary_frag" => {} // socket side; handled directly in proxy.rs
@@ -225,7 +230,8 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
             list.contains("tls_padding"),
         )
         .with_mixed_case_sni(list.contains("mixed_case_sni"))
-        .with_sni_boundary_split(list.contains("sni_boundary_frag")),
+        .with_sni_boundary_split(list.contains("sni_boundary_frag"))
+        .with_ccs_prefix(list.contains("ccs_prefix")),
     ))
 }
 
@@ -409,5 +415,24 @@ mod tests {
         let cfg = cfg_with_method(r#"BYPASS_METHOD = ["ip_frag", "tls_frag"]"#);
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "ip_frag + tls_frag");
+    }
+
+    #[test]
+    fn build_wrong_seq_ccs_prefix_method() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["wrong_seq", "ccs_prefix"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "wrong_seq + ccs_prefix");
+    }
+
+    #[test]
+    fn socket_ccs_prefix_method_returns_none() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "ccs_prefix""#);
+        assert!(build_method(&cfg).is_none());
+    }
+
+    #[test]
+    fn socket_list_with_ccs_prefix_returns_none() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["ccs_prefix", "tls_padding"]"#);
+        assert!(build_method(&cfg).is_none());
     }
 }

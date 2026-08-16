@@ -10,7 +10,8 @@
 //! proxy enables the corresponding socket-side data-stage transforms.
 //! `mixed_case_sni` follows the same pattern via
 //! [`CompositeMethod::mixed_case_sni_first_hello`], and `sni_boundary_frag`
-//! via [`CompositeMethod::splits_first_client_hello`].
+//! via [`CompositeMethod::splits_first_client_hello`], with `ccs_prefix`
+//! via [`CompositeMethod::ccs_prefix_first_hello`].
 //!
 //! Composition rules (provably reproduce the former hard-coded combos):
 //! - PSH / IP-ident settings come from the **first** handshake-stage member.
@@ -33,6 +34,7 @@ pub struct CompositeMethod {
     pub pads_first_client_hello: bool,
     pub mixed_case_sni_first_hello: bool,
     pub splits_first_client_hello: bool,
+    pub ccs_prefix_first_hello: bool,
 }
 
 impl CompositeMethod {
@@ -49,6 +51,7 @@ impl CompositeMethod {
             pads_first_client_hello,
             mixed_case_sni_first_hello: false,
             splits_first_client_hello: false,
+            ccs_prefix_first_hello: false,
         }
     }
 
@@ -64,6 +67,14 @@ impl CompositeMethod {
     /// handshake stage waits for the data stage.
     pub fn with_sni_boundary_split(mut self, enabled: bool) -> Self {
         self.splits_first_client_hello = enabled;
+        self
+    }
+
+    /// Mark the composite as including the socket-side `ccs_prefix` transform
+    /// so its name reflects the full method list and the handshake stage
+    /// waits for the data stage.
+    pub fn with_ccs_prefix(mut self, enabled: bool) -> Self {
+        self.ccs_prefix_first_hello = enabled;
         self
     }
 }
@@ -85,6 +96,9 @@ impl BypassMethod for CompositeMethod {
         }
         if self.splits_first_client_hello {
             parts.push("sni_boundary_frag".into());
+        }
+        if self.ccs_prefix_first_hello {
+            parts.push("ccs_prefix".into());
         }
         parts.join(" + ")
     }
@@ -129,6 +143,7 @@ impl BypassMethod for CompositeMethod {
             || self.segments_first_client_hello
             || self.pads_first_client_hello
             || self.splits_first_client_hello
+            || self.ccs_prefix_first_hello
         {
             tracing::trace!(
                 target = "zerodpi::composite",
@@ -442,5 +457,24 @@ mod tests {
         let action = m.on_first_data_packet(&handshake_state(), &mut packet);
         assert_eq!(action, MethodAction::emit_and_complete());
         assert!(packet.new_payload.is_some());
+    }
+
+    #[test]
+    fn wrong_seq_plus_ccs_prefix_waits_for_data_stage() {
+        let cfg = cfg_with("");
+        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, false, false)
+            .with_ccs_prefix(true);
+
+        let mut packet = pkt(&[], 0);
+        let action = m.on_handshake_complete_ack(&handshake_state(), &mut packet);
+        assert_eq!(action, MethodAction::emit_and_wait_for_data());
+        assert_eq!(m.name(), "wrong_seq + ccs_prefix");
+    }
+
+    #[test]
+    fn name_omits_ccs_prefix_when_not_set() {
+        let cfg = cfg_with("");
+        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, false, false);
+        assert_eq!(m.name(), "wrong_seq");
     }
 }

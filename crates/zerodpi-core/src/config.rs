@@ -1074,7 +1074,7 @@ pub struct Config {
     #[serde(default = "default_method_scan_methods")]
     pub METHOD_SCAN_METHODS: BypassMethodList,
 
-    /// Number of probe samples per method. Default: `10`.
+    /// Number of probe samples per method. Default: `3`.
     #[serde(default = "default_method_scan_samples")]
     pub METHOD_SCAN_SAMPLES: usize,
 
@@ -1213,7 +1213,7 @@ fn default_method_scan_methods() -> BypassMethodList {
 }
 
 fn default_method_scan_samples() -> usize {
-    10
+    3
 }
 
 fn default_method_scan_interval_ms() -> u64 {
@@ -3133,7 +3133,7 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.METHOD_SCAN_SAMPLES, 10);
+        assert_eq!(cfg.METHOD_SCAN_SAMPLES, 3);
         assert_eq!(cfg.METHOD_SCAN_INTERVAL_MS, 1000);
         assert_eq!(cfg.METHOD_SCAN_TIMEOUT_SECS, 10);
         assert_eq!(

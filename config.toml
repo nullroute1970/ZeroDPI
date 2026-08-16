@@ -121,8 +121,8 @@ SCAN_OUTPUT = ""
 # trim the list to test only a subset.
 #METHOD_SCAN_METHODS = ["wrong_seq", "tls_frag"]
 
-# Number of probe samples per method. Must be >= 1. Default: 10.
-METHOD_SCAN_SAMPLES = 10
+# Number of probe samples per method. Must be >= 1. Default: 3.
+METHOD_SCAN_SAMPLES = 3
 
 # Interval between samples in milliseconds. 0 = back-to-back.
 # Default: 1000.

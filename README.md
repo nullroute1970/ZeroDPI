@@ -998,7 +998,7 @@ When `tls_frag` is combined with a handshake-stage method (e.g. `["wrong_seq", "
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `METHOD_SCAN_METHODS` | `BypassMethodList` | all base methods | Bypass methods to test, in any order; entries must be in `BASE_BYPASS_METHODS` with no duplicates |
-| `METHOD_SCAN_SAMPLES` | `usize` | `10` | Probe samples per method (must be `>= 1`) |
+| `METHOD_SCAN_SAMPLES` | `usize` | `3` | Probe samples per method (must be `>= 1`) |
 | `METHOD_SCAN_INTERVAL_MS` | `u64` | `1000` | Interval between samples in ms (`0` = back-to-back) |
 | `METHOD_SCAN_TIMEOUT_SECS` | `u64` | `10` | Per-sample probe timeout in seconds (TCP + TLS + HTTP; must be `> 0`) |
 | `METHOD_SCAN_OUTPUT` | `string` | `""` | Optional path to save the JSON report; relative paths are resolved from the config directory; `""` disables saving |

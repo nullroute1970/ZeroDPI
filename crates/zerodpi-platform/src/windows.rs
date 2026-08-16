@@ -5,6 +5,7 @@
 //! receives a filter expression and diverts matching packets to user space.
 
 use std::borrow::Cow;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
@@ -99,6 +100,91 @@ impl PacketInterceptor for WinDivertInterceptor {
                             };
                             if let Err(e) = self.divert.send(&frag_pkt) {
                                 debug!(error = %e, "fragment send failed");
+                            }
+                        }
+                    } else if let Some(spec) = view.disorder_spec {
+                        let segments = zerodpi_core::tcp_segment::split_tcp_payload(
+                            &new_bytes,
+                            spec.segments,
+                            spec.reverse,
+                        );
+                        if segments.len() > 1 {
+                            // Emit the first segment synchronously and never
+                            // reinject the original: the segments replace it
+                            // on the wire. Remaining segments follow on a
+                            // short-lived thread so the capture loop never
+                            // blocks on the delay.
+                            let send_segment = |data: &[u8]| -> bool {
+                                let seg_pkt = WinDivertPacket::<NetworkLayer> {
+                                    address: packet.address.clone(),
+                                    data: Cow::Owned(data.to_vec()),
+                                };
+                                match self.divert.send(&seg_pkt) {
+                                    Ok(_) => true,
+                                    Err(e) => {
+                                        debug!(error = %e, "disorder segment send failed");
+                                        false
+                                    }
+                                }
+                            };
+                            if !send_segment(&segments[0]) {
+                                // Fall back: forward the original packet.
+                                if let Err(e) = self.divert.send(&packet) {
+                                    debug!(error = %e, "disorder fallback send failed");
+                                }
+                                continue;
+                            }
+                            if spec.delay_ms > 0 {
+                                let remaining = segments[1..].to_vec();
+                                let address = packet.address.clone();
+                                let delay = Duration::from_millis(spec.delay_ms);
+                                std::thread::spawn(move || {
+                                    // A send-only handle: the filter "false"
+                                    // matches nothing, so this handle only
+                                    // injects. The segments already carry
+                                    // valid checksums from the splitter, so
+                                    // no recalculation happens here.
+                                    let handle = match WinDivert::network(
+                                        "false",
+                                        0,
+                                        WinDivertFlags::default(),
+                                    ) {
+                                        Ok(h) => h,
+                                        Err(e) => {
+                                            warn!(error = %e, "failed to open delayed-emission WinDivert handle; abandoning delayed disorder segments (TCP retransmission will heal the connection)");
+                                            return;
+                                        }
+                                    };
+                                    for (i, seg) in remaining.iter().enumerate() {
+                                        std::thread::sleep(delay * (i as u32 + 1));
+                                        let seg_pkt = WinDivertPacket::<NetworkLayer> {
+                                            address: address.clone(),
+                                            data: Cow::Owned(seg.clone()),
+                                        };
+                                        if let Err(e) = handle.send(&seg_pkt) {
+                                            debug!(error = %e, "delayed disorder segment send failed");
+                                            break;
+                                        }
+                                    }
+                                });
+                            } else {
+                                for seg in &segments[1..] {
+                                    if !send_segment(seg) {
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            let mut new_pkt = WinDivertPacket::<NetworkLayer> {
+                                address: packet.address.clone(),
+                                data: Cow::Owned(new_bytes),
+                            };
+                            if let Err(e) = new_pkt.recalculate_checksums(ChecksumFlags::default())
+                            {
+                                warn!(error = %e, "recalculate_checksums failed");
+                            }
+                            if let Err(e) = self.divert.send(&new_pkt) {
+                                debug!(error = %e, "modified send failed");
                             }
                         }
                     } else {
@@ -698,6 +784,79 @@ mod tests {
             assert_eq!(
                 parsed.header_checksum(),
                 parsed.to_header().calc_header_checksum()
+            );
+        }
+    }
+
+    #[test]
+    fn build_modified_splits_into_disorder_segments() {
+        use etherparse::{IpNumber, Ipv4Header, TcpHeader, TcpHeaderSlice};
+        use zerodpi_core::interceptor::DisorderSpec;
+        use zerodpi_core::tcp_segment::split_tcp_payload;
+
+        let mut ip = Ipv4Header::new(20, 64, IpNumber::TCP, [10, 0, 0, 1], [1, 2, 3, 4]).unwrap();
+        ip.identification = 0x1234;
+        ip.header_checksum = ip.calc_header_checksum();
+        let mut tcp = TcpHeader::new(12345, 443, 1001, 65535);
+        tcp.acknowledgment_number = 5001;
+        tcp.ack = true;
+        tcp.psh = true;
+        tcp.checksum = tcp.calc_checksum_ipv4(&ip, &[0xAB; 517]).unwrap();
+        let mut buf = Vec::new();
+        ip.write(&mut buf).unwrap();
+        tcp.write(&mut buf).unwrap();
+        buf.extend_from_slice(&[0xAB; 517]);
+
+        let layout = PacketLayout {
+            ip_hdr_len: ip.header_len(),
+            tcp_hdr_len: tcp.header_len(),
+            payload_off: ip.header_len() + tcp.header_len(),
+            total_len: buf.len(),
+        };
+        let mut view = make_view();
+        view.disorder_spec = Some(DisorderSpec {
+            segments: 2,
+            reverse: true,
+            delay_ms: 0,
+        });
+
+        let out = build_modified(&buf, &layout, &view).unwrap();
+        let segments = split_tcp_payload(&out, 2, true);
+        assert_eq!(segments.len(), 2);
+
+        // Reverse emission: the tail chunk (258 bytes) goes out first with
+        // seq 1001 + 259 and PSH (it ends the in-sequence payload); the
+        // head chunk (259 bytes) follows with seq 1001 and PSH cleared.
+        let first = TcpHeaderSlice::from_slice(&segments[0][20..]).unwrap();
+        assert_eq!(first.sequence_number(), 1001 + 259);
+        assert_eq!(segments[0].len(), 40 + 258);
+        assert!(first.psh());
+
+        let second = TcpHeaderSlice::from_slice(&segments[1][20..]).unwrap();
+        assert_eq!(second.sequence_number(), 1001);
+        assert_eq!(segments[1].len(), 40 + 259);
+        assert!(!second.psh());
+
+        // Concatenated in original order (head then tail), the payloads
+        // match the rebuilt packet's payload byte-for-byte.
+        let mut reassembled = segments[1][40..].to_vec();
+        reassembled.extend_from_slice(&segments[0][40..]);
+        assert_eq!(reassembled, &out[40..]);
+
+        // IP and TCP checksums are valid on every segment.
+        for seg in &segments {
+            let parsed_ip = etherparse::Ipv4HeaderSlice::from_slice(seg).unwrap();
+            assert_eq!(
+                parsed_ip.header_checksum(),
+                parsed_ip.to_header().calc_header_checksum()
+            );
+            let parsed_tcp = etherparse::TcpHeaderSlice::from_slice(&seg[20..]).unwrap();
+            assert_eq!(
+                parsed_tcp.checksum(),
+                parsed_tcp
+                    .to_header()
+                    .calc_checksum_ipv4(&parsed_ip.to_header(), &seg[40..])
+                    .unwrap()
             );
         }
     }

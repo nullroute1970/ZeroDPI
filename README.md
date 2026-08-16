@@ -44,7 +44,6 @@ It is not a replacement VPN client. It is a local TCP relay that your existing V
 - [🧯 Troubleshooting](#-troubleshooting)
 - [🔐 Security & Privacy Checklist](#-security--privacy-checklist)
 - [🧩 Extending](#-extending)
-- [🙏 Credits](#-credits)
 - [📄 License](#-license)
 
 ---
@@ -340,142 +339,205 @@ Results are blended using a configurable weight and displayed in the TUI.
 | `sni_boundary_frag` | SNI Extension Boundary Fragmentation: parses the ClientHello down to the SNI extension and writes the first record as two TCP segments cut at the extension length field (or mid-domain), separated by a 5–10 ms delay so inline DPI cannot stitch them together | ❌ No | DPI with reassembly buffers that stitch adjacent TCP segments |
 | `ccs_prefix` | TLS 1.3 Middlebox-Compat ChangeCipherSpec Prefix: writes a dummy ChangeCipherSpec record (`14 03 03 00 01 01`) as the very first upstream bytes, so DPIs that classify on the first TLS record see a benign CCS instead of the ClientHello; TLS 1.3 servers ignore the early CCS per RFC 8446 §5.5 (TLS 1.2 servers may reject it) | ❌ No | DPI that classifies flows on the first TLS record only |
 
+### 🤔 Why Each Method Evades
+
+Every method exploits an asymmetry between what the DPI inspects and what
+the real server tolerates: either the DPI classifies a packet the server
+discards, or the server reassembles a stream the DPI cannot.
+
+| Method | Why it evades |
+|--------|---------------|
+| `wrong_seq` | The DPI parses the injected decoy ClientHello as the flow's handshake and passes it; the server discards the segment because its sequence number falls behind the receive window, so the real ClientHello proceeds untouched |
+| `wrong_ack` | The same desync on a different axis: the DPI inspects the decoy without validating the ACK number, while the server rejects the bogus ACK and processes only the genuine handshake |
+| `wrong_checksum` | The DPI never verifies TCP checksums, so it reads the decoy ClientHello; the server recomputes the checksum, sees the corruption, and drops the packet |
+| `wrong_md5` | The DPI inspects the decoy ClientHello; the server rejects any segment carrying a TCP-MD5 Signature option when no MD5 key was negotiated |
+| `wrong_timestamp` | The DPI ignores TCP timestamps and inspects the decoy; the server's PAWS check rejects the backdated `TSval`, so only the genuine ClientHello is accepted |
+| `low_ttl` | The decoy's TTL reaches the inline DPI middlebox but expires before the destination server: the DPI classifies the flow on the decoy, the server never receives it, and the real handshake completes via TCP retransmission |
+| `tls_record_frag` | Handshake messages may legally span multiple TLS records (RFC 5246 §6.2.1), so the server's TLS stack reassembles the ClientHello — a DPI that parses only the first record, or cannot reassemble records, never sees a complete SNI |
+| `fake_tls` | The decoy is a well-formed TLS record, so a record-parsing DPI sees a complete benign ClientHello as the first record; the out-of-window sequence number makes the server discard it, and the genuine ClientHello follows |
+| `ip_frag` | The destination kernel reassembles IPv4 fragments before the TLS stack sees them; a DPI that does not reassemble fragments (or gives up after a short budget) never reads a complete ClientHello |
+| `disorder` | The destination kernel reorders TCP segments; a DPI that tracks per-flow sequence state or inspects only the first segment sees non-monotonic segments and no complete ClientHello |
+| `urg_sni_split` | The server's TCP stack strips the urgent byte, so its TLS stream is the original ClientHello; a DPI reading raw bytes sees a mangled SNI |
+| `tls_frag` | The TLS bytes are unchanged, but a DPI that inspects individual TCP segments never sees the full ClientHello in a single segment |
+| `tls_padding` | The server skips the unknown RFC 7685 padding extension and parses the SNI normally; the padding pushes the SNI bytes past the DPI's inspection window or record buffer |
+| `mixed_case_sni` | Servers lowercase the SNI per RFC 6066; a case-sensitive DPI blocklist misses the randomized casing |
+| `sni_boundary_frag` | The server's TLS stack reassembles the two TCP segments into one record; DPI reassembly buffers that stitch adjacent segments expire during the inter-segment delay and never see the full SNI |
+| `ccs_prefix` | TLS 1.3 servers treat an early ChangeCipherSpec as a no-op (RFC 8446 §5.5); a DPI that classifies on the first TLS record sees a benign CCS — there is no SNI to find |
+
 ## 🔗 Combining Bypass Methods
 
 `BYPASS_METHOD` accepts a single name or a list, e.g.
-`BYPASS_METHOD = ["wrong_seq", "low_ttl", "tls_frag"]`. Common layered
-combinations are written the same way:
+`BYPASS_METHOD = ["wrong_seq", "low_ttl", "tls_frag"]`. A list composes
+methods that act at different stages of the connection: handshake fake
+packet → data-stage transform → socket-side transform.
 
-- `BYPASS_METHOD = ["wrong_seq", "wrong_md5"]` — one fake ClientHello with
-  both an old TCP sequence number and the TCP-MD5 option.
-- `BYPASS_METHOD = ["wrong_seq", "tls_frag"]` — wrong-sequence fake
-  ClientHello, then TCP-level fragmentation of the real client data.
-- `BYPASS_METHOD = ["wrong_md5", "tls_frag"]` — TCP-MD5 fake ClientHello,
-  then TCP-level fragmentation of the real client data.
-- `BYPASS_METHOD = ["wrong_seq", "tls_record_frag"]` — wrong-sequence fake
-  ClientHello, then TLS-record fragmentation of the real ClientHello.
+### 📦 Common Combinations
 
-Combination limits:
+| `BYPASS_METHOD` | What the combination does |
+|-----------------|---------------------------|
+| `["wrong_seq", "wrong_md5"]` | One fake ClientHello carrying both an old TCP sequence number and the TCP-MD5 option |
+| `["wrong_seq", "tls_frag"]` | Wrong-sequence fake ClientHello, then TCP-level fragmentation of the real client data |
+| `["wrong_md5", "tls_frag"]` | TCP-MD5 fake ClientHello, then TCP-level fragmentation of the real client data |
+| `["wrong_seq", "tls_record_frag"]` | Wrong-sequence fake ClientHello, then TLS-record fragmentation of the real ClientHello |
 
-- The list must not be empty and must not contain duplicate method names
-  (after alias expansion).
-- `urg_sni_split` can only be used alone or together with `tls_frag` /
-  `tls_record_frag`; it cannot be combined with other handshake-stage methods.
-- `sni_boundary_frag` cannot be combined with `tls_record_frag` or
-  `urg_sni_split`; it combines with the handshake fake-packet methods, and
-  with `tls_frag`, `tls_padding`, `mixed_case_sni`, and `ccs_prefix`.
-- `fake_tls` cannot be combined with `tls_record_frag` or `urg_sni_split`.
-- `ip_frag` cannot be combined with `tls_record_frag`, `fake_tls`, or
-  `urg_sni_split`.
-- `disorder` cannot be combined with `tls_record_frag`, `fake_tls`,
-  `ip_frag`, or `urg_sni_split`.
-- `ccs_prefix` combines with every method except `urg_sni_split` (which keeps
-  its existing restriction); it is included in the `ip_bypass_plus` real-SNI
-  whitelist.
-- `MODE = "ip_bypass_plus"` supports only `tls_record_frag`, `tls_frag`,
-  `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, or
-  `ip_frag` so the VPN client's real SNI is preserved.
-- `LOW_TTL_DISCOVER` only takes effect when `low_ttl` is in the list;
-  otherwise discovery is silently skipped.
+### 🚫 Combination Rules
 
-How combinations behave:
+| Rule | Detail |
+|------|--------|
+| No empty list, no duplicates | The list must not be empty and must not contain duplicate method names (after alias expansion) |
+| `urg_sni_split` | Can only be used alone or together with `tls_frag` / `tls_record_frag`; it cannot be combined with other handshake-stage methods |
+| `sni_boundary_frag` | Cannot be combined with `tls_record_frag` or `urg_sni_split`; it combines with the handshake fake-packet methods, and with `tls_frag`, `tls_padding`, `mixed_case_sni`, and `ccs_prefix` |
+| `fake_tls` | Cannot be combined with `tls_record_frag` or `urg_sni_split` |
+| `ip_frag` | Cannot be combined with `tls_record_frag`, `fake_tls`, or `urg_sni_split` |
+| `disorder` | Cannot be combined with `tls_record_frag`, `fake_tls`, `ip_frag`, or `urg_sni_split` |
+| `ccs_prefix` | Combines with every method except `urg_sni_split` (which keeps its existing restriction); included in the `ip_bypass_plus` real-SNI whitelist |
+| `ip_bypass_plus` | Supports only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, or `ip_frag` so the VPN client's real SNI is preserved |
+| `LOW_TTL_DISCOVER` | Only takes effect when `low_ttl` is in the list; otherwise discovery is silently skipped |
 
-- Handshake-stage methods (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
-  `wrong_md5`, `wrong_timestamp`, `low_ttl`) all inject the same fake
-  ClientHello; when several are listed they merge their tricks onto that one
-  fake packet (e.g. `["wrong_seq", "low_ttl"]` rewinds the sequence number
-  **and** stamps a low TTL).
-- PSH / IPv4-Identification behavior comes from the **first** listed
-  handshake method; completion behavior (`wait for ACK` vs `complete
-  immediately`) comes from the **last** listed handshake method.
-- `tls_record_frag` and/or `tls_frag` add the data stage after the fake
-  packet. `tls_padding` adds a socket-side data stage that expands the real
-  ClientHello with an RFC 7685 padding extension before it is written
-  upstream, `mixed_case_sni` adds a socket-side data stage that randomizes
-  the SNI case in the real ClientHello, `sni_boundary_frag` adds a
-  socket-side data stage that writes the real ClientHello as two TCP
-  segments cut at the SNI extension boundary, and `ccs_prefix` adds a
-  socket-side prefix stage that writes a dummy ChangeCipherSpec record as
-  the very first upstream bytes. A list containing `tls_frag`
-  alongside other methods still uses packet interception; a list containing
-  only `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`,
-  and/or `ccs_prefix` skips the interceptor entirely.
-- `fake_tls` adds a data-stage decoy record injection.  It combines with the
-  handshake-stage fake-packet methods and with `tls_frag`, `tls_padding`,
-  `mixed_case_sni`, `sni_boundary_frag`, and `ccs_prefix`, but it is
-  mutually exclusive
-  with `tls_record_frag` and `urg_sni_split` (all three own the first data
-  packet).
-- `ip_frag` adds a data-stage IP fragmentation.  It combines with the
-  handshake-stage fake-packet methods and with `tls_frag`, `tls_padding`,
-  `mixed_case_sni`, `sni_boundary_frag`, and `ccs_prefix`, but it is
-  mutually exclusive
-  with `tls_record_frag`, `fake_tls`, and `urg_sni_split` (all own the
-  first data packet).
-- `disorder` adds a data-stage out-of-order TCP segmentation.  It combines
-  with the handshake-stage fake-packet methods and with `tls_frag`,
-  `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, and `ccs_prefix`,
-  but it is mutually exclusive with `tls_record_frag`, `fake_tls`,
-  `ip_frag`, and `urg_sni_split` (all own the first data packet).
+### 🧩 How a Combination Executes
+
+**1. Handshake stage — fake-packet family.** `wrong_seq`, `wrong_ack`,
+`wrong_checksum`, `wrong_md5`, `wrong_timestamp`, and `low_ttl` all inject
+the same fake ClientHello; when several are listed they merge their tricks
+onto that one fake packet (e.g. `["wrong_seq", "low_ttl"]` rewinds the
+sequence number **and** stamps a low TTL). PSH / IPv4-Identification
+behavior comes from the **first** listed handshake method; completion
+behavior (`wait for ACK` vs `complete immediately`) comes from the **last**
+listed handshake method.
+
+**2. Data stage — first-data-packet methods.** Each of `tls_record_frag`,
+`fake_tls`, `ip_frag`, and `disorder` owns the first data packet, which is
+why they are mutually exclusive with one another. They combine with the
+handshake-stage fake-packet methods and with the socket-side methods below.
+`tls_record_frag` and/or `tls_frag` add the data stage after the fake
+packet.
+
+**3. Socket-side transforms.** `tls_padding` expands the real ClientHello
+with an RFC 7685 padding extension before it is written upstream,
+`mixed_case_sni` randomizes the SNI case in the real ClientHello,
+`sni_boundary_frag` writes the real ClientHello as two TCP segments cut at
+the SNI extension boundary, and `ccs_prefix` writes a dummy
+ChangeCipherSpec record as the very first upstream bytes.
+
+**4. Interceptor requirement.** A list containing any interceptor method
+(fake-packet family, `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`,
+or `urg_sni_split`) still uses packet interception; a list containing only
+`tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, and/or
+`ccs_prefix` skips the interceptor entirely.
 
 ---
 
 ## 🎯 Choosing a Bypass Method
 
-Start with the least complex method that can run on your platform, then move to stronger or more specific methods only when needed.
+Start with the least complex method that can run on your platform, then move
+to stronger or more specific methods only when needed.
+
+### 1️⃣ Start Simple
 
 | Situation | Try |
 |-----------|-----|
 | Windows or Linux desktop with Administrator/root access | `wrong_seq` first |
 | Rooted Android where NFQUEUE support is uncertain | `tls_frag` first |
 | You cannot run packet interception but can point the VPN client at ZeroDPI | `tls_frag` / `sni_boundary_frag` |
+
+### 2️⃣ When the DPI Ignores Invalid-Packet Tricks
+
+| Situation | Try |
+|-----------|-----|
 | DPI appears to ignore invalid sequence tricks | `["wrong_seq", "wrong_md5"]`, `wrong_ack`, `wrong_timestamp`, `wrong_checksum`, `wrong_md5`, or `tls_record_frag` |
 | DPI middlebox is closer to you than the server and ignores invalid-packet tricks | `low_ttl` |
 | DPI sees through fake packets but fails with fragmented real handshakes | `tls_record_frag` |
+
+### 3️⃣ Match the DPI's Parsing Weakness
+
+| Situation | Try |
+|-----------|-----|
 | DPI inspects only the first N bytes of the TLS stream | `tls_padding` |
 | DPI classifies flows on the first TLS record only | `ccs_prefix` |
-| You need a scanned IPv4 target but must preserve the VPN client's real SNI | `MODE = "ip_bypass_plus"` with `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, or `disorder` |
 | DPI reassembles TLS records but not IP fragments | `ip_frag` (increase `IP_FRAG_SIZE` for DPI with a small reassembly budget) |
 | DPI reassembles IP fragments but chokes on out-of-order TCP segments | `disorder` (tune `DISORDER_SEGMENTS` / `DISORDER_DELAY_MS`) |
-| A first firewall layer is fooled, but another layer still blocks the real ClientHello | `["wrong_seq", "tls_frag"]`, `["wrong_md5", "tls_frag"]`, or `["wrong_seq", "tls_record_frag"]` |
+
+### 4️⃣ Preserve the Real SNI
+
+| Situation | Try |
+|-----------|-----|
+| You need a scanned IPv4 target but must preserve the VPN client's real SNI | `MODE = "ip_bypass_plus"` with `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, or `disorder` |
 | You only need the fastest reachable IP and not SNI spoofing | `MODE = "ip_bypass"` |
 
-Method behavior in more detail:
+### 5️⃣ Layer Two Methods
 
-- `wrong_seq`, `wrong_ack`, `wrong_timestamp`, `wrong_checksum`, and `wrong_md5` (alone or combined) send a fake decoy ClientHello during the TCP handshake path. DPI may inspect it, but the real upstream server should discard it.
-- `wrong_md5` is ZeroDPI's snake_case name for sing-box's `wrong-md5` spoof behavior. It adds a TCP-MD5 Signature option to the forged segment without negotiating a TCP-MD5 key.
-- Combined as `["wrong_seq", "wrong_md5"]`, the fake ClientHello carries both the `wrong_seq` sequence rewrite and the `wrong_md5` TCP-MD5 option.
-- `wrong_timestamp` is ZeroDPI's snake_case name for sing-box's `wrong-timestamp` spoof behavior. It requires TCP timestamps on the intercepted flow and backdates `TSval` so PAWS rejects the forged segment.
-- `low_ttl` sends a valid decoy ClientHello carrying the selected whitelisted SNI but stamps it with a low IP TTL (`LOW_TTL_VALUE`). The decoy reaches an inline DPI middlebox and then expires, so the server never receives it; the real handshake completes via TCP retransmission. Tune `LOW_TTL_VALUE` to the DPI's hop distance (typically 4–8), or enable `LOW_TTL_DISCOVER` and let ZeroDPI find the correct value automatically.
-- `tls_record_frag` rewrites the real first TLS record into many smaller TLS records. The server should reassemble the TLS handshake normally.
-- `fake_tls` requires Administrator/root (WinDivert/NFQUEUE) and is IPv4-only.
-  With `FAKE_TLS_FORWARD_REAL = false` every connection pays roughly one TCP
-  retransmission timeout (~200 ms) while the real ClientHello is retransmitted.
-  With `FAKE_TLS_FORWARD_REAL = true` (default) the decoy goes out first and
-  the real ClientHello is forwarded immediately after it — no added latency.
-- `ip_frag` requires Administrator/root (WinDivert/NFQUEUE) and is IPv4-only.
-  The fragmenter clears the IPv4 DF bit so fragmentation is legal; some
-  middleboxes drop all IP fragments, in which case `ip_frag` connections
-  fail and the method should be removed from the list.  Fragment-all mode
-  (`IP_FRAG_ONLY_FIRST_PACKET = false`) rewrites every outbound data packet;
-  prefer the default `true`.  `ip_frag` is not available through the Android
-  root-helper protocol (desktop Linux/Windows only).
-  WinDivert sends both packets; on Linux/Android the decoy is injected
-  through a raw IP socket in the root helper.  If the raw socket is
+| Situation | Try |
+|-----------|-----|
+| A first firewall layer is fooled, but another layer still blocks the real ClientHello | `["wrong_seq", "tls_frag"]`, `["wrong_md5", "tls_frag"]`, or `["wrong_seq", "tls_record_frag"]` |
+
+### 🔬 Method Behavior in Detail
+
+**Fake-packet methods (handshake stage):**
+
+- `wrong_seq`, `wrong_ack`, `wrong_timestamp`, `wrong_checksum`, and
+  `wrong_md5` (alone or combined) send a fake decoy ClientHello during the
+  TCP handshake path. DPI may inspect it, but the real upstream server
+  should discard it.
+- `wrong_md5` is ZeroDPI's snake_case name for sing-box's `wrong-md5` spoof
+  behavior. It adds a TCP-MD5 Signature option to the forged segment without
+  negotiating a TCP-MD5 key.
+- Combined as `["wrong_seq", "wrong_md5"]`, the fake ClientHello carries
+  both the `wrong_seq` sequence rewrite and the `wrong_md5` TCP-MD5 option.
+- `wrong_timestamp` is ZeroDPI's snake_case name for sing-box's
+  `wrong-timestamp` spoof behavior. It requires TCP timestamps on the
+  intercepted flow and backdates `TSval` so PAWS rejects the forged segment.
+- `low_ttl` sends a valid decoy ClientHello carrying the selected
+  whitelisted SNI but stamps it with a low IP TTL (`LOW_TTL_VALUE`). The
+  decoy reaches an inline DPI middlebox and then expires, so the server
+  never receives it; the real handshake completes via TCP retransmission.
+  Tune `LOW_TTL_VALUE` to the DPI's hop distance (typically 4–8), or enable
+  `LOW_TTL_DISCOVER` and let ZeroDPI find the correct value automatically.
+
+**Interceptor data-stage methods:**
+
+- `tls_record_frag` rewrites the real first TLS record into many smaller
+  TLS records. The server should reassemble the TLS handshake normally.
+- `fake_tls` requires Administrator/root (WinDivert/NFQUEUE) and is
+  IPv4-only. With `FAKE_TLS_FORWARD_REAL = false` every connection pays
+  roughly one TCP retransmission timeout (~200 ms) while the real
+  ClientHello is retransmitted. With `FAKE_TLS_FORWARD_REAL = true`
+  (default) the decoy goes out first and the real ClientHello is forwarded
+  immediately after it — no added latency.
+- `ip_frag` requires Administrator/root (WinDivert/NFQUEUE) and is
+  IPv4-only. The fragmenter clears the IPv4 DF bit so fragmentation is
+  legal; some middleboxes drop all IP fragments, in which case `ip_frag`
+  connections fail and the method should be removed from the list.
+  Fragment-all mode (`IP_FRAG_ONLY_FIRST_PACKET = false`) rewrites every
+  outbound data packet; prefer the default `true`. `ip_frag` is not
+  available through the Android root-helper protocol (desktop Linux/Windows
+  only). WinDivert sends both packets; on Linux/Android the decoy is
+  injected through a raw IP socket in the root helper. If the raw socket is
   unavailable, ZeroDPI logs a warning and falls back to single-packet mode
   (retransmission path).
 - `disorder` requires Administrator/root (WinDivert/NFQUEUE) and is
-  IPv4-only.  The first segment is emitted synchronously and the remaining
+  IPv4-only. The first segment is emitted synchronously and the remaining
   segments are injected from a short-lived background thread (delay `0`
   emits everything back-to-back with no thread); if a delayed segment is
   ever lost, the client's TCP retransmission passes through after bypass
-  completion and heals the connection.  Some middleboxes drop
-  non-monotonic segments, in which case `disorder` connections fail and the
-  method should be removed from the list.  Fragment-all mode
+  completion and heals the connection. Some middleboxes drop non-monotonic
+  segments, in which case `disorder` connections fail and the method should
+  be removed from the list. Fragment-all mode
   (`DISORDER_ONLY_FIRST_PACKET = false`) re-chunks every outbound data
   packet; prefer the default `true`.
-- `urg_sni_split` rewrites the real first TLS record, splicing a configurable dummy byte into the middle of the SNI and setting the TCP URG flag. The destination server's TCP stack extracts the urgent byte, so its TLS stream is the original ClientHello; DPI that reads raw bytes sees a mangled SNI.
-- `sni_boundary_frag` keeps the TLS bytes unchanged and writes the first ClientHello as exactly two TCP segments cut at the SNI extension boundary (`SNI_BOUNDARY_FRAG_SPLIT_POINT`), with a configurable delay between them (`SNI_BOUNDARY_FRAG_DELAY_MS`). It needs no packet interception when combined only with other socket-side methods (`tls_frag`, `tls_padding`, `mixed_case_sni`, `ccs_prefix`).
+- `urg_sni_split` rewrites the real first TLS record, splicing a
+  configurable dummy byte into the middle of the SNI and setting the TCP
+  URG flag. The destination server's TCP stack extracts the urgent byte, so
+  its TLS stream is the original ClientHello; DPI that reads raw bytes sees
+  a mangled SNI.
+
+**Socket-side methods (no packet interception):**
+
+- `sni_boundary_frag` keeps the TLS bytes unchanged and writes the first
+  ClientHello as exactly two TCP segments cut at the SNI extension boundary
+  (`SNI_BOUNDARY_FRAG_SPLIT_POINT`), with a configurable delay between them
+  (`SNI_BOUNDARY_FRAG_DELAY_MS`). It needs no packet interception when
+  combined only with other socket-side methods (`tls_frag`, `tls_padding`,
+  `mixed_case_sni`, `ccs_prefix`).
 - `ccs_prefix` writes a dummy ChangeCipherSpec record (`14 03 03 00 01 01`,
   version bytes configurable via `CCS_PREFIX_RECORD_VERSION`) as the very
   first bytes of the upstream stream, before any ClientHello write. TLS 1.3
@@ -484,7 +546,10 @@ Method behavior in more detail:
   no packet interception and combines with every other method except
   `urg_sni_split`. TLS 1.2 servers are not required to tolerate a
   pre-ClientHello CCS.
-- `tls_frag` keeps the TLS bytes unchanged and writes selected client data in small TCP chunks from the proxy. It can fragment a 1-based range of client writes such as `TLS_FRAG_PACKETS = "1-3"` or the first TLS ClientHello with `TLS_FRAG_PACKETS = "tlshello"`.
+- `tls_frag` keeps the TLS bytes unchanged and writes selected client data
+  in small TCP chunks from the proxy. It can fragment a 1-based range of
+  client writes such as `TLS_FRAG_PACKETS = "1-3"` or the first TLS
+  ClientHello with `TLS_FRAG_PACKETS = "tlshello"`.
 - `tls_padding` inserts an RFC 7685 padding extension (type `0x0015`) of
   `TLS_PADDING_SIZE` zero bytes into the client's real ClientHello. With
   `TLS_PADDING_POSITION = "before"` (default) the padding is placed
@@ -493,9 +558,13 @@ Method behavior in more detail:
   end of the extension list. The server skips the unknown extension and
   parses the SNI normally. The padding size is sampled per connection and
   clamped so the record never exceeds 16383 bytes.
-- Combinations are expressed as lists of base method names, e.g. `BYPASS_METHOD = ["wrong_seq", "tls_frag"]`.
+- Combinations are expressed as lists of base method names, e.g.
+  `BYPASS_METHOD = ["wrong_seq", "tls_frag"]`.
 
-If a method works but connection setup is slow, increase fragment sizes gradually (`TLS_FRAG_LENGTH`, `TLS_RECORD_FRAG_SIZE`) or try a higher-scoring SNI/IP. Very small fragments are aggressive and can add connection-start overhead.
+If a method works but connection setup is slow, increase fragment sizes
+gradually (`TLS_FRAG_LENGTH`, `TLS_RECORD_FRAG_SIZE`) or try a higher-scoring
+SNI/IP. Very small fragments are aggressive and can add connection-start
+overhead.
 
 ---
 
@@ -1563,13 +1632,6 @@ strings, auto update settings, and last remote update status.
 | **New bypass method** | Implement [`zerodpi_core::methods::BypassMethod`] → register in `methods::build_method` |
 | **New OS backend** | Implement [`zerodpi_core::interceptor::PacketInterceptor`] in `zerodpi-platform` |
 | **New operating mode** | Add branch in `zerodpi/src/main.rs` guarded by `cfg.MODE` + implement proxy logic in `zerodpi-core::proxy` |
-
----
-
-## 🙏 Credits
-
-- Original Python project: [`patterniha/SNI-Spoofing`](https://github.com/patterniha/SNI-Spoofing)
-- WinDivert: <https://reqrypt.org/windivert.html>
 
 ---
 

@@ -21,7 +21,8 @@ LISTEN_PORT = 44444
 # ---------------------------------------------------------------------------
 
 # Operating mode. Valid values: "sni_spoof" (default), "ip_bypass",
-# "ip_bypass_plus", "sni_scan", "ip_scan", "proxy_scan".
+# "ip_bypass_plus", "sni_scan", "ip_scan", "proxy_scan",
+# "sni_method_scan", "ip_method_scan".
 # - "sni_spoof"     — DPI bypass via SNI spoofing (default).
 # - "ip_bypass"     — plain TCP relay through a scanned IP; no packet interception.
 # - "ip_bypass_plus" — IPv4 relay through a scanned IP plus real-SNI-preserving
@@ -34,6 +35,12 @@ LISTEN_PORT = 44444
 # - "proxy_scan"    — scan sni_list.txt (Phase 1), then test each working SNI
 #                     through your V2RayN SOCKS5 mixed port (Phase 2); display
 #                     blended results and exit.  Requires V2RayN to be running.
+# - "sni_method_scan" — scan sni_list.txt, pick the top candidate, then test
+#                       every METHOD_SCAN_METHODS bypass method against it
+#                       and report which works best; then exit.
+# - "ip_method_scan"   — scan ip_list.txt, pick the top IPv4 candidate, then
+#                       test every METHOD_SCAN_METHODS bypass method against
+#                       it (TLS SNI = IP_SCAN_SNI) and report; then exit.
 MODE = "sni_spoof"
 
 # When true, ZeroDPI automatically picks the highest-ranked candidate
@@ -100,6 +107,35 @@ SNI_SWITCH_MIN_SCORE = 1
 # run (MODE = "sni_scan" or "ip_scan").
 # Leave as an empty string ("") to disable saving.
 SCAN_OUTPUT = ""
+
+# ---------------------------------------------------------------------------
+# Method Scan Modes
+# ---------------------------------------------------------------------------
+# These settings apply when MODE = "sni_method_scan" or "ip_method_scan".
+# These modes first run the normal scan internally (sni_scan / ip_scan),
+# pick the single top-scoring candidate, then test every bypass method
+# against it to find which method works best. Method parameters are taken
+# from this config file unchanged.
+
+# Bypass methods to test, in any order. Defaults to every base method;
+# trim the list to test only a subset.
+#METHOD_SCAN_METHODS = ["wrong_seq", "tls_frag"]
+
+# Number of probe samples per method. Must be >= 1. Default: 10.
+METHOD_SCAN_SAMPLES = 10
+
+# Interval between samples in milliseconds. 0 = back-to-back.
+# Default: 1000.
+METHOD_SCAN_INTERVAL_MS = 1000
+
+# Per-sample probe timeout in seconds (TCP + TLS + HTTP). Must be > 0.
+# Default: 10.
+METHOD_SCAN_TIMEOUT_SECS = 10
+
+# Optional path to write the method-scan report as a JSON file.
+# Relative paths are resolved from the directory containing config.toml.
+# Leave as an empty string ("") to disable saving.
+METHOD_SCAN_OUTPUT = ""
 
 # ---------------------------------------------------------------------------
 # Scanner Tuning

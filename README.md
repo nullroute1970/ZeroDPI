@@ -53,7 +53,7 @@ It is not a replacement VPN client. It is a local TCP relay that your existing V
 | Feature | Description |
 |---------|-------------|
 | 🧩 **16 combinable bypass methods** | `wrong_seq`, `wrong_ack`, `wrong_checksum`, `wrong_md5`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `urg_sni_split`, `sni_boundary_frag`, `ccs_prefix` — combinable via `BYPASS_METHOD = ["wrong_seq", "tls_frag"]` |
-| 🎯 **6 operating modes** | `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan` |
+| 🎯 **8 operating modes** | `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan`, `sni_method_scan`, `ip_method_scan` |
 | 🖥️ **TUI dashboard** | Ratatui-powered live progress, selection tables, and connection monitoring |
 | 🔄 **Auto-rescan** | Background re-scanning hot-swaps the best target without restart |
 | 🧪 **Smart scoring** | Unified 0–100 composite score across TCP, TLS, TTFB, speed, and cert validity |
@@ -147,8 +147,8 @@ Use this checklist when ZeroDPI starts but the VPN app still does not connect:
 1️⃣ Confirm the VPN profile is TCP + TLS based. UDP-only profiles are outside ZeroDPI's relay path.
 2️⃣ Keep the VPN profile's real TLS `serverName` / SNI unchanged.
 3️⃣ Change the VPN profile's dial address to `127.0.0.1` and dial port to `44444` unless you changed `LISTEN_HOST` or `LISTEN_PORT`.
-4️⃣ Put candidate public hostnames in `sni_list.txt` when using `sni_spoof`, `sni_scan`, or `proxy_scan`.
-5️⃣ Put plain IPs or CIDR ranges in `ip_list.txt` when using `ip_bypass`, `ip_bypass_plus`, or `ip_scan`.
+4️⃣ Put candidate public hostnames in `sni_list.txt` when using `sni_spoof`, `sni_scan`, `proxy_scan`, or `sni_method_scan`.
+5️⃣ Put plain IPs or CIDR ranges in `ip_list.txt` when using `ip_bypass`, `ip_bypass_plus`, `ip_scan`, or `ip_method_scan`.
 6️⃣ Start ZeroDPI before starting or reconnecting the VPN client.
 7️⃣ Run as Administrator/root for all interceptor methods except standalone `tls_frag` / `tls_padding` / `mixed_case_sni` / `sni_boundary_frag` / `ccs_prefix`, plain `ip_bypass`, and `ip_bypass_plus` when it uses `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, or `ccs_prefix`.
 8️⃣ If the TUI is unavailable, pass `--auto-select --no-tui` and read logs instead.
@@ -230,6 +230,7 @@ Copy or deploy the whole generated directory, not only the binary.
 | Audit SNI candidates only | `sni_scan` | Runs the SNI scanner, displays or saves results, then exits. |
 | Audit IP/CIDR candidates only | `ip_scan` | Runs the IP scanner, displays or saves results, then exits. |
 | Measure real VPN performance through an existing SOCKS5 client | `proxy_scan` | Tests candidates through V2RayN/sing-box and blends scanner score with end-to-end proxy results. |
+| Find the best bypass method for a fixed target | `sni_method_scan` / `ip_method_scan` | Scans the candidate list, picks the top candidate, then tests every `METHOD_SCAN_METHODS` bypass method through the full engine and reports a ranked method table. |
 
 Choose a bypass method separately with `BYPASS_METHOD`. If you cannot or do not want to use WinDivert/NFQUEUE packet interception, try `BYPASS_METHOD = "tls_frag"`, `BYPASS_METHOD = "tls_padding"`, `BYPASS_METHOD = "sni_boundary_frag"`, or `BYPASS_METHOD = "ccs_prefix"` with `MODE = "sni_spoof"` or `MODE = "ip_bypass_plus"`.
 
@@ -243,6 +244,7 @@ Mode-specific inputs:
 | `sni_scan` | Yes | No | No | No relay; scan only |
 | `ip_scan` | No | Yes | No | No |
 | `proxy_scan` | Yes | No | Temporary per-candidate tests | Yes, except standalone proxy scoring still depends on your SOCKS5 proxy |
+| `sni_method_scan` / `ip_method_scan` | Yes | Yes | Temporary per-method tests | Yes |
 
 `SELECTED_SNI` and `SELECTED_IP` are operational shortcuts. They skip scanning and are useful after you have already identified a stable candidate. They are not a replacement for periodic scan-only testing, because CDN routing and IP reachability can change.
 
@@ -315,6 +317,22 @@ A two-phase hybrid scan:
 Results are blended using a configurable weight and displayed in the TUI.
 
 **Use for:** Evaluating how each SNI candidate performs end-to-end through your actual proxy setup.
+
+---
+
+### 7️⃣ `sni_method_scan` / `ip_method_scan` — Bypass Method Evaluation 🧪
+
+Instead of finding the best *target*, these modes find the best *bypass method* for a fixed target. Both run in two phases:
+
+1️⃣ **Phase 0 — target scan** — Identical to the regular scan mode:
+   - `sni_method_scan` scans `sni_list.txt` and picks the single top-scoring `(SNI, IP)` candidate (probe path `/`).
+   - `ip_method_scan` scans `ip_list.txt` and picks the top-scoring **IPv4** candidate (probe SNI = `IP_SCAN_SNI`, path `/cdn-cgi/trace`). IPv6 candidates are skipped because the engine and interceptor filter are IPv4-only.
+
+2️⃣ **Phase 1 — method testing** — For every method in `METHOD_SCAN_METHODS` (default: all base methods), ZeroDPI starts a fresh engine (proxy task on `LISTEN_HOST:LISTEN_PORT` plus the packet interceptor when the method needs one), runs `METHOD_SCAN_SAMPLES` direct TLS+HTTP probes spaced `METHOD_SCAN_INTERVAL_MS` apart, tears the engine down, and moves to the next method. A sample succeeds when the TLS handshake completes through the engine **and** an HTTP response with at least one body byte arrives.
+
+Methods are ranked by **success rate (desc), then average TTFB (asc)** — methods with no TTFB sort last on ties. Results are shown in a TUI table (or printed to stdout with `--no-tui`) and optionally saved to `METHOD_SCAN_OUTPUT` as JSON.
+
+**Use for:** Choosing which `BYPASS_METHOD` (or combination) to deploy for a specific SNI or relay IP that you already know works.
 
 ---
 
@@ -740,7 +758,7 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `MODE` | `string` | `"sni_spoof"` | One of: `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan` |
+| `MODE` | `string` | `"sni_spoof"` | One of: `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan`, `sni_method_scan`, `ip_method_scan` |
 | `AUTO_SELECT` | `bool` | `true` | Auto-pick rank-1 after scan (skip manual selection table) |
 | `SELECTED_SNI` | `string` | — | Skip SNI scan; use this hostname directly |
 | `SELECTED_IP` | `string` | — | Skip IP scan; use this IP directly |
@@ -975,6 +993,49 @@ When `tls_frag` is combined with a handshake-stage method (e.g. `["wrong_seq", "
 | `PROXY_TEST_TTFB_CAP_MS` | `f64` | `3000.0` | Proxy TTFB cap (ms) |
 | `PROXY_TEST_SPEED_CAP_BPS` | `f64` | `2048000` | Proxy speed cap (bytes/sec) |
 
+### 🧪 Method Scan Modes (`sni_method_scan` / `ip_method_scan`)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `METHOD_SCAN_METHODS` | `BypassMethodList` | all base methods | Bypass methods to test, in any order; entries must be in `BASE_BYPASS_METHODS` with no duplicates |
+| `METHOD_SCAN_SAMPLES` | `usize` | `10` | Probe samples per method (must be `>= 1`) |
+| `METHOD_SCAN_INTERVAL_MS` | `u64` | `1000` | Interval between samples in ms (`0` = back-to-back) |
+| `METHOD_SCAN_TIMEOUT_SECS` | `u64` | `10` | Per-sample probe timeout in seconds (TCP + TLS + HTTP; must be `> 0`) |
+| `METHOD_SCAN_OUTPUT` | `string` | `""` | Optional path to save the JSON report; relative paths are resolved from the config directory; `""` disables saving |
+
+Method parameters are **not** changed during a scan — each method runs with its existing config values (e.g. `low_ttl` uses `LOW_TTL_VALUE`; `LOW_TTL_DISCOVER` is never invoked during method scans).
+
+The JSON report written to `METHOD_SCAN_OUTPUT` contains:
+
+```json
+{
+  "mode": "sni_method_scan",
+  "target_sni": "example.com",
+  "target_ip": "1.2.3.4",
+  "target_score": 95,
+  "samples_per_method": 10,
+  "interval_ms": 1000,
+  "methods": [
+    {
+      "method": "wrong_seq",
+      "samples_total": 10,
+      "samples_ok": 9,
+      "success_rate": 90.0,
+      "avg_ttfb_ms": 250.0,
+      "min_ttfb_ms": 180,
+      "max_ttfb_ms": 400,
+      "avg_tls_ms": 60.0,
+      "http_status": 200,
+      "last_error": null
+    }
+  ]
+}
+```
+
+> ⚠️ Interceptor-based methods (`wrong_seq`, `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`, `low_ttl`, `urg_sni_split`, …) need **Administrator/root** privileges (WinDivert on Windows, NFQUEUE on Linux/Android) exactly like the normal bypass modes. Without privileges, each such method fails with an explanatory `last_error` in the report, while socket-only methods (`tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`) still test fine.
+
+> 🔌 Platform impact: no changes to NFQUEUE/WinDivert behavior. Method scans open the packet interceptor once per method with a 200 ms gap between methods, the same pattern as `proxy_scan`.
+
 ---
 
 ## 📊 Unified Probe Scoring (0–100)
@@ -1112,6 +1173,7 @@ ZeroDPI uses [ratatui](https://github.com/ratatui-org/ratatui) for a live termin
 | `sni_scan` | 📊 Scan progress | 📋 Results table (view-only) | — |
 | `ip_scan` | 📊 IP scan progress | 📋 Results table (view-only) | — |
 | `proxy_scan` | 📊 Phase 1 + Phase 2 progress | 📋 Blended results table | — |
+| `sni_method_scan` / `ip_method_scan` | 📊 Phase 1 method-testing progress (per-sample counters) | 📋 Ranked method results table | — |
 
 **Navigation:** `↑`/`↓` or `j`/`k` to move, `Enter` to confirm, `q`/`Esc` to skip to rank-1.
 

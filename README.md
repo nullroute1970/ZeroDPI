@@ -1468,6 +1468,13 @@ in the profile runtime directory when left blank). Socket-only methods
 (`tls_frag`, `ccs_prefix`, `tls_padding`, `mixed_case_sni`,
 `sni_boundary_frag`) run without root.
 
+With `AUTO_SELECT = false` the app mirrors the desktop selection table: the
+Home tab shows a target picker, Start runs a scan first and asks you to choose
+a ranked SNI/IP, and **Scan &amp; choose** (also on Home) re-picks at any
+time. The chosen target is stored app-side per profile and injected into an
+ephemeral run config on the next start — `config.toml` is never rewritten,
+and **Clear pin** returns to scan-and-ask behavior.
+
 ---
 
 ## 🔨 Building from Source

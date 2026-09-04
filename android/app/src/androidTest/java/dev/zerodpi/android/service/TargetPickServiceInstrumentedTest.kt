@@ -145,7 +145,8 @@ class TargetPickServiceInstrumentedTest {
 
         service.cancelTargetPick()
 
-        service.waitForState { it.status == RuntimeStatus.Running }
+        val resumed = service.waitForState { it.status == RuntimeStatus.Running }
+        assertNull(resumed.pickSession)
     }
 
     @Test

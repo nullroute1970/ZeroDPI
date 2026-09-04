@@ -328,8 +328,9 @@ class MainViewModelInstrumentedTest {
 
         viewModel.start()
 
-        viewModel.waitUntil("picker choosing", timeoutMs = 15_000L) {
-            viewModel.targetPickState.value.phase == TargetPickPhase.Choosing
+        viewModel.waitUntil("picker choosing with results", timeoutMs = 15_000L) {
+            viewModel.targetPickState.value.phase == TargetPickPhase.Choosing &&
+                viewModel.targetPickState.value.entries != null
         }
         val entries = viewModel.targetPickState.value.entries
         assertEquals(2, entries?.size)

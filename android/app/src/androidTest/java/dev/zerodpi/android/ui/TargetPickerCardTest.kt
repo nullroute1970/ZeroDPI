@@ -47,7 +47,7 @@ class TargetPickerCardTest {
                 state = TargetPickUiState(phase = TargetPickPhase.Idle, mode = "sni_spoof", pin = sniPin),
             )
         }
-        composeRule.onNodeWithText("cloudflare.com (1.1.1.1)").assertIsDisplayed()
+        composeRule.onNodeWithText("Pinned target cloudflare.com (1.1.1.1)").assertIsDisplayed()
         composeRule.onNodeWithTag("target_pick_clear").assertIsDisplayed()
     }
 

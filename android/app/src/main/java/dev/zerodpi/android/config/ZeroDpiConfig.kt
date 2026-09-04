@@ -275,10 +275,10 @@ object ZeroDpiConfigSchema {
         field(
             name = "AUTO_SELECT",
             type = ConfigFieldType.Boolean,
-            defaultValue = "false",
+            defaultValue = "true",
             section = ConfigSection.OperatingMode,
             validationRule = "true or false.",
-            helpText = "Automatically pick the highest-ranked scan result.",
+            helpText = "Automatically pick the highest-ranked scan result. Set to false to scan and choose a target manually.",
         ),
         field(
             name = "SELECTED_SNI",

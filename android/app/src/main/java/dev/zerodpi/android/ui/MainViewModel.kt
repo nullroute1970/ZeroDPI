@@ -239,8 +239,6 @@ class MainViewModel(
     val targetPickState: StateFlow<TargetPickUiState> = _targetPickState.asStateFlow()
 
     private var pinStore: TargetPinStore? = null
-    private var lastPickGeneration = 0
-    private var loadedPickGeneration = -1
 
     private var lastServiceStatus: RuntimeStatus? = null
 
@@ -363,7 +361,6 @@ class MainViewModel(
 
     fun requestTargetPick() {
         viewModelScope.launch {
-            lastPickGeneration += 1
             service?.requestTargetPick(_runtimeFilesState.value.activeProfileId)
         }
     }
@@ -1400,10 +1397,12 @@ class MainViewModel(
         val current = _targetPickState.value
         when {
             session?.phase == PickPhase.Choosing -> {
-                if (loadedPickGeneration != lastPickGeneration) {
-                    loadedPickGeneration = lastPickGeneration
+                if (current.entries == null && current.phase !is TargetPickPhase.Failed) {
+                    // First Choosing emission after a scan: load the results.
+                    // (A failed load keeps the Failed phase so the card never
+                    // shows an empty chooser; the retry action re-scans.)
                     loadPickResults(mode)
-                } else {
+                } else if (current.phase == TargetPickPhase.Choosing) {
                     _targetPickState.value = current.copy(
                         phase = TargetPickPhase.Choosing,
                         mode = mode,
@@ -1437,11 +1436,19 @@ class MainViewModel(
         }
     }
 
-    private fun loadPickResults(mode: String) {
+    private fun loadPickResults(mode: String, attempt: Int = 0) {
         viewModelScope.launch {
             val profileId = _runtimeFilesState.value.activeProfileId
             val current = _targetPickState.value
             val raw = runCatching { runtimeStorage.readPickScanResults(profileId) }.getOrNull()
+            if (raw == null && attempt < PICK_RESULTS_READ_ATTEMPTS) {
+                // The binary writes the results file just before it exits;
+                // retry briefly in case the write lands after the Choosing
+                // state was observed.
+                delay(PICK_RESULTS_RETRY_DELAY_MS)
+                loadPickResults(mode, attempt + 1)
+                return@launch
+            }
             val entries = raw?.let { text ->
                 when (TargetPickPolicy.scanModeFor(mode)) {
                     "sni_scan" -> ScanResultParser.parseSni(text)?.map { entry ->
@@ -1630,6 +1637,8 @@ class MainViewModel(
     }
 
     private companion object {
+        const val PICK_RESULTS_READ_ATTEMPTS = 3
+        const val PICK_RESULTS_RETRY_DELAY_MS = 200L
         const val RUNTIME_FILES_AUTO_SAVE_DELAY_MS = 600L
     }
 }

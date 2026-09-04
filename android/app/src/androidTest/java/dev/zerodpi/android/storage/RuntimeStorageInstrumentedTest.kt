@@ -191,17 +191,16 @@ class RuntimeStorageInstrumentedTest {
     @Test
     fun pinInjectionAddsSelectedSniAndSkipsScanOverrides() = runBlocking {
         val storage = RuntimeStorage(context)
-        val assignment = Regex("(?m)^\\s*SELECTED_SNI\\s*=")
         val pin = TargetPin(PinKind.Sni, "edge.example.com", "1.2.3.4", 95, 1L)
         val plain = storage.prepareRunConfig(profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID)
-        assertFalse(assignment.containsMatchIn(plain.configText))
+        assertFalse(plain.configText.contains("edge.example.com"))
         // modeOverride runs never inject a pin.
         val scanRun = storage.prepareRunConfig(
             profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID,
             modeOverride = "sni_scan",
             pin = pin,
         )
-        assertFalse(assignment.containsMatchIn(scanRun.configText))
+        assertFalse(scanRun.configText.contains("edge.example.com"))
         // Real run with matching pin -> ephemeral config with SELECTED_SNI.
         val pinned = storage.prepareRunConfig(profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID, pin = pin)
         assertTrue(pinned.configFile.name == ".run_config.toml")
@@ -209,7 +208,7 @@ class RuntimeStorageInstrumentedTest {
         // Real run with mismatched kind -> no injection.
         val ipPin = TargetPin(PinKind.Ip, null, "5.6.7.8", 96, 1L)
         val mismatched = storage.prepareRunConfig(profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID, pin = ipPin)
-        assertFalse(assignment.containsMatchIn(mismatched.configText))
+        assertFalse(mismatched.configText.contains("edge.example.com"))
     }
 
     @Test

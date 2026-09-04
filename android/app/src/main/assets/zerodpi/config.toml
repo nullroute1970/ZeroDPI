@@ -46,7 +46,7 @@ MODE = "sni_spoof"
 # after scanning instead of showing the manual selection table.
 # TUI progress, results, and dashboard views are still shown.
 # For systemd/headless runs, use the CLI flag: --no-tui.
-AUTO_SELECT = false
+AUTO_SELECT = true
 
 # If set to a hostname, skip the scan entirely and use this hostname as the spoofed SNI.
 # The IP address is resolved from DNS automatically.

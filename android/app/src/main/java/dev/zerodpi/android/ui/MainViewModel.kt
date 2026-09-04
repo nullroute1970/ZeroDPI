@@ -29,6 +29,8 @@ import dev.zerodpi.android.profile.ProfileUpdateResult
 import dev.zerodpi.android.profile.ProfileUpdater
 import dev.zerodpi.android.profile.ProfileValidationResult
 import dev.zerodpi.android.profile.ZeroDpiProfile
+import dev.zerodpi.android.service.PickOrigin
+import dev.zerodpi.android.service.PickPhase
 import dev.zerodpi.android.service.RootStatus
 import dev.zerodpi.android.service.RuntimeStatus
 import dev.zerodpi.android.service.ScanProgressInfo
@@ -37,6 +39,13 @@ import dev.zerodpi.android.service.ZeroDpiService
 import dev.zerodpi.android.service.ZeroDpiServiceState
 import dev.zerodpi.android.storage.RuntimeFileKind
 import dev.zerodpi.android.storage.RuntimeStorage
+import dev.zerodpi.android.storage.TargetPinStore
+import dev.zerodpi.android.targetscan.IpScanEntryModel
+import dev.zerodpi.android.targetscan.PinKind
+import dev.zerodpi.android.targetscan.ScanResultParser
+import dev.zerodpi.android.targetscan.SniScanEntryModel
+import dev.zerodpi.android.targetscan.TargetPickPolicy
+import dev.zerodpi.android.targetscan.TargetPin
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -172,6 +181,32 @@ data class MethodScanUiState(
     val report: MethodScanReportModel? = null,
 )
 
+sealed interface TargetPickPhase {
+    data object Hidden : TargetPickPhase
+    data object Idle : TargetPickPhase
+    data object Scanning : TargetPickPhase
+    data object Choosing : TargetPickPhase
+    data class Failed(val message: String) : TargetPickPhase
+}
+
+/** One selectable scan-result row (kind-specific fields flattened). */
+data class TargetPickEntryModel(
+    val sni: String?,
+    val ip: String,
+    val score: Int,
+    val tcpLatencyMs: Long?,
+)
+
+data class TargetPickUiState(
+    val phase: TargetPickPhase = TargetPickPhase.Hidden,
+    val mode: String? = null,
+    val pin: TargetPin? = null,
+    val progress: ScanProgressInfo? = null,
+    val entries: List<TargetPickEntryModel>? = null,
+    val resumeAvailable: Boolean = false,
+    val origin: PickOrigin? = null,
+)
+
 class MainViewModel(
     application: Application,
     private val profileRepository: ProfileRepository = ProfileRepository(application.applicationContext),
@@ -200,6 +235,12 @@ class MainViewModel(
     val diagnosticsState: StateFlow<DiagnosticsUiState> = _diagnosticsState.asStateFlow()
     private val _methodScanState = MutableStateFlow(MethodScanUiState())
     val methodScanState: StateFlow<MethodScanUiState> = _methodScanState.asStateFlow()
+    private val _targetPickState = MutableStateFlow(TargetPickUiState())
+    val targetPickState: StateFlow<TargetPickUiState> = _targetPickState.asStateFlow()
+
+    private var pinStore: TargetPinStore? = null
+    private var lastPickGeneration = 0
+    private var loadedPickGeneration = -1
 
     private var lastServiceStatus: RuntimeStatus? = null
 
@@ -223,6 +264,7 @@ class MainViewModel(
                     _uiState.value = state
                     syncIdleRuntimeStateFromConfig()
                     updateMethodScanState(state)
+                    updateTargetPickState(state)
                 }
             }
             if (startWhenConnected) {
@@ -243,6 +285,7 @@ class MainViewModel(
             _uiState.value = _uiState.value.copy(status = RuntimeStatus.Stopped)
             syncIdleRuntimeStateFromConfig()
             updateMethodScanState(_uiState.value)
+            updateTargetPickState(_uiState.value)
         }
     }
 
@@ -316,6 +359,82 @@ class MainViewModel(
 
     fun stop() {
         service?.stopZeroDpi()
+    }
+
+    fun requestTargetPick() {
+        viewModelScope.launch {
+            lastPickGeneration += 1
+            service?.requestTargetPick(_runtimeFilesState.value.activeProfileId)
+        }
+    }
+
+    fun cancelTargetPick() {
+        service?.cancelTargetPick()
+    }
+
+    fun chooseTarget(entry: TargetPickEntryModel) {
+        viewModelScope.launch {
+            val profileId = _runtimeFilesState.value.activeProfileId
+            val configEditor = _runtimeFilesState.value.configEditor
+            val kind = TargetPickPolicy.pinKindForMode(configEditor.valueFor("MODE")) ?: return@launch
+            val pin = TargetPin(
+                kind = kind,
+                sni = entry.sni,
+                ip = entry.ip,
+                score = entry.score.takeIf { it > 0 },
+                pickedAtMs = System.currentTimeMillis(),
+            )
+            runCatching { pinStore().write(profileId, pin) }
+                .onSuccess {
+                    _targetPickState.update { it.copy(pin = pin) }
+                    service?.applyTargetPick()
+                }
+                .onFailure { error ->
+                    _targetPickState.update {
+                        it.copy(
+                            phase = TargetPickPhase.Failed(
+                                error.message ?: "Could not save the target pin.",
+                            ),
+                        )
+                    }
+                }
+        }
+    }
+
+    fun clearTargetPin() {
+        viewModelScope.launch {
+            val profileId = _runtimeFilesState.value.activeProfileId
+            runCatching { pinStore().clear(profileId) }
+                .onSuccess {
+                    _targetPickState.update { it.copy(pin = null) }
+                    _runtimeFilesState.update {
+                        it.copy(
+                            statusMessage = "Cleared the pinned target; the next start will scan and ask again.",
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    _runtimeFilesState.update {
+                        it.copy(errorMessage = error.message ?: "Could not clear the target pin.")
+                    }
+                }
+        }
+    }
+
+    fun refreshTargetPin() {
+        viewModelScope.launch {
+            val profileId = _runtimeFilesState.value.activeProfileId
+            val pin = runCatching { pinStore().read(profileId) }.getOrNull()
+            _targetPickState.update { it.copy(pin = pin) }
+        }
+    }
+
+    private fun pinStore(): TargetPinStore {
+        val existing = pinStore
+        if (existing != null) {
+            return existing
+        }
+        return TargetPinStore(appContext).also { pinStore = it }
     }
 
     fun forceStop() {
@@ -1012,6 +1131,7 @@ class MainViewModel(
                     statusMessage = statusMessage,
                 )
                 syncIdleRuntimeStateFromConfig(configEditor)
+                refreshTargetPin()
                 refreshDiagnostics()
                 reconcileAutoUpdateWork(index)
                 true
@@ -1212,6 +1332,7 @@ class MainViewModel(
             )
         }
         updateMethodScanState(_uiState.value)
+        updateTargetPickState(_uiState.value)
     }
 
     private fun updateMethodScanState(serviceState: ZeroDpiServiceState) {
@@ -1264,6 +1385,91 @@ class MainViewModel(
         }
 
         _methodScanState.value = MethodScanUiState(phase = MethodScanPhase.Idle, mode = mode)
+    }
+
+    private fun updateTargetPickState(serviceState: ZeroDpiServiceState) {
+        val editor = _runtimeFilesState.value.configEditor
+        val mode = editor.valueFor("MODE")
+        val visible = TargetPickPolicy.scanModeFor(mode) != null &&
+            editor.valueFor("AUTO_SELECT") == "false"
+        if (!visible) {
+            _targetPickState.value = TargetPickUiState()
+            return
+        }
+        val session = serviceState.pickSession
+        val current = _targetPickState.value
+        when {
+            session?.phase == PickPhase.Choosing -> {
+                if (loadedPickGeneration != lastPickGeneration) {
+                    loadedPickGeneration = lastPickGeneration
+                    loadPickResults(mode)
+                } else {
+                    _targetPickState.value = current.copy(
+                        phase = TargetPickPhase.Choosing,
+                        mode = mode,
+                        resumeAvailable = session.resumeAvailable,
+                        origin = session.origin,
+                    )
+                }
+            }
+            session?.phase == PickPhase.Scanning -> {
+                _targetPickState.value = current.copy(
+                    phase = TargetPickPhase.Scanning,
+                    mode = mode,
+                    progress = serviceState.scanProgress,
+                    resumeAvailable = session.resumeAvailable,
+                    origin = session.origin,
+                )
+            }
+            else -> {
+                if (current.phase != TargetPickPhase.Idle) {
+                    refreshTargetPin()
+                }
+                _targetPickState.value = current.copy(
+                    phase = TargetPickPhase.Idle,
+                    mode = mode,
+                    progress = null,
+                    entries = null,
+                    resumeAvailable = session?.resumeAvailable ?: false,
+                    origin = session?.origin,
+                )
+            }
+        }
+    }
+
+    private fun loadPickResults(mode: String) {
+        viewModelScope.launch {
+            val profileId = _runtimeFilesState.value.activeProfileId
+            val current = _targetPickState.value
+            val raw = runCatching { runtimeStorage.readPickScanResults(profileId) }.getOrNull()
+            val entries = raw?.let { text ->
+                when (TargetPickPolicy.scanModeFor(mode)) {
+                    "sni_scan" -> ScanResultParser.parseSni(text)?.map { entry ->
+                        TargetPickEntryModel(entry.sni, entry.ip, entry.score, entry.tcpLatencyMs)
+                    }
+                    "ip_scan" -> ScanResultParser.parseIp(text)?.map { entry ->
+                        TargetPickEntryModel(null, entry.ip, entry.score, entry.tcpLatencyMs)
+                    }
+                    else -> null
+                }
+            }
+            _targetPickState.value = if (entries != null) {
+                current.copy(
+                    phase = TargetPickPhase.Choosing,
+                    mode = mode,
+                    entries = entries,
+                )
+            } else {
+                current.copy(
+                    phase = TargetPickPhase.Failed(
+                        raw?.let { "Scan results could not be parsed." }
+                            ?: "The scan finished without results. Check the SNI/IP list and try again.",
+                    ),
+                    mode = mode,
+                    entries = null,
+                )
+            }
+        }
     }
 
     private fun reportProfileError(error: Throwable, fallbackMessage: String) {
@@ -1370,6 +1576,17 @@ class MainViewModel(
                 }
             }.fold(
                 onSuccess = {
+                    if (RuntimeFileKind.Config in filesToSave) {
+                        val savedEditor = ZeroDpiConfigToml.analyze(snapshot.textFor(RuntimeFileKind.Config))
+                        if (savedEditor.valueFor("SELECTED_SNI").isNotBlank() ||
+                            savedEditor.valueFor("SELECTED_IP").isNotBlank()
+                        ) {
+                            // One selection mechanism at a time: a manual
+                            // SELECTED_* in the config replaces the app pin.
+                            runCatching { pinStore().clear(snapshot.activeProfileId) }
+                            _targetPickState.update { it.copy(pin = null) }
+                        }
+                    }
                     _runtimeFilesState.update { current ->
                         val unchangedFiles = filesToSave.filterTo(mutableSetOf()) { kind ->
                             current.activeProfileId == snapshot.activeProfileId &&

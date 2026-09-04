@@ -15,8 +15,12 @@ import dev.zerodpi.android.profile.ProfileUpdateFileContents
 import dev.zerodpi.android.profile.ProfileUpdateManager
 import dev.zerodpi.android.profile.ZeroDpiProfile
 import dev.zerodpi.android.service.RootStatus
+import dev.zerodpi.android.service.RuntimeStatus
 import dev.zerodpi.android.storage.RuntimeFileKind
 import dev.zerodpi.android.storage.RuntimeStorage
+import dev.zerodpi.android.storage.TargetPinStore
+import dev.zerodpi.android.targetscan.PinKind
+import dev.zerodpi.android.targetscan.TargetPin
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -310,5 +314,57 @@ class MainViewModelInstrumentedTest {
 
     private fun clearRuntimeDir() {
         File(context.filesDir, "zerodpi").deleteRecursively()
+    }
+
+    @Test
+    fun startGateWithAutoSelectOffShowsPickerAndPickPinsAndRuns() = runBlocking {
+        val viewModel = viewModel()
+        viewModel.waitUntilLoaded()
+        viewModel.updateConfigField("AUTO_SELECT", "false")
+        viewModel.waitUntil("auto-select config saved") {
+            RuntimeFileKind.Config !in runtimeFilesState.value.dirtyFiles &&
+                runtimeFilesState.value.configEditor.valueFor("AUTO_SELECT") == "false"
+        }
+
+        viewModel.start()
+
+        viewModel.waitUntil("picker choosing", timeoutMs = 15_000L) {
+            viewModel.targetPickState.value.phase == TargetPickPhase.Choosing
+        }
+        val entries = viewModel.targetPickState.value.entries
+        assertEquals(2, entries?.size)
+        val best = entries?.first { it.score > 0 }
+        assertEquals("cloudflare.com", best?.sni)
+
+        viewModel.chooseTarget(best!!)
+
+        viewModel.waitUntil("running after pick", timeoutMs = 15_000L) {
+            uiState.value.status == RuntimeStatus.Running && uiState.value.pickSession == null
+        }
+        // Pin persisted app-side.
+        val pin = TargetPinStore(context).read(ZeroDpiProfile.DEFAULT_PROFILE_ID)
+        assertEquals("cloudflare.com", pin?.sni)
+        assertEquals(PinKind.Sni, pin?.kind)
+
+        viewModel.stop()
+        viewModel.waitUntil("stopped after pick run") {
+            uiState.value.status == RuntimeStatus.Stopped
+        }
+    }
+
+    @Test
+    fun clearTargetPinClearsStoredPin() = runBlocking {
+        val viewModel = viewModel()
+        viewModel.waitUntilLoaded()
+        TargetPinStore(context).write(
+            ZeroDpiProfile.DEFAULT_PROFILE_ID,
+            TargetPin(PinKind.Sni, "cloudflare.com", "1.1.1.1", 95, 1L),
+        )
+        viewModel.refreshTargetPin()
+        viewModel.waitUntil("pin shown") { targetPickState.value.pin?.sni == "cloudflare.com" }
+
+        viewModel.clearTargetPin()
+
+        viewModel.waitUntil("pin cleared") { targetPickState.value.pin == null }
     }
 }

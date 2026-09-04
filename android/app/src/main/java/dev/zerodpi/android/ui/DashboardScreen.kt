@@ -58,6 +58,7 @@ fun DashboardScreen(
     profileState: ProfileUiState,
     diagnosticsState: DiagnosticsUiState,
     methodScanState: MethodScanUiState,
+    targetPickState: TargetPickUiState = TargetPickUiState(),
     onStart: () -> Unit,
     onStop: () -> Unit,
     onForceStop: () -> Unit,
@@ -85,6 +86,10 @@ fun DashboardScreen(
     onRefreshDiagnostics: () -> Unit,
     onExportSupportBundle: (Boolean) -> Unit,
     onClearLogs: () -> Unit,
+    onRequestTargetPick: () -> Unit = {},
+    onCancelTargetPick: () -> Unit = {},
+    onChooseTarget: (TargetPickEntryModel) -> Unit = {},
+    onClearTargetPin: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var destination by rememberSaveable { mutableStateOf(AppDestination.Home) }
@@ -174,12 +179,17 @@ fun DashboardScreen(
                         runtimeFilesState = runtimeFilesState,
                         profileState = profileState,
                         methodScanState = methodScanState,
+                        targetPickState = targetPickState,
                         onStart = onStart,
                         onStop = onStop,
                         onForceStop = onForceStop,
                         onOpenProfiles = { destination = AppDestination.Profiles },
                         onOpenConfigure = { destination = AppDestination.Configure },
                         onOpenList = openList,
+                        onRequestTargetPick = onRequestTargetPick,
+                        onCancelTargetPick = onCancelTargetPick,
+                        onChooseTarget = onChooseTarget,
+                        onClearTargetPin = onClearTargetPin,
                     )
 
                     AppDestination.Profiles -> ProfilesScreen(

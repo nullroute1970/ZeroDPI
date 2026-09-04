@@ -143,4 +143,19 @@
     <string name="method_scan_column_tls">Avg TLS</string>
     <string name="method_scan_column_http">HTTP</string>
     <string name="method_scan_value_na">—</string>
+    <string name="target_pick_title">Target picker</string>
+    <string name="target_pick_idle_no_pin">No pinned target. AUTO_SELECT is off, so starting ZeroDPI will scan and ask you to choose.</string>
+    <string name="target_pick_pinned_sni">Pinned target %1$s (%2$s)</string>
+    <string name="target_pick_pinned_ip">Pinned target %1$s</string>
+    <string name="target_pick_scanning">Scanning for reachable targets…</string>
+    <string name="target_pick_progress">%1$d/%2$d candidates probed</string>
+    <string name="target_pick_choose_prompt">Choose the target to run with (score 0 rows failed and are disabled):</string>
+    <string name="target_pick_no_results">The scan produced no candidates.</string>
+    <string name="target_pick_row_failed">failed</string>
+    <string name="target_pick_column_rank">#</string>
+    <string name="target_pick_column_target">Target</string>
+    <string name="target_pick_column_score">Score</string>
+    <string name="target_pick_column_latency">TCP</string>
+    <string name="action_scan_choose">Scan &amp; choose</string>
+    <string name="action_clear_pin">Clear pin</string>
 </resources>

@@ -49,12 +49,17 @@ internal fun HomeScreen(
     runtimeFilesState: RuntimeFilesUiState,
     profileState: ProfileUiState,
     methodScanState: MethodScanUiState,
+    targetPickState: TargetPickUiState,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onForceStop: () -> Unit,
     onOpenProfiles: () -> Unit,
     onOpenConfigure: () -> Unit,
     onOpenList: (RuntimeFileKind) -> Unit,
+    onRequestTargetPick: () -> Unit = {},
+    onCancelTargetPick: () -> Unit = {},
+    onChooseTarget: (TargetPickEntryModel) -> Unit = {},
+    onClearTargetPin: () -> Unit = {},
 ) {
     val canStart = runtimeFilesState.canStart &&
         !runtimeFilesState.isLoading &&
@@ -76,6 +81,14 @@ internal fun HomeScreen(
             onStart = onStart,
             onStop = onStop,
             onForceStop = onForceStop,
+        )
+
+        TargetPickerCard(
+            state = targetPickState,
+            onRequestPick = onRequestTargetPick,
+            onCancelPick = onCancelTargetPick,
+            onChoose = onChooseTarget,
+            onClearPin = onClearTargetPin,
         )
 
         MethodScanCard(state = methodScanState)

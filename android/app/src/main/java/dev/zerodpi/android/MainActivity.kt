@@ -64,6 +64,7 @@ class MainActivity : ComponentActivity() {
             val profileState by viewModel.profileState.collectAsState()
             val diagnosticsState by viewModel.diagnosticsState.collectAsState()
             val methodScanState by viewModel.methodScanState.collectAsState()
+            val targetPickState by viewModel.targetPickState.collectAsState()
             ZeroDpiTheme {
                 DashboardScreen(
                     state = state,
@@ -71,6 +72,7 @@ class MainActivity : ComponentActivity() {
                     profileState = profileState,
                     diagnosticsState = diagnosticsState,
                     methodScanState = methodScanState,
+                    targetPickState = targetPickState,
                     onStart = viewModel::start,
                     onStop = viewModel::stop,
                     onForceStop = viewModel::forceStop,
@@ -98,6 +100,10 @@ class MainActivity : ComponentActivity() {
                     onRefreshDiagnostics = viewModel::refreshDiagnostics,
                     onExportSupportBundle = ::launchSupportBundleExport,
                     onClearLogs = viewModel::clearLogs,
+                    onRequestTargetPick = viewModel::requestTargetPick,
+                    onCancelTargetPick = viewModel::cancelTargetPick,
+                    onChooseTarget = viewModel::chooseTarget,
+                    onClearTargetPin = viewModel::clearTargetPin,
                 )
             }
         }

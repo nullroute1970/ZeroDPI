@@ -333,12 +333,12 @@ class SuRootManager(
                 process.errorStream.bufferedReader().use { it.readText() }
             }
             val finished = withContext(Dispatchers.IO) {
-                process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+                process.waitForCompat(timeoutSeconds, TimeUnit.SECONDS)
             }
             if (!finished) {
-                process.destroyForcibly()
+                process.destroyForciblyCompat()
                 withContext(Dispatchers.IO) {
-                    process.waitFor(1, TimeUnit.SECONDS)
+                    process.waitForCompat(1, TimeUnit.SECONDS)
                 }
             }
 

@@ -88,7 +88,7 @@ class ProcessZeroDpiRunner internal constructor(
     override fun events(): Flow<ZeroDpiRunnerEvent> = events.asSharedFlow()
 
     override suspend fun start(request: ZeroDpiRunRequest) {
-        if (dataPlaneProcess?.isAlive == true || helperProcess?.isAlive == true) {
+        if (dataPlaneProcess?.isAliveCompat() == true || helperProcess?.isAliveCompat() == true) {
             events.emit(ZeroDpiRunnerEvent.Log("ZeroDPI process is already active."))
             return
         }
@@ -203,7 +203,7 @@ class ProcessZeroDpiRunner internal constructor(
                                 ),
                             )
                             stopRequested.set(true)
-                            launchedProcess.destroyForcibly()
+                            launchedProcess.destroyForciblyCompat()
                             stopHelperProcess()
                         } else {
                             events.emit(ZeroDpiRunnerEvent.DataPlaneStarted(identity.pid, identity.uid))
@@ -219,7 +219,7 @@ class ProcessZeroDpiRunner internal constructor(
             stopRequested.set(true)
             dataPlaneProcess = null
             nativeProcessPid = null
-            if (helperProcess?.isAlive == true) {
+            if (helperProcess?.isAliveCompat() == true) {
                 val cleanupConfirmed = stopHelperProcess()
                 events.emit(ZeroDpiRunnerEvent.FirewallCleanup(cleanupConfirmed))
             }
@@ -232,10 +232,10 @@ class ProcessZeroDpiRunner internal constructor(
                 val exitCode = helper.waitFor()
                 helperProcess = null
                 helperProcessPid = null
-                if (exitCode != 0 && !stopRequested.get() && dataPlaneProcess?.isAlive == true) {
+                if (exitCode != 0 && !stopRequested.get() && dataPlaneProcess?.isAliveCompat() == true) {
                     events.emit(ZeroDpiRunnerEvent.Failed("Root helper exited unexpectedly with code $exitCode."))
                     events.emit(ZeroDpiRunnerEvent.FirewallCleanup(completed = false))
-                    dataPlaneProcess?.destroyForcibly()
+                    dataPlaneProcess?.destroyForciblyCompat()
                 }
             }
         }
@@ -248,7 +248,7 @@ class ProcessZeroDpiRunner internal constructor(
             if (!sendSigterm(current)) {
                 current.destroy()
             }
-            val stopped = withContext(Dispatchers.IO) { current.waitFor(5, TimeUnit.SECONDS) }
+            val stopped = withContext(Dispatchers.IO) { current.waitForCompat(5, TimeUnit.SECONDS) }
             if (!stopped) {
                 events.emit(ZeroDpiRunnerEvent.StopTimedOut)
                 return
@@ -263,9 +263,9 @@ class ProcessZeroDpiRunner internal constructor(
 
     override suspend fun forceStop() {
         stopRequested.set(true)
-        dataPlaneProcess?.destroyForcibly()
+        dataPlaneProcess?.destroyForciblyCompat()
         withContext(Dispatchers.IO) {
-            dataPlaneProcess?.waitFor(2, TimeUnit.SECONDS)
+            dataPlaneProcess?.waitForCompat(2, TimeUnit.SECONDS)
         }
         val cleanupConfirmed = stopHelperProcess()
         cleanupProcesses()
@@ -276,7 +276,7 @@ class ProcessZeroDpiRunner internal constructor(
 
     private suspend fun stopHelperProcess(): Boolean {
         val helper = helperProcess ?: return true
-        if (!helper.isAlive) {
+        if (!helper.isAliveCompat()) {
             helperProcess = null
             helperProcessPid = null
             return true
@@ -291,16 +291,16 @@ class ProcessZeroDpiRunner internal constructor(
             }
         }
         val exitedAfterTerm = if (termRequested) {
-            withContext(Dispatchers.IO) { helper.waitFor(2, TimeUnit.SECONDS) }
+            withContext(Dispatchers.IO) { helper.waitForCompat(2, TimeUnit.SECONDS) }
         } else {
             false
         }
-        if (helper.isAlive) {
+        if (helper.isAliveCompat()) {
             helper.destroy()
-            withContext(Dispatchers.IO) { helper.waitFor(2, TimeUnit.SECONDS) }
+            withContext(Dispatchers.IO) { helper.waitForCompat(2, TimeUnit.SECONDS) }
         }
-        if (helper.isAlive) {
-            helper.destroyForcibly()
+        if (helper.isAliveCompat()) {
+            helper.destroyForciblyCompat()
         }
         helperProcess = null
         helperProcessPid = null
@@ -368,7 +368,7 @@ class ProcessZeroDpiRunner internal constructor(
 
     private fun helperExitDiagnostic(process: Process, startupOutput: Collection<String>): String {
         val exitCode = runCatching {
-            if (process.waitFor(HELPER_EXIT_STATUS_WAIT_MS, TimeUnit.MILLISECONDS)) {
+            if (process.waitForCompat(HELPER_EXIT_STATUS_WAIT_MS, TimeUnit.MILLISECONDS)) {
                 process.exitValue()
             } else {
                 null

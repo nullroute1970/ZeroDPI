@@ -5,6 +5,8 @@ import android.content.pm.PackageManager
 import android.os.Build
 import dev.zerodpi.android.BuildConfig
 import dev.zerodpi.android.config.ZeroDpiConfigToml
+import dev.zerodpi.android.runtime.destroyForciblyCompat
+import dev.zerodpi.android.runtime.waitForCompat
 import dev.zerodpi.android.service.ZeroDpiServiceState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -98,10 +100,10 @@ class AndroidDiagnosticsProvider(context: Context) {
             )
         }
 
-        val finished = process.waitFor(COMMAND_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        val finished = process.waitForCompat(COMMAND_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         if (!finished) {
-            process.destroyForcibly()
-            process.waitFor(1, TimeUnit.SECONDS)
+            process.destroyForciblyCompat()
+            process.waitForCompat(1, TimeUnit.SECONDS)
         }
         val output = process.inputStream.bufferedReader().use { it.readText() }
         return DiagnosticCommandResult(

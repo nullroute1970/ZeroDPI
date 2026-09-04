@@ -1,5 +1,6 @@
 package dev.zerodpi.android.profile
 
+import dev.zerodpi.android.runtime.contentLengthLongCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -184,7 +185,7 @@ class HttpUrlConnectionProfileRemoteClient(
                     )
                 }
 
-                val contentLength = connection.contentLengthLong
+                val contentLength = connection.contentLengthLongCompat()
                 if (contentLength == 0L) {
                     return errorResult(
                         file = file,

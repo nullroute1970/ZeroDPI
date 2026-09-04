@@ -42,6 +42,10 @@ Rules:
   `sni_spoof`, `ip_bypass`, `ip_bypass_plus`.
 - Scan kind by mode: `sni_spoof` → SNI list scan (`sni_scan`); `ip_bypass`
   and `ip_bypass_plus` → IP list scan (`ip_scan`).
+- **Clear pin** affects future launches only: the running session keeps its
+  current target until stopped/restarted (the launched process already has its
+  own config). After clearing, the next Start with `AUTO_SELECT = false` scans
+  and asks again. Clearing while stopped needs no further action.
 - The runner keeps passing `--auto-select`; once `SELECTED_SNI`/`SELECTED_IP`
   is present in the run config the binary skips scanning, so the flag is
   harmless. The picked SNI is re-resolved via DNS by the binary at run start

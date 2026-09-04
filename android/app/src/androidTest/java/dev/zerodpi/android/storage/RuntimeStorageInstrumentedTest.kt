@@ -6,9 +6,13 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.zerodpi.android.config.ZeroDpiConfigToml
 import dev.zerodpi.android.profile.ProfileRepository
 import dev.zerodpi.android.profile.ZeroDpiProfile
+import dev.zerodpi.android.targetscan.PinKind
+import dev.zerodpi.android.targetscan.TargetPin
+import dev.zerodpi.android.targetscan.TargetScanFiles
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -16,6 +20,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.nio.charset.StandardCharsets
 
 @RunWith(AndroidJUnit4::class)
 class RuntimeStorageInstrumentedTest {
@@ -164,6 +169,76 @@ class RuntimeStorageInstrumentedTest {
         target.parentFile?.mkdirs()
         target.writeText("""{"mode":"sni_method_scan"}""")
         assertEquals("""{"mode":"sni_method_scan"}""", storage.readMethodScanOutput(profileId, configText))
+    }
+
+    @Test
+    fun pickScanConfigPatchesModeAndScanOutputIntoEphemeralFile() = runBlocking {
+        val storage = RuntimeStorage(context)
+        val files = storage.ensureInitialized(ZeroDpiProfile.DEFAULT_PROFILE_ID)
+        val stored = files.configFile.readText(StandardCharsets.UTF_8)
+        val run = storage.prepareRunConfig(
+            profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID,
+            modeOverride = "sni_scan",
+            patchFields = mapOf("SCAN_OUTPUT" to TargetScanFiles.PICK_SCAN_RESULTS_FILE_NAME),
+        )
+        assertTrue(run.configFile.name.startsWith(".sni_scan_config.toml"))
+        assertTrue(run.configText.contains("MODE = \"sni_scan\""))
+        assertTrue(run.configText.contains("SCAN_OUTPUT = \"pick_scan_results.json\""))
+        // The user's config file is untouched.
+        assertEquals(stored, files.configFile.readText(StandardCharsets.UTF_8))
+    }
+
+    @Test
+    fun pinInjectionAddsSelectedSniAndSkipsScanOverrides() = runBlocking {
+        val storage = RuntimeStorage(context)
+        val assignment = Regex("(?m)^\\s*SELECTED_SNI\\s*=")
+        val pin = TargetPin(PinKind.Sni, "edge.example.com", "1.2.3.4", 95, 1L)
+        val plain = storage.prepareRunConfig(profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID)
+        assertFalse(assignment.containsMatchIn(plain.configText))
+        // modeOverride runs never inject a pin.
+        val scanRun = storage.prepareRunConfig(
+            profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID,
+            modeOverride = "sni_scan",
+            pin = pin,
+        )
+        assertFalse(assignment.containsMatchIn(scanRun.configText))
+        // Real run with matching pin -> ephemeral config with SELECTED_SNI.
+        val pinned = storage.prepareRunConfig(profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID, pin = pin)
+        assertTrue(pinned.configFile.name == ".run_config.toml")
+        assertTrue(pinned.configText.contains("SELECTED_SNI = \"edge.example.com\""))
+        // Real run with mismatched kind -> no injection.
+        val ipPin = TargetPin(PinKind.Ip, null, "5.6.7.8", 96, 1L)
+        val mismatched = storage.prepareRunConfig(profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID, pin = ipPin)
+        assertFalse(assignment.containsMatchIn(mismatched.configText))
+    }
+
+    @Test
+    fun pinInjectionDefersToManualSelectedSni() = runBlocking {
+        val storage = RuntimeStorage(context)
+        val manual = ZeroDpiConfigToml.replaceOrAppendField(
+            storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText,
+            "SELECTED_SNI",
+            "manual.example",
+        )
+        storage.save(ZeroDpiProfile.DEFAULT_PROFILE_ID, RuntimeFileKind.Config, manual)
+        val pin = TargetPin(PinKind.Sni, "edge.example.com", "1.2.3.4", 95, 1L)
+        val run = storage.prepareRunConfig(profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID, pin = pin)
+        assertTrue(run.configText.contains("SELECTED_SNI = \"manual.example\""))
+        assertFalse(run.configText.contains("edge.example.com"))
+    }
+
+    @Test
+    fun pickScanResultsWriteReadDeleteLifecycle() = runBlocking {
+        val storage = RuntimeStorage(context)
+        val profileId = ZeroDpiProfile.DEFAULT_PROFILE_ID
+        storage.deletePickScanResults(profileId)
+        assertNull(storage.readPickScanResults(profileId))
+        val files = storage.ensureInitialized(profileId)
+        val resultsFile = File(files.runtimeDir, TargetScanFiles.PICK_SCAN_RESULTS_FILE_NAME)
+        resultsFile.writeText("[]")
+        assertEquals("[]", storage.readPickScanResults(profileId))
+        storage.deletePickScanResults(profileId)
+        assertNull(storage.readPickScanResults(profileId))
     }
 
     private fun String.replaceField(fieldName: String, value: String): String =

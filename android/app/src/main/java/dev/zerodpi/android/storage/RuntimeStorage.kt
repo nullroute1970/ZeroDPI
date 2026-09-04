@@ -6,6 +6,10 @@ import dev.zerodpi.android.diagnostics.DeviceDiagnostics
 import dev.zerodpi.android.profile.ProfileFilePaths
 import dev.zerodpi.android.profile.ProfileRepository
 import dev.zerodpi.android.profile.ZeroDpiProfile
+import dev.zerodpi.android.targetscan.PinKind
+import dev.zerodpi.android.targetscan.TargetPin
+import dev.zerodpi.android.targetscan.TargetPickPolicy
+import dev.zerodpi.android.targetscan.TargetScanFiles
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -161,22 +165,45 @@ class RuntimeStorage(context: Context) {
             resolvedPaths
         }
 
-    suspend fun prepareRunConfig(profileId: String, modeOverride: String? = null): RuntimeRunConfig =
+    suspend fun prepareRunConfig(
+        profileId: String,
+        modeOverride: String? = null,
+        patchFields: Map<String, String> = emptyMap(),
+        pin: TargetPin? = null,
+    ): RuntimeRunConfig =
         withContext(Dispatchers.IO) {
             val currentFiles = ensureInitializedForProfile(profileId)
             val storedConfigText = currentFiles.configFile.readText(StandardCharsets.UTF_8)
-            val runConfigText = modeOverride?.let { mode ->
+            val withMode = modeOverride?.let { mode ->
                 ZeroDpiConfigToml.replaceOrAppendField(
                     text = storedConfigText,
                     fieldName = "MODE",
                     value = mode,
                 )
             } ?: storedConfigText
-            val runConfigFile = modeOverride?.let { mode ->
-                File(currentFiles.runtimeDir, ".${mode}_config.toml").also { target ->
+            val withPatches = patchFields.entries.fold(withMode) { text, (fieldName, value) ->
+                ZeroDpiConfigToml.replaceOrAppendField(
+                    text = text,
+                    fieldName = fieldName,
+                    value = value,
+                )
+            }
+            val runConfigText = if (modeOverride == null) {
+                withPatches.injectPin(pin)
+            } else {
+                // Scan / test overrides never consume a pin.
+                withPatches
+            }
+
+            val ephemeral = modeOverride != null || patchFields.isNotEmpty() || pin != null
+            val runConfigFile = if (ephemeral) {
+                val name = modeOverride?.let { ".${it}_config.toml" } ?: ".run_config.toml"
+                File(currentFiles.runtimeDir, name).also { target ->
                     RuntimeFileOps.atomicWrite(target = target, content = runConfigText, backup = null)
                 }
-            } ?: currentFiles.configFile
+            } else {
+                currentFiles.configFile
+            }
 
             val resolvedPaths = resolveConfigPaths(runConfigText, currentFiles.runtimeDir)
             resolvedPaths.scanOutput?.parentFile?.let(RuntimeFileOps::ensureDirectory)
@@ -189,6 +216,47 @@ class RuntimeStorage(context: Context) {
                 modeOverride = modeOverride,
             )
         }
+
+    private fun String.injectPin(pin: TargetPin?): String {
+        if (pin == null) {
+            return this
+        }
+        val mode = readTomlString(this, "MODE") ?: "sni_spoof"
+        val expectedKind = TargetPickPolicy.pinKindForMode(mode) ?: return this
+        if (pin.kind != expectedKind) {
+            return this
+        }
+        val fieldName = when (expectedKind) {
+            PinKind.Sni -> "SELECTED_SNI"
+            PinKind.Ip -> "SELECTED_IP"
+        }
+        // A manual SELECTED_* in the user's config wins over the app pin.
+        if (!readTomlString(this, fieldName).isNullOrBlank()) {
+            return this
+        }
+        val value = when (expectedKind) {
+            PinKind.Sni -> pin.sni ?: return this
+            PinKind.Ip -> pin.ip
+        }
+        return ZeroDpiConfigToml.replaceOrAppendField(text = this, fieldName = fieldName, value = value)
+    }
+
+    suspend fun readPickScanResults(profileId: String): String? =
+        withContext(Dispatchers.IO) {
+            pickScanResultsFile(profileId)
+                .takeIf { it.isFile }
+                ?.readText(StandardCharsets.UTF_8)
+        }
+
+    suspend fun deletePickScanResults(profileId: String) =
+        withContext(Dispatchers.IO) {
+            pickScanResultsFile(profileId).delete()
+        }
+
+    private suspend fun pickScanResultsFile(profileId: String): File {
+        val currentFiles = ensureInitializedForProfile(profileId)
+        return File(currentFiles.runtimeDir, TargetScanFiles.PICK_SCAN_RESULTS_FILE_NAME)
+    }
 
     suspend fun startNewLogSession(label: String): File =
         withContext(Dispatchers.IO) {

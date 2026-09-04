@@ -26,6 +26,10 @@ import dev.zerodpi.android.runtime.ZeroDpiRunRequest
 import dev.zerodpi.android.runtime.ZeroDpiRunner
 import dev.zerodpi.android.runtime.ZeroDpiRunnerEvent
 import dev.zerodpi.android.storage.RuntimeStorage
+import dev.zerodpi.android.storage.RuntimeRunConfig
+import dev.zerodpi.android.storage.TargetPinStore
+import dev.zerodpi.android.targetscan.TargetPickPolicy
+import dev.zerodpi.android.targetscan.TargetScanFiles
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -121,6 +125,11 @@ class ZeroDpiService : Service() {
     private var userStopRequested = false
     private var restartExitSignal: CompletableDeferred<Unit>? = null
     private var restartStopTimeoutSignal: CompletableDeferred<Unit>? = null
+    private lateinit var pinStore: TargetPinStore
+    private var pickSession: PickSession? = null
+    private var pickStage: PickStage? = null
+    private var pickScanMode: String? = null
+    private var pickCancelRequested = false
 
     override fun onCreate() {
         super.onCreate()
@@ -130,6 +139,7 @@ class ZeroDpiService : Service() {
         runtimeStorage = RuntimeStorage(this)
         profileRepository = ProfileRepository(this)
         rootManager = SuRootManager()
+        pinStore = TargetPinStore(this)
         runner = createRunner()
         scope.launch {
             runner.events().collect { event ->
@@ -216,11 +226,12 @@ class ZeroDpiService : Service() {
     private suspend fun launchRun(
         runSpec: ActiveRunSpec,
         isAutomaticRestart: Boolean,
+        preparedConfigOverride: RuntimeRunConfig? = null,
     ) {
         val profileId = runSpec.profileId
         val modeOverride = runSpec.modeOverride
 
-        val runConfig = runCatching {
+        val runConfig = preparedConfigOverride ?: runCatching {
             runtimeStorage.prepareRunConfig(profileId = profileId, modeOverride = modeOverride)
         }.getOrElse { error ->
             if (error is CancellationException) {
@@ -243,6 +254,38 @@ class ZeroDpiService : Service() {
             editorState.valueFor("BYPASS_METHOD"),
         ).ifBlank { "unknown" }
         val rootRequired = editorState.rootRequirement.requiresRoot
+
+        // Target-pick gate: a real run (no mode override) whose config has
+        // AUTO_SELECT off, no manual SELECTED_* and no stored pin of the
+        // matching kind starts with a scan-and-choose session instead.
+        if (modeOverride == null && pickSession == null && !userStopRequested) {
+            val gateEligible = runCatching {
+                TargetPickPolicy.isGateEligible(
+                    mode = editorState.valueFor("MODE"),
+                    autoSelect = editorState.valueFor("AUTO_SELECT") == "true",
+                    selectedSni = editorState.valueFor("SELECTED_SNI"),
+                    selectedIp = editorState.valueFor("SELECTED_IP"),
+                    pin = pinStore.read(profileId),
+                )
+            }.getOrDefault(false)
+            if (gateEligible) {
+                networkMonitor?.stop()
+                appendLog("AUTO_SELECT is off — scanning; choose a target after the scan.")
+                pickSession = PickSession(profileId, PickOrigin.StartGate, resumeRunSpec = null)
+                state.update {
+                    it.copy(
+                        pickSession = PickSessionUi(
+                            PickPhase.Scanning,
+                            PickOrigin.StartGate,
+                            mode = "",
+                            resumeAvailable = false,
+                        ),
+                    )
+                }
+                launchPickScan(pickSession!!)
+                return
+            }
+        }
         resetRuntimeCounters()
         state.update {
             it.copy(
@@ -349,6 +392,7 @@ class ZeroDpiService : Service() {
 
     fun stopZeroDpi() {
         userStopRequested = true
+        clearPickSession()
         networkMonitor?.stop()
         launchJob?.cancel()
         ZeroDpiRuntimeStateStore.markRuntimeActive(this, activeRunSpec?.profileId)
@@ -362,6 +406,7 @@ class ZeroDpiService : Service() {
 
     fun forceStopZeroDpi() {
         userStopRequested = true
+        clearPickSession()
         networkMonitor?.stop()
         launchJob?.cancel()
         ZeroDpiRuntimeStateStore.markRuntimeActive(this, activeRunSpec?.profileId)
@@ -369,6 +414,199 @@ class ZeroDpiService : Service() {
         scope.launch {
             runner.forceStop()
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Target pick sessions
+    // -------------------------------------------------------------------
+
+    /**
+     * Starts an interactive scan-and-choose session. While a session is
+     * active the runtime is stopped (or never started); the ViewModel writes
+     * the picked target pin and then calls [applyTargetPick], or calls
+     * [cancelTargetPick] to abort. Origin is derived from the current status:
+     * a running runtime becomes a MidRun session that resumes the previous
+     * run after the session resolves.
+     */
+    fun requestTargetPick(profileId: String) {
+        val currentStatus = state.value.status
+        when {
+            pickSession != null || restartStopInProgress -> {
+                appendLog("A target pick session is already in progress.")
+            }
+            currentStatus in networkRestartableStatuses -> {
+                val resume = activeRunSpec ?: run {
+                    appendLog("Cannot re-scan: no active run to resume.")
+                    return
+                }
+                networkMonitor?.stop()
+                pickSession = PickSession(profileId, PickOrigin.MidRun, resume)
+                pickStage = PickStage.StoppingForRescan
+                state.update {
+                    it.copy(
+                        status = RuntimeStatus.Restarting,
+                        pickSession = PickSessionUi(
+                            PickPhase.Scanning,
+                            PickOrigin.MidRun,
+                            mode = "",
+                            resumeAvailable = true,
+                        ),
+                        activeTarget = "None",
+                        activeTargetScore = null,
+                        scanProgress = null,
+                    )
+                }
+                appendLog("Stopping to scan for a new target.")
+                scope.launch { runner.stop() }
+            }
+            currentStatus == RuntimeStatus.Stopped || currentStatus == RuntimeStatus.Failed -> {
+                ensureForeground()
+                pickSession = PickSession(profileId, PickOrigin.Standalone, resumeRunSpec = null)
+                state.update {
+                    it.copy(
+                        pickSession = PickSessionUi(
+                            PickPhase.Scanning,
+                            PickOrigin.Standalone,
+                            mode = "",
+                            resumeAvailable = false,
+                        ),
+                    )
+                }
+                launchPickScan(pickSession!!)
+            }
+            else -> appendLog("Target picking is unavailable while ${currentStatus.name.lowercase()}.")
+        }
+    }
+
+    /** Applies the ViewModel's already-stored pin and resolves the session. */
+    fun applyTargetPick() {
+        if (pickStage != PickStage.Choosing) {
+            appendLog("No target pick waiting to be applied.")
+            return
+        }
+        appendLog("Target pinned. Applying selection.")
+        resolvePickSession(startAfterPick = true)
+    }
+
+    /** Aborts the session without touching the stored pin. */
+    fun cancelTargetPick() {
+        when (pickStage) {
+            PickStage.Choosing -> {
+                appendLog("Target pick cancelled.")
+                resolvePickSession(startAfterPick = false)
+            }
+            PickStage.Scanning -> {
+                pickCancelRequested = true
+                scope.launch { runner.stop() }
+            }
+            null, PickStage.StoppingForRescan -> {
+                appendLog("No target pick is waiting for input.")
+            }
+        }
+    }
+
+    /**
+     * Shared resolution after a pick session ends (apply or cancel):
+     * MidRun sessions resume the previous run; StartGate sessions either
+     * start the pinned run (apply) or finish (cancel); Standalone sessions
+     * always finish — the pin is applied on the next manual Start.
+     */
+    private fun resolvePickSession(startAfterPick: Boolean) {
+        val session = pickSession ?: return
+        val resume = session.resumeRunSpec
+        clearPickSession()
+        when (session.origin) {
+            PickOrigin.MidRun -> {
+                if (resume != null && !userStopRequested) {
+                    launchJob = scope.launch {
+                        launchRun(resume, isAutomaticRestart = true)
+                    }
+                } else {
+                    finishAfterExit(0)
+                }
+            }
+            PickOrigin.StartGate -> {
+                if (startAfterPick && !userStopRequested) {
+                    state.update {
+                        it.copy(status = RuntimeStatus.Stopped, pickSession = null)
+                    }
+                    startZeroDpi(profileId = session.profileId)
+                } else {
+                    appendLog("Start aborted — no target selected.")
+                    finishAfterExit(0)
+                }
+            }
+            PickOrigin.Standalone -> {
+                if (startAfterPick) {
+                    appendLog("Target pinned — start ZeroDPI when ready.")
+                }
+                finishAfterExit(0)
+            }
+        }
+    }
+
+    private fun launchPickScan(session: PickSession) {
+        scope.launch {
+            val userMode = runCatching {
+                ZeroDpiConfigToml.analyze(
+                    runtimeStorage.readAll(session.profileId).configText,
+                ).valueFor("MODE")
+            }.getOrDefault("sni_spoof")
+            val scanMode = TargetPickPolicy.scanModeFor(userMode)
+            if (scanMode == null) {
+                failPickSession("MODE '$userMode' does not support target picking.", session)
+                return@launch
+            }
+            pickScanMode = scanMode
+            val runConfig = runCatching {
+                runtimeStorage.prepareRunConfig(
+                    profileId = session.profileId,
+                    modeOverride = scanMode,
+                    patchFields = mapOf(
+                        "SCAN_OUTPUT" to TargetScanFiles.PICK_SCAN_RESULTS_FILE_NAME,
+                    ),
+                )
+            }.getOrElse { error ->
+                if (error is CancellationException) {
+                    throw error
+                }
+                failPickSession(
+                    error.message ?: "Could not prepare the pick scan config.",
+                    session,
+                )
+                return@launch
+            }
+            runtimeStorage.deletePickScanResults(session.profileId)
+            pickStage = PickStage.Scanning
+            launchRun(
+                ActiveRunSpec(profileId = session.profileId, modeOverride = scanMode),
+                isAutomaticRestart = false,
+                preparedConfigOverride = runConfig,
+            )
+        }
+    }
+
+    private fun failPickSession(message: String, session: PickSession) {
+        appendLog(message)
+        val resume = session.resumeRunSpec
+        clearPickSession()
+        if (session.origin == PickOrigin.MidRun && resume != null && !userStopRequested) {
+            appendLog("Resuming the previous run.")
+            launchJob = scope.launch {
+                launchRun(resume, isAutomaticRestart = true)
+            }
+        } else {
+            state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
+            finishForegroundRun()
+        }
+    }
+
+    private fun clearPickSession() {
+        pickSession = null
+        pickStage = null
+        pickScanMode = null
+        pickCancelRequested = false
+        state.update { it.copy(pickSession = null) }
     }
 
     internal fun requestAutomaticRestart() {
@@ -595,6 +833,10 @@ class ZeroDpiService : Service() {
                 }
             }
             is ZeroDpiRunnerEvent.FatalError -> {
+                if (pickStage == PickStage.Scanning && pickSession != null) {
+                    failPickSession(event.message, pickSession!!)
+                    return
+                }
                 appendLog(event.message)
                 state.update { it.copy(status = RuntimeStatus.Failed, lastError = event.message) }
             }
@@ -605,6 +847,10 @@ class ZeroDpiService : Service() {
                 appendLog(event.message)
             }
             is ZeroDpiRunnerEvent.Failed -> {
+                if (pickStage == PickStage.Scanning && pickSession != null) {
+                    failPickSession(event.message, pickSession!!)
+                    return
+                }
                 appendLog(event.message)
                 state.update { it.copy(status = RuntimeStatus.Failed, lastError = event.message) }
                 finishForegroundRun()
@@ -613,6 +859,57 @@ class ZeroDpiService : Service() {
                 appendLog("ZeroDPI exited with code ${event.exitCode}.")
                 activeConnections.clear()
                 activeRelayBytes.clear()
+                when {
+                    pickStage == PickStage.StoppingForRescan && !userStopRequested -> {
+                        if (event.exitCode == 0) {
+                            val session = pickSession
+                            if (session != null) {
+                                launchPickScan(session) // sets pickStage = Scanning
+                            } else {
+                                finishAfterExit(event.exitCode)
+                            }
+                        } else {
+                            appendLog("Could not stop the running ZeroDPI for a target pick.")
+                            resolvePickSession(startAfterPick = false)
+                        }
+                        return
+                    }
+                    pickStage == PickStage.Scanning &&
+                        event.exitCode == 0 &&
+                        !pickCancelRequested &&
+                        !userStopRequested -> {
+                        pickStage = PickStage.Choosing
+                        state.update {
+                            it.copy(
+                                status = RuntimeStatus.Choosing,
+                                pickSession = PickSessionUi(
+                                    phase = PickPhase.Choosing,
+                                    origin = pickSession?.origin ?: PickOrigin.Standalone,
+                                    mode = pickScanMode.orEmpty(),
+                                    resumeAvailable = pickSession?.resumeRunSpec != null,
+                                ),
+                                scanProgress = null,
+                                activeTarget = "Choose a target",
+                                activeTargetScore = null,
+                            )
+                        }
+                        appendLog("Scan finished — choose a target from the picker.")
+                        return
+                    }
+                    pickStage == PickStage.Scanning && pickCancelRequested -> {
+                        val session = pickSession
+                        clearPickSession()
+                        if (session?.origin == PickOrigin.MidRun && session.resumeRunSpec != null) {
+                            appendLog("Target pick cancelled — resuming the previous run.")
+                            launchJob = scope.launch {
+                                launchRun(session.resumeRunSpec!!, isAutomaticRestart = true)
+                            }
+                        } else {
+                            finishAfterExit(event.exitCode)
+                        }
+                        return
+                    }
+                }
                 if (restartStopInProgress) {
                     restartExitSignal?.complete(Unit)
                     if (userStopRequested) {
@@ -689,6 +986,7 @@ class ZeroDpiService : Service() {
     }
 
     private fun finishAfterExit(exitCode: Int) {
+        clearPickSession()
         restartStopInProgress = false
         automaticForceStopRequested = false
         restartExitSignal = null
@@ -798,6 +1096,7 @@ class ZeroDpiService : Service() {
     }
 
     private fun finishForegroundRun() {
+        clearPickSession()
         networkMonitor?.stop()
         networkMonitor = null
         launchJob = null
@@ -849,6 +1148,14 @@ class ZeroDpiService : Service() {
     private data class ActiveRunSpec(
         val profileId: String,
         val modeOverride: String?,
+    )
+
+    private enum class PickStage { StoppingForRescan, Scanning, Choosing }
+
+    private data class PickSession(
+        val profileId: String,
+        val origin: PickOrigin,
+        val resumeRunSpec: ActiveRunSpec?,
     )
 
     companion object {

@@ -198,7 +198,7 @@ class ZeroDpiServiceInstrumentedTest {
         val storage = RuntimeStorage(context)
         val rootlessConfig = storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText
             .replaceField("MODE", "sni_spoof")
-            .replaceField("BYPASS_METHOD", "tls_frag")
+            .replaceField("BYPASS_METHOD", "[\"tls_frag\"]")
             .replaceField("LISTEN_PORT", "44444")
         storage.save(ZeroDpiProfile.DEFAULT_PROFILE_ID, RuntimeFileKind.Config, rootlessConfig)
     }
@@ -230,7 +230,7 @@ class ZeroDpiServiceInstrumentedTest {
         val storage = RuntimeStorage(context)
         val rootRequiredConfig = storage.readAll(WORK_PROFILE_ID).configText
             .replaceField("MODE", "sni_spoof")
-            .replaceField("BYPASS_METHOD", "wrong_seq")
+            .replaceField("BYPASS_METHOD", "[\"wrong_seq\"]")
             .replaceField("LISTEN_PORT", "45666")
         storage.save(WORK_PROFILE_ID, RuntimeFileKind.Config, rootRequiredConfig)
     }

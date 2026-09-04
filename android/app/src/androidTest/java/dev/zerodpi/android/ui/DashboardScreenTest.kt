@@ -6,6 +6,7 @@ import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import dev.zerodpi.android.service.RuntimeStatus
 import dev.zerodpi.android.service.ZeroDpiServiceState
@@ -75,9 +76,9 @@ class DashboardScreenTest {
             )
         }
 
-        composeRule.onNodeWithText("Target score").assertIsDisplayed()
-        composeRule.onNodeWithText("95").assertIsDisplayed()
-        composeRule.onNodeWithText("Next scan").assertIsDisplayed()
+        composeRule.onNodeWithText("Target score").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("95").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("Next scan").performScrollTo().assertIsDisplayed()
     }
 
     @Test
@@ -135,10 +136,10 @@ class DashboardScreenTest {
         composeRule.setContent { TestDashboard() }
         composeRule.onNodeWithTag("nav_configure").performClick()
 
-        composeRule.onNodeWithTag("config_section_ProxyListener").assertIsDisplayed()
-        composeRule.onNodeWithTag("config_section_BypassEngine").assertIsDisplayed()
-        composeRule.onNodeWithTag("config_advanced").performClick()
-        composeRule.onNodeWithTag("config_section_ScanBehavior").assertIsDisplayed()
+        composeRule.onNodeWithTag("config_section_ProxyListener").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("config_section_BypassEngine").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("config_advanced").performScrollTo().performClick()
+        composeRule.onNodeWithTag("config_section_ScanBehavior").performScrollTo().assertIsDisplayed()
     }
 
     @Test

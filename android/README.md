@@ -29,6 +29,19 @@ The data-plane executable is packaged as `libzerodpi_exec.so` under
 to the app native library directory at install time. The security boundary
 and protocol are documented in [PRIVILEGE_SEPARATION.md](PRIVILEGE_SEPARATION.md).
 
+### Target scan &amp; pick (AUTO_SELECT = false)
+
+When the config has `AUTO_SELECT = false` and no `SELECTED_SNI`/`SELECTED_IP`
+and no app-side pin, tapping **Start** first runs a rootless scan against the
+active profile's SNI/IP list and shows the ranked results on the Home tab.
+Choosing a row pins that target app-side (`target_pin.json` in the profile
+runtime directory) and starts the run with it. The pin is injected at launch
+through an ephemeral run config — `config.toml` is never rewritten. The Home
+tab also offers **Scan &amp; choose** while stopped (saves the pin only) and
+while running (gracefully restarts the data plane with the new pick) plus
+**Clear pin** to return to scan-and-ask behavior. Pins are per profile and are
+never included in support bundles or profile exports.
+
 ## Build
 
 From the repository root:

@@ -56,6 +56,18 @@ class DashboardScreenTest {
     }
 
     @Test
+    fun choosingRuntimeShowsChoosingLabelAndStopAction() {
+        composeRule.setContent {
+            TestDashboard(
+                serviceState = ZeroDpiServiceState(status = RuntimeStatus.Choosing),
+            )
+        }
+
+        composeRule.onNodeWithText("Choosing target").assertIsDisplayed()
+        composeRule.onNodeWithText("Stop ZeroDPI").assertIsDisplayed()
+    }
+
+    @Test
     fun homeShowsSelectedTargetScore() {
         composeRule.setContent {
             TestDashboard(

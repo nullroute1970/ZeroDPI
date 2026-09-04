@@ -50,6 +50,7 @@ enum class RuntimeStatus {
     Scanning,
     Running,
     Restarting,
+    Choosing,
     Stopping,
     Failed,
 }
@@ -69,6 +70,17 @@ data class ScanProgressInfo(
     val total: Int? = null,
 )
 
+enum class PickPhase { Scanning, Choosing }
+
+enum class PickOrigin { StartGate, MidRun, Standalone }
+
+data class PickSessionUi(
+    val phase: PickPhase,
+    val origin: PickOrigin,
+    val mode: String,
+    val resumeAvailable: Boolean,
+)
+
 data class ZeroDpiServiceState(
     val status: RuntimeStatus = RuntimeStatus.Stopped,
     val rootStatus: RootStatus = RootStatus.Needed,
@@ -85,6 +97,7 @@ data class ZeroDpiServiceState(
     val lastExitCode: Int? = null,
     val recentLogs: List<String> = emptyList(),
     val forceStopAvailable: Boolean = false,
+    val pickSession: PickSessionUi? = null,
 )
 
 class ZeroDpiService : Service() {
@@ -850,8 +863,11 @@ class ZeroDpiService : Service() {
             RuntimeStatus.Scanning,
             RuntimeStatus.Running,
             RuntimeStatus.Restarting,
+            RuntimeStatus.Choosing,
             RuntimeStatus.Stopping,
         )
+        // networkRestartableStatuses intentionally does NOT include Choosing:
+        // a network change during a pick session must not race the session.
         private val networkRestartableStatuses = setOf(
             RuntimeStatus.Starting,
             RuntimeStatus.Scanning,

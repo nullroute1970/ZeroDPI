@@ -283,6 +283,7 @@ private fun RuntimeStatusCard(
                 RuntimeStatus.Scanning,
                 RuntimeStatus.Running,
                 RuntimeStatus.Restarting,
+                RuntimeStatus.Choosing,
                 -> OutlinedButton(
                     onClick = onStop,
                     modifier = Modifier
@@ -404,6 +405,7 @@ internal fun statusLabel(status: RuntimeStatus): String =
             RuntimeStatus.Scanning -> R.string.status_scanning
             RuntimeStatus.Running -> R.string.status_running
             RuntimeStatus.Restarting -> R.string.status_restarting
+            RuntimeStatus.Choosing -> R.string.status_choosing
             RuntimeStatus.Stopping -> R.string.status_stopping
             RuntimeStatus.Failed -> R.string.status_failed
         },

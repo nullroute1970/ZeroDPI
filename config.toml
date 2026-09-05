@@ -47,7 +47,7 @@ MODE = "sni_spoof"
 # after scanning instead of showing the manual selection table.
 # TUI progress, results, and dashboard views are still shown.
 # For systemd/headless runs, use the CLI flag: --no-tui.
-AUTO_SELECT = true
+AUTO_SELECT = false
 
 # If set to a hostname, skip the scan entirely and use this hostname as the spoofed SNI.
 # The IP address is resolved from DNS automatically.
@@ -97,7 +97,7 @@ SCAN_TIMEOUT_SECS = 5
 # How often (in seconds) ZeroDPI re-runs the full SNI scan in the background
 # while the proxy is running. In sni_spoof mode, a better top result switches
 # the active SNI/IP for new connections. Set to 0 to disable periodic rescanning.
-RESCAN_INTERVAL_SECS = 600
+RESCAN_INTERVAL_SECS = 0
 
 # Minimum score required before a background SNI rescan can switch the active
 # SNI/IP target.

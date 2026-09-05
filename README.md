@@ -759,7 +759,7 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `MODE` | `string` | `"sni_spoof"` | One of: `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan`, `sni_method_scan`, `ip_method_scan` |
-| `AUTO_SELECT` | `bool` | `true` | Auto-pick rank-1 after scan (skip manual selection table) |
+| `AUTO_SELECT` | `bool` | `false` | Auto-pick rank-1 after scan (skip manual selection table) |
 | `SELECTED_SNI` | `string` | — | Skip SNI scan; use this hostname directly |
 | `SELECTED_IP` | `string` | — | Skip IP scan; use this IP directly |
 
@@ -793,7 +793,7 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `SCAN_TIMEOUT_SECS` | `u64` | `5` | Per-probe timeout (seconds) |
-| `RESCAN_INTERVAL_SECS` | `u64` | `600` | Background rescan interval (`0` = disabled) |
+| `RESCAN_INTERVAL_SECS` | `u64` | `0` | Background rescan interval (`0` = disabled) |
 | `SNI_SWITCH_MIN_SCORE` | `u8` | `1` | Minimum score to auto-switch target on rescan (0–100) |
 | `SCAN_OUTPUT` | `string` | — | Path to save scan results as JSON (scan-only modes) |
 

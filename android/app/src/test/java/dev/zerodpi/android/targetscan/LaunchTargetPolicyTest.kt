@@ -31,11 +31,11 @@ class LaunchTargetPolicyTest {
     }
 
     @Test
-    fun treatsMissingAutoSelectAsDefaultAutoSelectOn() {
+    fun treatsMissingAutoSelectAsDefaultAutoSelectOff() {
         val noAutoSelectField = """
             MODE = "sni_spoof"
             SELECTED_SNI = ""
         """.trimIndent()
-        assertFalse(LaunchTargetPolicy.consumesPin(noAutoSelectField, modeOverride = null))
+        assertTrue(LaunchTargetPolicy.consumesPin(noAutoSelectField, modeOverride = null))
     }
 }

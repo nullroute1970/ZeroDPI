@@ -453,13 +453,13 @@ pub struct Config {
     /// When `true` the application automatically picks the top-ranked entry
     /// after scanning instead of showing the manual selection table.
     /// TUI progress, result, and dashboard views are still shown.
-    /// Default: `true`.
-    #[serde(default = "default_true")]
+    /// Default: `false`.
+    #[serde(default)]
     pub AUTO_SELECT: bool,
 
     /// Rescan interval in seconds.  After the proxy starts the scanner runs
     /// again in the background every this many seconds and logs the new
-    /// rankings.  Set to `0` to disable periodic rescanning.  Default: `600`.
+    /// rankings.  Set to `0` to disable periodic rescanning.  Default: `0`.
     #[serde(default = "default_rescan_interval_secs")]
     pub RESCAN_INTERVAL_SECS: u64,
 
@@ -1224,7 +1224,7 @@ fn default_method_scan_timeout_secs() -> u64 {
     10
 }
 fn default_rescan_interval_secs() -> u64 {
-    600
+    0
 }
 fn default_method() -> BypassMethodList {
     BypassMethodList::from_delimited("wrong_seq, tls_frag")
@@ -1871,8 +1871,8 @@ mod tests {
         );
         assert_eq!(cfg.NFQUEUE_NUM, 1);
         assert_eq!(cfg.LINUX_FIREWALL_BACKEND, "iptables");
-        assert!(cfg.AUTO_SELECT);
-        assert_eq!(cfg.RESCAN_INTERVAL_SECS, 600);
+        assert!(!cfg.AUTO_SELECT);
+        assert_eq!(cfg.RESCAN_INTERVAL_SECS, 0);
         assert_eq!(cfg.SNI_SWITCH_MIN_SCORE, 1);
         assert_eq!(cfg.SNI_LIST, "sni_list.txt");
         assert_eq!(cfg.SCAN_TIMEOUT_SECS, 5);

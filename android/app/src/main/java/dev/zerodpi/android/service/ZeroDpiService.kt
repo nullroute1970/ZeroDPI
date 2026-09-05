@@ -28,7 +28,9 @@ import dev.zerodpi.android.runtime.ZeroDpiRunnerEvent
 import dev.zerodpi.android.storage.RuntimeStorage
 import dev.zerodpi.android.storage.RuntimeRunConfig
 import dev.zerodpi.android.storage.TargetPinStore
+import dev.zerodpi.android.targetscan.LaunchTargetPolicy
 import dev.zerodpi.android.targetscan.TargetPickPolicy
+import dev.zerodpi.android.targetscan.TargetPin
 import dev.zerodpi.android.targetscan.TargetScanFiles
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -231,8 +233,29 @@ class ZeroDpiService : Service() {
         val profileId = runSpec.profileId
         val modeOverride = runSpec.modeOverride
 
+        // AUTO_SELECT-off runs carry the stored app pin into the run config
+        // (SELECTED_SNI/SELECTED_IP), so the native binary skips its startup
+        // scan and keeps the pinned target. Automatic restarts relaunch through
+        // the same path, so a network change must never turn into a scan:
+        // with AUTO_SELECT off only the manual Scan & choose flow scans.
+        val pin: TargetPin? = if (modeOverride == null && preparedConfigOverride == null) {
+            runCatching {
+                val configText = runtimeStorage.readAll(profileId).configText
+                if (LaunchTargetPolicy.consumesPin(configText, modeOverride)) {
+                    pinStore.read(profileId)
+                } else {
+                    null
+                }
+            }.getOrNull()
+        } else {
+            null
+        }
         val runConfig = preparedConfigOverride ?: runCatching {
-            runtimeStorage.prepareRunConfig(profileId = profileId, modeOverride = modeOverride)
+            runtimeStorage.prepareRunConfig(
+                profileId = profileId,
+                modeOverride = modeOverride,
+                pin = pin,
+            )
         }.getOrElse { error ->
             if (error is CancellationException) {
                 throw error
@@ -255,9 +278,10 @@ class ZeroDpiService : Service() {
         ).ifBlank { "unknown" }
         val rootRequired = editorState.rootRequirement.requiresRoot
 
-        // Target-pick gate: a real run (no mode override) whose config has
-        // AUTO_SELECT off, no manual SELECTED_* and no stored pin of the
-        // matching kind starts with a scan-and-choose session instead.
+        // Target-pick gate: a user-initiated run (no mode override) whose
+        // config has AUTO_SELECT off, no manual SELECTED_* and no stored pin
+        // of the matching kind starts with a scan-and-choose session instead.
+        // Automatic restarts never scan (see the gate-eligible branch below).
         if (modeOverride == null && pickSession == null && !userStopRequested) {
             val gateEligible = runCatching {
                 TargetPickPolicy.isGateEligible(
@@ -269,6 +293,17 @@ class ZeroDpiService : Service() {
                 )
             }.getOrDefault(false)
             if (gateEligible) {
+                if (isAutomaticRestart) {
+                    // An automatic (network-change) restart must never start a
+                    // scan by itself: with AUTO_SELECT off and no target to
+                    // pin, stop cleanly and let the user scan manually.
+                    appendLog(
+                        "AUTO_SELECT is off and no target is pinned — stopping after the " +
+                            "network change instead of scanning. Use Scan & choose to pick a target.",
+                    )
+                    finishAfterExit(0)
+                    return
+                }
                 networkMonitor?.stop()
                 appendLog("AUTO_SELECT is off — scanning; choose a target after the scan.")
                 pickSession = PickSession(profileId, PickOrigin.StartGate, resumeRunSpec = null)

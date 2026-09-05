@@ -61,13 +61,26 @@ class FakeZeroDpiRunner(
                 return@launch
             }
 
-            events.emit(ZeroDpiRunnerEvent.ScanStarted("sni", total = 1))
-            delay(700)
+            // Mirror the real binary: when the run config already selects a
+            // target (SELECTED_SNI / SELECTED_IP), the startup scan is skipped
+            // and the run goes straight to that target.
+            val forcedSelection = runCatching { File(request.configPath).readText() }
+                .getOrNull()
+                ?.let { forcedSelectionFor(request.mode, it) }
+
+            if (forcedSelection == null) {
+                events.emit(ZeroDpiRunnerEvent.ScanStarted("sni", total = 1))
+                delay(700)
+            }
             events.emit(
                 ZeroDpiRunnerEvent.SelectedTarget(
-                    target = "sni",
-                    sni = "cloudflare.com",
-                    ip = "1.1.1.1",
+                    target = when {
+                        forcedSelection?.sni != null -> "sni"
+                        forcedSelection?.ip != null -> "ip"
+                        else -> "sni"
+                    },
+                    sni = forcedSelection?.sni ?: "cloudflare.com",
+                    ip = forcedSelection?.ip ?: "1.1.1.1",
                     score = 95,
                 ),
             )
@@ -104,6 +117,37 @@ class FakeZeroDpiRunner(
     override suspend fun forceStop() {
         stop()
     }
+
+    /**
+     * Mirrors the real binary's "skipping scan" behavior: a run whose config
+     * carries the SELECTED_* field of its mode starts without a scan.
+     */
+    private fun forcedSelectionFor(mode: String, configText: String): ForcedSelection? {
+        when (mode) {
+            "sni_spoof" -> {
+                val sni = tomlStringField(configText, "SELECTED_SNI")
+                return sni?.takeIf { it.isNotBlank() }?.let(::ForcedSelection)
+            }
+            "ip_bypass", "ip_bypass_plus" -> {
+                val ip = tomlStringField(configText, "SELECTED_IP")
+                return ip?.takeIf { it.isNotBlank() }
+                    ?.let { ForcedSelection(ip = it) }
+            }
+            else -> return null
+        }
+    }
+
+    private fun tomlStringField(text: String, name: String): String? {
+        val pattern = Regex("""(?m)^\s*${Regex.escape(name)}\s*=\s*"((?:\\.|[^"\\])*)""")
+        return pattern.find(text)?.groupValues?.get(1)
+            ?.replace("\\\"", "\"")
+            ?.replace("\\\\", "\\")
+    }
+
+    private data class ForcedSelection(
+        val sni: String? = null,
+        val ip: String? = null,
+    )
 
     /**
      * Mirrors the real binary's SCAN_OUTPUT write for scan modes so fake-mode

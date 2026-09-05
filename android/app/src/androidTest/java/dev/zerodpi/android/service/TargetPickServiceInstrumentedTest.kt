@@ -15,6 +15,7 @@ import dev.zerodpi.android.targetscan.TargetPinCodec
 import dev.zerodpi.android.targetscan.TargetScanFiles
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -163,6 +164,90 @@ class TargetPickServiceInstrumentedTest {
             it.status == RuntimeStatus.Stopped && it.lastExitCode == 0
         }
         assertNull(stopped.pickSession)
+    }
+
+    @Test
+    fun autoSelectOffPinnedRunNetworkRestartKeepsPinnedTargetWithoutScan() = runBlocking {
+        val storage = RuntimeStorage(context)
+        storage.save(
+            ZeroDpiProfile.DEFAULT_PROFILE_ID,
+            RuntimeFileKind.Config,
+            ZeroDpiConfigToml.replaceOrAppendField(
+                storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText,
+                "AUTO_SELECT",
+                "false",
+            ),
+        )
+        val service = bindZeroDpiService()
+        pinFile(storage).writeText(
+            TargetPinCodec.encode(TargetPin(PinKind.Sni, "pinned.example.net", "1.1.1.1", 95, 1L)),
+        )
+
+        service.startZeroDpi()
+        val running = service.waitForState { it.status == RuntimeStatus.Running }
+        assertNull(running.pickSession)
+        // The pinned run must not scan at launch: the pin reaches the run
+        // config as SELECTED_SNI and the native skips its startup scan.
+        assertTrue(running.recentLogs.none { it.contains("Started sni scan") })
+        assertTrue(running.recentLogs.any { it.contains("Selected sni target pinned.example.net") })
+
+        // A network change restarts the run with the same pinned target.
+        service.requestAutomaticRestart()
+        val restarted = service.waitForState {
+            it.status == RuntimeStatus.Running &&
+                it.recentLogs.any { line -> line.contains("Relaunching ZeroDPI") }
+        }
+        val relaunchIndex = restarted.recentLogs.indexOfFirst { it.contains("Relaunching ZeroDPI") }
+        assertTrue(relaunchIndex >= 0)
+        val relaunchLines = restarted.recentLogs.drop(relaunchIndex)
+        // No scan, no pick session, and the same pinned target is selected.
+        assertNull(restarted.pickSession)
+        assertTrue(relaunchLines.none { it.contains("Started sni scan") })
+        assertTrue(relaunchLines.any { it.contains("Selected sni target pinned.example.net") })
+        // The relaunch config carried the pin as SELECTED_SNI.
+        val configPath = relaunchLines.firstNotNullOfOrNull { line ->
+            Regex("""Loaded config from (.+)\.$""").find(line)?.groupValues?.get(1)
+        }
+        assertNotNull(configPath)
+        val runConfigText = File(configPath!!).readText()
+        assertTrue(runConfigText.contains("SELECTED_SNI = \"pinned.example.net\""))
+
+        service.stopZeroDpi()
+        service.waitForState { it.status == RuntimeStatus.Stopped && it.lastExitCode == 0 }
+    }
+
+    @Test
+    fun autoSelectOffClearedPinNetworkRestartStopsInsteadOfScanning() = runBlocking {
+        val storage = RuntimeStorage(context)
+        storage.save(
+            ZeroDpiProfile.DEFAULT_PROFILE_ID,
+            RuntimeFileKind.Config,
+            ZeroDpiConfigToml.replaceOrAppendField(
+                storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText,
+                "AUTO_SELECT",
+                "false",
+            ),
+        )
+        val service = bindZeroDpiService()
+        val pin = pinFile(storage)
+        pin.writeText(
+            TargetPinCodec.encode(TargetPin(PinKind.Sni, "pinned.example.net", "1.1.1.1", 95, 1L)),
+        )
+        service.startZeroDpi()
+        service.waitForState { it.status == RuntimeStatus.Running }
+
+        // Clear pin while running, then a network change: the automatic
+        // restart must not scan on its own and must not open a pick session.
+        pin.delete()
+        service.requestAutomaticRestart()
+
+        val stopped = service.waitForState {
+            it.status == RuntimeStatus.Stopped && it.lastExitCode == 0
+        }
+        assertNull(stopped.pickSession)
+        assertTrue(stopped.recentLogs.any { it.contains("stopping after the network change") })
+        assertTrue(stopped.recentLogs.none { it.contains("Relaunching ZeroDPI") })
+        assertTrue(stopped.recentLogs.none { it.contains("Started sni scan") })
     }
 
     // ---- helpers ----

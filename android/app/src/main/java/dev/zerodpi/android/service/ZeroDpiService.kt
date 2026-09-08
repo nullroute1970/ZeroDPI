@@ -39,6 +39,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -132,6 +133,13 @@ class ZeroDpiService : Service() {
     private var pickStage: PickStage? = null
     private var pickScanMode: String? = null
     private var pickCancelRequested = false
+    // Supervised-session state: while set, an unexpected run end auto-relaunches
+    // the same run spec instead of tearing the foreground service down. The
+    // session is created by the user pressing Start and ends only on an
+    // explicit stop (or another terminal condition).
+    private var superviseSession = false
+    private var errorRestartJob: Job? = null
+    private var errorRestartAttempt = 0
 
     override fun onCreate() {
         super.onCreate()
@@ -196,6 +204,10 @@ class ZeroDpiService : Service() {
             userStopRequested = false
             restartStopInProgress = false
             automaticForceStopRequested = false
+            superviseSession = modeOverride == null
+            errorRestartJob?.cancel()
+            errorRestartJob = null
+            errorRestartAttempt = 0
             ZeroDpiRuntimeStateStore.markRuntimeActive(this@ZeroDpiService, profileId = profileId)
             runCatching {
                 runtimeStorage.startNewLogSession("runtime")
@@ -262,8 +274,12 @@ class ZeroDpiService : Service() {
             }
             val message = error.message ?: "Failed to prepare runtime storage."
             appendLog(message)
-            state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
-            finishForegroundRun()
+            if (isSessionSupervised()) {
+                scheduleErrorRestart(message, exitCode = null)
+            } else {
+                state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
+                finishForegroundRun()
+            }
             return
         }
         val profileName = runCatching {
@@ -388,8 +404,12 @@ class ZeroDpiService : Service() {
                 }
                 val message = error.message ?: "Failed to launch ZeroDPI."
                 appendLog(message)
-                state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
-                finishForegroundRun()
+                if (isSessionSupervised()) {
+                    scheduleErrorRestart(message, exitCode = null)
+                } else {
+                    state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
+                    finishForegroundRun()
+                }
             }
     }
 
@@ -427,6 +447,9 @@ class ZeroDpiService : Service() {
 
     fun stopZeroDpi() {
         userStopRequested = true
+        superviseSession = false
+        errorRestartJob?.cancel()
+        errorRestartJob = null
         clearPickSession()
         networkMonitor?.stop()
         launchJob?.cancel()
@@ -441,6 +464,9 @@ class ZeroDpiService : Service() {
 
     fun forceStopZeroDpi() {
         userStopRequested = true
+        superviseSession = false
+        errorRestartJob?.cancel()
+        errorRestartJob = null
         clearPickSession()
         networkMonitor?.stop()
         launchJob?.cancel()
@@ -470,6 +496,8 @@ class ZeroDpiService : Service() {
                 appendLog("A target pick session is already in progress.")
             }
             currentStatus in networkRestartableStatuses -> {
+                errorRestartJob?.cancel()
+                errorRestartJob = null
                 val resume = activeRunSpec ?: run {
                     appendLog("Cannot re-scan: no active run to resume.")
                     return
@@ -644,7 +672,9 @@ class ZeroDpiService : Service() {
         state.update { it.copy(pickSession = null) }
     }
 
-    internal fun requestAutomaticRestart() {
+    internal fun requestAutomaticRestart(
+        restartMessage: String = "Restarting after network change.",
+    ) {
         if (
             userStopRequested ||
             activeRunSpec == null ||
@@ -660,6 +690,8 @@ class ZeroDpiService : Service() {
         automaticForceStopRequested = false
         restartExitSignal = CompletableDeferred()
         restartStopTimeoutSignal = CompletableDeferred()
+        errorRestartJob?.cancel()
+        errorRestartJob = null
         launchJob?.cancel()
         resetRuntimeCounters()
         state.update {
@@ -676,8 +708,72 @@ class ZeroDpiService : Service() {
                 forceStopAvailable = false,
             )
         }
-        appendLog("Restarting after network change.")
+        appendLog(restartMessage)
         scope.launch { performAutomaticRestartShutdown() }
+    }
+
+    /**
+     * Test-only seam: feeds a runner event through the same handler that
+     * consumes real native-process events. Instrumented tests use it to
+     * simulate unexpected exits and failures without a device binary.
+     */
+    internal fun simulateRunnerEventForTesting(event: ZeroDpiRunnerEvent) {
+        handleRunnerEvent(event)
+    }
+
+    /**
+     * True while a user-pressed-Start session must survive unexpected run
+     * ends. Interactive pick sessions are excluded: they own their lifecycle
+     * (scan → choose → apply/resume/cancel) and are never auto-relaunched.
+     */
+    private fun isSessionSupervised(): Boolean =
+        superviseSession &&
+            activeRunSpec != null &&
+            pickSession == null &&
+            pickStage == null &&
+            !userStopRequested
+
+    /**
+     * A supervised session's run ended without the user asking for it: keep
+     * the foreground service alive, surface the reason in the service state,
+     * and relaunch the same run spec after a backoff delay. Only an explicit
+     * stop (or another terminal condition) can end the session.
+     */
+    private fun scheduleErrorRestart(reason: String, exitCode: Int?) {
+        errorRestartJob?.cancel()
+        errorRestartJob = null
+        errorRestartAttempt += 1
+        val attempt = errorRestartAttempt
+        val delayMs = AutoRestartPolicy.delayMsForAttempt(attempt)
+        val delayText = if (delayMs % 1_000L == 0L) {
+            "${delayMs / 1_000L}s"
+        } else {
+            "${delayMs}ms"
+        }
+        resetRuntimeCounters()
+        state.update {
+            it.copy(
+                status = RuntimeStatus.Restarting,
+                activeTarget = "None",
+                activeTargetScore = null,
+                scanProgress = null,
+                nextScanAtElapsedRealtimeMs = null,
+                connectionCount = 0,
+                relayBytes = 0L,
+                lastError = reason,
+                lastExitCode = exitCode,
+                forceStopAvailable = false,
+            )
+        }
+        appendLog("Auto-restarting in $delayText (attempt $attempt): $reason")
+        errorRestartJob = scope.launch {
+            delay(delayMs)
+            if (!isSessionSupervised()) {
+                return@launch
+            }
+            errorRestartJob = null
+            requestAutomaticRestart(restartMessage = "Restarting after error (attempt $attempt).")
+        }
     }
 
     fun clearLogs() {
@@ -800,6 +896,9 @@ class ZeroDpiService : Service() {
                 appendLog("Selected ${event.target} target ${displayTarget(event.sni, event.ip)}.")
             }
             is ZeroDpiRunnerEvent.ListenerStarted -> {
+                // A run that reaches Running again proves the failure was
+                // transient: reset the auto-restart escalation counter.
+                errorRestartAttempt = 0
                 state.update {
                     it.copy(
                         status = RuntimeStatus.Running,
@@ -873,6 +972,15 @@ class ZeroDpiService : Service() {
                     return
                 }
                 appendLog(event.message)
+                if (restartStopInProgress) {
+                    // An automatic-restart shutdown owns the outcome; the
+                    // Exited/StopTimedOut paths decide how the session ends.
+                    return
+                }
+                if (isSessionSupervised()) {
+                    scheduleErrorRestart(event.message, exitCode = null)
+                    return
+                }
                 state.update { it.copy(status = RuntimeStatus.Failed, lastError = event.message) }
             }
             is ZeroDpiRunnerEvent.GracefulShutdown -> {
@@ -887,6 +995,15 @@ class ZeroDpiService : Service() {
                     return
                 }
                 appendLog(event.message)
+                if (restartStopInProgress) {
+                    // An automatic-restart shutdown owns the outcome; the
+                    // Exited/StopTimedOut paths decide how the session ends.
+                    return
+                }
+                if (isSessionSupervised()) {
+                    scheduleErrorRestart(event.message, exitCode = null)
+                    return
+                }
                 state.update { it.copy(status = RuntimeStatus.Failed, lastError = event.message) }
                 finishForegroundRun()
             }
@@ -950,6 +1067,13 @@ class ZeroDpiService : Service() {
                     if (userStopRequested) {
                         finishAfterExit(event.exitCode)
                     }
+                    return
+                }
+                if (isSessionSupervised()) {
+                    scheduleErrorRestart(
+                        "ZeroDPI exited with code ${event.exitCode}.",
+                        event.exitCode,
+                    )
                     return
                 }
                 finishAfterExit(event.exitCode)
@@ -1132,6 +1256,10 @@ class ZeroDpiService : Service() {
 
     private fun finishForegroundRun() {
         clearPickSession()
+        superviseSession = false
+        errorRestartJob?.cancel()
+        errorRestartJob = null
+        errorRestartAttempt = 0
         networkMonitor?.stop()
         networkMonitor = null
         launchJob = null

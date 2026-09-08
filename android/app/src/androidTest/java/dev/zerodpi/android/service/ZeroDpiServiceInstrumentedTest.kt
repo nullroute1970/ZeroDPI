@@ -9,6 +9,7 @@ import androidx.test.rule.ServiceTestRule
 import dev.zerodpi.android.config.ZeroDpiConfigToml
 import dev.zerodpi.android.profile.ProfileRepository
 import dev.zerodpi.android.profile.ZeroDpiProfile
+import dev.zerodpi.android.runtime.ZeroDpiRunnerEvent
 import dev.zerodpi.android.storage.RuntimeFileKind
 import dev.zerodpi.android.storage.RuntimeStorage
 import kotlinx.coroutines.runBlocking
@@ -192,6 +193,140 @@ class ZeroDpiServiceInstrumentedTest {
             service.stopZeroDpi()
             service.waitForState { it.status == RuntimeStatus.Stopped && it.lastExitCode == 0 }
         }
+    }
+
+    @Test
+    fun unexpectedExitCodeAutoRestartsSupervisedSessionUntilStop() {
+        configureRootlessSupervisedSessionMode()
+        withFastAutoRestartPolicy {
+            val service = bindZeroDpiService()
+            service.ensureSessionStopped()
+            service.startZeroDpi()
+            service.waitForState { it.status == RuntimeStatus.Running }
+
+            service.simulateRunnerEventForTesting(ZeroDpiRunnerEvent.Exited(7))
+
+            val restarting = service.waitForState { it.status == RuntimeStatus.Restarting }
+            assertEquals(7, restarting.lastExitCode)
+            assertTrue(restarting.lastError?.contains("code 7") == true)
+            assertTrue(restarting.recentLogs.any { it.contains("Auto-restarting in") })
+            assertTrue(ZeroDpiRuntimeStateStore.runtimeMarker(context).active)
+
+            val running = service.waitForState {
+                it.status == RuntimeStatus.Running &&
+                    it.recentLogs.any { line -> line.startsWith("Relaunching ZeroDPI") }
+            }
+            assertEquals("sni_spoof", running.mode)
+            assertEquals("127.0.0.1:44444", running.listener)
+
+            service.stopZeroDpi()
+            service.waitForState { it.status == RuntimeStatus.Stopped && it.lastExitCode == 0 }
+        }
+    }
+
+    @Test
+    fun cleanUnexpectedExitAlsoAutoRestartsSupervisedSession() {
+        configureRootlessSupervisedSessionMode()
+        withFastAutoRestartPolicy {
+            val service = bindZeroDpiService()
+            service.ensureSessionStopped()
+            service.startZeroDpi()
+            service.waitForState { it.status == RuntimeStatus.Running }
+
+            service.simulateRunnerEventForTesting(ZeroDpiRunnerEvent.Exited(0))
+
+            service.waitForState { it.status == RuntimeStatus.Restarting }
+            service.waitForState {
+                it.status == RuntimeStatus.Running &&
+                    it.recentLogs.any { line -> line.startsWith("Relaunching ZeroDPI") }
+            }
+
+            service.stopZeroDpi()
+            service.waitForState { it.status == RuntimeStatus.Stopped && it.lastExitCode == 0 }
+        }
+    }
+
+    @Test
+    fun failedEventAutoRestartsSupervisedSessionAndKeepsErrorVisible() {
+        configureRootlessSupervisedSessionMode()
+        withFastAutoRestartPolicy {
+            val service = bindZeroDpiService()
+            service.ensureSessionStopped()
+            service.startZeroDpi()
+            service.waitForState { it.status == RuntimeStatus.Running }
+
+            service.simulateRunnerEventForTesting(
+                ZeroDpiRunnerEvent.Failed("simulated data-plane failure"),
+            )
+
+            val restarting = service.waitForState { it.status == RuntimeStatus.Restarting }
+            assertEquals("simulated data-plane failure", restarting.lastError)
+            assertTrue(restarting.recentLogs.any { it.contains("Auto-restarting in") })
+            assertTrue(ZeroDpiRuntimeStateStore.runtimeMarker(context).active)
+
+            service.waitForState {
+                it.status == RuntimeStatus.Running &&
+                    it.recentLogs.any { line -> line.startsWith("Relaunching ZeroDPI") }
+            }
+
+            service.stopZeroDpi()
+            service.waitForState { it.status == RuntimeStatus.Stopped && it.lastExitCode == 0 }
+        }
+    }
+
+    @Test
+    fun stopDuringErrorBackoffEndsSessionWithoutRelaunch() {
+        configureRootlessSupervisedSessionMode()
+        withFastAutoRestartPolicy {
+            val service = bindZeroDpiService()
+            service.ensureSessionStopped()
+            service.startZeroDpi()
+            service.waitForState { it.status == RuntimeStatus.Running }
+
+            service.simulateRunnerEventForTesting(ZeroDpiRunnerEvent.Exited(3))
+            service.waitForState { it.status == RuntimeStatus.Restarting }
+            service.stopZeroDpi()
+
+            val stopped = service.waitForState {
+                it.status == RuntimeStatus.Stopped && it.lastExitCode == 0
+            }
+            assertTrue(stopped.recentLogs.none { it.startsWith("Relaunching ZeroDPI") })
+        }
+    }
+
+    private fun <T> withFastAutoRestartPolicy(block: () -> T): T {
+        val previousBase = AutoRestartPolicy.baseDelayMs
+        val previousMax = AutoRestartPolicy.maxDelayMs
+        AutoRestartPolicy.baseDelayMs = 300L
+        AutoRestartPolicy.maxDelayMs = 2_000L
+        try {
+            return block()
+        } finally {
+            AutoRestartPolicy.baseDelayMs = previousBase
+            AutoRestartPolicy.maxDelayMs = previousMax
+        }
+    }
+
+    /**
+     * Stops whatever run earlier tests may have left alive on the shared
+     * foreground service (the suite shares one app process) so this test
+     * starts from a clean Stopped state.
+     */
+    private fun ZeroDpiService.ensureSessionStopped() {
+        stopZeroDpi()
+        waitForState { it.status == RuntimeStatus.Stopped }
+    }
+
+    private fun configureRootlessSupervisedSessionMode() = runBlocking {
+        val storage = RuntimeStorage(context)
+        val rootlessConfig = storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText
+            .replaceField("MODE", "sni_spoof")
+            .replaceField("BYPASS_METHOD", "[\"tls_frag\"]")
+            .replaceField("LISTEN_PORT", "44444")
+            // AUTO_SELECT on keeps the run out of the interactive target-pick
+            // gate so supervision tests exercise the plain main run.
+            .replaceField("AUTO_SELECT", "true")
+        storage.save(ZeroDpiProfile.DEFAULT_PROFILE_ID, RuntimeFileKind.Config, rootlessConfig)
     }
 
     private fun configureRootlessRunningMode() = runBlocking {

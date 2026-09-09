@@ -21,6 +21,7 @@ import dev.zerodpi.android.runtime.ProcessZeroDpiRunner
 import dev.zerodpi.android.runtime.RootAccessState
 import dev.zerodpi.android.runtime.RootDiagnosticReport
 import dev.zerodpi.android.runtime.RootManager
+import dev.zerodpi.android.runtime.RunnerStopResult
 import dev.zerodpi.android.runtime.SuRootManager
 import dev.zerodpi.android.runtime.ZeroDpiRunRequest
 import dev.zerodpi.android.runtime.ZeroDpiRunner
@@ -133,6 +134,14 @@ class ZeroDpiService : Service() {
     private var pickStage: PickStage? = null
     private var pickScanMode: String? = null
     private var pickCancelRequested = false
+    // Scan-watchdog state: while a supervised run's startup scan is active,
+    // the watchdog restarts the run if no scan events arrive for a long
+    // stretch. Scan events re-anchor it, so a healthy-but-slow scan is never
+    // cut short; only a wedged scanner (zero events for SCAN_STALL_TIMEOUT_MS)
+    // reaches the error-restart path. Interactive pick and test scans are not
+    // supervised and never arm it.
+    private var scanWatchdogJob: Job? = null
+    private var lastScanActivityElapsedRealtimeMs = 0L
     // Supervised-session state: while set, an unexpected run end auto-relaunches
     // the same run spec instead of tearing the foreground service down. The
     // session is created by the user pressing Start and ends only on an
@@ -450,6 +459,7 @@ class ZeroDpiService : Service() {
         superviseSession = false
         errorRestartJob?.cancel()
         errorRestartJob = null
+        cancelScanWatchdog()
         clearPickSession()
         networkMonitor?.stop()
         launchJob?.cancel()
@@ -467,6 +477,7 @@ class ZeroDpiService : Service() {
         superviseSession = false
         errorRestartJob?.cancel()
         errorRestartJob = null
+        cancelScanWatchdog()
         clearPickSession()
         networkMonitor?.stop()
         launchJob?.cancel()
@@ -672,6 +683,60 @@ class ZeroDpiService : Service() {
         state.update { it.copy(pickSession = null) }
     }
 
+    /**
+     * Arms (or re-anchors) the supervised-run scan-stall watchdog after scan
+     * activity. The watchdog waits until the scan has been silent for
+     * [SCAN_STALL_TIMEOUT_MS] and then restarts the run through the normal
+     * error-restart path. Progress events keep re-anchoring the silence
+     * deadline, so a healthy-but-slow scan is never cut short.
+     */
+    private fun pokeScanWatchdog() {
+        lastScanActivityElapsedRealtimeMs = SystemClock.elapsedRealtime()
+        if (!isScanWatchdogRelevant()) {
+            cancelScanWatchdog()
+            return
+        }
+        if (scanWatchdogJob == null) {
+            scanWatchdogJob = scope.launch {
+                while (isScanWatchdogRelevant()) {
+                    val waitMs = (SCAN_STALL_TIMEOUT_MS - scanProgressElapsed())
+                        .coerceIn(1L, SCAN_STALL_TIMEOUT_MS)
+                    delay(waitMs)
+                    if (!isScanWatchdogRelevant()) {
+                        break
+                    }
+                    if (scanProgressElapsed() >= SCAN_STALL_TIMEOUT_MS) {
+                        val scan = state.value.scanProgress?.scan
+                            .orEmpty()
+                            .ifBlank { "target" }
+                        scheduleErrorRestart(
+                            "The $scan scan made no progress for " +
+                                "${SCAN_STALL_TIMEOUT_MS / 1_000}s; restarting the run.",
+                            exitCode = null,
+                        )
+                        break
+                    }
+                }
+                scanWatchdogJob = null
+            }
+        }
+    }
+
+    private fun scanProgressElapsed(): Long {
+        val sinceActivity = SystemClock.elapsedRealtime() - lastScanActivityElapsedRealtimeMs
+        return sinceActivity.coerceAtLeast(0L)
+    }
+
+    private fun isScanWatchdogRelevant(): Boolean =
+        isSessionSupervised() &&
+            state.value.status == RuntimeStatus.Scanning &&
+            state.value.scanProgress != null
+
+    private fun cancelScanWatchdog() {
+        scanWatchdogJob?.cancel()
+        scanWatchdogJob = null
+    }
+
     internal fun requestAutomaticRestart(
         restartMessage: String = "Restarting after network change.",
     ) {
@@ -692,6 +757,7 @@ class ZeroDpiService : Service() {
         restartStopTimeoutSignal = CompletableDeferred()
         errorRestartJob?.cancel()
         errorRestartJob = null
+        cancelScanWatchdog()
         launchJob?.cancel()
         resetRuntimeCounters()
         state.update {
@@ -742,6 +808,7 @@ class ZeroDpiService : Service() {
     private fun scheduleErrorRestart(reason: String, exitCode: Int?) {
         errorRestartJob?.cancel()
         errorRestartJob = null
+        cancelScanWatchdog()
         errorRestartAttempt += 1
         val attempt = errorRestartAttempt
         val delayMs = AutoRestartPolicy.delayMsForAttempt(attempt)
@@ -846,37 +913,61 @@ class ZeroDpiService : Service() {
                 appendLog("Loaded ${event.mode} config for ${event.listenHost}:${event.listenPort}.")
             }
             is ZeroDpiRunnerEvent.ScanStarted -> {
-                val total = event.total?.let { " ($it candidates)" }.orEmpty()
-                state.update {
-                    it.copy(
-                        status = RuntimeStatus.Scanning,
-                        activeTarget = "Scanning ${event.scan}$total",
-                        activeTargetScore = null,
-                        scanProgress = ScanProgressInfo(scan = event.scan, total = event.total),
-                    )
+                if (state.value.status == RuntimeStatus.Running) {
+                    // Scan events belong to a run's startup phase, before its
+                    // listener is up. One arriving while a run is already
+                    // relaying is stale (left over from an earlier process
+                    // generation); it must never push the state back into
+                    // Scanning, because only ListenerStarted restores Running
+                    // and the UI would stay stuck on Scanning forever.
+                    appendLog("Ignoring a stale ${event.scan} scan start while ZeroDPI is running.")
+                } else {
+                    val total = event.total?.let { " ($it candidates)" }.orEmpty()
+                    state.update {
+                        it.copy(
+                            status = RuntimeStatus.Scanning,
+                            activeTarget = "Scanning ${event.scan}$total",
+                            activeTargetScore = null,
+                            scanProgress = ScanProgressInfo(scan = event.scan, total = event.total),
+                        )
+                    }
+                    appendLog("Started ${event.scan} scan$total.")
+                    pokeScanWatchdog()
                 }
-                appendLog("Started ${event.scan} scan$total.")
             }
             is ZeroDpiRunnerEvent.ScanProgress -> {
-                val progress = event.total?.let { "${event.completed}/$it" } ?: event.completed.toString()
-                state.update {
-                    it.copy(
-                        status = RuntimeStatus.Scanning,
-                        activeTarget = displayTarget(event.sni, event.ip).ifBlank { "Scanning ${event.scan}" },
-                        activeTargetScore = event.score,
-                        scanProgress = ScanProgressInfo(
-                            scan = event.scan,
-                            phase = event.phase,
-                            completed = event.completed,
-                            total = event.total,
-                        ),
-                    )
+                if (state.value.status == RuntimeStatus.Running) {
+                    // Same staleness rule as ScanStarted: progress from a scan
+                    // that is not the current run's startup scan must not
+                    // regress a live relay into Scanning.
+                    appendLog("Ignoring stale ${event.scan} scan progress while ZeroDPI is running.")
+                } else {
+                    val progress = event.total?.let { "${event.completed}/$it" } ?: event.completed.toString()
+                    state.update {
+                        it.copy(
+                            status = RuntimeStatus.Scanning,
+                            activeTarget = displayTarget(event.sni, event.ip).ifBlank { "Scanning ${event.scan}" },
+                            activeTargetScore = event.score,
+                            scanProgress = ScanProgressInfo(
+                                scan = event.scan,
+                                phase = event.phase,
+                                completed = event.completed,
+                                total = event.total,
+                            ),
+                        )
+                    }
+                    appendLog("${event.scan} scan progress: $progress.")
+                    pokeScanWatchdog()
                 }
-                appendLog("${event.scan} scan progress: $progress.")
             }
             is ZeroDpiRunnerEvent.ScanCompleted -> {
-                state.update { it.copy(scanProgress = null) }
-                appendLog("${event.scan} scan completed with ${event.results} result(s).")
+                if (state.value.status == RuntimeStatus.Running) {
+                    appendLog("Ignoring a stale ${event.scan} scan completion while ZeroDPI is running.")
+                } else {
+                    cancelScanWatchdog()
+                    state.update { it.copy(scanProgress = null) }
+                    appendLog("${event.scan} scan completed with ${event.results} result(s).")
+                }
             }
             is ZeroDpiRunnerEvent.NextScanScheduled -> {
                 state.update {
@@ -887,18 +978,25 @@ class ZeroDpiService : Service() {
                 }
             }
             is ZeroDpiRunnerEvent.SelectedTarget -> {
-                state.update {
-                    it.copy(
-                        activeTarget = displayTarget(event.sni, event.ip),
-                        activeTargetScore = event.score,
-                    )
+                if (state.value.status == RuntimeStatus.Running) {
+                    // Stale selection from an earlier run: the current run's
+                    // active target must stay as reported by the live run.
+                    appendLog("Ignoring a stale ${event.target} target selection while ZeroDPI is running.")
+                } else {
+                    state.update {
+                        it.copy(
+                            activeTarget = displayTarget(event.sni, event.ip),
+                            activeTargetScore = event.score,
+                        )
+                    }
+                    appendLog("Selected ${event.target} target ${displayTarget(event.sni, event.ip)}.")
                 }
-                appendLog("Selected ${event.target} target ${displayTarget(event.sni, event.ip)}.")
             }
             is ZeroDpiRunnerEvent.ListenerStarted -> {
                 // A run that reaches Running again proves the failure was
                 // transient: reset the auto-restart escalation counter.
                 errorRestartAttempt = 0
+                cancelScanWatchdog()
                 state.update {
                     it.copy(
                         status = RuntimeStatus.Running,
@@ -981,6 +1079,7 @@ class ZeroDpiService : Service() {
                     scheduleErrorRestart(event.message, exitCode = null)
                     return
                 }
+                cancelScanWatchdog()
                 state.update { it.copy(status = RuntimeStatus.Failed, lastError = event.message) }
             }
             is ZeroDpiRunnerEvent.GracefulShutdown -> {
@@ -1004,11 +1103,13 @@ class ZeroDpiService : Service() {
                     scheduleErrorRestart(event.message, exitCode = null)
                     return
                 }
+                cancelScanWatchdog()
                 state.update { it.copy(status = RuntimeStatus.Failed, lastError = event.message) }
                 finishForegroundRun()
             }
             is ZeroDpiRunnerEvent.Exited -> {
                 appendLog("ZeroDPI exited with code ${event.exitCode}.")
+                cancelScanWatchdog()
                 activeConnections.clear()
                 activeRelayBytes.clear()
                 when {
@@ -1109,7 +1210,17 @@ class ZeroDpiService : Service() {
     }
 
     private suspend fun performAutomaticRestartShutdown() {
-        runner.stop()
+        when (runner.stop()) {
+            RunnerStopResult.Exited -> Unit // The Exited event completes exitSignal.
+            RunnerStopResult.AlreadyExited -> {
+                // The run was already gone when this shutdown started (for
+                // example a supervised error restart whose exit event was
+                // consumed first). No further exit event will arrive, so
+                // resolve the wait immediately instead of hanging.
+                restartExitSignal?.complete(Unit)
+            }
+            RunnerStopResult.TimedOut -> Unit // StopTimedOut completes timeoutSignal.
+        }
         val exitSignal = restartExitSignal ?: return
         val timeoutSignal = restartStopTimeoutSignal ?: return
         val gracefulStopTimedOut = select {
@@ -1117,7 +1228,9 @@ class ZeroDpiService : Service() {
             timeoutSignal.onAwait { true }
         }
         if (gracefulStopTimedOut && !userStopRequested) {
-            runner.forceStop()
+            if (runner.forceStop() == RunnerStopResult.AlreadyExited) {
+                restartExitSignal?.complete(Unit)
+            }
             exitSignal.await()
         }
         if (userStopRequested || !restartStopInProgress) {
@@ -1146,6 +1259,7 @@ class ZeroDpiService : Service() {
 
     private fun finishAfterExit(exitCode: Int) {
         clearPickSession()
+        cancelScanWatchdog()
         restartStopInProgress = false
         automaticForceStopRequested = false
         restartExitSignal = null
@@ -1256,6 +1370,7 @@ class ZeroDpiService : Service() {
 
     private fun finishForegroundRun() {
         clearPickSession()
+        cancelScanWatchdog()
         superviseSession = false
         errorRestartJob?.cancel()
         errorRestartJob = null
@@ -1328,6 +1443,13 @@ class ZeroDpiService : Service() {
         private const val LOG_FLUSH_TIMEOUT_MS = 1_000L
         private const val MAX_RECENT_LOG_LINES = 12
         private const val MAX_SESSION_LOG_LINES = 500
+        // A supervised run's startup scan is wedged when no scan event
+        // (progress, completion, ...) arrives for this long. Healthy scans
+        // emit progress per completed probe (each probe is bounded by the
+        // per-probe timeout), so a silent stretch this large means the
+        // scanner cannot make progress and the run is restarted through the
+        // normal supervised error-restart path.
+        private const val SCAN_STALL_TIMEOUT_MS = 120_000L
         private val activeStatuses = setOf(
             RuntimeStatus.Starting,
             RuntimeStatus.Scanning,

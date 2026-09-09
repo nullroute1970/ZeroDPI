@@ -15,6 +15,7 @@ class FakeZeroDpiRunner(
 ) : ZeroDpiRunner {
     private val events = MutableSharedFlow<ZeroDpiRunnerEvent>(extraBufferCapacity = 32)
     private var job: Job? = null
+    private val exitEmitted = java.util.concurrent.atomic.AtomicBoolean(false)
 
     override fun events(): Flow<ZeroDpiRunnerEvent> = events.asSharedFlow()
 
@@ -23,6 +24,7 @@ class FakeZeroDpiRunner(
             events.emit(ZeroDpiRunnerEvent.Log("Fake runner is already active."))
             return
         }
+        exitEmitted.set(false)
 
         job = scope.launch {
             events.emit(ZeroDpiRunnerEvent.Starting)
@@ -56,7 +58,7 @@ class FakeZeroDpiRunner(
                 events.emit(ZeroDpiRunnerEvent.ScanCompleted(request.mode.removeSuffix("_scan"), results = 1))
                 writeScanResults(request)
                 events.emit(ZeroDpiRunnerEvent.Log("Fake ${request.mode} completed."))
-                events.emit(ZeroDpiRunnerEvent.Exited(0))
+                emitExited(0)
                 job = null
                 return@launch
             }
@@ -108,14 +110,26 @@ class FakeZeroDpiRunner(
         }
     }
 
-    override suspend fun stop() {
+    override suspend fun stop(): RunnerStopResult {
         job?.cancel()
         job = null
-        events.emit(ZeroDpiRunnerEvent.Exited(0))
+        // Mirror the real runner: the exit event is emitted at most once per
+        // run, so a stop after a natural exit reports AlreadyExited.
+        return if (emitExited(0)) RunnerStopResult.Exited else RunnerStopResult.AlreadyExited
     }
 
-    override suspend fun forceStop() {
-        stop()
+    override suspend fun forceStop(): RunnerStopResult {
+        job?.cancel()
+        job = null
+        return if (emitExited(-1)) RunnerStopResult.Exited else RunnerStopResult.AlreadyExited
+    }
+
+    private suspend fun emitExited(exitCode: Int): Boolean {
+        if (exitEmitted.compareAndSet(false, true)) {
+            events.emit(ZeroDpiRunnerEvent.Exited(exitCode))
+            return true
+        }
+        return false
     }
 
     /**

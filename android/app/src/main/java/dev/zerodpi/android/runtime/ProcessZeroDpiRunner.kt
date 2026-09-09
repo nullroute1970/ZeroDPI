@@ -241,7 +241,7 @@ class ProcessZeroDpiRunner internal constructor(
         }
     }
 
-    override suspend fun stop() {
+    override suspend fun stop(): RunnerStopResult {
         stopRequested.set(true)
         val current = dataPlaneProcess
         if (current != null) {
@@ -251,17 +251,17 @@ class ProcessZeroDpiRunner internal constructor(
             val stopped = withContext(Dispatchers.IO) { current.waitForCompat(5, TimeUnit.SECONDS) }
             if (!stopped) {
                 events.emit(ZeroDpiRunnerEvent.StopTimedOut)
-                return
+                return RunnerStopResult.TimedOut
             }
         }
         val cleanupConfirmed = stopHelperProcess()
         cleanupProcesses()
         cleanupBootstrap()
         events.emit(ZeroDpiRunnerEvent.FirewallCleanup(completed = cleanupConfirmed))
-        emitExited(0)
+        return if (emitExited(0)) RunnerStopResult.Exited else RunnerStopResult.AlreadyExited
     }
 
-    override suspend fun forceStop() {
+    override suspend fun forceStop(): RunnerStopResult {
         stopRequested.set(true)
         dataPlaneProcess?.destroyForciblyCompat()
         withContext(Dispatchers.IO) {
@@ -271,7 +271,7 @@ class ProcessZeroDpiRunner internal constructor(
         cleanupProcesses()
         cleanupBootstrap()
         events.emit(ZeroDpiRunnerEvent.FirewallCleanup(completed = cleanupConfirmed))
-        emitExited(-1)
+        return if (emitExited(-1)) RunnerStopResult.Exited else RunnerStopResult.AlreadyExited
     }
 
     private suspend fun stopHelperProcess(): Boolean {
@@ -388,10 +388,17 @@ class ProcessZeroDpiRunner internal constructor(
         }
     }
 
-    private suspend fun emitExited(exitCode: Int) {
+    /**
+     * Emits [ZeroDpiRunnerEvent.Exited] exactly once per run; returns whether
+     * this call performed the emission (false means the wait job already
+     * emitted it, so callers must not wait for another exit event).
+     */
+    private suspend fun emitExited(exitCode: Int): Boolean {
         if (exitEmitted.compareAndSet(false, true)) {
             events.emit(ZeroDpiRunnerEvent.Exited(exitCode))
+            return true
         }
+        return false
     }
 
     private fun sendSigterm(process: Process): Boolean {

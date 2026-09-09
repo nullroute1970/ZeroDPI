@@ -14,6 +14,7 @@ import dev.zerodpi.android.storage.RuntimeFileKind
 import dev.zerodpi.android.storage.RuntimeStorage
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -196,6 +197,51 @@ class ZeroDpiServiceInstrumentedTest {
     }
 
     @Test
+    fun staleScanEventsWhileRunningDoNotRegressStatusOrTarget() {
+        configureRootlessRunningMode()
+        val service = bindZeroDpiService()
+        service.startZeroDpi()
+
+        val running = service.waitForState { it.status == RuntimeStatus.Running }
+
+        // Scan events belong to a run's startup phase. Events left over from
+        // an earlier process generation (e.g. delivered while the next run is
+        // already relaying) must not push a live run back into Scanning:
+        // only ListenerStarted restores Running, so one stale event would
+        // wedge the UI on Scanning forever.
+        service.simulateRunnerEventForTesting(ZeroDpiRunnerEvent.ScanStarted("sni", total = 12))
+        service.simulateRunnerEventForTesting(
+            ZeroDpiRunnerEvent.ScanProgress(
+                scan = "sni",
+                phase = null,
+                completed = 4,
+                total = 12,
+                sni = "stale.example.net",
+                ip = "10.0.0.1",
+                score = 3,
+            ),
+        )
+        service.simulateRunnerEventForTesting(
+            ZeroDpiRunnerEvent.SelectedTarget(
+                target = "sni",
+                sni = "stale.example.net",
+                ip = "10.0.0.1",
+                score = 3,
+            ),
+        )
+
+        val stillRunning = service.waitForState {
+            it.status == RuntimeStatus.Running &&
+                it.recentLogs.any { line -> line.contains("Ignoring a stale") }
+        }
+        assertEquals(running.activeTarget, stillRunning.activeTarget)
+        assertNull(stillRunning.pickSession)
+
+        service.stopZeroDpi()
+        service.waitForState { it.status == RuntimeStatus.Stopped && it.lastExitCode == 0 }
+    }
+
+    @Test
     fun unexpectedExitCodeAutoRestartsSupervisedSessionUntilStop() {
         configureRootlessSupervisedSessionMode()
         withFastAutoRestartPolicy {
@@ -335,6 +381,10 @@ class ZeroDpiServiceInstrumentedTest {
             .replaceField("MODE", "sni_spoof")
             .replaceField("BYPASS_METHOD", "[\"tls_frag\"]")
             .replaceField("LISTEN_PORT", "44444")
+            // AUTO_SELECT on keeps the run out of the interactive target-pick
+            // gate so these tests exercise the plain main run. The gate flow
+            // has its own coverage in TargetPickServiceInstrumentedTest.
+            .replaceField("AUTO_SELECT", "true")
         storage.save(ZeroDpiProfile.DEFAULT_PROFILE_ID, RuntimeFileKind.Config, rootlessConfig)
     }
 
@@ -367,6 +417,9 @@ class ZeroDpiServiceInstrumentedTest {
             .replaceField("MODE", "sni_spoof")
             .replaceField("BYPASS_METHOD", "[\"wrong_seq\"]")
             .replaceField("LISTEN_PORT", "45666")
+            // Same as the rootless helper: exercise the plain root-required
+            // run, not the AUTO_SELECT=false interactive pick gate.
+            .replaceField("AUTO_SELECT", "true")
         storage.save(WORK_PROFILE_ID, RuntimeFileKind.Config, rootRequiredConfig)
     }
 

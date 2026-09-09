@@ -84,6 +84,38 @@ class ProcessZeroDpiRunnerTest {
     }
 
     @Test
+    fun stopAfterNaturalProcessExitReportsAlreadyExited() = runBlocking {
+        val executable = temporaryFolder.newFile("libzerodpi_exec.so")
+        val workingDirectory = temporaryFolder.newFolder("runtime")
+        val configFile = temporaryFolder.newFile("config.toml")
+        val runner = ProcessZeroDpiRunner(
+            scope = this,
+            rootManager = FakeRootManager(),
+            executableProvider = { executable },
+            processLauncher = RecordingProcessLauncher(FakeProcess()),
+        )
+
+        collectRunnerEventsUntil(
+            runner = runner,
+            complete = { collected -> collected.any { it is ZeroDpiRunnerEvent.Exited } },
+        ) {
+            runner.start(
+                ZeroDpiRunRequest(
+                    configPath = configFile.absolutePath,
+                    workingDirectory = workingDirectory.absolutePath,
+                    useRoot = false,
+                ),
+            )
+        }
+
+        // The exit event was already emitted by the process wait job, so a
+        // later stop must report AlreadyExited instead of waiting for an exit
+        // event that will never arrive (the supervised-restart deadlock).
+        assertEquals(RunnerStopResult.AlreadyExited, runner.stop())
+        assertEquals(RunnerStopResult.AlreadyExited, runner.forceStop())
+    }
+
+    @Test
     fun rootStartLaunchesOnlyHelperAsRootAndDataPlaneNormally() = runBlocking {
         val executable = temporaryFolder.newFile("libzerodpi_exec.so")
         val helperExecutable = temporaryFolder.newFile("libzerodpi_root_helper_exec.so")

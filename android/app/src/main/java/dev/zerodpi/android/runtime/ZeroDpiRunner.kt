@@ -88,9 +88,32 @@ sealed interface ZeroDpiRunnerEvent {
     data object StopTimedOut : ZeroDpiRunnerEvent
 }
 
+/**
+ * Outcome of a [ZeroDpiRunner.stop] / [ZeroDpiRunner.forceStop] call.
+ *
+ * The result tells the caller whether a fresh [ZeroDpiRunnerEvent.Exited] will
+ * still arrive on the event flow. Waiting on that event after the exit was
+ * already emitted (by the process's own wait job) would deadlock callers such
+ * as the service's automatic-restart shutdown.
+ */
+enum class RunnerStopResult {
+    /** This call emitted the [ZeroDpiRunnerEvent.Exited] event itself. */
+    Exited,
+
+    /**
+     * The [ZeroDpiRunnerEvent.Exited] event had already been emitted before
+     * this call (nothing was running, or the process's wait job won the
+     * race). No further exit event will arrive from this run.
+     */
+    AlreadyExited,
+
+    /** The process did not stop within the grace period; [ZeroDpiRunnerEvent.StopTimedOut] was emitted. */
+    TimedOut,
+}
+
 interface ZeroDpiRunner {
     fun events(): Flow<ZeroDpiRunnerEvent>
     suspend fun start(request: ZeroDpiRunRequest)
-    suspend fun stop()
-    suspend fun forceStop()
+    suspend fun stop(): RunnerStopResult
+    suspend fun forceStop(): RunnerStopResult
 }

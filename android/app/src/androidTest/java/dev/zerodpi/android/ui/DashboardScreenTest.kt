@@ -1,5 +1,6 @@
 package dev.zerodpi.android.ui
 
+import android.os.SystemClock
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
@@ -79,6 +80,35 @@ class DashboardScreenTest {
         composeRule.onNodeWithText("Target score").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText("95").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText("Next scan").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun expiredScheduleWithoutActiveRescanShowsDueInsteadOfScanning() {
+        composeRule.setContent {
+            TestDashboard(
+                serviceState = ZeroDpiServiceState(
+                    nextScanAtElapsedRealtimeMs = SystemClock.elapsedRealtime() - 1L,
+                ),
+            )
+        }
+
+        composeRule.onNodeWithText("Due").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("Scanning…").assertDoesNotExist()
+    }
+
+    @Test
+    fun explicitActiveRescanShowsScanningForExpiredSchedule() {
+        composeRule.setContent {
+            TestDashboard(
+                serviceState = ZeroDpiServiceState(
+                    nextScanAtElapsedRealtimeMs = SystemClock.elapsedRealtime() - 1L,
+                    rescanInProgress = true,
+                ),
+            )
+        }
+
+        composeRule.onNodeWithText("Scanning…").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("Due").assertDoesNotExist()
     }
 
     @Test

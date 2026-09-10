@@ -136,7 +136,10 @@ internal fun HomeScreen(
             )
             DetailRow(
                 stringResource(R.string.label_next_scan),
-                nextScanCountdown(serviceState.nextScanAtElapsedRealtimeMs),
+                nextScanCountdown(
+                    deadlineElapsedRealtimeMs = serviceState.nextScanAtElapsedRealtimeMs,
+                    rescanInProgress = serviceState.rescanInProgress,
+                ),
             )
         }
     }
@@ -381,21 +384,27 @@ private fun ReadinessCard(
 }
 
 @Composable
-private fun nextScanCountdown(deadlineElapsedRealtimeMs: Long?): String {
-    var nowElapsedRealtimeMs by remember(deadlineElapsedRealtimeMs) {
+private fun nextScanCountdown(
+    deadlineElapsedRealtimeMs: Long?,
+    rescanInProgress: Boolean,
+): String {
+    var nowElapsedRealtimeMs by remember(deadlineElapsedRealtimeMs, rescanInProgress) {
         mutableLongStateOf(SystemClock.elapsedRealtime())
     }
-    LaunchedEffect(deadlineElapsedRealtimeMs) {
-        while (isActive && deadlineElapsedRealtimeMs != null) {
+    LaunchedEffect(deadlineElapsedRealtimeMs, rescanInProgress) {
+        while (isActive && deadlineElapsedRealtimeMs != null && !rescanInProgress) {
             nowElapsedRealtimeMs = SystemClock.elapsedRealtime()
             delay(1_000)
         }
     }
 
+    if (rescanInProgress) {
+        return stringResource(R.string.next_scan_in_progress)
+    }
     val deadline = deadlineElapsedRealtimeMs
         ?: return stringResource(R.string.next_scan_not_scheduled)
     if (deadline <= nowElapsedRealtimeMs) {
-        return stringResource(R.string.next_scan_in_progress)
+        return stringResource(R.string.next_scan_due)
     }
 
     val totalSeconds = (deadline - nowElapsedRealtimeMs + 999L) / 1_000L

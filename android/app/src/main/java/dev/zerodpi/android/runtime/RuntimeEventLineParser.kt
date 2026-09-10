@@ -68,6 +68,16 @@ internal object RuntimeEventLineParser {
                 scan = stringValue(json, "scan").orEmpty(),
                 intervalSeconds = longValue(json, "interval_secs") ?: 0L,
             )
+            "rescan_started" -> ZeroDpiRunnerEvent.RescanStarted(
+                scan = stringValue(json, "scan").orEmpty(),
+            )
+            "rescan_finished" -> ZeroDpiRunnerEvent.RescanFinished(
+                scan = stringValue(json, "scan").orEmpty(),
+                found = longValue(json, "found")?.toInt() ?: 0,
+                bestScore = longValue(json, "best_score")?.toInt(),
+                durationMs = longValue(json, "duration_ms") ?: 0L,
+                switched = boolValue(json, "switched") ?: false,
+            )
             "selected_target" -> ZeroDpiRunnerEvent.SelectedTarget(
                 target = stringValue(json, "target").orEmpty(),
                 sni = stringValue(json, "sni"),

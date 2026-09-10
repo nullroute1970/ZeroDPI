@@ -1072,6 +1072,9 @@ async fn background_rescan(
             },
         );
         tokio::time::sleep(interval).await;
+        events.emit(RuntimeEvent::RescanStarted {
+            scan: ScanKind::Sni,
+        });
         if headless {
             info!(path = %path.display(), "background SNI rescan starting");
         } else {
@@ -1202,6 +1205,13 @@ async fn background_rescan(
             }
         }
         let (found, best_score) = scan_summary.unwrap_or((0, None));
+        events.emit(RuntimeEvent::RescanFinished {
+            scan: ScanKind::Sni,
+            found,
+            best_score,
+            duration_ms: scan_started.elapsed().as_millis() as u64,
+            switched,
+        });
         send_rescan_event(
             &event_tx,
             ProxyEvent::RescanFinished {
@@ -2169,6 +2179,7 @@ async fn background_ip_rescan(
             },
         );
         tokio::time::sleep(interval).await;
+        events.emit(RuntimeEvent::RescanStarted { scan: ScanKind::Ip });
         if headless {
             info!(mode = policy.mode_label, path = %ip_list_path.display(), "background IP rescan starting");
         } else {
@@ -2186,6 +2197,13 @@ async fn background_ip_rescan(
             Ok(v) => v,
             Err(e) => {
                 warn!(mode = policy.mode_label, error = %e, "background IP rescan failed to load ip_list");
+                events.emit(RuntimeEvent::RescanFinished {
+                    scan: ScanKind::Ip,
+                    found: 0,
+                    best_score: None,
+                    duration_ms: scan_started.elapsed().as_millis() as u64,
+                    switched: false,
+                });
                 send_rescan_event(
                     &event_tx,
                     ProxyEvent::RescanFinished {
@@ -2202,6 +2220,13 @@ async fn background_ip_rescan(
         if policy.ipv4_only {
             if let Err(e) = reject_ipv6_ip_candidates(&ips, policy.mode_label, &ip_list_path) {
                 warn!(mode = policy.mode_label, error = %e, "background IP rescan rejected ip_list");
+                events.emit(RuntimeEvent::RescanFinished {
+                    scan: ScanKind::Ip,
+                    found: 0,
+                    best_score: None,
+                    duration_ms: scan_started.elapsed().as_millis() as u64,
+                    switched: false,
+                });
                 send_rescan_event(
                     &event_tx,
                     ProxyEvent::RescanFinished {
@@ -2222,6 +2247,13 @@ async fn background_ip_rescan(
                 mode = policy.mode_label,
                 "background IP rescan found no working IPs"
             );
+            events.emit(RuntimeEvent::RescanFinished {
+                scan: ScanKind::Ip,
+                found: 0,
+                best_score: None,
+                duration_ms: scan_started.elapsed().as_millis() as u64,
+                switched: false,
+            });
             send_rescan_event(
                 &event_tx,
                 ProxyEvent::RescanFinished {
@@ -2259,6 +2291,13 @@ async fn background_ip_rescan(
             }
             info!(mode = policy.mode_label, old = %current, new = %best.ip, "hot-swapped active IP");
         }
+        events.emit(RuntimeEvent::RescanFinished {
+            scan: ScanKind::Ip,
+            found: entries.len(),
+            best_score: Some(best.score),
+            duration_ms: scan_started.elapsed().as_millis() as u64,
+            switched,
+        });
         send_rescan_event(
             &event_tx,
             ProxyEvent::RescanFinished {

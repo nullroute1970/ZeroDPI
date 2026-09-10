@@ -88,6 +88,16 @@ pub enum RuntimeEvent {
         scan: ScanKind,
         interval_secs: u64,
     },
+    RescanStarted {
+        scan: ScanKind,
+    },
+    RescanFinished {
+        scan: ScanKind,
+        found: usize,
+        best_score: Option<u8>,
+        duration_ms: u64,
+        switched: bool,
+    },
     SelectedTarget {
         target: TargetKind,
         sni: Option<String>,
@@ -170,6 +180,33 @@ mod tests {
         assert_eq!(
             json,
             r#"{"event":"next_scan_scheduled","scan":"sni","interval_secs":300}"#,
+        );
+    }
+
+    #[test]
+    fn serializes_rescan_started() {
+        let json = serde_json::to_string(&RuntimeEvent::RescanStarted {
+            scan: ScanKind::Sni,
+        })
+        .unwrap();
+
+        assert_eq!(json, r#"{"event":"rescan_started","scan":"sni"}"#);
+    }
+
+    #[test]
+    fn serializes_rescan_finished_summary() {
+        let json = serde_json::to_string(&RuntimeEvent::RescanFinished {
+            scan: ScanKind::Ip,
+            found: 4,
+            best_score: Some(91),
+            duration_ms: 2_300,
+            switched: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"event":"rescan_finished","scan":"ip","found":4,"best_score":91,"duration_ms":2300,"switched":true}"#,
         );
     }
 }

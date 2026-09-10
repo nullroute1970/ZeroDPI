@@ -1380,7 +1380,7 @@ Android process-wrapper runners should start ZeroDPI without the terminal UI:
 zerodpi --config <path> --no-tui --auto-select --json-events
 ```
 
-`--json-events` emits newline-delimited JSON to stdout and leaves human logs on stderr. It implies `--no-tui`, so the stream remains parseable for app controllers. Event names include `startup`, `config_loaded`, `scan_started`, `scan_progress`, `scan_completed`, `selected_target`, `listener_started`, `connection_accepted`, `bypass_finished`, `relay_bytes`, `active_target_changed`, `root_required`, `fatal_error`, and `graceful_shutdown`.
+`--json-events` emits newline-delimited JSON to stdout and leaves human logs on stderr. It implies `--no-tui`, so the stream remains parseable for app controllers. Event names include `startup`, `config_loaded`, `scan_started`, `scan_progress`, `scan_completed`, `next_scan_scheduled`, `rescan_started`, `rescan_finished`, `selected_target`, `listener_started`, `connection_accepted`, `bypass_finished`, `relay_bytes`, `active_target_changed`, `root_required`, `fatal_error`, and `graceful_shutdown`.
 
 To stop a headless run, send `SIGTERM` and wait for ZeroDPI to exit. On Linux/Android NFQUEUE paths, ZeroDPI requests interceptor shutdown before returning so firewall guards can clean up. A controller may kill the process only after its own timeout. Exit code `0` means a scan completed or a headless proxy stopped cleanly; non-zero means the controller should show the error and retain stderr/stdout logs. If root is required but unavailable, the JSON stream includes `root_required` with rootless alternatives.
 

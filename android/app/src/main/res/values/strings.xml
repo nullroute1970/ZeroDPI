@@ -118,6 +118,7 @@
     <string name="label_next_scan">Next scan</string>
     <string name="next_scan_not_scheduled">Not scheduled</string>
     <string name="next_scan_in_progress">Scanning…</string>
+    <string name="next_scan_due">Due</string>
     <string name="value_not_available">—</string>
     <string name="label_connections">Connections</string>
     <string name="label_relay_bytes">Relayed bytes</string>

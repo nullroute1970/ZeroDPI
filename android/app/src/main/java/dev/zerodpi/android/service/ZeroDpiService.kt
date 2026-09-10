@@ -99,6 +99,7 @@ data class ZeroDpiServiceState(
     val activeTargetScore: Int? = null,
     val scanProgress: ScanProgressInfo? = null,
     val nextScanAtElapsedRealtimeMs: Long? = null,
+    val rescanInProgress: Boolean = false,
     val connectionCount: Int = 0,
     val relayBytes: Long = 0L,
     val lastError: String? = null,
@@ -233,6 +234,7 @@ class ZeroDpiService : Service() {
                     activeTargetScore = null,
                     scanProgress = null,
                     nextScanAtElapsedRealtimeMs = null,
+                    rescanInProgress = false,
                     connectionCount = 0,
                     relayBytes = 0L,
                     lastError = null,
@@ -360,6 +362,7 @@ class ZeroDpiService : Service() {
                 activeTargetScore = null,
                 scanProgress = null,
                 nextScanAtElapsedRealtimeMs = null,
+                rescanInProgress = false,
                 connectionCount = 0,
                 relayBytes = 0L,
                 lastError = null,
@@ -471,7 +474,14 @@ class ZeroDpiService : Service() {
         networkMonitor?.stop()
         launchJob?.cancel()
         ZeroDpiRuntimeStateStore.markRuntimeActive(this, activeRunSpec?.profileId)
-        state.update { it.copy(status = RuntimeStatus.Stopping, forceStopAvailable = false) }
+        state.update {
+            it.copy(
+                status = RuntimeStatus.Stopping,
+                nextScanAtElapsedRealtimeMs = null,
+                rescanInProgress = false,
+                forceStopAvailable = false,
+            )
+        }
         if (!restartStopInProgress) {
             scope.launch {
                 // A run whose exit was already reported (or that was abandoned
@@ -494,7 +504,14 @@ class ZeroDpiService : Service() {
         networkMonitor?.stop()
         launchJob?.cancel()
         ZeroDpiRuntimeStateStore.markRuntimeActive(this, activeRunSpec?.profileId)
-        state.update { it.copy(status = RuntimeStatus.Stopping, forceStopAvailable = false) }
+        state.update {
+            it.copy(
+                status = RuntimeStatus.Stopping,
+                nextScanAtElapsedRealtimeMs = null,
+                rescanInProgress = false,
+                forceStopAvailable = false,
+            )
+        }
         scope.launch {
             if (runner.forceStop() == RunnerStopResult.AlreadyExited) {
                 finishAfterExit(-1)
@@ -542,6 +559,8 @@ class ZeroDpiService : Service() {
                         activeTarget = "None",
                         activeTargetScore = null,
                         scanProgress = null,
+                        nextScanAtElapsedRealtimeMs = null,
+                        rescanInProgress = false,
                     )
                 }
                 appendLog("Stopping to scan for a new target.")
@@ -819,6 +838,7 @@ class ZeroDpiService : Service() {
                 activeTargetScore = null,
                 scanProgress = null,
                 nextScanAtElapsedRealtimeMs = null,
+                rescanInProgress = false,
                 connectionCount = 0,
                 relayBytes = 0L,
                 lastError = null,
@@ -886,6 +906,7 @@ class ZeroDpiService : Service() {
                 activeTargetScore = null,
                 scanProgress = null,
                 nextScanAtElapsedRealtimeMs = null,
+                rescanInProgress = false,
                 connectionCount = 0,
                 relayBytes = 0L,
                 lastError = reason,
@@ -941,6 +962,8 @@ class ZeroDpiService : Service() {
                     it.copy(
                         status = RuntimeStatus.Starting,
                         lastError = null,
+                        nextScanAtElapsedRealtimeMs = null,
+                        rescanInProgress = false,
                         forceStopAvailable = false,
                     )
                 }
@@ -1035,10 +1058,30 @@ class ZeroDpiService : Service() {
                 }
             }
             is ZeroDpiRunnerEvent.NextScanScheduled -> {
-                state.update {
-                    it.copy(
-                        nextScanAtElapsedRealtimeMs =
-                            SystemClock.elapsedRealtime() + event.intervalSeconds * 1_000L,
+                if (acceptsBackgroundRescanEvent()) {
+                    state.update {
+                        it.copy(
+                            nextScanAtElapsedRealtimeMs =
+                                SystemClock.elapsedRealtime() + event.intervalSeconds * 1_000L,
+                        )
+                    }
+                }
+            }
+            is ZeroDpiRunnerEvent.RescanStarted -> {
+                if (acceptsBackgroundRescanEvent()) {
+                    state.update { it.copy(rescanInProgress = true) }
+                } else {
+                    appendLog(
+                        "Ignoring a stale ${event.scan} rescan start while ZeroDPI is inactive.",
+                    )
+                }
+            }
+            is ZeroDpiRunnerEvent.RescanFinished -> {
+                if (acceptsBackgroundRescanEvent()) {
+                    state.update { it.copy(rescanInProgress = false) }
+                } else {
+                    appendLog(
+                        "Ignoring a stale ${event.scan} rescan completion while ZeroDPI is inactive.",
                     )
                 }
             }
@@ -1126,6 +1169,8 @@ class ZeroDpiService : Service() {
                         status = RuntimeStatus.Failed,
                         rootStatus = rootStatus,
                         lastError = event.message,
+                        nextScanAtElapsedRealtimeMs = null,
+                        rescanInProgress = false,
                     )
                 }
             }
@@ -1145,7 +1190,14 @@ class ZeroDpiService : Service() {
                     return
                 }
                 cancelStartupWatchdog()
-                state.update { it.copy(status = RuntimeStatus.Failed, lastError = event.message) }
+                state.update {
+                    it.copy(
+                        status = RuntimeStatus.Failed,
+                        lastError = event.message,
+                        nextScanAtElapsedRealtimeMs = null,
+                        rescanInProgress = false,
+                    )
+                }
             }
             is ZeroDpiRunnerEvent.GracefulShutdown -> {
                 appendLog("Graceful shutdown: ${event.reason}.")
@@ -1169,7 +1221,14 @@ class ZeroDpiService : Service() {
                     return
                 }
                 cancelStartupWatchdog()
-                state.update { it.copy(status = RuntimeStatus.Failed, lastError = event.message) }
+                state.update {
+                    it.copy(
+                        status = RuntimeStatus.Failed,
+                        lastError = event.message,
+                        nextScanAtElapsedRealtimeMs = null,
+                        rescanInProgress = false,
+                    )
+                }
                 finishForegroundRun()
             }
             is ZeroDpiRunnerEvent.Exited -> {
@@ -1336,6 +1395,7 @@ class ZeroDpiService : Service() {
                 activeTarget = if (exitCode == 0) "None" else it.activeTarget,
                 activeTargetScore = if (exitCode == 0) null else it.activeTargetScore,
                 nextScanAtElapsedRealtimeMs = null,
+                rescanInProgress = false,
                 connectionCount = 0,
                 lastExitCode = exitCode,
                 forceStopAvailable = false,
@@ -1351,6 +1411,8 @@ class ZeroDpiService : Service() {
                 status = RuntimeStatus.Failed,
                 rootStatus = rootStatus,
                 lastError = message,
+                nextScanAtElapsedRealtimeMs = null,
+                rescanInProgress = false,
                 forceStopAvailable = false,
             )
         }
@@ -1377,6 +1439,22 @@ class ZeroDpiService : Service() {
         report.skipped.forEach { message ->
             appendLog(message)
         }
+    }
+
+    private fun acceptsBackgroundRescanEvent(): Boolean = when (state.value.status) {
+        RuntimeStatus.Stopped,
+        RuntimeStatus.Restarting,
+        RuntimeStatus.Stopping,
+        RuntimeStatus.Failed,
+        -> false
+
+        RuntimeStatus.Starting,
+        RuntimeStatus.Scanning,
+        RuntimeStatus.Running,
+        -> true
+
+        RuntimeStatus.Choosing,
+        -> false
     }
 
     private fun appendLog(message: String) {

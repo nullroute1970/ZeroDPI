@@ -46,6 +46,16 @@ sealed interface ZeroDpiRunnerEvent {
         val scan: String,
         val intervalSeconds: Long,
     ) : ZeroDpiRunnerEvent
+    data class RescanStarted(
+        val scan: String,
+    ) : ZeroDpiRunnerEvent
+    data class RescanFinished(
+        val scan: String,
+        val found: Int,
+        val bestScore: Int?,
+        val durationMs: Long,
+        val switched: Boolean,
+    ) : ZeroDpiRunnerEvent
     data class SelectedTarget(
         val target: String,
         val sni: String?,

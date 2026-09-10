@@ -25,6 +25,7 @@ private const val ROOT_HELPER_EXECUTABLE_NAME = "libzerodpi_root_helper_exec.so"
 private const val SESSION_PROOF_BYTES = 32
 private const val HELPER_READY_TIMEOUT_MS = 10_000L
 private const val HELPER_EXIT_STATUS_WAIT_MS = 250L
+private const val ABANDON_KILL_WAIT_MS = 2_000L
 private const val MAX_HELPER_STARTUP_LINES = 8
 private const val MAX_HELPER_STARTUP_LINE_LENGTH = 240
 
@@ -89,7 +90,16 @@ class ProcessZeroDpiRunner internal constructor(
 
     override suspend fun start(request: ZeroDpiRunRequest) {
         if (dataPlaneProcess?.isAliveCompat() == true || helperProcess?.isAliveCompat() == true) {
-            events.emit(ZeroDpiRunnerEvent.Log("ZeroDPI process is already active."))
+            // The service only launches when it believes nothing is running.
+            // Reaching this branch means a previous generation survived (a
+            // wedged process, a state restored after a service restart): report
+            // a failure so the caller recovers instead of waiting forever for
+            // events a process that never started cannot emit.
+            events.emit(
+                ZeroDpiRunnerEvent.Failed(
+                    "A ZeroDPI process from a previous run is still active.",
+                ),
+            )
             return
         }
 
@@ -272,6 +282,35 @@ class ProcessZeroDpiRunner internal constructor(
         cleanupBootstrap()
         events.emit(ZeroDpiRunnerEvent.FirewallCleanup(completed = cleanupConfirmed))
         return if (emitExited(-1)) RunnerStopResult.Exited else RunnerStopResult.AlreadyExited
+    }
+
+    override suspend fun abandon() {
+        stopRequested.set(true)
+        // Mark the run's exit as already reported before anything is killed:
+        // the wait job may already be on its way to emit it.
+        exitEmitted.set(true)
+
+        // Cancel the reporting jobs first so the process death below cannot be
+        // reported as this run's exit event.
+        outputJob?.cancel()
+        outputJob = null
+        waitJob?.cancel()
+        waitJob = null
+        helperOutputJob?.cancel()
+        helperOutputJob = null
+        helperWaitJob?.cancel()
+        helperWaitJob = null
+
+        val dataPlane = dataPlaneProcess
+        dataPlaneProcess = null
+        nativeProcessPid = null
+        dataPlane?.destroyForciblyCompat()
+        withContext(Dispatchers.IO) {
+            dataPlane?.waitForCompat(ABANDON_KILL_WAIT_MS, TimeUnit.MILLISECONDS)
+        }
+
+        stopHelperProcess()
+        cleanupBootstrap()
     }
 
     private suspend fun stopHelperProcess(): Boolean {

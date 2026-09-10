@@ -42,6 +42,19 @@ while running (gracefully restarts the data plane with the new pick) plus
 **Clear pin** to return to scan-and-ask behavior. Pins are per profile and are
 never included in support bundles or profile exports.
 
+### Run supervision
+
+Every run the app launches is supervised. An unexpected end (failure event or
+an exit the user did not ask for) relaunches the same run spec with a 1 s
+doubling backoff capped at 60 s, and a run that stops reporting events is
+treated the same way: `RunStartupWatchdogPolicy` counts silence per phase
+(two minutes while a scan is reporting progress, four minutes for the phases
+around it, which cover helper handshake, interceptor setup, LOW_TTL discovery,
+and listener bring-up). The watchdog kills the wedged child process and then
+recovers — restart for a supervised run, an inline failure for an interactive
+pick scan, a failed test scan otherwise — so the UI cannot stay on Starting or
+Scanning forever. The reason is written to the session log and to `lastError`.
+
 ## Build
 
 From the repository root:

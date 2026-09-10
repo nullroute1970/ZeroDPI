@@ -1475,6 +1475,16 @@ time. The chosen target is stored app-side per profile and injected into an
 ephemeral run config on the next start — `config.toml` is never rewritten,
 and **Clear pin** returns to scan-and-ask behavior.
 
+The app supervises every run it starts. A run that ends unexpectedly is
+relaunched with a backoff (1 s doubling to 60 s) until you press Stop, and a
+run that goes silent is recovered the same way: nothing reports progress for
+two minutes during a scan (four minutes after one) means the child process is
+wedged, so the app kills it and restarts — or fails the scan with the reason
+shown on Home and in Live logs. The visible state therefore never stays on
+Starting or Scanning forever; if it keeps returning to Scanning, check the log
+line that accompanies the restart (for example `no reachable SNI candidates
+found`) before blaming the app.
+
 ---
 
 ## 🔨 Building from Source
@@ -1665,6 +1675,7 @@ Unit tests cover:
 | Android app remote update is unavailable | In Settings -> `Remote update`, configure all three absolute `http://` or `https://` URLs. Stop ZeroDPI first; profile switching and remote updates are blocked while the runtime is active. |
 | Android app remote update fails | Check Settings -> `Remote update` for `Last attempt`, `Last success`, `Last update`, and the message below them. HTTP errors, DNS/TLS failures, unsupported redirects, empty responses, and size-limit failures leave local profile files unchanged. |
 | Android app remote update downloads but does not apply | The downloaded `config.toml`, `sni_list.txt`, or `ip_list.txt` failed validation. Fix the remote source, or disable automatic update and reset/edit the affected active-profile file locally. |
+| Android app stays on Scanning | Healthy scans report progress per probe and the app recovers a silent run on its own (restart for a run, an inline failure for a pick scan). Read Live logs: a repeated `no reachable SNI candidates found` means the candidates are blocked on the current network, so refresh `sni_list.txt`, raise `SCAN_TIMEOUT_SECS`, or pick a pinned target instead. |
 
 Use `RUST_LOG=debug` when collecting detailed diagnostics:
 

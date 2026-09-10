@@ -116,4 +116,17 @@ interface ZeroDpiRunner {
     suspend fun start(request: ZeroDpiRunRequest)
     suspend fun stop(): RunnerStopResult
     suspend fun forceStop(): RunnerStopResult
+
+    /**
+     * Kills whatever this runner still has running without emitting any event.
+     *
+     * [ZeroDpiService] calls this when it gives up on a run whose process went
+     * silent: that run's bookkeeping is already resolved, so a late
+     * [ZeroDpiRunnerEvent.Exited] would only overwrite the failure the service
+     * published, and a surviving child would block the next launch.
+     * Implementations must make sure no event from the abandoned run reaches
+     * [events], and that a later [stop] reports [RunnerStopResult.AlreadyExited]
+     * instead of waiting for an exit event that will never arrive.
+     */
+    suspend fun abandon()
 }

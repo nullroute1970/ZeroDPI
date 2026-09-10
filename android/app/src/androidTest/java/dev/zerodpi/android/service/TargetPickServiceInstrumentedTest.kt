@@ -46,9 +46,7 @@ class TargetPickServiceInstrumentedTest {
     @Test
     fun startGateRunsPickScanThenApplyingPickStartsPinnedRun() = runBlocking {
         val storage = RuntimeStorage(context)
-        val config = storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText
-            .let { ZeroDpiConfigToml.replaceOrAppendField(it, "AUTO_SELECT", "false") }
-        storage.save(ZeroDpiProfile.DEFAULT_PROFILE_ID, RuntimeFileKind.Config, config)
+        configurePickFlowConfig(autoSelect = "false")
         val service = bindZeroDpiService()
 
         service.startZeroDpi() // gate fires: scan, not run
@@ -73,15 +71,7 @@ class TargetPickServiceInstrumentedTest {
     @Test
     fun cancelFromStartGateStopsWithoutStarting() = runBlocking {
         val storage = RuntimeStorage(context)
-        storage.save(
-            ZeroDpiProfile.DEFAULT_PROFILE_ID,
-            RuntimeFileKind.Config,
-            ZeroDpiConfigToml.replaceOrAppendField(
-                storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText,
-                "AUTO_SELECT",
-                "false",
-            ),
-        )
+        configurePickFlowConfig(autoSelect = "false")
         val service = bindZeroDpiService()
         service.startZeroDpi()
         service.waitForState { it.status == RuntimeStatus.Choosing }
@@ -97,9 +87,7 @@ class TargetPickServiceInstrumentedTest {
     @Test
     fun midRunRescanStopsScansAndRelaunchesAfterPick() = runBlocking {
         val storage = RuntimeStorage(context)
-        val config = storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText
-            .let { ZeroDpiConfigToml.replaceOrAppendField(it, "AUTO_SELECT", "false") }
-        storage.save(ZeroDpiProfile.DEFAULT_PROFILE_ID, RuntimeFileKind.Config, config)
+        configurePickFlowConfig(autoSelect = "false")
         val service = bindZeroDpiService()
         // Seed a pin so the initial start runs directly.
         pinFile(storage).writeText(
@@ -125,15 +113,7 @@ class TargetPickServiceInstrumentedTest {
     @Test
     fun cancelMidRunRescanRelaunchesPreviousRun() = runBlocking {
         val storage = RuntimeStorage(context)
-        storage.save(
-            ZeroDpiProfile.DEFAULT_PROFILE_ID,
-            RuntimeFileKind.Config,
-            ZeroDpiConfigToml.replaceOrAppendField(
-                storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText,
-                "AUTO_SELECT",
-                "false",
-            ),
-        )
+        configurePickFlowConfig(autoSelect = "false")
         val service = bindZeroDpiService()
         pinFile(storage).writeText(
             TargetPinCodec.encode(TargetPin(PinKind.Sni, "cloudflare.com", "1.1.1.1", 95, 1L)),
@@ -167,17 +147,9 @@ class TargetPickServiceInstrumentedTest {
     }
 
     @Test
-    fun autoSelectOffPinnedRunNetworkRestartKeepsPinnedTargetWithoutScan() = runBlocking {
+    fun autoSelectOffPinnedRunNetworkRestartKeepsPinnedTargetWithoutScan() = runBlocking<Unit> {
         val storage = RuntimeStorage(context)
-        storage.save(
-            ZeroDpiProfile.DEFAULT_PROFILE_ID,
-            RuntimeFileKind.Config,
-            ZeroDpiConfigToml.replaceOrAppendField(
-                storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText,
-                "AUTO_SELECT",
-                "false",
-            ),
-        )
+        configurePickFlowConfig(autoSelect = "false")
         val service = bindZeroDpiService()
         pinFile(storage).writeText(
             TargetPinCodec.encode(TargetPin(PinKind.Sni, "pinned.example.net", "1.1.1.1", 95, 1L)),
@@ -219,15 +191,7 @@ class TargetPickServiceInstrumentedTest {
     @Test
     fun autoSelectOffClearedPinNetworkRestartStopsInsteadOfScanning() = runBlocking {
         val storage = RuntimeStorage(context)
-        storage.save(
-            ZeroDpiProfile.DEFAULT_PROFILE_ID,
-            RuntimeFileKind.Config,
-            ZeroDpiConfigToml.replaceOrAppendField(
-                storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText,
-                "AUTO_SELECT",
-                "false",
-            ),
-        )
+        configurePickFlowConfig(autoSelect = "false")
         val service = bindZeroDpiService()
         val pin = pinFile(storage)
         pin.writeText(
@@ -258,6 +222,21 @@ class TargetPickServiceInstrumentedTest {
         File(repositoryFiles.runtimeDir, TargetScanFiles.PIN_FILE_NAME).delete()
         storage.deletePickScanResults(ZeroDpiProfile.DEFAULT_PROFILE_ID)
         storage.clearLogs()
+    }
+
+    /**
+     * Writes the default profile config the pick tests run against. The run
+     * mode keeps a socket-only bypass method so the whole flow stays rootless:
+     * the pick scan never needs root, but the follow-up run would otherwise be
+     * rejected before the runner starts on unrooted devices.
+     */
+    private suspend fun configurePickFlowConfig(autoSelect: String) {
+        val storage = RuntimeStorage(context)
+        val config = storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText
+            .let { ZeroDpiConfigToml.replaceOrAppendField(it, "MODE", "sni_spoof") }
+            .let { ZeroDpiConfigToml.replaceOrAppendField(it, "BYPASS_METHOD", "[\"tls_frag\"]") }
+            .let { ZeroDpiConfigToml.replaceOrAppendField(it, "AUTO_SELECT", autoSelect) }
+        storage.save(ZeroDpiProfile.DEFAULT_PROFILE_ID, RuntimeFileKind.Config, config)
     }
 
     private suspend fun pinFile(storage: RuntimeStorage): File {

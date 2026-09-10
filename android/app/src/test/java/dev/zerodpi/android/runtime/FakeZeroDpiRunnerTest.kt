@@ -84,6 +84,28 @@ class FakeZeroDpiRunnerTest {
         assertTrue(events.any { it is ZeroDpiRunnerEvent.ScanCompleted })
     }
 
+    @Test
+    fun abandonedRunReportsNoExitAndMakesLaterStopReportAlreadyExited() = runBlocking {
+        val runner = FakeZeroDpiRunner(this)
+        val events = collectEvents(runner) { collected ->
+            runner.start(relayRequest())
+            withTimeout(5_000) {
+                while (collected.none { it is ZeroDpiRunnerEvent.ListenerStarted }) {
+                    delay(10)
+                }
+            }
+
+            // The service abandons a run whose process went silent: that run
+            // is already resolved app-side, so its exit event must never show
+            // up (it would overwrite the published failure).
+            runner.abandon()
+            delay(50)
+            assertEquals(RunnerStopResult.AlreadyExited, runner.stop())
+        }
+
+        assertEquals(0, events.count { it is ZeroDpiRunnerEvent.Exited })
+    }
+
     private fun relayRequest(): ZeroDpiRunRequest {
         val config = File(temporaryFolder.root, "relay-config.toml").apply {
             writeText("AUTO_SELECT = true\nSELECTED_SNI = \"pinned.example.net\"\n")

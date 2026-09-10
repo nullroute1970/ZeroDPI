@@ -134,14 +134,16 @@ class ZeroDpiService : Service() {
     private var pickStage: PickStage? = null
     private var pickScanMode: String? = null
     private var pickCancelRequested = false
-    // Scan-watchdog state: while a supervised run's startup scan is active,
-    // the watchdog restarts the run if no scan events arrive for a long
-    // stretch. Scan events re-anchor it, so a healthy-but-slow scan is never
-    // cut short; only a wedged scanner (zero events for SCAN_STALL_TIMEOUT_MS)
-    // reaches the error-restart path. Interactive pick and test scans are not
-    // supervised and never arm it.
-    private var scanWatchdogJob: Job? = null
-    private var lastScanActivityElapsedRealtimeMs = 0L
+    // Run-startup watchdog state: while a launched run is still in its
+    // Starting/Scanning phase, the watchdog recovers the run when the child
+    // process stops reporting events for the whole budget of that phase. Every
+    // runner event re-anchors it, so a healthy-but-slow run is never cut
+    // short; only a wedged child (frozen by the OS, blocked in a syscall, or
+    // dead without an exit event) trips it. It also covers the window between
+    // the end of the startup scan and the listener coming up, and interactive
+    // pick scans, which no other timer watches.
+    private var startupWatchdogJob: Job? = null
+    private var lastRunEventElapsedRealtimeMs = 0L
     // Supervised-session state: while set, an unexpected run end auto-relaunches
     // the same run spec instead of tearing the foreground service down. The
     // session is created by the user pressing Start and ends only on an
@@ -406,20 +408,25 @@ class ZeroDpiService : Service() {
             listenHost = listenHost,
             listenPort = listenPort.toIntOrNull() ?: 0,
         )
-        runCatching { runner.start(request) }
-            .onFailure { error ->
-                if (error is CancellationException) {
-                    throw error
-                }
-                val message = error.message ?: "Failed to launch ZeroDPI."
-                appendLog(message)
-                if (isSessionSupervised()) {
-                    scheduleErrorRestart(message, exitCode = null)
-                } else {
-                    state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
-                    finishForegroundRun()
-                }
+        val launch = runCatching { runner.start(request) }
+        launch.onFailure { error ->
+            if (error is CancellationException) {
+                throw error
             }
+            val message = error.message ?: "Failed to launch ZeroDPI."
+            appendLog(message)
+            if (isSessionSupervised()) {
+                scheduleErrorRestart(message, exitCode = null)
+            } else {
+                state.update { it.copy(status = RuntimeStatus.Failed, lastError = message) }
+                finishForegroundRun()
+            }
+        }
+        if (launch.isSuccess) {
+            // From here on the run has to prove it is alive by reporting
+            // events; the watchdog recovers the session if it goes silent.
+            noteRunActivity()
+        }
     }
 
     fun runRootDiagnostics(
@@ -459,7 +466,7 @@ class ZeroDpiService : Service() {
         superviseSession = false
         errorRestartJob?.cancel()
         errorRestartJob = null
-        cancelScanWatchdog()
+        cancelStartupWatchdog()
         clearPickSession()
         networkMonitor?.stop()
         launchJob?.cancel()
@@ -467,7 +474,12 @@ class ZeroDpiService : Service() {
         state.update { it.copy(status = RuntimeStatus.Stopping, forceStopAvailable = false) }
         if (!restartStopInProgress) {
             scope.launch {
-                runner.stop()
+                // A run whose exit was already reported (or that was abandoned
+                // because it went silent) emits nothing further: resolve the
+                // stop here so the UI cannot stay on Stopping forever.
+                if (runner.stop() == RunnerStopResult.AlreadyExited) {
+                    finishAfterExit(0)
+                }
             }
         }
     }
@@ -477,14 +489,16 @@ class ZeroDpiService : Service() {
         superviseSession = false
         errorRestartJob?.cancel()
         errorRestartJob = null
-        cancelScanWatchdog()
+        cancelStartupWatchdog()
         clearPickSession()
         networkMonitor?.stop()
         launchJob?.cancel()
         ZeroDpiRuntimeStateStore.markRuntimeActive(this, activeRunSpec?.profileId)
         state.update { it.copy(status = RuntimeStatus.Stopping, forceStopAvailable = false) }
         scope.launch {
-            runner.forceStop()
+            if (runner.forceStop() == RunnerStopResult.AlreadyExited) {
+                finishAfterExit(-1)
+            }
         }
     }
 
@@ -684,57 +698,95 @@ class ZeroDpiService : Service() {
     }
 
     /**
-     * Arms (or re-anchors) the supervised-run scan-stall watchdog after scan
-     * activity. The watchdog waits until the scan has been silent for
-     * [SCAN_STALL_TIMEOUT_MS] and then restarts the run through the normal
-     * error-restart path. Progress events keep re-anchoring the silence
-     * deadline, so a healthy-but-slow scan is never cut short.
+     * Arms (or re-anchors) the run-startup watchdog. Called when a run is
+     * launched and after every runner event, so the silence budget always
+     * counts from the last sign of life of the child process.
      */
-    private fun pokeScanWatchdog() {
-        lastScanActivityElapsedRealtimeMs = SystemClock.elapsedRealtime()
-        if (!isScanWatchdogRelevant()) {
-            cancelScanWatchdog()
+    private fun noteRunActivity() {
+        lastRunEventElapsedRealtimeMs = SystemClock.elapsedRealtime()
+        if (!isStartupWatchdogRelevant()) {
+            cancelStartupWatchdog()
             return
         }
-        if (scanWatchdogJob == null) {
-            scanWatchdogJob = scope.launch {
-                while (isScanWatchdogRelevant()) {
-                    val waitMs = (SCAN_STALL_TIMEOUT_MS - scanProgressElapsed())
-                        .coerceIn(1L, SCAN_STALL_TIMEOUT_MS)
+        if (startupWatchdogJob == null) {
+            startupWatchdogJob = scope.launch {
+                while (isStartupWatchdogRelevant()) {
+                    val waitMs = RunStartupWatchdogPolicy.waitMs(
+                        nowMs = SystemClock.elapsedRealtime(),
+                        lastEventMs = lastRunEventElapsedRealtimeMs,
+                        scanActive = state.value.scanProgress != null,
+                    )
                     delay(waitMs)
-                    if (!isScanWatchdogRelevant()) {
+                    if (!isStartupWatchdogRelevant()) {
                         break
                     }
-                    if (scanProgressElapsed() >= SCAN_STALL_TIMEOUT_MS) {
-                        val scan = state.value.scanProgress?.scan
-                            .orEmpty()
-                            .ifBlank { "target" }
-                        scheduleErrorRestart(
-                            "The $scan scan made no progress for " +
-                                "${SCAN_STALL_TIMEOUT_MS / 1_000}s; restarting the run.",
-                            exitCode = null,
-                        )
-                        break
-                    }
+                    val message = RunStartupWatchdogPolicy.stallMessage(
+                        nowMs = SystemClock.elapsedRealtime(),
+                        lastEventMs = lastRunEventElapsedRealtimeMs,
+                        scanActive = state.value.scanProgress != null,
+                        scan = state.value.scanProgress?.scan,
+                    ) ?: continue
+                    handleRunStartupStall(message)
+                    break
                 }
-                scanWatchdogJob = null
+                startupWatchdogJob = null
             }
         }
     }
 
-    private fun scanProgressElapsed(): Long {
-        val sinceActivity = SystemClock.elapsedRealtime() - lastScanActivityElapsedRealtimeMs
-        return sinceActivity.coerceAtLeast(0L)
+    /**
+     * A launched run is still in its startup phase but its process went
+     * silent: kill the wedged child and recover, so the UI never stays on
+     * Starting/Scanning forever. Supervised sessions auto-restart, interactive
+     * pick scans fail with the reason (and resume a mid-run session), and
+     * one-shot test scans report the failure and finish.
+     */
+    private fun handleRunStartupStall(reason: String) {
+        cancelStartupWatchdog()
+        appendLog(reason)
+        val stalledPickSession = pickSession
+        scope.launch {
+            // The child may still hold its listener or interceptor handles, so
+            // it must be gone before the follow-up run starts. `abandon`
+            // deliberately reports no exit event: this run is already resolved.
+            runner.abandon()
+            when {
+                stalledPickSession != null -> failPickSession(reason, stalledPickSession)
+                isSessionSupervised() -> scheduleErrorRestart(reason, exitCode = null)
+                else -> {
+                    state.update {
+                        it.copy(
+                            status = RuntimeStatus.Failed,
+                            lastError = reason,
+                            scanProgress = null,
+                            forceStopAvailable = false,
+                        )
+                    }
+                    finishForegroundRun()
+                }
+            }
+        }
     }
 
-    private fun isScanWatchdogRelevant(): Boolean =
-        isSessionSupervised() &&
-            state.value.status == RuntimeStatus.Scanning &&
-            state.value.scanProgress != null
+    /**
+     * True while a launched run still owes the app a startup result: reaching
+     * its listener, exiting, or failing. Covers supervised sessions,
+     * interactive pick scans, and one-shot test scans.
+     */
+    private fun isStartupWatchdogRelevant(): Boolean {
+        if (userStopRequested) {
+            return false
+        }
+        if (activeRunSpec == null && pickSession == null) {
+            return false
+        }
+        return state.value.status == RuntimeStatus.Starting ||
+            state.value.status == RuntimeStatus.Scanning
+    }
 
-    private fun cancelScanWatchdog() {
-        scanWatchdogJob?.cancel()
-        scanWatchdogJob = null
+    private fun cancelStartupWatchdog() {
+        startupWatchdogJob?.cancel()
+        startupWatchdogJob = null
     }
 
     internal fun requestAutomaticRestart(
@@ -757,7 +809,7 @@ class ZeroDpiService : Service() {
         restartStopTimeoutSignal = CompletableDeferred()
         errorRestartJob?.cancel()
         errorRestartJob = null
-        cancelScanWatchdog()
+        cancelStartupWatchdog()
         launchJob?.cancel()
         resetRuntimeCounters()
         state.update {
@@ -788,6 +840,15 @@ class ZeroDpiService : Service() {
     }
 
     /**
+     * Test-only seam: makes the next fake run go silent in its startup phase,
+     * which is how a wedged native process looks to the service. Only
+     * meaningful for debug builds that use [FakeZeroDpiRunner].
+     */
+    internal fun stallFakeRunnerStartupForTesting() {
+        (runner as? FakeZeroDpiRunner)?.stallAfterStartupEventsForTesting = true
+    }
+
+    /**
      * True while a user-pressed-Start session must survive unexpected run
      * ends. Interactive pick sessions are excluded: they own their lifecycle
      * (scan → choose → apply/resume/cancel) and are never auto-relaunched.
@@ -808,7 +869,7 @@ class ZeroDpiService : Service() {
     private fun scheduleErrorRestart(reason: String, exitCode: Int?) {
         errorRestartJob?.cancel()
         errorRestartJob = null
-        cancelScanWatchdog()
+        cancelStartupWatchdog()
         errorRestartAttempt += 1
         val attempt = errorRestartAttempt
         val delayMs = AutoRestartPolicy.delayMsForAttempt(attempt)
@@ -870,6 +931,10 @@ class ZeroDpiService : Service() {
     }
 
     private fun handleRunnerEvent(event: ZeroDpiRunnerEvent) {
+        // Any event is proof the child process is still alive: re-anchor the
+        // startup watchdog before handling it, so the silence budget always
+        // measures idleness, not slow-but-progressing startup work.
+        noteRunActivity()
         when (event) {
             ZeroDpiRunnerEvent.Starting -> {
                 state.update {
@@ -932,7 +997,6 @@ class ZeroDpiService : Service() {
                         )
                     }
                     appendLog("Started ${event.scan} scan$total.")
-                    pokeScanWatchdog()
                 }
             }
             is ZeroDpiRunnerEvent.ScanProgress -> {
@@ -957,14 +1021,15 @@ class ZeroDpiService : Service() {
                         )
                     }
                     appendLog("${event.scan} scan progress: $progress.")
-                    pokeScanWatchdog()
                 }
             }
             is ZeroDpiRunnerEvent.ScanCompleted -> {
                 if (state.value.status == RuntimeStatus.Running) {
                     appendLog("Ignoring a stale ${event.scan} scan completion while ZeroDPI is running.")
                 } else {
-                    cancelScanWatchdog()
+                    // The scan reported its last result; the run still has to
+                    // bring its listener up (or exit), so the startup watchdog
+                    // stays armed with the quiet-phase budget.
                     state.update { it.copy(scanProgress = null) }
                     appendLog("${event.scan} scan completed with ${event.results} result(s).")
                 }
@@ -996,7 +1061,7 @@ class ZeroDpiService : Service() {
                 // A run that reaches Running again proves the failure was
                 // transient: reset the auto-restart escalation counter.
                 errorRestartAttempt = 0
-                cancelScanWatchdog()
+                cancelStartupWatchdog()
                 state.update {
                     it.copy(
                         status = RuntimeStatus.Running,
@@ -1079,7 +1144,7 @@ class ZeroDpiService : Service() {
                     scheduleErrorRestart(event.message, exitCode = null)
                     return
                 }
-                cancelScanWatchdog()
+                cancelStartupWatchdog()
                 state.update { it.copy(status = RuntimeStatus.Failed, lastError = event.message) }
             }
             is ZeroDpiRunnerEvent.GracefulShutdown -> {
@@ -1103,13 +1168,13 @@ class ZeroDpiService : Service() {
                     scheduleErrorRestart(event.message, exitCode = null)
                     return
                 }
-                cancelScanWatchdog()
+                cancelStartupWatchdog()
                 state.update { it.copy(status = RuntimeStatus.Failed, lastError = event.message) }
                 finishForegroundRun()
             }
             is ZeroDpiRunnerEvent.Exited -> {
                 appendLog("ZeroDPI exited with code ${event.exitCode}.")
-                cancelScanWatchdog()
+                cancelStartupWatchdog()
                 activeConnections.clear()
                 activeRelayBytes.clear()
                 when {
@@ -1131,6 +1196,7 @@ class ZeroDpiService : Service() {
                         event.exitCode == 0 &&
                         !pickCancelRequested &&
                         !userStopRequested -> {
+                        cancelStartupWatchdog()
                         pickStage = PickStage.Choosing
                         state.update {
                             it.copy(
@@ -1259,7 +1325,7 @@ class ZeroDpiService : Service() {
 
     private fun finishAfterExit(exitCode: Int) {
         clearPickSession()
-        cancelScanWatchdog()
+        cancelStartupWatchdog()
         restartStopInProgress = false
         automaticForceStopRequested = false
         restartExitSignal = null
@@ -1370,7 +1436,7 @@ class ZeroDpiService : Service() {
 
     private fun finishForegroundRun() {
         clearPickSession()
-        cancelScanWatchdog()
+        cancelStartupWatchdog()
         superviseSession = false
         errorRestartJob?.cancel()
         errorRestartJob = null
@@ -1443,13 +1509,6 @@ class ZeroDpiService : Service() {
         private const val LOG_FLUSH_TIMEOUT_MS = 1_000L
         private const val MAX_RECENT_LOG_LINES = 12
         private const val MAX_SESSION_LOG_LINES = 500
-        // A supervised run's startup scan is wedged when no scan event
-        // (progress, completion, ...) arrives for this long. Healthy scans
-        // emit progress per completed probe (each probe is bounded by the
-        // per-probe timeout), so a silent stretch this large means the
-        // scanner cannot make progress and the run is restarted through the
-        // normal supervised error-restart path.
-        private const val SCAN_STALL_TIMEOUT_MS = 120_000L
         private val activeStatuses = setOf(
             RuntimeStatus.Starting,
             RuntimeStatus.Scanning,

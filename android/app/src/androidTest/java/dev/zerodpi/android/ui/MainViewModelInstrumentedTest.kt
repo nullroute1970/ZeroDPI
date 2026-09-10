@@ -321,9 +321,13 @@ class MainViewModelInstrumentedTest {
         val viewModel = viewModel()
         viewModel.waitUntilLoaded()
         viewModel.updateConfigField("AUTO_SELECT", "false")
-        viewModel.waitUntil("auto-select config saved") {
+        // A socket-only method keeps the follow-up run rootless, so the whole
+        // pick flow runs on unrooted devices and emulators.
+        viewModel.updateConfigField("BYPASS_METHOD", "[\"tls_frag\"]")
+        viewModel.waitUntil("pick gate config saved") {
             RuntimeFileKind.Config !in runtimeFilesState.value.dirtyFiles &&
-                runtimeFilesState.value.configEditor.valueFor("AUTO_SELECT") == "false"
+                runtimeFilesState.value.configEditor.valueFor("AUTO_SELECT") == "false" &&
+                runtimeFilesState.value.configEditor.valueFor("BYPASS_METHOD").contains("tls_frag")
         }
 
         viewModel.start()

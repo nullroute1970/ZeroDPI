@@ -340,6 +340,53 @@ class ZeroDpiServiceInstrumentedTest {
         }
     }
 
+    @Test
+    fun silentStartupAutoRestartsSupervisedSession() {
+        configureRootlessSupervisedSessionMode()
+        withFastAutoRestartPolicy {
+            withFastStartupWatchdogPolicy {
+                val service = bindZeroDpiService()
+                service.ensureSessionStopped()
+                service.stallFakeRunnerStartupForTesting()
+                service.startZeroDpi()
+
+                // The child reported its first scan event and then went
+                // silent: the watchdog has to recover the session instead of
+                // leaving the UI on Scanning forever.
+                val restarting = service.waitForState(timeoutMs = 15_000) {
+                    it.status == RuntimeStatus.Restarting
+                }
+                assertTrue(restarting.lastError?.contains("made no progress") == true)
+                assertTrue(restarting.recentLogs.any { line -> line.contains("made no progress") })
+
+                service.stopZeroDpi()
+                service.waitForState { it.status == RuntimeStatus.Stopped }
+            }
+        }
+    }
+
+    @Test
+    fun silentPickScanFailsThePickSessionWithTheReason() {
+        configurePickGateMode()
+        withFastStartupWatchdogPolicy {
+            val service = bindZeroDpiService()
+            service.ensureSessionStopped()
+            service.stallFakeRunnerStartupForTesting()
+
+            // AUTO_SELECT off with no pin: Start opens the pick gate, so the
+            // stalled scan has to fail the session (with the reason visible)
+            // instead of hanging on "Scanning for reachable targets…".
+            service.startZeroDpi()
+
+            val failed = service.waitForState(timeoutMs = 15_000) {
+                it.status == RuntimeStatus.Failed
+            }
+            assertNull(failed.pickSession)
+            assertTrue(failed.lastError?.contains("made no progress") == true)
+            assertTrue(failed.recentLogs.any { line -> line.contains("Started sni scan") })
+        }
+    }
+
     private fun <T> withFastAutoRestartPolicy(block: () -> T): T {
         val previousBase = AutoRestartPolicy.baseDelayMs
         val previousMax = AutoRestartPolicy.maxDelayMs
@@ -350,6 +397,24 @@ class ZeroDpiServiceInstrumentedTest {
         } finally {
             AutoRestartPolicy.baseDelayMs = previousBase
             AutoRestartPolicy.maxDelayMs = previousMax
+        }
+    }
+
+    /**
+     * Shrinks the startup watchdog so a silent child is detected in about a
+     * second. The budget stays above the fake runner's own startup delays, so
+     * its first events re-anchor the watchdog the way real ones do.
+     */
+    private fun <T> withFastStartupWatchdogPolicy(block: () -> T): T {
+        val previousScan = RunStartupWatchdogPolicy.scanSilenceTimeoutMs
+        val previousQuiet = RunStartupWatchdogPolicy.quietPhaseSilenceTimeoutMs
+        RunStartupWatchdogPolicy.scanSilenceTimeoutMs = 1_000L
+        RunStartupWatchdogPolicy.quietPhaseSilenceTimeoutMs = 1_000L
+        try {
+            return block()
+        } finally {
+            RunStartupWatchdogPolicy.scanSilenceTimeoutMs = previousScan
+            RunStartupWatchdogPolicy.quietPhaseSilenceTimeoutMs = previousQuiet
         }
     }
 
@@ -373,6 +438,17 @@ class ZeroDpiServiceInstrumentedTest {
             // gate so supervision tests exercise the plain main run.
             .replaceField("AUTO_SELECT", "true")
         storage.save(ZeroDpiProfile.DEFAULT_PROFILE_ID, RuntimeFileKind.Config, rootlessConfig)
+    }
+
+    /**
+     * AUTO_SELECT off with no stored pin: tapping Start walks the interactive
+     * pick gate, which runs a rootless scan-only pass first.
+     */
+    private fun configurePickGateMode() = runBlocking {
+        val storage = RuntimeStorage(context)
+        val config = storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID).configText
+            .replaceField("AUTO_SELECT", "false")
+        storage.save(ZeroDpiProfile.DEFAULT_PROFILE_ID, RuntimeFileKind.Config, config)
     }
 
     private fun configureRootlessRunningMode() = runBlocking {
@@ -401,6 +477,10 @@ class ZeroDpiServiceInstrumentedTest {
             .replaceField("MODE", "sni_spoof")
             .replaceField("BYPASS_METHOD", "tls_frag")
             .replaceField("LISTEN_PORT", "45555")
+            // AUTO_SELECT on keeps this profile on the plain main run: the
+            // bundled default is off, which would open the interactive pick
+            // gate instead of starting the run this test asserts on.
+            .replaceField("AUTO_SELECT", "true")
         storage.save(WORK_PROFILE_ID, RuntimeFileKind.Config, rootlessConfig)
     }
 

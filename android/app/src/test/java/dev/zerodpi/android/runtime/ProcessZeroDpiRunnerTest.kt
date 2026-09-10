@@ -116,6 +116,56 @@ class ProcessZeroDpiRunnerTest {
     }
 
     @Test
+    fun abandonKillsSilentRunWithoutReportingAnExit() = runBlocking {
+        val executable = temporaryFolder.newFile("libzerodpi_exec.so")
+        val workingDirectory = temporaryFolder.newFolder("runtime")
+        val configFile = temporaryFolder.newFile("config.toml")
+        val process = HangingFakeProcess()
+        val processLauncher = RecordingProcessLauncher(process)
+        val runner = ProcessZeroDpiRunner(
+            scope = this,
+            rootManager = FakeRootManager(),
+            executableProvider = { executable },
+            processLauncher = processLauncher,
+        )
+        val events = mutableListOf<ZeroDpiRunnerEvent>()
+        val collector = launch { runner.events().collect { events += it } }
+
+        try {
+            yield()
+            runner.start(
+                ZeroDpiRunRequest(
+                    configPath = configFile.absolutePath,
+                    workingDirectory = workingDirectory.absolutePath,
+                    useRoot = false,
+                ),
+            )
+            assertTrue(process.isAlive)
+
+            runner.abandon()
+            delay(200)
+
+            // The wedged child is gone, no exit event was fabricated for the
+            // abandoned run, and a later start is not blocked by it.
+            assertTrue(!process.isAlive)
+            assertTrue(events.none { it is ZeroDpiRunnerEvent.Exited })
+            assertEquals(RunnerStopResult.AlreadyExited, runner.stop())
+            assertEquals(RunnerStopResult.AlreadyExited, runner.forceStop())
+
+            runner.start(
+                ZeroDpiRunRequest(
+                    configPath = configFile.absolutePath,
+                    workingDirectory = workingDirectory.absolutePath,
+                    useRoot = false,
+                ),
+            )
+            assertEquals(2, processLauncher.commands.size)
+        } finally {
+            collector.cancel()
+        }
+    }
+
+    @Test
     fun rootStartLaunchesOnlyHelperAsRootAndDataPlaneNormally() = runBlocking {
         val executable = temporaryFolder.newFile("libzerodpi_exec.so")
         val helperExecutable = temporaryFolder.newFile("libzerodpi_root_helper_exec.so")
@@ -372,5 +422,61 @@ class ProcessZeroDpiRunnerTest {
         }
 
         override fun isAlive(): Boolean = alive
+    }
+
+    /**
+     * Process double that stays alive until it is killed, so tests can model a
+     * data plane that went silent without exiting.
+     */
+    private class HangingFakeProcess : Process() {
+        private val output = ByteArrayOutputStream()
+        private val input = ByteArrayInputStream(ByteArray(0))
+
+        @Volatile
+        private var alive = true
+
+        override fun getOutputStream(): OutputStream = output
+
+        override fun getInputStream(): InputStream = input
+
+        override fun getErrorStream(): InputStream =
+            ByteArrayInputStream(ByteArray(0))
+
+        override fun waitFor(): Int {
+            while (alive) {
+                Thread.sleep(20)
+            }
+            return EXIT_CODE
+        }
+
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+            val deadline = System.currentTimeMillis() + unit.toMillis(timeout)
+            while (alive && System.currentTimeMillis() < deadline) {
+                Thread.sleep(20)
+            }
+            return !alive
+        }
+
+        override fun exitValue(): Int {
+            if (alive) {
+                throw IllegalThreadStateException("Fake process is still alive.")
+            }
+            return EXIT_CODE
+        }
+
+        override fun destroy() {
+            alive = false
+        }
+
+        override fun destroyForcibly(): Process {
+            alive = false
+            return this
+        }
+
+        override fun isAlive(): Boolean = alive
+
+        private companion object {
+            const val EXIT_CODE = 137
+        }
     }
 }

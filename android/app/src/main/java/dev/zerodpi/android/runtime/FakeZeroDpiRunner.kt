@@ -3,6 +3,7 @@ package dev.zerodpi.android.runtime
 import dev.zerodpi.android.targetscan.TargetScanFiles
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -17,11 +18,18 @@ class FakeZeroDpiRunner(
     private var job: Job? = null
     private val exitEmitted = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    /**
+     * Test-only: when set, a run reports its first startup events and then
+     * stops reporting anything, the way a wedged native process looks to
+     * [dev.zerodpi.android.service.ZeroDpiService].
+     */
+    internal var stallAfterStartupEventsForTesting: Boolean = false
+
     override fun events(): Flow<ZeroDpiRunnerEvent> = events.asSharedFlow()
 
     override suspend fun start(request: ZeroDpiRunRequest) {
         if (job?.isActive == true) {
-            events.emit(ZeroDpiRunnerEvent.Log("Fake runner is already active."))
+            events.emit(ZeroDpiRunnerEvent.Failed("Fake runner is already active."))
             return
         }
         exitEmitted.set(false)
@@ -42,6 +50,9 @@ class FakeZeroDpiRunner(
             )
             if (request.mode == "sni_scan" || request.mode == "ip_scan") {
                 events.emit(ZeroDpiRunnerEvent.ScanStarted(request.mode.removeSuffix("_scan"), total = 1))
+                if (stallAfterStartupEventsForTesting) {
+                    awaitCancellation()
+                }
                 delay(350)
                 events.emit(
                     ZeroDpiRunnerEvent.ScanProgress(
@@ -72,6 +83,9 @@ class FakeZeroDpiRunner(
 
             if (forcedSelection == null) {
                 events.emit(ZeroDpiRunnerEvent.ScanStarted("sni", total = 1))
+                if (stallAfterStartupEventsForTesting) {
+                    awaitCancellation()
+                }
                 delay(700)
             }
             events.emit(
@@ -122,6 +136,14 @@ class FakeZeroDpiRunner(
         job?.cancel()
         job = null
         return if (emitExited(-1)) RunnerStopResult.Exited else RunnerStopResult.AlreadyExited
+    }
+
+    override suspend fun abandon() {
+        job?.cancel()
+        job = null
+        // Mirror the real runner: an abandoned run reports no exit event, so a
+        // later stop has to resolve as AlreadyExited.
+        exitEmitted.set(true)
     }
 
     private suspend fun emitExited(exitCode: Int): Boolean {

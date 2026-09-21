@@ -264,6 +264,41 @@ fn expand_v6(net: &Ipv6Net, max: u64, out: &mut Vec<IpAddr>) {
 ///
 /// Returns all entries (including TCP-only failures) sorted by score desc,
 /// then TCP latency asc.
+/// Probe one IP without the full scan pipeline.
+///
+/// Used by network-recovery target verification.
+pub async fn probe_ip_candidate(
+    ip: IpAddr,
+    scan_sni: Arc<str>,
+    timeout: Duration,
+    config: Arc<crate::config::Config>,
+) -> IpProbeEntry {
+    let addr = SocketAddr::new(ip, SCAN_PORT);
+    let start = Instant::now();
+    match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => {
+            let tcp_ms = start.elapsed().as_millis() as u64;
+            probe_tls_ttfb(ip, tcp_ms, &scan_sni, timeout, config).await
+        }
+        _ => {
+            let mut entry = IpProbeEntry {
+                ip,
+                tcp_latency_ms: None,
+                tls_ok: false,
+                tls_latency_ms: None,
+                cert_valid: false,
+                ttfb_ms: None,
+                download_bps: None,
+                upload_bps: None,
+                http_status: None,
+                score: 0,
+            };
+            entry.score = compute_score(&entry, &config);
+            entry
+        }
+    }
+}
+
 pub async fn scan_ip_list(
     ips: Vec<IpAddr>,
     scan_sni: Arc<str>,
@@ -719,5 +754,29 @@ mod tests {
         let ips = load_ip_list(&path, 65536).unwrap();
         assert_eq!(ips.len(), 1);
         assert_eq!(ips[0], "1.1.1.1".parse::<IpAddr>().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn candidate_probe_returns_an_entry_for_a_closed_port() {
+        // Both ring and aws-lc-rs features are enabled in this build;
+        // select ring explicitly, as the binary does at startup.
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let cfg = crate::config::test_support::minimal_config();
+        let entry = probe_ip_candidate(
+            "127.0.0.1".parse().unwrap(),
+            Arc::from("example.com"),
+            std::time::Duration::from_millis(200),
+            Arc::new(cfg),
+        )
+        .await;
+        let expected_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(entry.ip, expected_ip);
     }
 }

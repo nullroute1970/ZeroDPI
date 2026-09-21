@@ -186,6 +186,19 @@ async fn probe_sni_upload(
 ///
 /// The returned list is sorted by score (descending), then by TCP latency
 /// (ascending) as a tiebreaker.
+/// Probe one `(sni, ip)` pair without DNS resolution.
+///
+/// Used by network-recovery target verification.
+pub async fn probe_sni_candidate(
+    sni: &str,
+    ip: Ipv4Addr,
+    timeout: Duration,
+    config: Arc<crate::config::Config>,
+) -> SniProbeEntry {
+    let connector = Arc::new(make_tls_connector());
+    probe_sni_ip(sni.to_owned(), ip, timeout, config, connector).await
+}
+
 pub async fn scan_sni_list(
     path: &Path,
     timeout: Duration,
@@ -619,5 +632,30 @@ mod tests {
     #[test]
     fn parse_http_garbage() {
         assert_eq!(parse_http_status("not http"), None);
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn candidate_probe_returns_an_entry_for_a_closed_port() {
+        // Both ring and aws-lc-rs features are enabled in this build;
+        // select ring explicitly, as the binary does at startup.
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let cfg = crate::config::test_support::minimal_config();
+        let entry = probe_sni_candidate(
+            "example.com",
+            "127.0.0.1".parse().unwrap(),
+            std::time::Duration::from_millis(200),
+            Arc::new(cfg),
+        )
+        .await;
+        assert_eq!(entry.sni, "example.com");
+        let expected_ip: std::net::Ipv4Addr = "127.0.0.1".parse().unwrap();
+        assert_eq!(entry.ip, expected_ip);
     }
 }

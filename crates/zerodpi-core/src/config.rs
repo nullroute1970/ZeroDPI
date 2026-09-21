@@ -3840,3 +3840,18 @@ mod tests {
         assert!(unknown.validate().is_err());
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Minimal config used by scanner probe tests. Everything except the
+    /// listener address has a serde default.
+    pub(crate) fn minimal_config() -> Config {
+        toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .expect("parse minimal config")
+    }
+}

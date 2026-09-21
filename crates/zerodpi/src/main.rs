@@ -482,8 +482,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         .context("could not determine local interface IP for upstream")?;
     info!(%interface_ip, %connect_ip, sni = %selected.sni, "starting proxy");
 
-    let (interface_ip_handle, interface_ip) =
-        zerodpi_core::net::interface_ip_channel(interface_ip);
+    let (interface_ip_handle, interface_ip) = zerodpi_core::net::interface_ip_channel(interface_ip);
     let mut low_ttl_handle: Option<Arc<AtomicU8>> = None;
 
     let (flow_controller, data_plane_controller): (
@@ -1215,9 +1214,7 @@ async fn rescan_sni_once(
                     );
                 }
 
-                if let Some(next) =
-                    select_rescan_target(&current, best, cfg.SNI_SWITCH_MIN_SCORE)
-                {
+                if let Some(next) = select_rescan_target(&current, best, cfg.SNI_SWITCH_MIN_SCORE) {
                     // A switch is warranted. With discovery configured,
                     // probe the candidate first and gate the hot-swap on
                     // success; the discovered TTL then goes live together
@@ -2053,8 +2050,7 @@ fn ip_bypass_plus_main(
         "ip_bypass_plus: starting proxy"
     );
 
-    let (interface_ip_handle, interface_ip) =
-        zerodpi_core::net::interface_ip_channel(interface_ip);
+    let (interface_ip_handle, interface_ip) = zerodpi_core::net::interface_ip_channel(interface_ip);
 
     // ---- step 3: optional packet interceptor ----
     let (flow_controller, data_plane_controller): (
@@ -2390,7 +2386,10 @@ async fn rescan_ip_once(
                     switched: false,
                 },
             );
-            return network_recovery::RescanOutcome { found: 0, switched: false };
+            return network_recovery::RescanOutcome {
+                found: 0,
+                switched: false,
+            };
         }
     };
     if policy.ipv4_only {
@@ -2413,7 +2412,10 @@ async fn rescan_ip_once(
                     switched: false,
                 },
             );
-            return network_recovery::RescanOutcome { found: 0, switched: false };
+            return network_recovery::RescanOutcome {
+                found: 0,
+                switched: false,
+            };
         }
     }
     let cfg_clone = cfg.clone();
@@ -2440,7 +2442,10 @@ async fn rescan_ip_once(
                 switched: false,
             },
         );
-        return network_recovery::RescanOutcome { found: 0, switched: false };
+        return network_recovery::RescanOutcome {
+            found: 0,
+            switched: false,
+        };
     }
     let best = &entries[0];
     if headless {
@@ -3763,7 +3768,9 @@ mod tests {
             std::net::Ipv4Addr::new(198, 51, 100, 7)
         );
         let v6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
-        assert_eq!(monitor_probe_target(v6), std::net::Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(
+            monitor_probe_target(v6),
+            std::net::Ipv4Addr::new(1, 1, 1, 1)
+        );
     }
-
 }

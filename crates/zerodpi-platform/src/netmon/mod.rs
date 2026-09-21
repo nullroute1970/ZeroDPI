@@ -308,10 +308,22 @@ mod tests {
 
     #[test]
     fn classifies_netlink_message_types() {
-        assert_eq!(classify_nlmsg(RTM_NEWADDR), Some(NetworkChangeSource::Address));
-        assert_eq!(classify_nlmsg(RTM_DELADDR), Some(NetworkChangeSource::Address));
-        assert_eq!(classify_nlmsg(RTM_NEWROUTE), Some(NetworkChangeSource::Route));
-        assert_eq!(classify_nlmsg(RTM_DELROUTE), Some(NetworkChangeSource::Route));
+        assert_eq!(
+            classify_nlmsg(RTM_NEWADDR),
+            Some(NetworkChangeSource::Address)
+        );
+        assert_eq!(
+            classify_nlmsg(RTM_DELADDR),
+            Some(NetworkChangeSource::Address)
+        );
+        assert_eq!(
+            classify_nlmsg(RTM_NEWROUTE),
+            Some(NetworkChangeSource::Route)
+        );
+        assert_eq!(
+            classify_nlmsg(RTM_DELROUTE),
+            Some(NetworkChangeSource::Route)
+        );
         assert_eq!(classify_nlmsg(RTM_NEWLINK), Some(NetworkChangeSource::Link));
         assert_eq!(classify_nlmsg(RTM_DELLINK), Some(NetworkChangeSource::Link));
         assert_eq!(classify_nlmsg(0xffff), None);

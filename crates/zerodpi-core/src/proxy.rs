@@ -43,13 +43,13 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, TlsFragPackets};
-use crate::net::InterfaceIp;
 use crate::flow::{BypassOutcome, FlowController, FlowEntry, FlowKey};
 use crate::methods::ccs_prefix::CcsPrefix;
 use crate::methods::mixed_case_sni::MixedCaseSni;
 use crate::methods::sni_boundary_frag::{write_boundary_split, SniBoundaryFrag};
 use crate::methods::tcp_segmentation::{read_one_tls_record, write_fragmented, TcpSegmentation};
 use crate::methods::tls_padding::TlsPadding;
+use crate::net::InterfaceIp;
 use crate::tls_template::build_client_hello;
 
 // ---------------------------------------------------------------------------

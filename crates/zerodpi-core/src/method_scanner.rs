@@ -527,7 +527,8 @@ where
             crate::net::InterfaceIp::fixed(interface_ip),
             proxy_fc,
             None,
-        ).await;
+        )
+        .await;
     });
     // Give the listener a moment to bind before connecting.
     tokio::time::sleep(Duration::from_millis(50)).await;

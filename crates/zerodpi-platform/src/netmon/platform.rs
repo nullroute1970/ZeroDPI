@@ -22,8 +22,8 @@ mod windows_impl {
 
     use windows_sys::Win32::Foundation::{HANDLE, WIN32_ERROR};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        CancelMibChangeNotify2, MibInitialNotification, NotifyIpInterfaceChange, NotifyRouteChange2,
-        MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
+        CancelMibChangeNotify2, MibInitialNotification, NotifyIpInterfaceChange,
+        NotifyRouteChange2, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
     };
     use windows_sys::Win32::Networking::WinSock::AF_INET;
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
@@ -114,7 +114,10 @@ mod windows_impl {
         }
     }
 
-    fn notifier_thread(tx: Sender<NetworkChangeSource>, ready_tx: Sender<Result<u32, WIN32_ERROR>>) {
+    fn notifier_thread(
+        tx: Sender<NetworkChangeSource>,
+        ready_tx: Sender<Result<u32, WIN32_ERROR>>,
+    ) {
         let context = Box::into_raw(Box::new(NotifyContext { tx: Mutex::new(tx) }));
         let caller_context = context as *const core::ffi::c_void;
         let mut interface_handle: HANDLE = std::ptr::null_mut();
@@ -281,7 +284,8 @@ mod linux {
                 },
             ];
             let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-            let polled = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+            let polled =
+                unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
             if polled < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
@@ -354,13 +358,7 @@ mod linux {
         fn wake(&self) {
             self.stop.store(true, Ordering::SeqCst);
             let byte = [1u8; 1];
-            unsafe {
-                libc::write(
-                    self.fd.as_raw_fd(),
-                    byte.as_ptr() as *const libc::c_void,
-                    1,
-                )
-            };
+            unsafe { libc::write(self.fd.as_raw_fd(), byte.as_ptr() as *const libc::c_void, 1) };
         }
     }
 }

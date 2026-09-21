@@ -115,7 +115,10 @@ impl DataPlaneController {
             .configure(interceptor_config(&cfg, interface_ip, None, CONNECT_PORT))
             .await
             .context("configure root helper interceptor")?;
-        helper.open().await.context("open root helper interceptor")?;
+        helper
+            .open()
+            .await
+            .context("open root helper interceptor")?;
         Ok(Self {
             inner: Mutex::new(Inner::Remote(RemotePlane {
                 cfg,

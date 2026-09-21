@@ -327,7 +327,8 @@ async fn run_socks5_probe(
             crate::net::InterfaceIp::fixed(interface_ip),
             flow_controller,
             None,
-        ).await;
+        )
+        .await;
     });
 
     // Give the listener a moment to bind before connecting.

@@ -689,5 +689,4 @@ mod tests {
         assert!(runtime_event_for(&status).is_none());
         assert!(proxy_status_for(&status).is_some());
     }
-
 }

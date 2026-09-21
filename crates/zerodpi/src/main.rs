@@ -14,6 +14,7 @@
 
 mod data_plane;
 mod helper_client;
+mod network_recovery;
 mod runtime_events;
 mod tui;
 

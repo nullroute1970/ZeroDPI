@@ -1060,7 +1060,6 @@ async fn background_rescan(
     headless: bool,
 ) {
     let interval = Duration::from_secs(interval_secs);
-    let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     loop {
         events.emit(RuntimeEvent::NextScanScheduled {
             scan: ScanKind::Sni,
@@ -1074,157 +1073,182 @@ async fn background_rescan(
             },
         );
         tokio::time::sleep(interval).await;
-        events.emit(RuntimeEvent::RescanStarted {
-            scan: ScanKind::Sni,
-        });
-        if headless {
-            info!(path = %path.display(), "background SNI rescan starting");
-        } else {
-            debug!("background rescan starting");
-        }
-        send_rescan_event(
-            &event_tx,
-            ProxyEvent::RescanStarted {
-                kind: RescanKind::Sni,
-            },
-        );
-        let scan_started = std::time::Instant::now();
-        let mut switched = false;
-        let mut scan_summary: Option<(usize, Option<u8>)> = None;
-        let cfg_clone = cfg.clone();
-        match scan_sni_list(&path, scan_timeout, cfg_clone, None).await {
-            Ok(entries) => {
-                scan_summary = Some((entries.len(), entries.first().map(|e| e.score)));
+        let _ = rescan_sni_once(
+            cfg.clone(),
+            path.clone(),
+            rescan_discovery.clone(),
+            active_target.clone(),
+            event_tx.clone(),
+            events.clone(),
+            headless,
+        )
+        .await;
+    }
+}
+
+/// Run one SNI rescan and hot-swap the active target when warranted.
+#[allow(clippy::too_many_arguments)]
+async fn rescan_sni_once(
+    cfg: Arc<Config>,
+    path: PathBuf,
+    rescan_discovery: Option<LowTtlDiscoveryState>,
+    active_target: Arc<std::sync::RwLock<ActiveSniTarget>>,
+    event_tx: Option<ProxyEventSender>,
+    events: RuntimeEventEmitter,
+    headless: bool,
+) -> network_recovery::RescanOutcome {
+    let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+    events.emit(RuntimeEvent::RescanStarted {
+        scan: ScanKind::Sni,
+    });
+    if headless {
+        info!(path = %path.display(), "background SNI rescan starting");
+    } else {
+        debug!("background rescan starting");
+    }
+    send_rescan_event(
+        &event_tx,
+        ProxyEvent::RescanStarted {
+            kind: RescanKind::Sni,
+        },
+    );
+    let scan_started = std::time::Instant::now();
+    let mut switched = false;
+    let mut scan_summary: Option<(usize, Option<u8>)> = None;
+    let cfg_clone = cfg.clone();
+    match scan_sni_list(&path, scan_timeout, cfg_clone, None).await {
+        Ok(entries) => {
+            scan_summary = Some((entries.len(), entries.first().map(|e| e.score)));
+            if headless {
+                info!(
+                    "background SNI rescan complete — {} (SNI, IP) pairs",
+                    entries.len()
+                );
+                log_sni_scan_top("background SNI rescan top candidates", &entries);
+            } else {
+                debug!(
+                    "background rescan complete — {} (SNI, IP) pairs",
+                    entries.len()
+                );
+            }
+            if let Some(best) = entries.first() {
+                let current = active_target.read().unwrap().clone();
                 if headless {
                     info!(
-                        "background SNI rescan complete — {} (SNI, IP) pairs",
-                        entries.len()
+                        sni = %best.sni,
+                        ip = %best.ip,
+                        score = best.score,
+                        current_sni = %current.sni,
+                        current_ip = %current.ip,
+                        current_score = current.score,
+                        "background SNI rescan evaluated top result"
                     );
-                    log_sni_scan_top("background SNI rescan top candidates", &entries);
                 } else {
                     debug!(
-                        "background rescan complete — {} (SNI, IP) pairs",
-                        entries.len()
+                        sni = %best.sni,
+                        ip = %best.ip,
+                        score = best.score,
+                        current_sni = %current.sni,
+                        current_ip = %current.ip,
+                        current_score = current.score,
+                        "rescan top result"
                     );
                 }
-                if let Some(best) = entries.first() {
-                    let current = active_target.read().unwrap().clone();
-                    if headless {
-                        info!(
-                            sni = %best.sni,
-                            ip = %best.ip,
-                            score = best.score,
-                            current_sni = %current.sni,
-                            current_ip = %current.ip,
-                            current_score = current.score,
-                            "background SNI rescan evaluated top result"
-                        );
-                    } else {
-                        debug!(
-                            sni = %best.sni,
-                            ip = %best.ip,
-                            score = best.score,
-                            current_sni = %current.sni,
-                            current_ip = %current.ip,
-                            current_score = current.score,
-                            "rescan top result"
-                        );
-                    }
 
-                    if let Some(next) =
-                        select_rescan_target(&current, best, cfg.SNI_SWITCH_MIN_SCORE)
-                    {
-                        // A switch is warranted. With discovery configured,
-                        // probe the candidate first and gate the hot-swap on
-                        // success; the discovered TTL then goes live together
-                        // with the new target.
-                        let (switch, discovered) = match rescan_discovery.as_ref() {
-                            Some(state) => {
-                                if headless {
-                                    info!(
-                                        sni = %next.sni,
-                                        ip = %next.ip,
-                                        "rescan switch warranted; probing TTL candidates"
-                                    );
-                                } else {
-                                    debug!(
-                                        sni = %next.sni,
-                                        ip = %next.ip,
-                                        "rescan switch warranted; probing TTL candidates"
-                                    );
-                                }
-                                let discovered = state.run(&next.sni, next.ip).await;
-                                (
-                                    discovery_gated_switch(
-                                        discovered,
-                                        &current,
-                                        best,
-                                        cfg.SNI_SWITCH_MIN_SCORE,
-                                    ),
-                                    discovered,
-                                )
-                            }
-                            None => (Some(next), None),
-                        };
-                        match switch {
-                            Some(next) => {
-                                *active_target.write().unwrap() = next.clone();
+                if let Some(next) =
+                    select_rescan_target(&current, best, cfg.SNI_SWITCH_MIN_SCORE)
+                {
+                    // A switch is warranted. With discovery configured,
+                    // probe the candidate first and gate the hot-swap on
+                    // success; the discovered TTL then goes live together
+                    // with the new target.
+                    let (switch, discovered) = match rescan_discovery.as_ref() {
+                        Some(state) => {
+                            if headless {
                                 info!(
-                                    old_sni = %current.sni,
-                                    old_ip = %current.ip,
-                                    old_score = current.score,
-                                    new_sni = %next.sni,
-                                    new_ip = %next.ip,
-                                    new_score = next.score,
-                                    "hot-swapped active SNI target"
+                                    sni = %next.sni,
+                                    ip = %next.ip,
+                                    "rescan switch warranted; probing TTL candidates"
                                 );
-                                if let Some(ref tx) = event_tx {
-                                    let _ = tx.send(ProxyEvent::SniTargetChanged {
-                                        sni: next.sni.to_string(),
-                                        ip: next.ip,
-                                        score: next.score,
-                                    });
-                                    if let Some(value) = discovered {
-                                        let _ = tx.send(ProxyEvent::LowTtlDiscovered { value });
-                                    }
+                            } else {
+                                debug!(
+                                    sni = %next.sni,
+                                    ip = %next.ip,
+                                    "rescan switch warranted; probing TTL candidates"
+                                );
+                            }
+                            let discovered = state.run(&next.sni, next.ip).await;
+                            (
+                                discovery_gated_switch(
+                                    discovered,
+                                    &current,
+                                    best,
+                                    cfg.SNI_SWITCH_MIN_SCORE,
+                                ),
+                                discovered,
+                            )
+                        }
+                        None => (Some(next), None),
+                    };
+                    match switch {
+                        Some(next) => {
+                            *active_target.write().unwrap() = next.clone();
+                            info!(
+                                old_sni = %current.sni,
+                                old_ip = %current.ip,
+                                old_score = current.score,
+                                new_sni = %next.sni,
+                                new_ip = %next.ip,
+                                new_score = next.score,
+                                "hot-swapped active SNI target"
+                            );
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(ProxyEvent::SniTargetChanged {
+                                    sni: next.sni.to_string(),
+                                    ip: next.ip,
+                                    score: next.score,
+                                });
+                                if let Some(value) = discovered {
+                                    let _ = tx.send(ProxyEvent::LowTtlDiscovered { value });
                                 }
-                                switched = true;
                             }
-                            None => {
-                                warn!(
-                                    sni = %best.sni,
-                                    ip = %best.ip,
-                                    "rescan discovery found no working TTL; \
-                                     keeping current target and TTL"
-                                );
-                            }
+                            switched = true;
+                        }
+                        None => {
+                            warn!(
+                                sni = %best.sni,
+                                ip = %best.ip,
+                                "rescan discovery found no working TTL; \
+                                 keeping current target and TTL"
+                            );
                         }
                     }
                 }
             }
-            Err(e) => {
-                warn!(error = %e, "background rescan failed");
-            }
         }
-        let (found, best_score) = scan_summary.unwrap_or((0, None));
-        events.emit(RuntimeEvent::RescanFinished {
-            scan: ScanKind::Sni,
+        Err(e) => {
+            warn!(error = %e, "background rescan failed");
+        }
+    }
+    let (found, best_score) = scan_summary.unwrap_or((0, None));
+    events.emit(RuntimeEvent::RescanFinished {
+        scan: ScanKind::Sni,
+        found,
+        best_score,
+        duration_ms: scan_started.elapsed().as_millis() as u64,
+        switched,
+    });
+    send_rescan_event(
+        &event_tx,
+        ProxyEvent::RescanFinished {
+            kind: RescanKind::Sni,
             found,
             best_score,
             duration_ms: scan_started.elapsed().as_millis() as u64,
             switched,
-        });
-        send_rescan_event(
-            &event_tx,
-            ProxyEvent::RescanFinished {
-                kind: RescanKind::Sni,
-                found,
-                best_score,
-                duration_ms: scan_started.elapsed().as_millis() as u64,
-                switched,
-            },
-        );
-    }
+        },
+    );
+    network_recovery::RescanOutcome { found, switched }
 }
 
 fn select_rescan_target(
@@ -2192,8 +2216,6 @@ async fn background_ip_rescan(
     policy: IpRescanPolicy,
 ) {
     let interval = Duration::from_secs(interval_secs);
-    let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
-    let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
     loop {
         events.emit(RuntimeEvent::NextScanScheduled {
             scan: ScanKind::Ip,
@@ -2207,74 +2229,50 @@ async fn background_ip_rescan(
             },
         );
         tokio::time::sleep(interval).await;
-        events.emit(RuntimeEvent::RescanStarted { scan: ScanKind::Ip });
-        if headless {
-            info!(mode = policy.mode_label, path = %ip_list_path.display(), "background IP rescan starting");
-        } else {
-            debug!(mode = policy.mode_label, "background IP rescan starting");
-        }
-        send_rescan_event(
-            &event_tx,
-            ProxyEvent::RescanStarted {
-                kind: RescanKind::Ip,
-            },
-        );
-        let scan_started = std::time::Instant::now();
+        let _ = rescan_ip_once(
+            cfg.clone(),
+            ip_list_path.clone(),
+            active_ip.clone(),
+            event_tx.clone(),
+            events.clone(),
+            headless,
+            policy,
+        )
+        .await;
+    }
+}
 
-        let ips = match load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(mode = policy.mode_label, error = %e, "background IP rescan failed to load ip_list");
-                events.emit(RuntimeEvent::RescanFinished {
-                    scan: ScanKind::Ip,
-                    found: 0,
-                    best_score: None,
-                    duration_ms: scan_started.elapsed().as_millis() as u64,
-                    switched: false,
-                });
-                send_rescan_event(
-                    &event_tx,
-                    ProxyEvent::RescanFinished {
-                        kind: RescanKind::Ip,
-                        found: 0,
-                        best_score: None,
-                        duration_ms: scan_started.elapsed().as_millis() as u64,
-                        switched: false,
-                    },
-                );
-                continue;
-            }
-        };
-        if policy.ipv4_only {
-            if let Err(e) = reject_ipv6_ip_candidates(&ips, policy.mode_label, &ip_list_path) {
-                warn!(mode = policy.mode_label, error = %e, "background IP rescan rejected ip_list");
-                events.emit(RuntimeEvent::RescanFinished {
-                    scan: ScanKind::Ip,
-                    found: 0,
-                    best_score: None,
-                    duration_ms: scan_started.elapsed().as_millis() as u64,
-                    switched: false,
-                });
-                send_rescan_event(
-                    &event_tx,
-                    ProxyEvent::RescanFinished {
-                        kind: RescanKind::Ip,
-                        found: 0,
-                        best_score: None,
-                        duration_ms: scan_started.elapsed().as_millis() as u64,
-                        switched: false,
-                    },
-                );
-                continue;
-            }
-        }
-        let cfg_clone = cfg.clone();
-        let entries = scan_ip_list(ips, scan_sni.clone(), scan_timeout, cfg_clone, None).await;
-        if entries.is_empty() {
-            warn!(
-                mode = policy.mode_label,
-                "background IP rescan found no working IPs"
-            );
+/// Run one IP rescan and hot-swap the active target when it changed.
+#[allow(clippy::too_many_arguments)]
+async fn rescan_ip_once(
+    cfg: Arc<Config>,
+    ip_list_path: PathBuf,
+    active_ip: Arc<std::sync::RwLock<std::net::IpAddr>>,
+    event_tx: Option<ProxyEventSender>,
+    events: RuntimeEventEmitter,
+    headless: bool,
+    policy: IpRescanPolicy,
+) -> network_recovery::RescanOutcome {
+    let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+    let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
+    events.emit(RuntimeEvent::RescanStarted { scan: ScanKind::Ip });
+    if headless {
+        info!(mode = policy.mode_label, path = %ip_list_path.display(), "background IP rescan starting");
+    } else {
+        debug!(mode = policy.mode_label, "background IP rescan starting");
+    }
+    send_rescan_event(
+        &event_tx,
+        ProxyEvent::RescanStarted {
+            kind: RescanKind::Ip,
+        },
+    );
+    let scan_started = std::time::Instant::now();
+
+    let ips = match load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(mode = policy.mode_label, error = %e, "background IP rescan failed to load ip_list");
             events.emit(RuntimeEvent::RescanFinished {
                 scan: ScanKind::Ip,
                 found: 0,
@@ -2292,50 +2290,103 @@ async fn background_ip_rescan(
                     switched: false,
                 },
             );
-            continue;
+            return network_recovery::RescanOutcome { found: 0, switched: false };
         }
-        let best = &entries[0];
-        if headless {
-            info!(
-                mode = policy.mode_label,
-                "background IP rescan complete — {} IPs probed",
-                entries.len()
+    };
+    if policy.ipv4_only {
+        if let Err(e) = reject_ipv6_ip_candidates(&ips, policy.mode_label, &ip_list_path) {
+            warn!(mode = policy.mode_label, error = %e, "background IP rescan rejected ip_list");
+            events.emit(RuntimeEvent::RescanFinished {
+                scan: ScanKind::Ip,
+                found: 0,
+                best_score: None,
+                duration_ms: scan_started.elapsed().as_millis() as u64,
+                switched: false,
+            });
+            send_rescan_event(
+                &event_tx,
+                ProxyEvent::RescanFinished {
+                    kind: RescanKind::Ip,
+                    found: 0,
+                    best_score: None,
+                    duration_ms: scan_started.elapsed().as_millis() as u64,
+                    switched: false,
+                },
             );
-            log_ip_scan_top("background IP rescan top candidates", &entries);
-            info!(mode = policy.mode_label, ip = %best.ip, score = best.score, "background IP rescan evaluated top result");
-        } else {
-            debug!(mode = policy.mode_label, ip = %best.ip, score = best.score, "background IP rescan top result");
+            return network_recovery::RescanOutcome { found: 0, switched: false };
         }
-
-        let current = *active_ip.read().unwrap();
-        let switched = best.ip != current;
-        if switched {
-            *active_ip.write().unwrap() = best.ip;
-            if let Some(ref tx) = event_tx {
-                let _ = tx.send(ProxyEvent::IpTargetChanged {
-                    ip: best.ip,
-                    score: best.score,
-                });
-            }
-            info!(mode = policy.mode_label, old = %current, new = %best.ip, "hot-swapped active IP");
-        }
+    }
+    let cfg_clone = cfg.clone();
+    let entries = scan_ip_list(ips, scan_sni.clone(), scan_timeout, cfg_clone, None).await;
+    if entries.is_empty() {
+        warn!(
+            mode = policy.mode_label,
+            "background IP rescan found no working IPs"
+        );
         events.emit(RuntimeEvent::RescanFinished {
             scan: ScanKind::Ip,
-            found: entries.len(),
-            best_score: Some(best.score),
+            found: 0,
+            best_score: None,
             duration_ms: scan_started.elapsed().as_millis() as u64,
-            switched,
+            switched: false,
         });
         send_rescan_event(
             &event_tx,
             ProxyEvent::RescanFinished {
                 kind: RescanKind::Ip,
-                found: entries.len(),
-                best_score: Some(best.score),
+                found: 0,
+                best_score: None,
                 duration_ms: scan_started.elapsed().as_millis() as u64,
-                switched,
+                switched: false,
             },
         );
+        return network_recovery::RescanOutcome { found: 0, switched: false };
+    }
+    let best = &entries[0];
+    if headless {
+        info!(
+            mode = policy.mode_label,
+            "background IP rescan complete — {} IPs probed",
+            entries.len()
+        );
+        log_ip_scan_top("background IP rescan top candidates", &entries);
+        info!(mode = policy.mode_label, ip = %best.ip, score = best.score, "background IP rescan evaluated top result");
+    } else {
+        debug!(mode = policy.mode_label, ip = %best.ip, score = best.score, "background IP rescan top result");
+    }
+
+    let current = *active_ip.read().unwrap();
+    let switched = best.ip != current;
+    if switched {
+        *active_ip.write().unwrap() = best.ip;
+        if let Some(ref tx) = event_tx {
+            let _ = tx.send(ProxyEvent::IpTargetChanged {
+                ip: best.ip,
+                score: best.score,
+            });
+        }
+        info!(mode = policy.mode_label, old = %current, new = %best.ip, "hot-swapped active IP");
+    }
+    events.emit(RuntimeEvent::RescanFinished {
+        scan: ScanKind::Ip,
+        found: entries.len(),
+        best_score: Some(best.score),
+        duration_ms: scan_started.elapsed().as_millis() as u64,
+        switched,
+    });
+    send_rescan_event(
+        &event_tx,
+        ProxyEvent::RescanFinished {
+            kind: RescanKind::Ip,
+            found: entries.len(),
+            best_score: Some(best.score),
+            duration_ms: scan_started.elapsed().as_millis() as u64,
+            switched,
+        },
+    );
+    network_recovery::RescanOutcome {
+        found: entries.len(),
+        switched,
     }
 }
 
@@ -3579,4 +3630,29 @@ mod tests {
             },
         );
     }
+    #[tokio::test]
+    async fn rescan_sni_once_reports_failure_for_an_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sni_list.txt");
+        std::fs::write(&path, "").unwrap();
+        let cfg = Arc::new(config_for_tests());
+        let active = Arc::new(std::sync::RwLock::new(ActiveSniTarget::new(
+            "example.com",
+            "1.1.1.1".parse().unwrap(),
+            50,
+        )));
+        let outcome = rescan_sni_once(
+            cfg,
+            path,
+            None,
+            active,
+            None,
+            RuntimeEventEmitter::default(),
+            true,
+        )
+        .await;
+        assert_eq!(outcome.found, 0);
+        assert!(!outcome.switched);
+    }
+
 }

@@ -90,35 +90,38 @@ class ZeroDpiServiceInstrumentedTest {
     }
 
     @Test
-    fun networkRestartPreservesProfileAndModeOverrideWithoutEndingForegroundRun() {
-        configureWorkProfile()
+    fun networkEventsDoNotRestartRun() {
+        configureRootlessRunningMode()
         val service = bindZeroDpiService()
+        service.startZeroDpi()
+        service.waitForState { it.status == RuntimeStatus.Running }
 
-        service.startZeroDpi(profileId = WORK_PROFILE_ID, modeOverride = "ip_bypass")
-        service.waitForState {
-            it.status == RuntimeStatus.Running &&
-                it.mode == "ip_bypass" &&
-                it.listener == "127.0.0.1:45555"
+        service.simulateRunnerEventForTesting(
+            ZeroDpiRunnerEvent.NetworkChanged(source = "address", interfaceIp = "192.0.2.10"),
+        )
+        service.simulateRunnerEventForTesting(
+            ZeroDpiRunnerEvent.NetworkRecoveryFailed(
+                attempt = 1,
+                nextRetryMs = 1_000,
+                message = "open packet interceptor",
+            ),
+        )
+        service.simulateRunnerEventForTesting(
+            ZeroDpiRunnerEvent.NetworkRecovered(
+                interfaceIp = "192.0.2.10",
+                targetVerified = true,
+                targetSwitched = false,
+            ),
+        )
+
+        val state = service.waitForState {
+            it.recentLogs.any { line -> line.contains("Network changed (address)") }
         }
-
-        service.requestAutomaticRestart()
-
-        val restarting = service.state().value
-        assertEquals(RuntimeStatus.Restarting, restarting.status)
-        assertEquals("None", restarting.activeTarget)
-        assertEquals(0, restarting.connectionCount)
-        assertEquals(0L, restarting.relayBytes)
-        assertTrue(restarting.recentLogs.any { it == "Restarting after network change." })
-        assertTrue(ZeroDpiRuntimeStateStore.runtimeMarker(context).active)
-
-        service.waitForState {
-            it.status == RuntimeStatus.Running &&
-                it.mode == "ip_bypass" &&
-                it.listener == "127.0.0.1:45555" &&
-                it.recentLogs.any { line -> line.contains("Relaunching ZeroDPI with profile \"Work\"") }
-        }
+        assertEquals(RuntimeStatus.Running, state.status)
+        assertTrue(state.recentLogs.any { it.contains("Network recovered on 192.0.2.10") })
+        assertTrue(state.recentLogs.none { it.contains("Relaunching ZeroDPI") })
         service.stopZeroDpi()
-        service.waitForState { it.status == RuntimeStatus.Stopped && it.lastExitCode == 0 }
+        service.waitForState { it.status == RuntimeStatus.Stopped }
     }
 
     @Test

@@ -122,7 +122,6 @@ class ZeroDpiService : Service() {
     private val activeRelayBytes = mutableMapOf<Int, Long>()
     private val sessionLogLines = ArrayDeque<String>()
     private var completedRelayBytes = 0L
-    private var networkMonitor: DefaultNetworkMonitor? = null
     private var activeRunSpec: ActiveRunSpec? = null
     private var launchJob: Job? = null
     private var restartStopInProgress = false
@@ -183,8 +182,6 @@ class ZeroDpiService : Service() {
     }
 
     override fun onDestroy() {
-        networkMonitor?.stop()
-        networkMonitor = null
         launchJob?.cancel()
         runBlocking {
             runner.stop()
@@ -243,7 +240,6 @@ class ZeroDpiService : Service() {
                     forceStopAvailable = false,
                 )
             }
-            startNetworkMonitoring()
             launchJob = scope.launch {
                 launchRun(runSpec, isAutomaticRestart = false)
             }
@@ -333,7 +329,6 @@ class ZeroDpiService : Service() {
                     finishAfterExit(0)
                     return
                 }
-                networkMonitor?.stop()
                 appendLog("AUTO_SELECT is off — scanning; choose a target after the scan.")
                 pickSession = PickSession(profileId, PickOrigin.StartGate, resumeRunSpec = null)
                 state.update {
@@ -471,7 +466,6 @@ class ZeroDpiService : Service() {
         errorRestartJob = null
         cancelStartupWatchdog()
         clearPickSession()
-        networkMonitor?.stop()
         launchJob?.cancel()
         ZeroDpiRuntimeStateStore.markRuntimeActive(this, activeRunSpec?.profileId)
         state.update {
@@ -501,7 +495,6 @@ class ZeroDpiService : Service() {
         errorRestartJob = null
         cancelStartupWatchdog()
         clearPickSession()
-        networkMonitor?.stop()
         launchJob?.cancel()
         ZeroDpiRuntimeStateStore.markRuntimeActive(this, activeRunSpec?.profileId)
         state.update {
@@ -544,7 +537,6 @@ class ZeroDpiService : Service() {
                     appendLog("Cannot re-scan: no active run to resume.")
                     return
                 }
-                networkMonitor?.stop()
                 pickSession = PickSession(profileId, PickOrigin.MidRun, resume)
                 pickStage = PickStage.StoppingForRescan
                 state.update {
@@ -809,7 +801,7 @@ class ZeroDpiService : Service() {
     }
 
     internal fun requestAutomaticRestart(
-        restartMessage: String = "Restarting after network change.",
+        restartMessage: String = "Restarting automatically.",
     ) {
         if (
             userStopRequested ||
@@ -1438,15 +1430,6 @@ class ZeroDpiService : Service() {
         finishForegroundRun()
     }
 
-    private fun startNetworkMonitoring() {
-        networkMonitor?.stop()
-        networkMonitor = DefaultNetworkMonitor(
-            context = this,
-            scope = scope,
-            onStableNetworkChange = ::requestAutomaticRestart,
-        ).also(DefaultNetworkMonitor::start)
-    }
-
     private fun appendRootDiagnosticReport(report: RootDiagnosticReport) {
         appendLog(report.rootAccess.message)
         report.rootAccess.commandResult?.let { result ->
@@ -1538,8 +1521,6 @@ class ZeroDpiService : Service() {
         errorRestartJob?.cancel()
         errorRestartJob = null
         errorRestartAttempt = 0
-        networkMonitor?.stop()
-        networkMonitor = null
         launchJob = null
         activeRunSpec = null
         restartStopInProgress = false

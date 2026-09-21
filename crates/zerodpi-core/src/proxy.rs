@@ -173,6 +173,9 @@ pub enum RelayEndReason {
     /// The configured maximum relay lifetime expired and the relay was closed
     /// so the upstream client can reconnect through the current target.
     MaxLifetime,
+    /// A relay direction ended on an I/O error (for example, the network
+    /// disappeared mid-session) rather than a clean close.
+    NetworkError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +270,25 @@ fn emit(tx: &Option<ProxyEventSender>, event: ProxyEvent) {
     if let Some(ref tx) = tx {
         let _ = tx.send(event);
     }
+}
+
+/// Bound on a single upstream connect attempt. The TCP stack can otherwise
+/// keep a SYN attempt alive for minutes while the network is down.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn connect_with_timeout<F>(timeout: Duration, connect: F) -> anyhow::Result<TcpStream>
+where
+    F: std::future::Future<Output = std::io::Result<TcpStream>>,
+{
+    match tokio::time::timeout(timeout, connect).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => anyhow::bail!("upstream connect timed out after {timeout:?}"),
+    }
+}
+
+fn io_end_error(result: &std::io::Result<usize>) -> bool {
+    result.is_err()
 }
 
 fn configured_relay_max_lifetime(cfg: &Config) -> Option<Duration> {
@@ -655,21 +677,23 @@ async fn handle_intercept_connection(
 
     // Connect: while this is happening, the kernel emits SYN, receives SYN-ACK,
     // and sends the bare ACK that the interceptor will rewrite.
-    let mut outgoing = match socket
-        .connect(SocketAddr::from((connect_ip, connect_port)))
-        .await
+    let mut outgoing = match connect_with_timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        socket.connect(SocketAddr::from((connect_ip, connect_port))),
+    )
+    .await
     {
-        Ok(s) => s,
-        Err(e) => {
+        Ok(stream) => stream,
+        Err(error) => {
             entry.finish(BypassOutcome::UnexpectedClose);
             emit(
                 &event_tx,
                 ProxyEvent::ConnectionError {
                     src_port,
-                    error: e.to_string(),
+                    error: error.to_string(),
                 },
             );
-            return Err(e).context("connect upstream");
+            return Err(error).context("connect upstream");
         }
     };
 
@@ -1081,17 +1105,22 @@ async fn handle_tcp_seg_connection_with_ip(
     let connect_addr = SocketAddr::from((connect_ip, CONNECT_PORT));
 
     // Connect to upstream.
-    let mut outgoing = match TcpStream::connect(connect_addr).await {
-        Ok(s) => s,
-        Err(e) => {
+    let mut outgoing = match connect_with_timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        TcpStream::connect(connect_addr),
+    )
+    .await
+    {
+        Ok(stream) => stream,
+        Err(error) => {
             emit(
                 &event_tx,
                 ProxyEvent::ConnectionError {
                     src_port,
-                    error: e.to_string(),
+                    error: error.to_string(),
                 },
             );
-            return Err(e).context("tls_frag: connect upstream");
+            return Err(error).context("tls_frag: connect upstream");
         }
     };
 
@@ -1352,8 +1381,8 @@ async fn counting_relay_with_client_fragmentation(
     });
 
     let result = if let Some(max_lifetime) = max_lifetime {
-        let mut c2s_done: Option<u64> = None;
-        let mut s2c_done: Option<u64> = None;
+        let mut c2s_done: Option<(u64, bool)> = None;
+        let mut s2c_done: Option<(u64, bool)> = None;
         let deadline = tokio::time::sleep(max_lifetime);
         tokio::pin!(deadline);
 
@@ -1367,28 +1396,28 @@ async fn counting_relay_with_client_fragmentation(
                         s2c_task.abort();
                     }
                     break RelayResult {
-                        c2s_bytes: c2s_done.unwrap_or_else(|| c2s_atomic.load(Ordering::Relaxed)),
-                        s2c_bytes: s2c_done.unwrap_or_else(|| s2c_atomic.load(Ordering::Relaxed)),
+                        c2s_bytes: c2s_done.map(|(bytes, _)| bytes).unwrap_or_else(|| c2s_atomic.load(Ordering::Relaxed)),
+                        s2c_bytes: s2c_done.map(|(bytes, _)| bytes).unwrap_or_else(|| s2c_atomic.load(Ordering::Relaxed)),
                         reason: RelayEndReason::MaxLifetime,
                     };
                 }
                 c2s_result = &mut c2s_task, if c2s_done.is_none() => {
-                    c2s_done = Some(c2s_result.unwrap_or(0));
-                    if let (Some(c2s_bytes), Some(s2c_bytes)) = (c2s_done, s2c_done) {
+                    c2s_done = Some(c2s_result.unwrap_or((0, false)));
+                    if let (Some((c2s_bytes, c2s_err)), Some((s2c_bytes, s2c_err))) = (c2s_done, s2c_done) {
                         break RelayResult {
                             c2s_bytes,
                             s2c_bytes,
-                            reason: RelayEndReason::Completed,
+                            reason: if c2s_err || s2c_err { RelayEndReason::NetworkError } else { RelayEndReason::Completed },
                         };
                     }
                 }
                 s2c_result = &mut s2c_task, if s2c_done.is_none() => {
-                    s2c_done = Some(s2c_result.unwrap_or(0));
-                    if let (Some(c2s_bytes), Some(s2c_bytes)) = (c2s_done, s2c_done) {
+                    s2c_done = Some(s2c_result.unwrap_or((0, false)));
+                    if let (Some((c2s_bytes, c2s_err)), Some((s2c_bytes, s2c_err))) = (c2s_done, s2c_done) {
                         break RelayResult {
                             c2s_bytes,
                             s2c_bytes,
-                            reason: RelayEndReason::Completed,
+                            reason: if c2s_err || s2c_err { RelayEndReason::NetworkError } else { RelayEndReason::Completed },
                         };
                     }
                 }
@@ -1396,10 +1425,16 @@ async fn counting_relay_with_client_fragmentation(
         }
     } else {
         let (c2s_result, s2c_result) = tokio::join!(c2s_task, s2c_task);
+        let (c2s_bytes, c2s_err) = c2s_result.unwrap_or((0, false));
+        let (s2c_bytes, s2c_err) = s2c_result.unwrap_or((0, false));
         RelayResult {
-            c2s_bytes: c2s_result.unwrap_or(0),
-            s2c_bytes: s2c_result.unwrap_or(0),
-            reason: RelayEndReason::Completed,
+            c2s_bytes,
+            s2c_bytes,
+            reason: if c2s_err || s2c_err {
+                RelayEndReason::NetworkError
+            } else {
+                RelayEndReason::Completed
+            },
         }
     };
 
@@ -1418,14 +1453,19 @@ async fn copy_counting_client_to_server(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     counter: Arc<AtomicU64>,
     client_fragmentation: Option<(TcpSegmentation, u32)>,
-) -> u64 {
+) -> (u64, bool) {
     let mut buf = vec![0u8; 64 * 1024];
     let mut total = 0u64;
     let mut write_index = client_fragmentation.map(|(_, index)| index).unwrap_or(0);
     let segmentation = client_fragmentation.map(|(segmentation, _)| segmentation);
 
     loop {
-        let n = match reader.read(&mut buf).await {
+        let read = reader.read(&mut buf).await;
+        if io_end_error(&read) {
+            let _ = writer.shutdown().await;
+            return (total, true);
+        }
+        let n = match read {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
@@ -1441,35 +1481,42 @@ async fn copy_counting_client_to_server(
         };
 
         if write_result.is_err() {
-            break;
+            let _ = writer.shutdown().await;
+            return (total, true);
         }
         total += n as u64;
         counter.store(total, Ordering::Relaxed);
     }
     let _ = writer.shutdown().await;
-    total
+    (total, false)
 }
 
 async fn copy_counting(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     counter: Arc<AtomicU64>,
-) -> u64 {
+) -> (u64, bool) {
     let mut buf = vec![0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
-        let n = match reader.read(&mut buf).await {
+        let read = reader.read(&mut buf).await;
+        if io_end_error(&read) {
+            let _ = writer.shutdown().await;
+            return (total, true);
+        }
+        let n = match read {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
         if writer.write_all(&buf[..n]).await.is_err() {
-            break;
+            let _ = writer.shutdown().await;
+            return (total, true);
         }
         total += n as u64;
         counter.store(total, Ordering::Relaxed);
     }
     let _ = writer.shutdown().await;
-    total
+    (total, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1556,8 +1603,13 @@ async fn handle_ip_bypass_connection(
         },
     );
 
-    let outgoing = match TcpStream::connect(connect_addr).await {
-        Ok(s) => {
+    let outgoing = match connect_with_timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        TcpStream::connect(connect_addr),
+    )
+    .await
+    {
+        Ok(stream) => {
             // Reuse BypassComplete / FakeDataAcked to signal "TCP connect OK".
             emit(
                 &event_tx,
@@ -1566,17 +1618,17 @@ async fn handle_ip_bypass_connection(
                     outcome: crate::flow::BypassOutcome::FakeDataAcked,
                 },
             );
-            s
+            stream
         }
-        Err(e) => {
+        Err(error) => {
             emit(
                 &event_tx,
                 ProxyEvent::ConnectionError {
                     src_port,
-                    error: e.to_string(),
+                    error: error.to_string(),
                 },
             );
-            return Err(e).context("ip_bypass: connect upstream");
+            return Err(error).context("ip_bypass: connect upstream");
         }
     };
 
@@ -2048,5 +2100,27 @@ mod tests {
             writer.writes,
             vec![vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01]]
         );
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_fires_on_a_stalled_connect() {
+        let pending = std::future::pending::<std::io::Result<TcpStream>>();
+        let started = std::time::Instant::now();
+        let error = connect_with_timeout(std::time::Duration::from_millis(50), pending)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(40));
+    }
+
+    #[test]
+    fn io_error_is_not_clean_eof() {
+        let error: std::io::Result<usize> = Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(io_end_error(&error));
+        assert!(!io_end_error(&Ok(0)));
+        assert!(!io_end_error(&Ok(64)));
     }
 }

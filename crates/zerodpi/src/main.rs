@@ -1574,6 +1574,18 @@ async fn log_headless_proxy_events(
                         c2s_bytes, s2c_bytes, "relay rotated after max lifetime"
                     );
                 }
+                RelayEndReason::NetworkError => {
+                    events.emit(RuntimeEvent::RelayBytes {
+                        src_port,
+                        c2s_bytes,
+                        s2c_bytes,
+                        is_final: true,
+                    });
+                    warn!(
+                        src_port,
+                        c2s_bytes, s2c_bytes, "relay ended on a network error"
+                    );
+                }
             },
             ProxyEvent::ConnectionError { src_port, error } => {
                 events.emit(RuntimeEvent::BypassFinished {

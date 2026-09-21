@@ -1167,6 +1167,7 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
                 let status = match reason {
                     RelayEndReason::Completed => ConnStatus::Done,
                     RelayEndReason::MaxLifetime => ConnStatus::Rotated,
+                    RelayEndReason::NetworkError => ConnStatus::Failed,
                 };
                 r.set_status(status, now);
                 r.c2s_bytes = c2s_bytes;

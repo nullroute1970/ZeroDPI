@@ -65,6 +65,9 @@ struct LocalPlane {
     method: Arc<dyn BypassMethod>,
     shutdown: Option<InterceptorShutdown>,
     done_rx: Option<oneshot::Receiver<Result<()>>>,
+    /// True while an interceptor may still be live. Cleared only after a
+    /// confirmed shutdown, so a failed stop can never reopen over live rules.
+    armed: bool,
 }
 
 struct RemotePlane {
@@ -96,6 +99,7 @@ impl DataPlaneController {
             method,
             shutdown: None,
             done_rx: None,
+            armed: false,
         };
         plane.open(interface_ip)?;
         Ok(Self {
@@ -229,19 +233,30 @@ impl LocalPlane {
             .context("spawn intercept thread")?;
         self.shutdown = Some(shutdown);
         self.done_rx = Some(done_rx);
+        self.armed = true;
         info!(%interface_ip, "packet interceptor open");
         Ok(())
     }
 }
 
 async fn stop_local(plane: &mut LocalPlane) -> Result<()> {
-    if let Some(shutdown) = plane.shutdown.take() {
-        shutdown.request();
+    if !plane.armed {
+        return Ok(());
     }
-    if let Some(done_rx) = plane.done_rx.take() {
-        let mut report_rx = spawn_interceptor_report(done_rx);
-        wait_for_interceptor_shutdown(&mut report_rx).await?;
-    }
+    let Some(shutdown) = plane.shutdown.take() else {
+        anyhow::bail!(
+            "packet interceptor stop did not complete; refusing to reopen over live firewall rules"
+        );
+    };
+    shutdown.request();
+    let Some(done_rx) = plane.done_rx.take() else {
+        anyhow::bail!(
+            "packet interceptor stop did not complete; refusing to reopen over live firewall rules"
+        );
+    };
+    let mut report_rx = spawn_interceptor_report(done_rx);
+    wait_for_interceptor_shutdown(&mut report_rx).await?;
+    plane.armed = false;
     Ok(())
 }
 
@@ -309,5 +324,33 @@ mod tests {
         plane.rebuild(Ipv4Addr::LOCALHOST).await.unwrap();
         plane.stop().await.unwrap();
         assert!(!plane.remote_disconnected());
+    }
+    fn local_plane_with_missing_handles() -> LocalPlane {
+        let cfg = Arc::new(crate::config_for_tests());
+        let flows = zerodpi_core::flow::new_flow_table();
+        let flow_controller: Arc<dyn FlowController> =
+            Arc::new(LocalFlowController::new(flows.clone()));
+        let method: Arc<dyn BypassMethod> =
+            Arc::from(zerodpi_core::methods::build_method(&cfg).expect("method"));
+        LocalPlane {
+            cfg,
+            flows,
+            flow_controller,
+            method,
+            shutdown: None,
+            done_rx: None,
+            armed: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_local_after_a_failed_shutdown_does_not_silently_succeed() {
+        let mut plane = local_plane_with_missing_handles();
+        let error = stop_local(&mut plane).await.unwrap_err();
+        assert!(error.to_string().contains("did not complete"), "{error}");
+        assert!(
+            plane.armed,
+            "a plane whose interceptor may still be live stays armed"
+        );
     }
 }

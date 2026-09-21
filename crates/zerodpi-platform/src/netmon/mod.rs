@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::broadcast;
+use tracing::warn;
 use zerodpi_core::net::{default_interface_ipv4, NetworkChangeSource};
 
 mod platform;
@@ -193,7 +194,20 @@ impl NetworkMonitor {
     ) -> Result<Self> {
         let (tx, _rx) = broadcast::channel(16);
         let stop = Arc::new(AtomicBool::new(false));
-        let SourceParts { source, waker } = platform::source()?;
+        let SourceParts { source, waker } = match platform::source() {
+            Ok(parts) => SourceParts {
+                source: Box::new(parts.source) as Box<dyn NetworkSource>,
+                waker: parts.waker,
+            },
+            Err(error) => {
+                warn!(
+                    %error,
+                    "native network notifications unavailable;                      using the polling safety net only"
+                );
+                poll_only_source()
+            }
+        };
+        let source: Box<dyn NetworkSource> = source;
         let emit_tx = tx.clone();
         let thread_stop = stop.clone();
         let probe = move || {
@@ -243,11 +257,10 @@ impl NetworkMonitor {
     }
 }
 
-/// Source used only on platforms without a native notification API.
-#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+/// Source used when no native notification API is available, and as the
+/// fallback when native initialization fails.
 pub(crate) struct PollOnlySource;
 
-#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 impl NetworkSource for PollOnlySource {
     fn wait(&mut self, timeout: Duration) -> SourceEvent {
         std::thread::sleep(timeout);
@@ -255,12 +268,24 @@ impl NetworkSource for PollOnlySource {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 pub(crate) struct NoopWaker;
 
-#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 impl NetworkWaker for NoopWaker {
     fn wake(&self) {}
+}
+
+impl NetworkSource for Box<dyn NetworkSource> {
+    fn wait(&mut self, timeout: Duration) -> SourceEvent {
+        (**self).wait(timeout)
+    }
+}
+
+/// A boxed poll-only source for the fallback path.
+pub(crate) fn poll_only_source() -> SourceParts<Box<dyn NetworkSource>> {
+    SourceParts {
+        source: Box::new(PollOnlySource),
+        waker: Arc::new(NoopWaker),
+    }
 }
 
 #[cfg(test)]
@@ -337,5 +362,16 @@ mod tests {
         assert!(filter.observe(Some("10.0.0.1".parse().unwrap())));
         assert!(!filter.observe(Some("10.0.0.1".parse().unwrap())));
         assert!(filter.observe(None));
+    }
+    #[test]
+    fn poll_fallback_is_available_and_times_out() {
+        let mut parts = poll_only_source();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            parts.source.wait(Duration::from_millis(20)),
+            SourceEvent::Timeout
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(15));
+        parts.waker.wake();
     }
 }

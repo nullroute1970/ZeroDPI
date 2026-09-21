@@ -590,6 +590,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     }
 
     // ---- step 4: optional background rescan ----
+    let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(connect_ip)));
     let rescan_cfg = cfg.clone();
     let rescan_path = sni_list_path.clone();
     if cfg.RESCAN_INTERVAL_SECS > 0 {
@@ -602,11 +603,13 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         };
         let rescan_events = events.clone();
         let rescan_discovery = low_ttl_discovery_state.clone();
+        let background_probe_target = probe_target.clone();
         rt.spawn(async move {
             background_rescan(
                 rescan_cfg,
                 rescan_path,
                 interval,
+                background_probe_target,
                 rescan_discovery,
                 active_target,
                 rescan_event_tx,
@@ -618,7 +621,6 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     }
 
     // ---- step 5: network recovery ----
-    let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(connect_ip)));
     let monitor = zerodpi_platform::netmon::NetworkMonitor::start(
         probe_target.clone(),
         Some(interface_ip.current()),
@@ -668,13 +670,17 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         let events = rescan_events.clone();
         let probe_target = rescan_probe_target.clone();
         Box::pin(async move {
-            let outcome =
-                rescan_sni_once(cfg, path, discovery, target.clone(), tx, events, no_tui).await;
-            if outcome.switched {
-                let ip = target.read().unwrap().ip;
-                probe_target.store(u32::from(ip), std::sync::atomic::Ordering::SeqCst);
-            }
-            outcome
+            rescan_sni_once(
+                cfg,
+                path,
+                discovery,
+                target,
+                tx,
+                events,
+                no_tui,
+                &probe_target,
+            )
+            .await
         })
     });
 
@@ -1112,6 +1118,7 @@ async fn background_rescan(
     cfg: Arc<Config>,
     path: PathBuf,
     interval_secs: u64,
+    probe_target: Arc<std::sync::atomic::AtomicU32>,
     rescan_discovery: Option<LowTtlDiscoveryState>,
     active_target: Arc<std::sync::RwLock<ActiveSniTarget>>,
     event_tx: Option<ProxyEventSender>,
@@ -1140,6 +1147,7 @@ async fn background_rescan(
             event_tx.clone(),
             events.clone(),
             headless,
+            &probe_target,
         )
         .await;
     }
@@ -1155,6 +1163,7 @@ async fn rescan_sni_once(
     event_tx: Option<ProxyEventSender>,
     events: RuntimeEventEmitter,
     headless: bool,
+    probe_target: &std::sync::atomic::AtomicU32,
 ) -> network_recovery::RescanOutcome {
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     events.emit(RuntimeEvent::RescanStarted {
@@ -1250,6 +1259,7 @@ async fn rescan_sni_once(
                     match switch {
                         Some(next) => {
                             *active_target.write().unwrap() = next.clone();
+                            store_probe_target(probe_target, IpAddr::V4(next.ip));
                             info!(
                                 old_sni = %current.sni,
                                 old_ip = %current.ip,
@@ -1760,6 +1770,9 @@ fn ip_bypass_main(
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
 
     // ---- step 2: optional background IP rescan ----
+    let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(
+        monitor_probe_target(active_ip),
+    )));
     if cfg.RESCAN_INTERVAL_SECS > 0 {
         let rescan_cfg = cfg.clone();
         let rescan_path = ip_list_path.clone();
@@ -1771,11 +1784,13 @@ fn ip_bypass_main(
             Some(event_tx.clone())
         };
         let rescan_events = events.clone();
+        let background_probe_target = probe_target.clone();
         rt.spawn(async move {
             background_ip_rescan(
                 rescan_cfg,
                 rescan_path,
                 interval,
+                background_probe_target,
                 active_clone,
                 rescan_event_tx,
                 rescan_events,
@@ -1791,9 +1806,6 @@ fn ip_bypass_main(
 
     let data_plane_controller: Arc<dyn data_plane::DataPlane> =
         Arc::new(data_plane::DataPlaneController::none());
-    let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(
-        monitor_probe_target(active_ip),
-    )));
     let monitor = zerodpi_platform::netmon::NetworkMonitor::start(
         probe_target.clone(),
         default_interface_ipv4(monitor_probe_target(active_ip)).ok(),
@@ -1838,10 +1850,10 @@ fn ip_bypass_main(
         let events = rescan_events.clone();
         let probe_target = rescan_probe_target.clone();
         Box::pin(async move {
-            let outcome = rescan_ip_once(
+            rescan_ip_once(
                 cfg,
                 path,
-                active.clone(),
+                active,
                 tx,
                 events,
                 no_tui,
@@ -1849,16 +1861,9 @@ fn ip_bypass_main(
                     mode_label: "ip_bypass",
                     ipv4_only: false,
                 },
+                &probe_target,
             )
-            .await;
-            if outcome.switched {
-                let ip = *active.read().unwrap();
-                probe_target.store(
-                    u32::from(monitor_probe_target(ip)),
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-            }
-            outcome
+            .await
         })
     });
 
@@ -2014,6 +2019,7 @@ fn ip_bypass_plus_main(
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
 
     // ---- step 2: optional background IPv4 rescan ----
+    let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(active_v4)));
     if cfg.RESCAN_INTERVAL_SECS > 0 {
         let rescan_cfg = cfg.clone();
         let rescan_path = ip_list_path.clone();
@@ -2025,11 +2031,13 @@ fn ip_bypass_plus_main(
             Some(event_tx.clone())
         };
         let rescan_events = events.clone();
+        let background_probe_target = probe_target.clone();
         rt.spawn(async move {
             background_ip_rescan(
                 rescan_cfg,
                 rescan_path,
                 interval,
+                background_probe_target,
                 active_clone,
                 rescan_event_tx,
                 rescan_events,
@@ -2091,7 +2099,6 @@ fn ip_bypass_plus_main(
     };
 
     // ---- step 4: network recovery ----
-    let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(active_v4)));
     let monitor = zerodpi_platform::netmon::NetworkMonitor::start(
         probe_target.clone(),
         Some(interface_ip.current()),
@@ -2136,10 +2143,10 @@ fn ip_bypass_plus_main(
         let events = rescan_events.clone();
         let probe_target = rescan_probe_target.clone();
         Box::pin(async move {
-            let outcome = rescan_ip_once(
+            rescan_ip_once(
                 cfg,
                 path,
-                active.clone(),
+                active,
                 tx,
                 events,
                 no_tui,
@@ -2147,14 +2154,9 @@ fn ip_bypass_plus_main(
                     mode_label: "ip_bypass_plus",
                     ipv4_only: true,
                 },
+                &probe_target,
             )
-            .await;
-            if outcome.switched {
-                if let IpAddr::V4(ip) = *active.read().unwrap() {
-                    probe_target.store(u32::from(ip), std::sync::atomic::Ordering::SeqCst);
-                }
-            }
-            outcome
+            .await
         })
     });
 
@@ -2222,6 +2224,14 @@ fn monitor_probe_target(active: IpAddr) -> Ipv4Addr {
         IpAddr::V4(ip) => ip,
         IpAddr::V6(_) => Ipv4Addr::new(1, 1, 1, 1),
     }
+}
+
+/// Store the monitor probe target for an active relay address.
+fn store_probe_target(probe_target: &std::sync::atomic::AtomicU32, active: IpAddr) {
+    probe_target.store(
+        u32::from(monitor_probe_target(active)),
+        std::sync::atomic::Ordering::SeqCst,
+    );
 }
 
 fn require_ipv4_target(ip: IpAddr, mode: &str) -> Result<Ipv4Addr> {
@@ -2305,6 +2315,7 @@ async fn background_ip_rescan(
     cfg: Arc<Config>,
     ip_list_path: PathBuf,
     interval_secs: u64,
+    probe_target: Arc<std::sync::atomic::AtomicU32>,
     active_ip: Arc<std::sync::RwLock<std::net::IpAddr>>,
     event_tx: Option<ProxyEventSender>,
     events: RuntimeEventEmitter,
@@ -2333,6 +2344,7 @@ async fn background_ip_rescan(
             events.clone(),
             headless,
             policy,
+            &probe_target,
         )
         .await;
     }
@@ -2348,6 +2360,7 @@ async fn rescan_ip_once(
     events: RuntimeEventEmitter,
     headless: bool,
     policy: IpRescanPolicy,
+    probe_target: &std::sync::atomic::AtomicU32,
 ) -> network_recovery::RescanOutcome {
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
@@ -2464,6 +2477,7 @@ async fn rescan_ip_once(
     let switched = best.ip != current;
     if switched {
         *active_ip.write().unwrap() = best.ip;
+        store_probe_target(probe_target, best.ip);
         if let Some(ref tx) = event_tx {
             let _ = tx.send(ProxyEvent::IpTargetChanged {
                 ip: best.ip,
@@ -3746,6 +3760,7 @@ mod tests {
             "1.1.1.1".parse().unwrap(),
             50,
         )));
+        let probe_target = std::sync::atomic::AtomicU32::new(0);
         let outcome = rescan_sni_once(
             cfg,
             path,
@@ -3754,6 +3769,7 @@ mod tests {
             None,
             RuntimeEventEmitter::default(),
             true,
+            &probe_target,
         )
         .await;
         assert_eq!(outcome.found, 0);
@@ -3771,6 +3787,20 @@ mod tests {
         assert_eq!(
             monitor_probe_target(v6),
             std::net::Ipv4Addr::new(1, 1, 1, 1)
+        );
+    }
+    #[test]
+    fn store_probe_target_stores_ipv4_and_anchor() {
+        let probe_target = std::sync::atomic::AtomicU32::new(0);
+        store_probe_target(&probe_target, "198.51.100.7".parse().unwrap());
+        assert_eq!(
+            probe_target.load(std::sync::atomic::Ordering::SeqCst),
+            u32::from(std::net::Ipv4Addr::new(198, 51, 100, 7))
+        );
+        store_probe_target(&probe_target, "2001:db8::1".parse().unwrap());
+        assert_eq!(
+            probe_target.load(std::sync::atomic::Ordering::SeqCst),
+            u32::from(std::net::Ipv4Addr::new(1, 1, 1, 1))
         );
     }
 }

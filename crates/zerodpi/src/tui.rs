@@ -782,6 +782,8 @@ struct DashboardState {
     rescan_started_at: Option<Instant>,
     /// Most recent ConnectionError, shown as a header line.
     last_error: Option<LastError>,
+    /// Most recent network recovery status, shown as a header line.
+    network_status: Option<String>,
     /// Score of the active IP target (from `IpTargetChanged`).
     active_ip_score: Option<u8>,
     /// (mode, bound address) reported by `ListenerStarted`.
@@ -888,6 +890,7 @@ fn rescan_status_line(state: &DashboardState, now: Instant) -> Option<Line<'stat
 /// Number of text lines the dashboard header renders, excluding borders.
 fn header_content_rows(state: &DashboardState, now: Instant) -> usize {
     2 + usize::from(rescan_status_line(state, now).is_some())
+        + usize::from(state.network_status.is_some())
         + usize::from(state.last_error.is_some())
 }
 
@@ -1000,6 +1003,7 @@ pub fn run_dashboard(
         last_rescan: None,
         rescan_started_at: None,
         last_error: None,
+        network_status: None,
         active_ip_score: None,
         listener: None,
         start: Instant::now(),
@@ -1207,6 +1211,22 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
                 r.set_status(ConnStatus::Failed, now);
                 r.end_instant = Some(now);
             }
+        }
+        ProxyEvent::NetworkStatus { status } => {
+            state.network_status = Some(match status {
+                zerodpi_core::proxy::NetworkStatus::Online { interface_ip } => {
+                    format!("Network: {interface_ip}")
+                }
+                zerodpi_core::proxy::NetworkStatus::Changing { interface_ip } => {
+                    format!("Network: changing to {interface_ip}")
+                }
+                zerodpi_core::proxy::NetworkStatus::Recovering { attempt } => {
+                    format!("Network: recovering (attempt {attempt})")
+                }
+                zerodpi_core::proxy::NetworkStatus::Unavailable { message } => {
+                    format!("Network: unavailable ({message})")
+                }
+            });
         }
         ProxyEvent::SniTargetChanged { sni, ip, score } => {
             state.active_sni = Some((sni, ip, score));
@@ -1436,6 +1456,17 @@ fn draw_dashboard(
         };
         if let Some(line) = rescan_line {
             header_lines.push(line);
+        }
+        if let Some(status) = &state.network_status {
+            header_lines.push(Line::from(vec![
+                Span::styled(
+                    "Network: ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(status.clone(), label_style()),
+            ]));
         }
         if let Some(err) = &state.last_error {
             header_lines.push(Line::from(vec![
@@ -2290,6 +2321,7 @@ mod tests {
             last_rescan: None,
             rescan_started_at: None,
             last_error: None,
+            network_status: None,
             active_ip_score: None,
             listener: None,
             start: Instant::now(),

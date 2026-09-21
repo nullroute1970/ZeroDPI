@@ -1589,6 +1589,20 @@ async fn log_headless_proxy_events(
                     );
                 }
             },
+            ProxyEvent::NetworkStatus { status } => match status {
+                zerodpi_core::proxy::NetworkStatus::Online { interface_ip } => {
+                    info!(%interface_ip, "network online");
+                }
+                zerodpi_core::proxy::NetworkStatus::Changing { interface_ip } => {
+                    info!(%interface_ip, "network changed; rebuilding interception");
+                }
+                zerodpi_core::proxy::NetworkStatus::Recovering { attempt } => {
+                    warn!(attempt, "network recovery retrying");
+                }
+                zerodpi_core::proxy::NetworkStatus::Unavailable { message } => {
+                    warn!(%message, "network unavailable");
+                }
+            },
             ProxyEvent::ConnectionError { src_port, error } => {
                 events.emit(RuntimeEvent::BypassFinished {
                     src_port,

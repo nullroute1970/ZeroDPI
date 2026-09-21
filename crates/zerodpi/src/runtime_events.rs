@@ -40,6 +40,9 @@ impl RuntimeEventEmitter {
     }
 }
 
+// The four network_* variants are constructed by MainRecoveryEnv in Task 12.
+// Remove this allow when that wiring lands.
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
@@ -135,6 +138,23 @@ pub enum RuntimeEvent {
         message: String,
         rootless_alternatives: Vec<String>,
     },
+    NetworkUnavailable {
+        message: String,
+    },
+    NetworkChanged {
+        source: zerodpi_core::net::NetworkChangeSource,
+        interface_ip: String,
+    },
+    NetworkRecoveryFailed {
+        attempt: u32,
+        next_retry_ms: u64,
+        message: String,
+    },
+    NetworkRecovered {
+        interface_ip: String,
+        target_verified: bool,
+        target_switched: bool,
+    },
     FatalError {
         message: String,
     },
@@ -207,6 +227,59 @@ mod tests {
         assert_eq!(
             json,
             r#"{"event":"rescan_finished","scan":"ip","found":4,"best_score":91,"duration_ms":2300,"switched":true}"#,
+        );
+    }
+
+    #[test]
+    fn serializes_network_unavailable() {
+        let json = serde_json::to_string(&RuntimeEvent::NetworkUnavailable {
+            message: "no route".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"event":"network_unavailable","message":"no route"}"#
+        );
+    }
+
+    #[test]
+    fn serializes_network_changed() {
+        let json = serde_json::to_string(&RuntimeEvent::NetworkChanged {
+            source: zerodpi_core::net::NetworkChangeSource::Address,
+            interface_ip: "192.0.2.10".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"event":"network_changed","source":"address","interface_ip":"192.0.2.10"}"#
+        );
+    }
+
+    #[test]
+    fn serializes_network_recovery_failed() {
+        let json = serde_json::to_string(&RuntimeEvent::NetworkRecoveryFailed {
+            attempt: 2,
+            next_retry_ms: 4_000,
+            message: "open packet interceptor".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"event":"network_recovery_failed","attempt":2,"next_retry_ms":4000,"message":"open packet interceptor"}"#
+        );
+    }
+
+    #[test]
+    fn serializes_network_recovered() {
+        let json = serde_json::to_string(&RuntimeEvent::NetworkRecovered {
+            interface_ip: "192.0.2.10".to_owned(),
+            target_verified: true,
+            target_switched: false,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"event":"network_recovered","interface_ip":"192.0.2.10","target_verified":true,"target_switched":false}"#
         );
     }
 }

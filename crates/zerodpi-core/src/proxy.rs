@@ -80,6 +80,15 @@ pub type SharedSniTarget = Arc<RwLock<ActiveSniTarget>>;
 // Proxy events
 // ---------------------------------------------------------------------------
 
+/// Dashboard-facing network recovery state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkStatus {
+    Online { interface_ip: Ipv4Addr },
+    Changing { interface_ip: Ipv4Addr },
+    Recovering { attempt: u32 },
+    Unavailable { message: String },
+}
+
 /// Events emitted by the proxy for each connection, used to drive the live
 /// dashboard when running in interactive mode.
 #[derive(Debug)]
@@ -150,6 +159,8 @@ pub enum ProxyEvent {
         kind: RescanKind,
         interval_secs: u64,
     },
+    /// Network recovery status for the dashboard.
+    NetworkStatus { status: NetworkStatus },
 }
 
 /// Which background rescan produced a [`ProxyEvent`].

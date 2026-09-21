@@ -3,12 +3,194 @@
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) use linux::source;
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(windows)]
+pub(crate) use windows_impl::source;
+
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 pub(crate) fn source() -> anyhow::Result<super::SourceParts<super::PollOnlySource>> {
     Ok(super::SourceParts {
         source: super::PollOnlySource,
         waker: std::sync::Arc::new(super::NoopWaker),
     })
+}
+
+#[cfg(windows)]
+mod windows_impl {
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::{HANDLE, WIN32_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        CancelMibChangeNotify2, MibInitialNotification, NotifyIpInterfaceChange, NotifyRouteChange2,
+        MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetMessageW, PeekMessageW, PostThreadMessageW, MSG, PM_NOREMOVE, WM_QUIT,
+    };
+
+    use zerodpi_core::net::NetworkChangeSource;
+
+    use crate::netmon::{NetworkSource, NetworkWaker, SourceEvent, SourceParts};
+
+    const ERROR_SUCCESS: WIN32_ERROR = 0;
+
+    pub(crate) struct WindowsSource {
+        rx: Receiver<NetworkChangeSource>,
+    }
+
+    impl NetworkSource for WindowsSource {
+        fn wait(&mut self, timeout: Duration) -> SourceEvent {
+            match self.rx.recv_timeout(timeout) {
+                Ok(kind) => SourceEvent::Change(kind),
+                Err(RecvTimeoutError::Timeout) => SourceEvent::Timeout,
+                Err(RecvTimeoutError::Disconnected) => SourceEvent::Shutdown,
+            }
+        }
+    }
+
+    pub(crate) fn source() -> anyhow::Result<SourceParts<WindowsSource>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, WIN32_ERROR>>();
+        std::thread::Builder::new()
+            .name("zerodpi-netmon-win".into())
+            .spawn(move || notifier_thread(tx, ready_tx))?;
+        let thread_id = ready_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("windows netmon thread exited during registration"))?
+            .map_err(|code| {
+                anyhow::anyhow!("windows network notification registration failed: {code}")
+            })?;
+        Ok(SourceParts {
+            source: WindowsSource { rx },
+            waker: Arc::new(WindowsWaker { thread_id }),
+        })
+    }
+
+    struct WindowsWaker {
+        thread_id: u32,
+    }
+
+    impl NetworkWaker for WindowsWaker {
+        fn wake(&self) {
+            unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) };
+        }
+    }
+
+    struct NotifyContext {
+        tx: Mutex<Sender<NetworkChangeSource>>,
+    }
+
+    unsafe extern "system" fn on_interface_change(
+        caller_context: *const core::ffi::c_void,
+        _row: *const MIB_IPINTERFACE_ROW,
+        notification_type: MIB_NOTIFICATION_TYPE,
+    ) {
+        if notification_type == MibInitialNotification {
+            return;
+        }
+        notify(caller_context, NetworkChangeSource::Address);
+    }
+
+    unsafe extern "system" fn on_route_change(
+        caller_context: *const core::ffi::c_void,
+        _row: *const MIB_IPFORWARD_ROW2,
+        notification_type: MIB_NOTIFICATION_TYPE,
+    ) {
+        if notification_type == MibInitialNotification {
+            return;
+        }
+        notify(caller_context, NetworkChangeSource::Route);
+    }
+
+    fn notify(caller_context: *const core::ffi::c_void, source: NetworkChangeSource) {
+        // The context outlives every callback: notifications are cancelled
+        // before the box is dropped.
+        let context = unsafe { &*(caller_context as *const NotifyContext) };
+        if let Ok(tx) = context.tx.lock() {
+            let _ = tx.send(source);
+        }
+    }
+
+    fn notifier_thread(tx: Sender<NetworkChangeSource>, ready_tx: Sender<Result<u32, WIN32_ERROR>>) {
+        let context = Box::into_raw(Box::new(NotifyContext { tx: Mutex::new(tx) }));
+        let caller_context = context as *const core::ffi::c_void;
+        let mut interface_handle: HANDLE = std::ptr::null_mut();
+        let mut route_handle: HANDLE = std::ptr::null_mut();
+
+        let interface_result = unsafe {
+            NotifyIpInterfaceChange(
+                AF_INET,
+                Some(on_interface_change),
+                caller_context,
+                false,
+                &mut interface_handle,
+            )
+        };
+        if interface_result != ERROR_SUCCESS {
+            unsafe { drop(Box::from_raw(context)) };
+            let _ = ready_tx.send(Err(interface_result));
+            return;
+        }
+
+        let route_result = unsafe {
+            NotifyRouteChange2(
+                AF_INET,
+                Some(on_route_change),
+                caller_context,
+                false,
+                &mut route_handle,
+            )
+        };
+        if route_result != ERROR_SUCCESS {
+            unsafe { CancelMibChangeNotify2(interface_handle) };
+            unsafe { drop(Box::from_raw(context)) };
+            let _ = ready_tx.send(Err(route_result));
+            return;
+        }
+
+        // Force creation of this thread's message queue before publishing the
+        // thread id, so an early wake cannot be lost.
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE) };
+        let thread_id = unsafe { GetCurrentThreadId() };
+        let _ = ready_tx.send(Ok(thread_id));
+
+        loop {
+            let result = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+            if result <= 0 {
+                break;
+            }
+        }
+
+        unsafe { CancelMibChangeNotify2(interface_handle) };
+        unsafe { CancelMibChangeNotify2(route_handle) };
+        unsafe { drop(Box::from_raw(context)) };
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::time::Duration;
+
+    use crate::netmon::{NetworkSource, SourceEvent};
+
+    use super::source;
+
+    #[test]
+    fn notifier_shutdown_is_prompt() {
+        let parts = source().expect("start windows notification source");
+        let mut source = parts.source;
+        // Wait briefly so registration is live before shutdown.
+        std::thread::sleep(Duration::from_millis(50));
+        parts.waker.wake();
+        let started = std::time::Instant::now();
+        let event = source.wait(Duration::from_secs(5));
+        assert!(matches!(event, SourceEvent::Shutdown));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

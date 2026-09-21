@@ -109,10 +109,6 @@ impl ChangeFilter {
 }
 
 /// What a platform source reports while the monitor waits.
-// The `Change` and `Shutdown` variants are constructed by the native Linux
-// and Windows sources (Tasks 3 and 4); the poll-only fallback never builds
-// them on its own. The allow is removed once both native sources exist.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum SourceEvent {
     Change(NetworkChangeSource),
@@ -247,9 +243,11 @@ impl NetworkMonitor {
     }
 }
 
-/// Source used on unsupported platforms and as the fallback path.
+/// Source used only on platforms without a native notification API.
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 pub(crate) struct PollOnlySource;
 
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 impl NetworkSource for PollOnlySource {
     fn wait(&mut self, timeout: Duration) -> SourceEvent {
         std::thread::sleep(timeout);
@@ -257,8 +255,10 @@ impl NetworkSource for PollOnlySource {
     }
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 pub(crate) struct NoopWaker;
 
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 impl NetworkWaker for NoopWaker {
     fn wake(&self) {}
 }

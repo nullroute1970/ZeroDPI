@@ -431,6 +431,19 @@ mod unix {
             }
         }
 
+        fn reset(&self) {
+            let mut flows = self.inner.flows.lock().expect("flows mutex poisoned");
+            for entry in flows.values() {
+                entry.finish(BypassOutcome::UnexpectedClose);
+            }
+            flows.clear();
+            self.inner
+                .flow_ids
+                .lock()
+                .expect("flow IDs mutex poisoned")
+                .clear();
+        }
+
         fn flow_exists(&self, key: FlowKey) -> bool {
             self.inner
                 .flow_ids
@@ -535,6 +548,8 @@ impl FlowController for RemoteHelperClient {
     }
 
     fn remove_flow(&self, _key: FlowKey) {}
+
+    fn reset(&self) {}
 }
 
 pub fn interceptor_config(

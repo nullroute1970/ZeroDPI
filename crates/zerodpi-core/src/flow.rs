@@ -180,6 +180,11 @@ pub trait FlowController: Send + Sync {
     /// Idempotently release a flow. Implementations must make this safe to
     /// call from a cancellation/drop guard.
     fn remove_flow(&self, key: FlowKey);
+
+    /// Drop every tracked flow after the data plane was rebuilt for a new
+    /// interface address. Implementations must wake flow waiters with
+    /// [`BypassOutcome::UnexpectedClose`].
+    fn reset(&self);
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +223,13 @@ impl FlowController for LocalFlowController {
     fn remove_flow(&self, key: FlowKey) {
         self.flows.remove(&key);
     }
+
+    fn reset(&self) {
+        for entry in self.flows.iter() {
+            entry.value().finish(BypassOutcome::UnexpectedClose);
+        }
+        self.flows.clear();
+    }
 }
 
 #[cfg(test)]
@@ -252,6 +264,24 @@ mod tests {
         assert_eq!(
             entry.state.lock().outcome,
             Some(BypassOutcome::FakeDataAcked)
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_finishes_and_drops_every_flow() {
+        let controller = LocalFlowController::new(new_flow_table());
+        let key = FlowKey {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_port: 1234,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            dst_port: 443,
+        };
+        let entry = controller.register_flow(key, vec![1], None).await.unwrap();
+        controller.reset();
+        assert!(!controller.flow_exists(key));
+        assert_eq!(
+            entry.state.lock().outcome,
+            Some(BypassOutcome::UnexpectedClose)
         );
     }
 

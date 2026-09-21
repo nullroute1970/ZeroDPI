@@ -331,6 +331,8 @@ mod tests {
         }
 
         fn remove_flow(&self, _key: FlowKey) {}
+
+        fn reset(&self) {}
     }
 
     fn probe_key() -> FlowKey {

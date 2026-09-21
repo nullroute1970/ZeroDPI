@@ -1475,6 +1475,17 @@ time. The chosen target is stored app-side per profile and injected into an
 ephemeral run config on the next start — `config.toml` is never rewritten,
 and **Clear pin** returns to scan-and-ask behavior.
 
+ZeroDPI recovers from network changes in place. When the default interface
+address changes (Wi-Fi to cellular, DHCP lease change, sleep/wake, adapter
+reset), the core detects it from OS notifications with a 10-second polling
+safety net, rebuilds packet interception against the new address, drops stale
+flow state, and verifies the active target. If the target no longer works and
+`AUTO_SELECT = true`, it runs one rescan (at most once per minute) and
+hot-swaps; a pinned target (`AUTO_SELECT = false` or `SELECTED_SNI`/`SELECTED_IP`)
+is never replaced automatically. Rebuild failures retry with a 1 s to 60 s
+backoff, reset by the next network event. Existing connections still break on
+a network change; only new connections recover.
+
 The app supervises every run it starts. A run that ends unexpectedly is
 relaunched with a backoff (1 s doubling to 60 s) until you press Stop, and a
 run that goes silent is recovered the same way: nothing reports progress for
@@ -1675,6 +1686,8 @@ Unit tests cover:
 | Android app remote update is unavailable | In Settings -> `Remote update`, configure all three absolute `http://` or `https://` URLs. Stop ZeroDPI first; profile switching and remote updates are blocked while the runtime is active. |
 | Android app remote update fails | Check Settings -> `Remote update` for `Last attempt`, `Last success`, `Last update`, and the message below them. HTTP errors, DNS/TLS failures, unsupported redirects, empty responses, and size-limit failures leave local profile files unchanged. |
 | Android app remote update downloads but does not apply | The downloaded `config.toml`, `sni_list.txt`, or `ip_list.txt` failed validation. Fix the remote source, or disable automatic update and reset/edit the affected active-profile file locally. |
+| ZeroDPI reports `network_recovery_failed` or stays on `Network: recovering` | The data plane cannot be rebuilt on the new address. Check that interception permissions still hold (root helper alive, iptables/nftables available) and read the event's `message`. Recovery retries automatically; a dead root helper stays fatal and the supervisor restarts the run. |
+| `AUTO_SELECT = false` and the pinned target stopped working after a network change | Pinned targets are never replaced automatically. Run a scan and pick a target, or clear the pin. |
 | Android app stays on Scanning | Healthy scans report progress per probe and the app recovers a silent run on its own (restart for a run, an inline failure for a pick scan). Read Live logs: a repeated `no reachable SNI candidates found` means the candidates are blocked on the current network, so refresh `sni_list.txt`, raise `SCAN_TIMEOUT_SECS`, or pick a pinned target instead. |
 
 Use `RUST_LOG=debug` when collecting detailed diagnostics:

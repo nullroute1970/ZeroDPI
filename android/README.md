@@ -44,6 +44,12 @@ never included in support bundles or profile exports.
 
 ### Run supervision
 
+Network changes are recovered by the native core, not by the app: the service
+keeps the run alive and surfaces the `network_changed`, `network_recovered`,
+`network_unavailable`, and `network_recovery_failed` events in the log and in
+`lastError`. The service still restarts a run that exits unexpectedly (1 s to
+60 s backoff) and still recovers a run that goes silent during startup.
+
 Every run the app launches is supervised. An unexpected end (failure event or
 an exit the user did not ask for) relaunches the same run spec with a 1 s
 doubling backoff capped at 60 s, and a run that stops reporting events is

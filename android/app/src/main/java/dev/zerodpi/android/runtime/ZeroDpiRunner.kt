@@ -86,6 +86,18 @@ sealed interface ZeroDpiRunnerEvent {
         val ip: String,
         val score: Int?,
     ) : ZeroDpiRunnerEvent
+    data class NetworkUnavailable(val message: String) : ZeroDpiRunnerEvent
+    data class NetworkChanged(val source: String, val interfaceIp: String) : ZeroDpiRunnerEvent
+    data class NetworkRecoveryFailed(
+        val attempt: Int,
+        val nextRetryMs: Long,
+        val message: String,
+    ) : ZeroDpiRunnerEvent
+    data class NetworkRecovered(
+        val interfaceIp: String,
+        val targetVerified: Boolean,
+        val targetSwitched: Boolean,
+    ) : ZeroDpiRunnerEvent
     data class RootRequired(
         val message: String,
         val alternatives: List<String>,

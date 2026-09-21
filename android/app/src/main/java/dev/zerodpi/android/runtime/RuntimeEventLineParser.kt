@@ -108,6 +108,23 @@ internal object RuntimeEventLineParser {
                 ip = stringValue(json, "ip").orEmpty(),
                 score = longValue(json, "score")?.toInt(),
             )
+            "network_unavailable" -> ZeroDpiRunnerEvent.NetworkUnavailable(
+                message = stringValue(json, "message").orEmpty(),
+            )
+            "network_changed" -> ZeroDpiRunnerEvent.NetworkChanged(
+                source = stringValue(json, "source").orEmpty(),
+                interfaceIp = stringValue(json, "interface_ip").orEmpty(),
+            )
+            "network_recovery_failed" -> ZeroDpiRunnerEvent.NetworkRecoveryFailed(
+                attempt = longValue(json, "attempt")?.toInt() ?: 0,
+                nextRetryMs = longValue(json, "next_retry_ms") ?: 0L,
+                message = stringValue(json, "message").orEmpty(),
+            )
+            "network_recovered" -> ZeroDpiRunnerEvent.NetworkRecovered(
+                interfaceIp = stringValue(json, "interface_ip").orEmpty(),
+                targetVerified = boolValue(json, "target_verified") ?: false,
+                targetSwitched = boolValue(json, "target_switched") ?: false,
+            )
             "root_required" -> ZeroDpiRunnerEvent.RootRequired(
                 message = stringValue(json, "message").orEmpty(),
                 alternatives = stringArrayValue(json, "rootless_alternatives"),

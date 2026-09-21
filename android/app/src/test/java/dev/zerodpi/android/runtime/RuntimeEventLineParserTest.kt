@@ -46,4 +46,45 @@ class RuntimeEventLineParserTest {
         assertEquals(2_300L, finished.durationMs)
         assertEquals(true, finished.switched)
     }
+    @Test
+    fun parsesNetworkUnavailable() {
+        val event = RuntimeEventLineParser.parse(
+            """{"event":"network_unavailable","message":"no route"}""",
+        )
+        val unavailable = event as ZeroDpiRunnerEvent.NetworkUnavailable
+        assertEquals("no route", unavailable.message)
+    }
+
+    @Test
+    fun parsesNetworkChanged() {
+        val event = RuntimeEventLineParser.parse(
+            """{"event":"network_changed","source":"address","interface_ip":"192.0.2.10"}""",
+        )
+        val changed = event as ZeroDpiRunnerEvent.NetworkChanged
+        assertEquals("address", changed.source)
+        assertEquals("192.0.2.10", changed.interfaceIp)
+    }
+
+    @Test
+    fun parsesNetworkRecoveryFailed() {
+        val event = RuntimeEventLineParser.parse(
+            """{"event":"network_recovery_failed","attempt":2,"next_retry_ms":4000,"message":"open packet interceptor"}""",
+        )
+        val failed = event as ZeroDpiRunnerEvent.NetworkRecoveryFailed
+        assertEquals(2, failed.attempt)
+        assertEquals(4_000L, failed.nextRetryMs)
+        assertEquals("open packet interceptor", failed.message)
+    }
+
+    @Test
+    fun parsesNetworkRecovered() {
+        val event = RuntimeEventLineParser.parse(
+            """{"event":"network_recovered","interface_ip":"192.0.2.10","target_verified":true,"target_switched":false}""",
+        )
+        val recovered = event as ZeroDpiRunnerEvent.NetworkRecovered
+        assertEquals("192.0.2.10", recovered.interfaceIp)
+        assertEquals(true, recovered.targetVerified)
+        assertEquals(false, recovered.targetSwitched)
+    }
+
 }

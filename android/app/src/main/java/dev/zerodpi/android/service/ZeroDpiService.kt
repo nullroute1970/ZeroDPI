@@ -1154,6 +1154,25 @@ class ZeroDpiService : Service() {
                 }
                 appendLog("Active ${event.target} target changed to ${displayTarget(event.sni, event.ip)}.")
             }
+            is ZeroDpiRunnerEvent.NetworkChanged -> {
+                appendLog("Network changed (${event.source}) — rebuilding interception.")
+            }
+            is ZeroDpiRunnerEvent.NetworkRecovered -> {
+                appendLog(
+                    "Network recovered on ${event.interfaceIp}" +
+                        if (event.targetSwitched) " with a new target." else ".",
+                )
+            }
+            is ZeroDpiRunnerEvent.NetworkUnavailable -> {
+                appendLog("Network unavailable: ${event.message}")
+            }
+            is ZeroDpiRunnerEvent.NetworkRecoveryFailed -> {
+                appendLog(
+                    "Network recovery attempt ${event.attempt} failed: ${event.message} " +
+                        "(retrying in ${event.nextRetryMs} ms)",
+                )
+                state.update { it.copy(lastError = event.message) }
+            }
             is ZeroDpiRunnerEvent.RootRequired -> {
                 val rootStatus = if (state.value.rootStatus == RootStatus.Granted) {
                     RootStatus.Unsupported

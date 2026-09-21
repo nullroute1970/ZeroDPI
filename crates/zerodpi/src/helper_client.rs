@@ -245,6 +245,10 @@ mod unix {
             }
         }
 
+        pub fn is_disconnected(&self) -> bool {
+            self.inner.disconnected.load(Ordering::SeqCst)
+        }
+
         pub async fn wait_disconnected(&self) {
             if self.inner.disconnected.load(Ordering::SeqCst) {
                 return;
@@ -529,6 +533,10 @@ impl RemoteHelperClient {
     pub async fn shutdown(&self) -> Result<()> {
         bail!("external root helper is unavailable")
     }
+    pub fn is_disconnected(&self) -> bool {
+        false
+    }
+
     pub async fn wait_disconnected(&self) {}
 }
 

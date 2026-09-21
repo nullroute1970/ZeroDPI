@@ -12,6 +12,7 @@
 //!   6. If `RESCAN_INTERVAL_SECS > 0`, run the scanner again in the background
 //!      every that many seconds and switch new connections to better targets.
 
+mod data_plane;
 mod helper_client;
 mod runtime_events;
 mod tui;
@@ -3245,6 +3246,15 @@ fn proxy_scan_main(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn config_for_tests() -> Config {
+    toml::from_str(
+        r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+    )
+    .expect("parse minimal config")
 }
 
 #[cfg(test)]

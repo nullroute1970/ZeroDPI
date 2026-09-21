@@ -40,9 +40,6 @@ impl RuntimeEventEmitter {
     }
 }
 
-// The four network_* variants are constructed by MainRecoveryEnv in Task 12.
-// Remove this allow when that wiring lands.
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {

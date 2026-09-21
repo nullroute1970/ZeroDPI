@@ -43,6 +43,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, TlsFragPackets};
+use crate::net::InterfaceIp;
 use crate::flow::{BypassOutcome, FlowController, FlowEntry, FlowKey};
 use crate::methods::ccs_prefix::CcsPrefix;
 use crate::methods::mixed_case_sni::MixedCaseSni;
@@ -567,7 +568,7 @@ mod rand_lite {
 pub async fn run_proxy(
     cfg: Arc<Config>,
     active_target: SharedSniTarget,
-    interface_ip: Ipv4Addr,
+    interface_ip: InterfaceIp,
     flow_controller: Arc<dyn FlowController>,
     event_tx: Option<ProxyEventSender>,
 ) -> anyhow::Result<()> {
@@ -616,12 +617,13 @@ pub async fn run_proxy(
         let target = active_target.read().unwrap().clone();
         let flow_controller = flow_controller.clone();
         let event_tx = event_tx.clone();
+        let current_interface_ip = interface_ip.current();
         let connection_settings = ConnectionSettings::from_config(&cfg);
         let fake_client_hello = fresh_fake_client_hello(target.sni.as_bytes());
         tokio::spawn(async move {
             if let Err(e) = handle_intercept_connection(
                 InterceptConnectionTarget {
-                    interface_ip,
+                    interface_ip: current_interface_ip,
                     connect_ip: target.ip,
                     fake_client_hello,
                 },
@@ -994,7 +996,7 @@ async fn handle_intercept_connection(
 pub async fn run_ip_bypass_plus_proxy(
     cfg: Arc<Config>,
     active_ip: Arc<RwLock<IpAddr>>,
-    interface_ip: Ipv4Addr,
+    interface_ip: InterfaceIp,
     flow_controller: Arc<dyn FlowController>,
     event_tx: Option<ProxyEventSender>,
 ) -> anyhow::Result<()> {
@@ -1047,11 +1049,12 @@ pub async fn run_ip_bypass_plus_proxy(
 
         let flow_controller = flow_controller.clone();
         let event_tx = event_tx.clone();
+        let current_interface_ip = interface_ip.current();
         let connection_settings = ConnectionSettings::from_config(&cfg);
         tokio::spawn(async move {
             if let Err(e) = handle_intercept_connection(
                 InterceptConnectionTarget {
-                    interface_ip,
+                    interface_ip: current_interface_ip,
                     connect_ip,
                     fake_client_hello: Vec::new(),
                 },

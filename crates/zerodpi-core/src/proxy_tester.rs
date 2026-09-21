@@ -321,7 +321,13 @@ async fn run_socks5_probe(
     let cfg_clone = config.clone();
     let at_clone = active_target.clone();
     let proxy_task = tokio::spawn(async move {
-        let _ = run_proxy(cfg_clone, at_clone, interface_ip, flow_controller, None).await;
+        let _ = run_proxy(
+            cfg_clone,
+            at_clone,
+            crate::net::InterfaceIp::fixed(interface_ip),
+            flow_controller,
+            None,
+        ).await;
     });
 
     // Give the listener a moment to bind before connecting.

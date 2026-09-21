@@ -3,8 +3,6 @@
 //! The coordinator reacts to settled network changes, rebuilds the data plane
 //! with the new interface address, verifies the active target, and only then
 //! asks for a rescan when the selection policy allows it.
-// Remove this allow when Task 12 wires the coordinator into the modes.
-#![allow(dead_code)]
 
 use std::future::Future;
 use std::net::Ipv4Addr;
@@ -219,6 +217,138 @@ impl<E: RecoveryEnv> RecoveryCoordinator<E> {
         match self.last_rescan {
             None => true,
             Some(at) => at.elapsed() >= RECOVERY_RESCAN_MIN_INTERVAL,
+        }
+    }
+}
+
+use zerodpi_core::net::InterfaceIpHandle;
+use zerodpi_core::proxy::{NetworkStatus as ProxyNetworkStatus, ProxyEvent, ProxyEventSender};
+
+use crate::data_plane::DataPlane;
+use crate::runtime_events::{RuntimeEvent, RuntimeEventEmitter};
+
+/// Runtime event for a status, when the contract defines one.
+pub(crate) fn runtime_event_for(status: &NetworkStatus) -> Option<RuntimeEvent> {
+    match status {
+        NetworkStatus::Online { .. } => None,
+        NetworkStatus::Unavailable { message } => Some(RuntimeEvent::NetworkUnavailable {
+            message: message.clone(),
+        }),
+        NetworkStatus::Changing {
+            interface_ip,
+            source,
+        } => Some(RuntimeEvent::NetworkChanged {
+            source: *source,
+            interface_ip: interface_ip.to_string(),
+        }),
+        NetworkStatus::Recovering {
+            attempt,
+            next_retry_ms,
+            message,
+        } => Some(RuntimeEvent::NetworkRecoveryFailed {
+            attempt: *attempt,
+            next_retry_ms: *next_retry_ms,
+            message: message.clone(),
+        }),
+        NetworkStatus::Recovered {
+            interface_ip,
+            target_verified,
+            target_switched,
+        } => Some(RuntimeEvent::NetworkRecovered {
+            interface_ip: interface_ip.to_string(),
+            target_verified: *target_verified,
+            target_switched: *target_switched,
+        }),
+    }
+}
+
+/// Dashboard event for a status.
+pub(crate) fn proxy_status_for(status: &NetworkStatus) -> Option<ProxyNetworkStatus> {
+    match status {
+        NetworkStatus::Online { interface_ip } => Some(ProxyNetworkStatus::Online {
+            interface_ip: *interface_ip,
+        }),
+        NetworkStatus::Unavailable { message } => Some(ProxyNetworkStatus::Unavailable {
+            message: message.clone(),
+        }),
+        NetworkStatus::Changing { interface_ip, .. } => Some(ProxyNetworkStatus::Changing {
+            interface_ip: *interface_ip,
+        }),
+        NetworkStatus::Recovering { attempt, .. } => {
+            Some(ProxyNetworkStatus::Recovering { attempt: *attempt })
+        }
+        NetworkStatus::Recovered { interface_ip, .. } => Some(ProxyNetworkStatus::Online {
+            interface_ip: *interface_ip,
+        }),
+    }
+}
+
+/// Callbacks the running mode supplies to recovery.
+pub struct RecoveryCallbacks {
+    pub verify: Arc<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>,
+    pub rescan: Arc<dyn Fn() -> BoxFuture<'static, RescanOutcome> + Send + Sync>,
+}
+
+/// Concrete [`RecoveryEnv`] used by the CLI.
+pub struct MainRecoveryEnv {
+    interface_ip_handle: InterfaceIpHandle,
+    data_plane: Arc<dyn DataPlane>,
+    callbacks: RecoveryCallbacks,
+    events: RuntimeEventEmitter,
+    proxy_events: Option<ProxyEventSender>,
+}
+
+impl MainRecoveryEnv {
+    pub fn new(
+        interface_ip_handle: InterfaceIpHandle,
+        data_plane: Arc<dyn DataPlane>,
+        callbacks: RecoveryCallbacks,
+        events: RuntimeEventEmitter,
+        proxy_events: Option<ProxyEventSender>,
+    ) -> Self {
+        Self {
+            interface_ip_handle,
+            data_plane,
+            callbacks,
+            events,
+            proxy_events,
+        }
+    }
+}
+
+impl RecoveryEnv for MainRecoveryEnv {
+    fn probe(&self, target: Ipv4Addr) -> anyhow::Result<Ipv4Addr> {
+        zerodpi_core::net::default_interface_ipv4(target)
+    }
+
+    fn rebuild<'a>(&'a self, interface_ip: Ipv4Addr) -> BoxFuture<'a, anyhow::Result<()>> {
+        self.data_plane.rebuild(interface_ip)
+    }
+
+    fn verify<'a>(&'a self) -> BoxFuture<'a, bool> {
+        (self.callbacks.verify)()
+    }
+
+    fn rescan<'a>(&'a self) -> BoxFuture<'a, RescanOutcome> {
+        (self.callbacks.rescan)()
+    }
+
+    fn apply_interface_ip(&self, interface_ip: Ipv4Addr) {
+        self.interface_ip_handle.set(interface_ip);
+    }
+
+    fn remote_disconnected(&self) -> bool {
+        self.data_plane.remote_disconnected()
+    }
+
+    fn publish(&self, status: NetworkStatus) {
+        if let Some(event) = runtime_event_for(&status) {
+            self.events.emit(event);
+        }
+        if let (Some(tx), Some(proxy_status)) = (&self.proxy_events, proxy_status_for(&status)) {
+            let _ = tx.send(ProxyEvent::NetworkStatus {
+                status: proxy_status,
+            });
         }
     }
 }
@@ -517,4 +647,47 @@ mod tests {
             Some(NetworkStatus::Unavailable { .. })
         ));
     }
+    #[test]
+    fn maps_changing_status_to_network_changed_event() {
+        let status = NetworkStatus::Changing {
+            interface_ip: Ipv4Addr::new(192, 0, 2, 10),
+            source: NetworkChangeSource::Route,
+        };
+        let event = runtime_event_for(&status).expect("runtime event");
+        assert!(matches!(
+            event,
+            crate::runtime_events::RuntimeEvent::NetworkChanged {
+                interface_ip,
+                ..
+            } if interface_ip == "192.0.2.10"
+        ));
+        assert!(proxy_status_for(&status).is_some());
+    }
+
+    #[test]
+    fn maps_recovered_status_to_runtime_and_proxy_events() {
+        let status = NetworkStatus::Recovered {
+            interface_ip: Ipv4Addr::new(192, 0, 2, 10),
+            target_verified: false,
+            target_switched: true,
+        };
+        assert!(matches!(
+            runtime_event_for(&status),
+            Some(crate::runtime_events::RuntimeEvent::NetworkRecovered {
+                target_switched: true,
+                ..
+            })
+        ));
+        assert!(proxy_status_for(&status).is_some());
+    }
+
+    #[test]
+    fn online_status_has_no_runtime_event() {
+        let status = NetworkStatus::Online {
+            interface_ip: Ipv4Addr::LOCALHOST,
+        };
+        assert!(runtime_event_for(&status).is_none());
+        assert!(proxy_status_for(&status).is_some());
+    }
+
 }

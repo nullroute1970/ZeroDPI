@@ -27,16 +27,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
 use zerodpi_core::config::{BypassMethodList, Config};
 use zerodpi_core::dns::DnsResolver;
 use zerodpi_core::flow::{new_flow_table, FlowController, LocalFlowController};
-use zerodpi_core::handler::Handler;
-use zerodpi_core::interceptor::{FilterSpec, InterceptorShutdown, PacketInterceptor};
+use zerodpi_core::interceptor::PacketInterceptor;
 use zerodpi_core::ip_scanner::{load_ip_list, scan_ip_list, IpProbeEntry, IpScanEvent};
 use zerodpi_core::low_ttl_discover::{discover_low_ttl, LowTtlDiscovery};
 use zerodpi_core::method_scanner::{
@@ -483,68 +482,50 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         .context("could not determine local interface IP for upstream")?;
     info!(%interface_ip, %connect_ip, sni = %selected.sni, "starting proxy");
 
+    let (interface_ip_handle, interface_ip) =
+        zerodpi_core::net::interface_ip_channel(interface_ip);
     let mut low_ttl_handle: Option<Arc<AtomicU8>> = None;
 
-    let (flow_controller, interceptor_runtime): (
+    let (flow_controller, data_plane_controller): (
         Arc<dyn FlowController>,
-        Option<InterceptorRuntime>,
+        Arc<dyn data_plane::DataPlane>,
     ) = if cfg.BYPASS_METHOD.is_socket_only() {
         info!(method = %cfg.BYPASS_METHOD, "socket-only bypass method selected; skipping packet interceptor");
-        let flows = new_flow_table();
-        (Arc::new(LocalFlowController::new(flows)), None)
+        (
+            Arc::new(LocalFlowController::new(new_flow_table())),
+            Arc::new(data_plane::DataPlaneController::none()),
+        )
     } else if let Some(helper) = remote_helper.as_ref() {
-        let config = interceptor_config(&cfg, interface_ip, None, CONNECT_PORT);
-        rt.block_on(async {
-            helper.configure(config).await?;
-            helper.open().await
-        })
-        .context("prepare root helper interceptor")?;
+        let controller = rt
+            .block_on(data_plane::DataPlaneController::remote(
+                cfg.clone(),
+                helper.clone(),
+                Arc::new(helper.clone()),
+                interface_ip.current(),
+            ))
+            .context("prepare root helper interceptor")?;
         info!(
             helper_pid = helper.helper_pid(),
             helper_uid = helper.helper_uid(),
             "root helper interceptor ready"
         );
-        (
-            Arc::new(helper.clone()),
-            Some(InterceptorRuntime::Remote(helper.clone())),
-        )
+        (Arc::new(helper.clone()), Arc::new(controller))
     } else {
         let flows = new_flow_table();
         let method_box = build_method(&cfg)
             .with_context(|| format!("unknown BYPASS_METHOD '{}'", cfg.BYPASS_METHOD))?;
         let method: Arc<dyn zerodpi_core::methods::BypassMethod> = Arc::from(method_box);
         low_ttl_handle = method.low_ttl_handle();
-
-        let filter = FilterSpec {
-            interface_ip,
-            remote_ip: None,
-            remote_port: CONNECT_PORT,
-            queue_num: cfg.NFQUEUE_NUM,
-            linux_firewall_backend: cfg.linux_firewall_backend(),
-            firewall_owner: None,
-        };
-        let interceptor = DefaultInterceptor::open(filter).context("open packet interceptor")?;
-
-        let handler = Handler::new(flows.clone(), method);
-        let (intercept_done_tx, intercept_done_rx) = oneshot::channel();
-        let shutdown = InterceptorShutdown::default();
-        let thread_shutdown = shutdown.clone();
-        std::thread::Builder::new()
-            .name("zerodpi-intercept".into())
-            .spawn(move || {
-                let result = interceptor.run_until(handler, thread_shutdown);
-                if let Err(ref e) = result {
-                    error!(error = %e, "intercept loop ended with error");
-                }
-                let _ = intercept_done_tx.send(result);
-            })
-            .context("spawn intercept thread")?;
+        let controller = data_plane::DataPlaneController::local(
+            cfg.clone(),
+            flows.clone(),
+            method,
+            interface_ip.current(),
+        )
+        .context("open packet interceptor")?;
         (
             Arc::new(LocalFlowController::new(flows)),
-            Some(InterceptorRuntime::Local {
-                shutdown,
-                done_rx: intercept_done_rx,
-            }),
+            Arc::new(controller),
         )
     };
 
@@ -568,7 +549,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                     settings: LowTtlDiscovery::from_config(&cfg),
                     connector: zerodpi_core::low_ttl_discover::make_discovery_tls_connector(),
                     flow_controller: flow_controller.clone(),
-                    interface_ip,
+                    interface_ip: interface_ip.clone(),
                     applier: LowTtlApplier::Local(handle),
                 })
             } else if let Some(helper) = remote_helper.clone() {
@@ -576,7 +557,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                     settings: LowTtlDiscovery::from_config(&cfg),
                     connector: zerodpi_core::low_ttl_discover::make_discovery_tls_connector(),
                     flow_controller: flow_controller.clone(),
-                    interface_ip,
+                    interface_ip: interface_ip.clone(),
                     applier: LowTtlApplier::Remote(helper),
                 })
             } else {
@@ -621,12 +602,13 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
             Some(event_tx.clone())
         };
         let rescan_events = events.clone();
+        let rescan_discovery = low_ttl_discovery_state.clone();
         rt.spawn(async move {
             background_rescan(
                 rescan_cfg,
                 rescan_path,
                 interval,
-                low_ttl_discovery_state.clone(),
+                rescan_discovery,
                 active_target,
                 rescan_event_tx,
                 rescan_events,
@@ -635,6 +617,82 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
             .await;
         });
     }
+
+    // ---- step 5: network recovery ----
+    let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(connect_ip)));
+    let monitor = zerodpi_platform::netmon::NetworkMonitor::start(
+        probe_target.clone(),
+        Some(interface_ip.current()),
+        network_recovery::SETTLE,
+        network_recovery::POLL_INTERVAL,
+    )
+    .context("start network monitor")?;
+
+    let cfg_verify = cfg.clone();
+    let verify_target = active_target.clone();
+    let verify: Arc<dyn Fn() -> network_recovery::BoxFuture<'static, bool> + Send + Sync> =
+        Arc::new(move || {
+            let cfg = cfg_verify.clone();
+            let (sni, ip) = {
+                let target = verify_target.read().unwrap();
+                (target.sni.to_string(), target.ip)
+            };
+            Box::pin(async move {
+                zerodpi_core::sni_scanner::probe_sni_candidate(
+                    &sni,
+                    ip,
+                    Duration::from_secs(cfg.SCAN_TIMEOUT_SECS),
+                    cfg,
+                )
+                .await
+                .tls_ok
+            })
+        });
+
+    let cfg_rescan = cfg.clone();
+    let rescan_path = sni_list_path.clone();
+    let rescan_target = active_target.clone();
+    let rescan_discovery = low_ttl_discovery_state.clone();
+    let rescan_event_tx = event_tx.clone();
+    let rescan_events = events.clone();
+    let rescan_probe_target = probe_target.clone();
+    let rescan: Arc<
+        dyn Fn() -> network_recovery::BoxFuture<'static, network_recovery::RescanOutcome>
+            + Send
+            + Sync,
+    > = Arc::new(move || {
+        let cfg = cfg_rescan.clone();
+        let path = rescan_path.clone();
+        let target = rescan_target.clone();
+        let discovery = rescan_discovery.clone();
+        let tx = Some(rescan_event_tx.clone());
+        let events = rescan_events.clone();
+        let probe_target = rescan_probe_target.clone();
+        Box::pin(async move {
+            let outcome =
+                rescan_sni_once(cfg, path, discovery, target.clone(), tx, events, no_tui).await;
+            if outcome.switched {
+                let ip = target.read().unwrap().ip;
+                probe_target.store(u32::from(ip), std::sync::atomic::Ordering::SeqCst);
+            }
+            outcome
+        })
+    });
+
+    let recovery_env = Arc::new(network_recovery::MainRecoveryEnv::new(
+        interface_ip_handle.clone(),
+        data_plane_controller.clone(),
+        network_recovery::RecoveryCallbacks { verify, rescan },
+        events.clone(),
+        Some(event_tx.clone()),
+    ));
+    let coordinator = network_recovery::RecoveryCoordinator::new(
+        recovery_env,
+        probe_target,
+        cfg.AUTO_SELECT && cfg.SELECTED_SNI.is_none(),
+        Some(interface_ip.current()),
+    );
+    let recovery_handle = rt.spawn(coordinator.run(monitor.events()));
 
     let cfg_dash = cfg.clone();
     let selected_dash = selected.clone();
@@ -646,7 +704,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         run_proxy(
             cfg,
             active_target,
-            interface_ip,
+            interface_ip.clone(),
             flow_controller,
             dashboard_event_tx,
         )
@@ -657,7 +715,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         let result = rt.block_on(run_headless_proxy(
             proxy_handle,
             event_rx,
-            interceptor_runtime,
+            data_plane_controller.clone(),
             events.clone(),
         ));
         info!("shutting down");
@@ -674,7 +732,9 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     tui::leave_tui(terminal)?;
 
     proxy_handle.abort();
-    rt.block_on(stop_interceptor(interceptor_runtime))?;
+    monitor.shutdown();
+    recovery_handle.abort();
+    rt.block_on(data_plane_controller.stop())?;
     info!("shutting down");
     dash_result?;
 
@@ -1000,7 +1060,7 @@ struct LowTtlDiscoveryState {
     settings: LowTtlDiscovery,
     connector: tokio_rustls::TlsConnector,
     flow_controller: Arc<dyn FlowController>,
-    interface_ip: Ipv4Addr,
+    interface_ip: zerodpi_core::net::InterfaceIp,
     applier: LowTtlApplier,
 }
 
@@ -1010,7 +1070,7 @@ impl LowTtlDiscoveryState {
             self.settings,
             sni,
             connect_ip,
-            self.interface_ip,
+            self.interface_ip.current(),
             self.flow_controller.clone(),
             self.connector.clone(),
         )
@@ -1368,170 +1428,42 @@ fn rootless_alternatives() -> Vec<String> {
     ]
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const INTERCEPTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
-enum InterceptorRuntime {
-    Local {
-        shutdown: InterceptorShutdown,
-        done_rx: oneshot::Receiver<anyhow::Result<()>>,
-    },
-    Remote(RemoteHelperClient),
-}
-
-async fn stop_interceptor(interceptor: Option<InterceptorRuntime>) -> anyhow::Result<()> {
-    let Some(interceptor) = interceptor else {
-        return Ok(());
-    };
-
-    match interceptor {
-        InterceptorRuntime::Local { shutdown, done_rx } => {
-            shutdown.request();
-            let mut report_rx = spawn_interceptor_report(done_rx);
-            wait_for_interceptor_shutdown(&mut report_rx).await
-        }
-        InterceptorRuntime::Remote(helper) => {
-            helper.close().await?;
-            helper.shutdown().await
-        }
-    }
-}
-
 async fn run_headless_proxy(
     proxy_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     event_rx: mpsc::UnboundedReceiver<ProxyEvent>,
-    interceptor: Option<InterceptorRuntime>,
+    data_plane: Arc<dyn data_plane::DataPlane>,
     events: RuntimeEventEmitter,
 ) -> anyhow::Result<()> {
     log_headless_proxy_start();
     let mut proxy_handle = proxy_handle;
     let event_log_handle = tokio::spawn(log_headless_proxy_events(event_rx, events.clone()));
+    let fatal = data_plane.wait_fatal();
+    tokio::pin!(fatal);
 
-    match interceptor {
-        Some(InterceptorRuntime::Local { shutdown, done_rx }) => {
-            let mut intercept_report_rx = spawn_interceptor_report(done_rx);
-            tokio::select! {
-                signal = shutdown_signal() => {
-                    let reason = signal?;
-                    proxy_handle.abort();
-                    shutdown.request();
-                    let result = wait_for_interceptor_shutdown(&mut intercept_report_rx).await;
-                    if result.is_ok() {
-                        events.emit(RuntimeEvent::GracefulShutdown { reason });
-                    }
-                    event_log_handle.abort();
-                    result
-                }
-                result = &mut proxy_handle => {
-                    shutdown.request();
-                    let proxy_result = result.context("proxy task panicked")?;
-                    let stop_result = wait_for_interceptor_shutdown(&mut intercept_report_rx).await;
-                    event_log_handle.abort();
-                    proxy_result?;
-                    stop_result
-                }
-                intercept_result = intercept_report_rx.recv() => {
-                    proxy_handle.abort();
-                    event_log_handle.abort();
-                    match intercept_result {
-                        Some(Ok(())) => Err(anyhow::anyhow!("packet interceptor stopped unexpectedly")),
-                        Some(Err(e)) => Err(e.context("packet interceptor stopped")),
-                        None => Err(anyhow::anyhow!("packet interceptor thread stopped before reporting a result")),
-                    }
-                }
+    tokio::select! {
+        signal = shutdown_signal() => {
+            let reason = signal?;
+            proxy_handle.abort();
+            let result = data_plane.stop().await;
+            if result.is_ok() {
+                events.emit(RuntimeEvent::GracefulShutdown { reason });
             }
+            event_log_handle.abort();
+            result
         }
-        Some(InterceptorRuntime::Remote(helper)) => {
-            let disconnected = helper.wait_disconnected();
-            tokio::pin!(disconnected);
-            tokio::select! {
-                signal = shutdown_signal() => {
-                    let reason = signal?;
-                    proxy_handle.abort();
-                    let result = async {
-                        helper.close().await?;
-                        helper.shutdown().await
-                    }.await;
-                    if result.is_ok() {
-                        events.emit(RuntimeEvent::GracefulShutdown { reason });
-                    }
-                    event_log_handle.abort();
-                    result
-                }
-                result = &mut proxy_handle => {
-                    let proxy_result = result.context("proxy task panicked")?;
-                    let stop_result = async {
-                        helper.close().await?;
-                        helper.shutdown().await
-                    }.await;
-                    event_log_handle.abort();
-                    proxy_result?;
-                    stop_result
-                }
-                _ = &mut disconnected => {
-                    proxy_handle.abort();
-                    event_log_handle.abort();
-                    Err(anyhow::anyhow!("root helper disconnected while interception was active"))
-                }
-            }
+        result = &mut proxy_handle => {
+            let proxy_result = result.context("proxy task panicked")?;
+            let stop_result = data_plane.stop().await;
+            event_log_handle.abort();
+            proxy_result?;
+            stop_result
         }
-        None => {
-            tokio::select! {
-                signal = shutdown_signal() => {
-                    let reason = signal?;
-                    events.emit(RuntimeEvent::GracefulShutdown { reason });
-                    proxy_handle.abort();
-                    event_log_handle.abort();
-                    Ok(())
-                }
-                result = &mut proxy_handle => {
-                    event_log_handle.abort();
-                    result.context("proxy task panicked")?
-                }
-            }
+        reason = &mut fatal => {
+            proxy_handle.abort();
+            event_log_handle.abort();
+            Err(anyhow::anyhow!(reason))
         }
     }
-}
-
-fn spawn_interceptor_report(
-    done_rx: oneshot::Receiver<anyhow::Result<()>>,
-) -> mpsc::UnboundedReceiver<anyhow::Result<()>> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        let result = match done_rx.await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!(
-                "packet interceptor thread stopped before reporting a result"
-            )),
-        };
-        let _ = tx.send(result);
-    });
-    rx
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-async fn wait_for_interceptor_shutdown(
-    report_rx: &mut mpsc::UnboundedReceiver<anyhow::Result<()>>,
-) -> anyhow::Result<()> {
-    match tokio::time::timeout(INTERCEPTOR_SHUTDOWN_TIMEOUT, report_rx.recv()).await {
-        Ok(Some(Ok(()))) => Ok(()),
-        Ok(Some(Err(e))) => Err(e.context("packet interceptor stopped during shutdown")),
-        Ok(None) => Err(anyhow::anyhow!(
-            "packet interceptor thread stopped before reporting a result"
-        )),
-        Err(_) => Err(anyhow::anyhow!(
-            "packet interceptor did not stop within {} seconds",
-            INTERCEPTOR_SHUTDOWN_TIMEOUT.as_secs()
-        )),
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-async fn wait_for_interceptor_shutdown(
-    report_rx: &mut mpsc::UnboundedReceiver<anyhow::Result<()>>,
-) -> anyhow::Result<()> {
-    let _ = tokio::time::timeout(Duration::from_millis(100), report_rx.recv()).await;
-    Ok(())
 }
 
 async fn log_headless_proxy_events(
@@ -1860,6 +1792,94 @@ fn ip_bypass_main(
         });
     }
 
+    let data_plane_controller: Arc<dyn data_plane::DataPlane> =
+        Arc::new(data_plane::DataPlaneController::none());
+    let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(
+        monitor_probe_target(active_ip),
+    )));
+    let monitor = zerodpi_platform::netmon::NetworkMonitor::start(
+        probe_target.clone(),
+        default_interface_ipv4(monitor_probe_target(active_ip)).ok(),
+        network_recovery::SETTLE,
+        network_recovery::POLL_INTERVAL,
+    )
+    .context("start network monitor")?;
+
+    let cfg_verify = cfg.clone();
+    let verify_active = active_ip_arc.clone();
+    let verify: Arc<dyn Fn() -> network_recovery::BoxFuture<'static, bool> + Send + Sync> =
+        Arc::new(move || {
+            let cfg = cfg_verify.clone();
+            let ip = *verify_active.read().unwrap();
+            Box::pin(async move {
+                zerodpi_core::ip_scanner::probe_ip_candidate(
+                    ip,
+                    Arc::from(cfg.IP_SCAN_SNI.as_str()),
+                    Duration::from_secs(cfg.SCAN_TIMEOUT_SECS),
+                    cfg,
+                )
+                .await
+                .tls_ok
+            })
+        });
+
+    let cfg_rescan = cfg.clone();
+    let rescan_path = ip_list_path.clone();
+    let rescan_active = active_ip_arc.clone();
+    let rescan_event_tx = event_tx.clone();
+    let rescan_events = events.clone();
+    let rescan_probe_target = probe_target.clone();
+    let rescan: Arc<
+        dyn Fn() -> network_recovery::BoxFuture<'static, network_recovery::RescanOutcome>
+            + Send
+            + Sync,
+    > = Arc::new(move || {
+        let cfg = cfg_rescan.clone();
+        let path = rescan_path.clone();
+        let active = rescan_active.clone();
+        let tx = Some(rescan_event_tx.clone());
+        let events = rescan_events.clone();
+        let probe_target = rescan_probe_target.clone();
+        Box::pin(async move {
+            let outcome = rescan_ip_once(
+                cfg,
+                path,
+                active.clone(),
+                tx,
+                events,
+                no_tui,
+                IpRescanPolicy {
+                    mode_label: "ip_bypass",
+                    ipv4_only: false,
+                },
+            )
+            .await;
+            if outcome.switched {
+                let ip = *active.read().unwrap();
+                probe_target.store(
+                    u32::from(monitor_probe_target(ip)),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+            outcome
+        })
+    });
+
+    let recovery_env = Arc::new(network_recovery::MainRecoveryEnv::new(
+        zerodpi_core::net::interface_ip_channel(monitor_probe_target(active_ip)).0,
+        data_plane_controller.clone(),
+        network_recovery::RecoveryCallbacks { verify, rescan },
+        events.clone(),
+        Some(event_tx.clone()),
+    ));
+    let coordinator = network_recovery::RecoveryCoordinator::new(
+        recovery_env,
+        probe_target,
+        cfg.AUTO_SELECT && cfg.SELECTED_IP.is_none(),
+        default_interface_ipv4(monitor_probe_target(active_ip)).ok(),
+    );
+    let recovery_handle = rt.spawn(coordinator.run(monitor.events()));
+
     info!(%active_ip, "ip_bypass: starting proxy (no packet interception)");
 
     // ---- step 3: run the proxy ----
@@ -1874,7 +1894,7 @@ fn ip_bypass_main(
         let result = rt.block_on(run_headless_proxy(
             proxy_handle,
             event_rx,
-            None,
+            data_plane_controller.clone(),
             events.clone(),
         ));
         info!("shutting down");
@@ -1887,6 +1907,8 @@ fn ip_bypass_main(
     tui::leave_tui(terminal)?;
 
     proxy_handle.abort();
+    monitor.shutdown();
+    recovery_handle.abort();
     info!("shutting down");
     dash_result?;
 
@@ -2031,63 +2053,129 @@ fn ip_bypass_plus_main(
         "ip_bypass_plus: starting proxy"
     );
 
+    let (interface_ip_handle, interface_ip) =
+        zerodpi_core::net::interface_ip_channel(interface_ip);
+
     // ---- step 3: optional packet interceptor ----
-    let (flow_controller, interceptor_runtime): (
+    let (flow_controller, data_plane_controller): (
         Arc<dyn FlowController>,
-        Option<InterceptorRuntime>,
+        Arc<dyn data_plane::DataPlane>,
     ) = if cfg.BYPASS_METHOD.is_socket_only() {
         info!(method = %cfg.BYPASS_METHOD, "ip_bypass_plus: socket-only bypass method selected; skipping packet interceptor");
-        let flows = new_flow_table();
-        (Arc::new(LocalFlowController::new(flows)), None)
-    } else if let Some(helper) = remote_helper {
-        let config = interceptor_config(&cfg, interface_ip, None, CONNECT_PORT);
-        rt.block_on(async {
-            helper.configure(config).await?;
-            helper.open().await
-        })
-        .context("prepare root helper interceptor")?;
         (
-            Arc::new(helper.clone()),
-            Some(InterceptorRuntime::Remote(helper)),
+            Arc::new(LocalFlowController::new(new_flow_table())),
+            Arc::new(data_plane::DataPlaneController::none()),
         )
+    } else if let Some(helper) = remote_helper {
+        let controller = rt
+            .block_on(data_plane::DataPlaneController::remote(
+                cfg.clone(),
+                helper.clone(),
+                Arc::new(helper.clone()),
+                interface_ip.current(),
+            ))
+            .context("prepare root helper interceptor")?;
+        (Arc::new(helper.clone()), Arc::new(controller))
     } else {
         let flows = new_flow_table();
         let method_box = build_method(&cfg)
             .with_context(|| format!("unknown BYPASS_METHOD '{}'", cfg.BYPASS_METHOD))?;
         let method: Arc<dyn zerodpi_core::methods::BypassMethod> = Arc::from(method_box);
-
-        let filter = FilterSpec {
-            interface_ip,
-            remote_ip: None,
-            remote_port: CONNECT_PORT,
-            queue_num: cfg.NFQUEUE_NUM,
-            linux_firewall_backend: cfg.linux_firewall_backend(),
-            firewall_owner: None,
-        };
-        let interceptor = DefaultInterceptor::open(filter).context("open packet interceptor")?;
-
-        let handler = Handler::new(flows.clone(), method);
-        let (intercept_done_tx, intercept_done_rx) = oneshot::channel();
-        let shutdown = InterceptorShutdown::default();
-        let thread_shutdown = shutdown.clone();
-        std::thread::Builder::new()
-            .name("zerodpi-ip-plus-intercept".into())
-            .spawn(move || {
-                let result = interceptor.run_until(handler, thread_shutdown);
-                if let Err(ref e) = result {
-                    error!(error = %e, "ip_bypass_plus intercept loop ended with error");
-                }
-                let _ = intercept_done_tx.send(result);
-            })
-            .context("spawn intercept thread")?;
+        let controller = data_plane::DataPlaneController::local(
+            cfg.clone(),
+            flows.clone(),
+            method,
+            interface_ip.current(),
+        )
+        .context("open packet interceptor")?;
         (
             Arc::new(LocalFlowController::new(flows)),
-            Some(InterceptorRuntime::Local {
-                shutdown,
-                done_rx: intercept_done_rx,
-            }),
+            Arc::new(controller),
         )
     };
+
+    // ---- step 4: network recovery ----
+    let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(active_v4)));
+    let monitor = zerodpi_platform::netmon::NetworkMonitor::start(
+        probe_target.clone(),
+        Some(interface_ip.current()),
+        network_recovery::SETTLE,
+        network_recovery::POLL_INTERVAL,
+    )
+    .context("start network monitor")?;
+
+    let cfg_verify = cfg.clone();
+    let verify_active = active_ip_arc.clone();
+    let verify: Arc<dyn Fn() -> network_recovery::BoxFuture<'static, bool> + Send + Sync> =
+        Arc::new(move || {
+            let cfg = cfg_verify.clone();
+            let ip = *verify_active.read().unwrap();
+            Box::pin(async move {
+                zerodpi_core::ip_scanner::probe_ip_candidate(
+                    ip,
+                    Arc::from(cfg.IP_SCAN_SNI.as_str()),
+                    Duration::from_secs(cfg.SCAN_TIMEOUT_SECS),
+                    cfg,
+                )
+                .await
+                .tls_ok
+            })
+        });
+
+    let cfg_rescan = cfg.clone();
+    let rescan_path = ip_list_path.clone();
+    let rescan_active = active_ip_arc.clone();
+    let rescan_event_tx = event_tx.clone();
+    let rescan_events = events.clone();
+    let rescan_probe_target = probe_target.clone();
+    let rescan: Arc<
+        dyn Fn() -> network_recovery::BoxFuture<'static, network_recovery::RescanOutcome>
+            + Send
+            + Sync,
+    > = Arc::new(move || {
+        let cfg = cfg_rescan.clone();
+        let path = rescan_path.clone();
+        let active = rescan_active.clone();
+        let tx = Some(rescan_event_tx.clone());
+        let events = rescan_events.clone();
+        let probe_target = rescan_probe_target.clone();
+        Box::pin(async move {
+            let outcome = rescan_ip_once(
+                cfg,
+                path,
+                active.clone(),
+                tx,
+                events,
+                no_tui,
+                IpRescanPolicy {
+                    mode_label: "ip_bypass_plus",
+                    ipv4_only: true,
+                },
+            )
+            .await;
+            if outcome.switched {
+                if let IpAddr::V4(ip) = *active.read().unwrap() {
+                    probe_target.store(u32::from(ip), std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            outcome
+        })
+    });
+
+    let recovery_env = Arc::new(network_recovery::MainRecoveryEnv::new(
+        interface_ip_handle.clone(),
+        data_plane_controller.clone(),
+        network_recovery::RecoveryCallbacks { verify, rescan },
+        events.clone(),
+        Some(event_tx.clone()),
+    ));
+    let coordinator = network_recovery::RecoveryCoordinator::new(
+        recovery_env,
+        probe_target,
+        cfg.AUTO_SELECT && cfg.SELECTED_IP.is_none(),
+        Some(interface_ip.current()),
+    );
+    let recovery_handle = rt.spawn(coordinator.run(monitor.events()));
 
     // ---- step 4: run the proxy ----
     let cfg_dash = cfg.clone();
@@ -2097,7 +2185,7 @@ fn ip_bypass_plus_main(
         run_ip_bypass_plus_proxy(
             cfg,
             proxy_active,
-            interface_ip,
+            interface_ip.clone(),
             flow_controller,
             dashboard_event_tx,
         )
@@ -2108,7 +2196,7 @@ fn ip_bypass_plus_main(
         let result = rt.block_on(run_headless_proxy(
             proxy_handle,
             event_rx,
-            interceptor_runtime,
+            data_plane_controller.clone(),
             events.clone(),
         ));
         info!("shutting down");
@@ -2121,11 +2209,23 @@ fn ip_bypass_plus_main(
     tui::leave_tui(terminal)?;
 
     proxy_handle.abort();
-    rt.block_on(stop_interceptor(interceptor_runtime))?;
+    monitor.shutdown();
+    recovery_handle.abort();
+    rt.block_on(data_plane_controller.stop())?;
     info!("shutting down");
     dash_result?;
 
     Ok(())
+}
+
+/// IPv4 address the network monitor probes with. `ip_bypass` may hold an IPv6
+/// target, which cannot detect the local IPv4 route, so it falls back to a
+/// stable anchor.
+fn monitor_probe_target(active: IpAddr) -> Ipv4Addr {
+    match active {
+        IpAddr::V4(ip) => ip,
+        IpAddr::V6(_) => Ipv4Addr::new(1, 1, 1, 1),
+    }
 }
 
 fn require_ipv4_target(ip: IpAddr, mode: &str) -> Result<Ipv4Addr> {
@@ -3653,6 +3753,17 @@ mod tests {
         .await;
         assert_eq!(outcome.found, 0);
         assert!(!outcome.switched);
+    }
+
+    #[test]
+    fn monitor_probe_target_falls_back_to_anchor_for_ipv6() {
+        let v4: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        assert_eq!(
+            monitor_probe_target(v4),
+            std::net::Ipv4Addr::new(198, 51, 100, 7)
+        );
+        let v6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(monitor_probe_target(v6), std::net::Ipv4Addr::new(1, 1, 1, 1));
     }
 
 }

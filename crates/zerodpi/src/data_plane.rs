@@ -1,6 +1,4 @@
 //! Ownership and in-place rebuild of the live packet-interception plane.
-// Remove this allow when Task 12 wires the controller into the modes.
-#![allow(dead_code)]
 
 use std::future::Future;
 use std::net::Ipv4Addr;

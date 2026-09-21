@@ -521,7 +521,13 @@ where
     let proxy_target = active_target.clone();
     let proxy_fc = flow_controller.clone();
     let proxy_task = tokio::spawn(async move {
-        let _ = run_proxy(proxy_cfg, proxy_target, interface_ip, proxy_fc, None).await;
+        let _ = run_proxy(
+            proxy_cfg,
+            proxy_target,
+            crate::net::InterfaceIp::fixed(interface_ip),
+            proxy_fc,
+            None,
+        ).await;
     });
     // Give the listener a moment to bind before connecting.
     tokio::time::sleep(Duration::from_millis(50)).await;

@@ -16,6 +16,32 @@ use zerodpi_core::net::{default_interface_ipv4, NetworkChangeSource};
 
 mod platform;
 
+// Linux netlink ABI constants. Kept platform-independent (and test-only
+// outside Linux/Android) so the pure classifier is testable everywhere.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+pub(crate) const RTM_NEWLINK: u16 = 16;
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+pub(crate) const RTM_DELLINK: u16 = 17;
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+pub(crate) const RTM_NEWADDR: u16 = 20;
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+pub(crate) const RTM_DELADDR: u16 = 21;
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+pub(crate) const RTM_NEWROUTE: u16 = 24;
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+pub(crate) const RTM_DELROUTE: u16 = 25;
+
+/// Map a netlink message type to the change kind it represents.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+pub(crate) fn classify_nlmsg(msg_type: u16) -> Option<NetworkChangeSource> {
+    match msg_type {
+        RTM_NEWADDR | RTM_DELADDR => Some(NetworkChangeSource::Address),
+        RTM_NEWROUTE | RTM_DELROUTE => Some(NetworkChangeSource::Route),
+        RTM_NEWLINK | RTM_DELLINK => Some(NetworkChangeSource::Link),
+        _ => None,
+    }
+}
+
 /// A settled, routing-relevant change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkEvent {
@@ -278,6 +304,17 @@ mod tests {
             settle.timeout(Duration::from_millis(5_500)),
             Some(Duration::from_millis(1_500))
         );
+    }
+
+    #[test]
+    fn classifies_netlink_message_types() {
+        assert_eq!(classify_nlmsg(RTM_NEWADDR), Some(NetworkChangeSource::Address));
+        assert_eq!(classify_nlmsg(RTM_DELADDR), Some(NetworkChangeSource::Address));
+        assert_eq!(classify_nlmsg(RTM_NEWROUTE), Some(NetworkChangeSource::Route));
+        assert_eq!(classify_nlmsg(RTM_DELROUTE), Some(NetworkChangeSource::Route));
+        assert_eq!(classify_nlmsg(RTM_NEWLINK), Some(NetworkChangeSource::Link));
+        assert_eq!(classify_nlmsg(RTM_DELLINK), Some(NetworkChangeSource::Link));
+        assert_eq!(classify_nlmsg(0xffff), None);
     }
 
     #[test]

@@ -11,6 +11,8 @@
 //! `tls_frag` still requires interception. See the `BYPASS_METHOD` docs in
 //! zerodpi-core for the list syntax and combination limits.
 
+pub mod netmon;
+
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     feature = "packet-interception"

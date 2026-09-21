@@ -1970,6 +1970,7 @@ dependencies = [
  "nfq",
  "parking_lot",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "windivert",
  "windivert-sys",

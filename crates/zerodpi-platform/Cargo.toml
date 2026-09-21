@@ -16,6 +16,7 @@ packet-interception = ["dep:nfq"]
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 zerodpi-core = { path = "../zerodpi-core" }
 etherparse.workspace = true
 parking_lot.workspace = true

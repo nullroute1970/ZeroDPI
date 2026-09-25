@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use tokio::sync::broadcast;
 
-use zerodpi_core::net::NetworkChangeSource;
+use zerodpi_core::net::{InterfaceBinding, NetworkChangeSource};
 use zerodpi_platform::netmon::NetworkEvent;
 
 /// Settle window handed to `NetworkMonitor::start`.
@@ -59,12 +59,12 @@ pub struct RescanOutcome {
 
 /// Everything the coordinator needs from the running mode.
 pub trait RecoveryEnv: Send + Sync + 'static {
-    /// Probe the canonical interface address for `target`.
-    fn probe(&self, target: Ipv4Addr) -> anyhow::Result<Ipv4Addr>;
-    fn rebuild<'a>(&'a self, interface_ip: Ipv4Addr) -> BoxFuture<'a, anyhow::Result<()>>;
+    /// Probe the physical outbound binding for `target`.
+    fn probe(&self, target: Ipv4Addr) -> anyhow::Result<InterfaceBinding>;
+    fn rebuild<'a>(&'a self, binding: InterfaceBinding) -> BoxFuture<'a, anyhow::Result<()>>;
     fn verify<'a>(&'a self) -> BoxFuture<'a, bool>;
     fn rescan<'a>(&'a self) -> BoxFuture<'a, RescanOutcome>;
-    fn apply_interface_ip(&self, interface_ip: Ipv4Addr);
+    fn apply_interface_binding(&self, binding: InterfaceBinding);
     fn remote_disconnected(&self) -> bool {
         false
     }
@@ -75,7 +75,7 @@ pub struct RecoveryCoordinator<E: RecoveryEnv> {
     env: Arc<E>,
     probe_target: Arc<AtomicU32>,
     auto_select: bool,
-    current: Option<Ipv4Addr>,
+    current: Option<InterfaceBinding>,
     last_rescan: Option<tokio::time::Instant>,
 }
 
@@ -84,7 +84,7 @@ impl<E: RecoveryEnv> RecoveryCoordinator<E> {
         env: Arc<E>,
         probe_target: Arc<AtomicU32>,
         auto_select: bool,
-        initial: Option<Ipv4Addr>,
+        initial: Option<InterfaceBinding>,
     ) -> Self {
         Self {
             env,
@@ -97,8 +97,10 @@ impl<E: RecoveryEnv> RecoveryCoordinator<E> {
 
     /// Run until the monitor channel closes.
     pub async fn run(mut self, mut rx: broadcast::Receiver<NetworkEvent>) {
-        if let Some(interface_ip) = self.current {
-            self.env.publish(NetworkStatus::Online { interface_ip });
+        if let Some(binding) = &self.current {
+            self.env.publish(NetworkStatus::Online {
+                interface_ip: binding.ip,
+            });
         }
         loop {
             let source = match rx.recv().await {
@@ -141,20 +143,22 @@ impl<E: RecoveryEnv> RecoveryCoordinator<E> {
                     });
                     return;
                 }
-                Ok(ip) if Some(ip) == self.current => {
-                    self.env.publish(NetworkStatus::Online { interface_ip: ip });
+                Ok(binding) if self.current.as_ref() == Some(&binding) => {
+                    self.env.publish(NetworkStatus::Online {
+                        interface_ip: binding.ip,
+                    });
                     return;
                 }
-                Ok(ip) => {
+                Ok(binding) => {
                     self.env.publish(NetworkStatus::Changing {
-                        interface_ip: ip,
+                        interface_ip: binding.ip,
                         source,
                     });
-                    if !self.rebuild_with_retry(ip, rx).await {
+                    if !self.rebuild_with_retry(binding.clone(), rx).await {
                         continue;
                     }
-                    self.current = Some(ip);
-                    self.env.apply_interface_ip(ip);
+                    self.current = Some(binding.clone());
+                    self.env.apply_interface_binding(binding.clone());
                     let target_verified = self.env.verify().await;
                     let mut target_switched = false;
                     if !target_verified && self.auto_select && self.rescan_allowed() {
@@ -168,7 +172,7 @@ impl<E: RecoveryEnv> RecoveryCoordinator<E> {
                         }
                     }
                     self.env.publish(NetworkStatus::Recovered {
-                        interface_ip: ip,
+                        interface_ip: binding.ip,
                         target_verified,
                         target_switched,
                     });
@@ -182,14 +186,14 @@ impl<E: RecoveryEnv> RecoveryCoordinator<E> {
     /// when a newer network event arrived and the caller should re-probe.
     async fn rebuild_with_retry(
         &mut self,
-        interface_ip: Ipv4Addr,
+        binding: InterfaceBinding,
         rx: &mut broadcast::Receiver<NetworkEvent>,
     ) -> bool {
         let mut delay = BACKOFF_INITIAL;
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            match self.env.rebuild(interface_ip).await {
+            match self.env.rebuild(binding.clone()).await {
                 Ok(()) => return true,
                 Err(error) => {
                     self.env.publish(NetworkStatus::Recovering {
@@ -221,7 +225,7 @@ impl<E: RecoveryEnv> RecoveryCoordinator<E> {
     }
 }
 
-use zerodpi_core::net::InterfaceIpHandle;
+use zerodpi_core::net::InterfaceBindingHandle;
 use zerodpi_core::proxy::{NetworkStatus as ProxyNetworkStatus, ProxyEvent, ProxyEventSender};
 
 use crate::data_plane::DataPlane;
@@ -291,7 +295,7 @@ pub struct RecoveryCallbacks {
 
 /// Concrete [`RecoveryEnv`] used by the CLI.
 pub struct MainRecoveryEnv {
-    interface_ip_handle: InterfaceIpHandle,
+    interface_binding_handle: InterfaceBindingHandle,
     data_plane: Arc<dyn DataPlane>,
     callbacks: RecoveryCallbacks,
     events: RuntimeEventEmitter,
@@ -300,14 +304,14 @@ pub struct MainRecoveryEnv {
 
 impl MainRecoveryEnv {
     pub fn new(
-        interface_ip_handle: InterfaceIpHandle,
+        interface_binding_handle: InterfaceBindingHandle,
         data_plane: Arc<dyn DataPlane>,
         callbacks: RecoveryCallbacks,
         events: RuntimeEventEmitter,
         proxy_events: Option<ProxyEventSender>,
     ) -> Self {
         Self {
-            interface_ip_handle,
+            interface_binding_handle,
             data_plane,
             callbacks,
             events,
@@ -317,12 +321,12 @@ impl MainRecoveryEnv {
 }
 
 impl RecoveryEnv for MainRecoveryEnv {
-    fn probe(&self, target: Ipv4Addr) -> anyhow::Result<Ipv4Addr> {
-        zerodpi_core::net::default_interface_ipv4(target)
+    fn probe(&self, target: Ipv4Addr) -> anyhow::Result<InterfaceBinding> {
+        zerodpi_platform::uplink::resolve_physical_binding(target)
     }
 
-    fn rebuild<'a>(&'a self, interface_ip: Ipv4Addr) -> BoxFuture<'a, anyhow::Result<()>> {
-        self.data_plane.rebuild(interface_ip)
+    fn rebuild<'a>(&'a self, binding: InterfaceBinding) -> BoxFuture<'a, anyhow::Result<()>> {
+        self.data_plane.rebuild(binding)
     }
 
     fn verify<'a>(&'a self) -> BoxFuture<'a, bool> {
@@ -333,8 +337,8 @@ impl RecoveryEnv for MainRecoveryEnv {
         (self.callbacks.rescan)()
     }
 
-    fn apply_interface_ip(&self, interface_ip: Ipv4Addr) {
-        self.interface_ip_handle.set(interface_ip);
+    fn apply_interface_binding(&self, binding: InterfaceBinding) {
+        self.interface_binding_handle.set(binding);
     }
 
     fn remote_disconnected(&self) -> bool {
@@ -363,22 +367,22 @@ mod tests {
     use super::*;
 
     struct FakeEnv {
-        probe_result: Mutex<anyhow::Result<Ipv4Addr>>,
+        probe_result: Mutex<anyhow::Result<InterfaceBinding>>,
         probe_calls: AtomicUsize,
         fail_rebuilds: AtomicUsize,
-        rebuilds: Mutex<Vec<Ipv4Addr>>,
+        rebuilds: Mutex<Vec<InterfaceBinding>>,
         verify_ok: AtomicBool,
         rescans: AtomicUsize,
         rescan_switched: AtomicBool,
         statuses: Mutex<Vec<NetworkStatus>>,
-        applied: Mutex<Vec<Ipv4Addr>>,
+        applied: Mutex<Vec<InterfaceBinding>>,
         disconnected: AtomicBool,
     }
 
     impl FakeEnv {
         fn arc() -> Arc<Self> {
             Arc::new(Self {
-                probe_result: Mutex::new(Ok(Ipv4Addr::new(10, 0, 0, 2))),
+                probe_result: Mutex::new(Ok(binding(Ipv4Addr::new(10, 0, 0, 2), 2))),
                 probe_calls: AtomicUsize::new(0),
                 fail_rebuilds: AtomicUsize::new(0),
                 rebuilds: Mutex::new(Vec::new()),
@@ -397,17 +401,17 @@ mod tests {
     }
 
     impl RecoveryEnv for FakeEnv {
-        fn probe(&self, _target: Ipv4Addr) -> anyhow::Result<Ipv4Addr> {
+        fn probe(&self, _target: Ipv4Addr) -> anyhow::Result<InterfaceBinding> {
             self.probe_calls.fetch_add(1, Ordering::SeqCst);
             match &*self.probe_result.lock().unwrap() {
-                Ok(ip) => Ok(*ip),
+                Ok(binding) => Ok(binding.clone()),
                 Err(error) => Err(anyhow::anyhow!("{error}")),
             }
         }
 
-        fn rebuild<'a>(&'a self, interface_ip: Ipv4Addr) -> BoxFuture<'a, anyhow::Result<()>> {
+        fn rebuild<'a>(&'a self, binding: InterfaceBinding) -> BoxFuture<'a, anyhow::Result<()>> {
             Box::pin(async move {
-                self.rebuilds.lock().unwrap().push(interface_ip);
+                self.rebuilds.lock().unwrap().push(binding);
                 if self.fail_rebuilds.load(Ordering::SeqCst) > 0 {
                     self.fail_rebuilds.fetch_sub(1, Ordering::SeqCst);
                     anyhow::bail!("rebuild failed");
@@ -430,8 +434,8 @@ mod tests {
             })
         }
 
-        fn apply_interface_ip(&self, interface_ip: Ipv4Addr) {
-            self.applied.lock().unwrap().push(interface_ip);
+        fn apply_interface_binding(&self, binding: InterfaceBinding) {
+            self.applied.lock().unwrap().push(binding);
         }
 
         fn remote_disconnected(&self) -> bool {
@@ -447,6 +451,10 @@ mod tests {
         NetworkEvent::Changed {
             source: NetworkChangeSource::Address,
         }
+    }
+
+    fn binding(ip: Ipv4Addr, if_index: u32) -> InterfaceBinding {
+        InterfaceBinding::new(ip, if_index, format!("if{if_index}"))
     }
 
     fn probe_target() -> Arc<AtomicU32> {
@@ -470,16 +478,16 @@ mod tests {
             env.clone(),
             probe_target(),
             true,
-            Some(Ipv4Addr::new(10, 0, 0, 1)),
+            Some(binding(Ipv4Addr::new(10, 0, 0, 1), 1)),
         );
         run_once(&mut coordinator, &mut rx).await;
         assert_eq!(
             env.rebuilds.lock().unwrap().as_slice(),
-            &[Ipv4Addr::new(10, 0, 0, 2)]
+            &[binding(Ipv4Addr::new(10, 0, 0, 2), 2)]
         );
         assert_eq!(
             env.applied.lock().unwrap().as_slice(),
-            &[Ipv4Addr::new(10, 0, 0, 2)]
+            &[binding(Ipv4Addr::new(10, 0, 0, 2), 2)]
         );
         assert!(env.statuses().iter().any(|status| matches!(
             status,
@@ -494,13 +502,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ignores_unchanged_address() {
         let env = FakeEnv::arc();
-        *env.probe_result.lock().unwrap() = Ok(Ipv4Addr::new(10, 0, 0, 1));
+        *env.probe_result.lock().unwrap() = Ok(binding(Ipv4Addr::new(10, 0, 0, 1), 1));
         let mut rx = broadcast::channel(8).1;
         let mut coordinator = RecoveryCoordinator::new(
             env.clone(),
             probe_target(),
             true,
-            Some(Ipv4Addr::new(10, 0, 0, 1)),
+            Some(binding(Ipv4Addr::new(10, 0, 0, 1), 1)),
         );
         run_once(&mut coordinator, &mut rx).await;
         assert!(env.rebuilds.lock().unwrap().is_empty());
@@ -508,6 +516,30 @@ mod tests {
             env.statuses().last(),
             Some(NetworkStatus::Online { .. })
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rebuilds_when_same_address_moves_to_another_interface() {
+        let env = FakeEnv::arc();
+        *env.probe_result.lock().unwrap() = Ok(binding(Ipv4Addr::new(10, 0, 0, 1), 2));
+        let mut rx = broadcast::channel(8).1;
+        let mut coordinator = RecoveryCoordinator::new(
+            env.clone(),
+            probe_target(),
+            true,
+            Some(binding(Ipv4Addr::new(10, 0, 0, 1), 1)),
+        );
+
+        run_once(&mut coordinator, &mut rx).await;
+
+        assert_eq!(
+            env.rebuilds.lock().unwrap().as_slice(),
+            &[binding(Ipv4Addr::new(10, 0, 0, 1), 2)]
+        );
+        assert_eq!(
+            env.applied.lock().unwrap().as_slice(),
+            &[binding(Ipv4Addr::new(10, 0, 0, 1), 2)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -519,7 +551,7 @@ mod tests {
             env.clone(),
             probe_target(),
             true,
-            Some(Ipv4Addr::new(10, 0, 0, 1)),
+            Some(binding(Ipv4Addr::new(10, 0, 0, 1), 1)),
         );
         run_once(&mut coordinator, &mut rx).await;
         assert!(env.rebuilds.lock().unwrap().is_empty());
@@ -538,7 +570,7 @@ mod tests {
             env.clone(),
             probe_target(),
             true,
-            Some(Ipv4Addr::new(10, 0, 0, 1)),
+            Some(binding(Ipv4Addr::new(10, 0, 0, 1), 1)),
         );
         run_once(&mut coordinator, &mut rx).await;
         assert_eq!(env.rebuilds.lock().unwrap().len(), 3);
@@ -566,12 +598,12 @@ mod tests {
             env.clone(),
             probe_target(),
             true,
-            Some(Ipv4Addr::new(10, 0, 0, 1)),
+            Some(binding(Ipv4Addr::new(10, 0, 0, 1), 1)),
         );
         run_once(&mut coordinator, &mut rx).await;
         assert_eq!(env.rescans.load(Ordering::SeqCst), 1);
 
-        *env.probe_result.lock().unwrap() = Ok(Ipv4Addr::new(10, 0, 0, 3));
+        *env.probe_result.lock().unwrap() = Ok(binding(Ipv4Addr::new(10, 0, 0, 3), 3));
         run_once(&mut coordinator, &mut rx).await;
         assert_eq!(
             env.rescans.load(Ordering::SeqCst),
@@ -586,7 +618,7 @@ mod tests {
             env.clone(),
             probe_target(),
             false,
-            Some(Ipv4Addr::new(10, 0, 0, 1)),
+            Some(binding(Ipv4Addr::new(10, 0, 0, 1), 1)),
         );
         run_once(&mut coordinator, &mut rx).await;
         assert_eq!(
@@ -605,7 +637,7 @@ mod tests {
             env.clone(),
             probe_target(),
             true,
-            Some(Ipv4Addr::new(10, 0, 0, 1)),
+            Some(binding(Ipv4Addr::new(10, 0, 0, 1), 1)),
         );
         tokio::spawn(async move {
             coordinator
@@ -638,7 +670,7 @@ mod tests {
             env.clone(),
             probe_target(),
             true,
-            Some(Ipv4Addr::new(10, 0, 0, 1)),
+            Some(binding(Ipv4Addr::new(10, 0, 0, 1), 1)),
         );
         run_once(&mut coordinator, &mut rx).await;
         assert!(env.rebuilds.lock().unwrap().is_empty());

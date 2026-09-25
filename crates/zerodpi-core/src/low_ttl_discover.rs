@@ -36,13 +36,14 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 use tracing::info;
 
 use crate::config::Config;
 use crate::flow::{FlowController, FlowEntry, FlowKey};
+use crate::net::{bound_tcp_socket, InterfaceBinding, OutboundSocketBinder};
 use crate::proxy::{fresh_fake_client_hello, CONNECT_PORT};
 
 /// Per-candidate probe timeout.
@@ -100,7 +101,8 @@ pub async fn discover_low_ttl(
     discovery: LowTtlDiscovery,
     sni: &str,
     connect_ip: Ipv4Addr,
-    interface_ip: Ipv4Addr,
+    binding: InterfaceBinding,
+    socket_binder: Arc<dyn OutboundSocketBinder>,
     flow_controller: Arc<dyn FlowController>,
     connector: TlsConnector,
 ) -> Option<u8> {
@@ -119,12 +121,15 @@ pub async fn discover_low_ttl(
         let server_name = server_name.clone();
         let flow_controller = flow_controller.clone();
         let connector = connector.clone();
+        let socket_binder = socket_binder.clone();
+        let binding = binding.clone();
         async move {
             probe_ttl(
                 fake_data,
                 &server_name,
                 connect_ip,
-                interface_ip,
+                binding,
+                socket_binder,
                 &flow_controller,
                 &connector,
                 timeout,
@@ -178,27 +183,24 @@ async fn probe_ttl(
     fake_data: Vec<u8>,
     server_name: &ServerName<'static>,
     connect_ip: Ipv4Addr,
-    interface_ip: Ipv4Addr,
+    binding: InterfaceBinding,
+    socket_binder: Arc<dyn OutboundSocketBinder>,
     flow_controller: &Arc<dyn FlowController>,
     connector: &TlsConnector,
     timeout: Duration,
     candidate_ttl: u8,
 ) -> bool {
-    let socket = match TcpSocket::new_v4() {
-        Ok(s) => s,
+    let socket = match bound_tcp_socket(socket_binder.as_ref(), &binding) {
+        Ok(socket) => socket,
         Err(_) => return false,
     };
-    let bind_addr = SocketAddr::from((interface_ip, 0));
-    if socket.bind(bind_addr).is_err() {
-        return false;
-    }
     let local = match socket.local_addr() {
         Ok(addr) => addr,
         Err(_) => return false,
     };
     let src_port = local.port();
     let key = FlowKey {
-        src_ip: interface_ip,
+        src_ip: binding.ip,
         src_port,
         dst_ip: connect_ip,
         dst_port: CONNECT_PORT,
@@ -353,13 +355,16 @@ mod tests {
             max_ttl: 5,
             probe_timeout: Duration::from_millis(50),
         };
+        let binding = InterfaceBinding::fixed(Ipv4Addr::LOCALHOST);
+        let socket_binder = Arc::new(crate::net::NoopSocketBinder);
         // No real target behind the probe I/O, so every probe fails and the
         // scan walks all five candidates.
         let found = discover_low_ttl(
             discovery,
             "example.com",
             Ipv4Addr::new(1, 1, 1, 1),
-            Ipv4Addr::LOCALHOST,
+            binding,
+            socket_binder,
             flow_controller,
             make_discovery_tls_connector(),
         )
@@ -383,11 +388,14 @@ mod tests {
         let flow_controller: Arc<dyn FlowController> = recording.clone();
         *recording.existing.lock().unwrap() = true;
         let server_name = ServerName::try_from("example.com").unwrap();
+        let binding = InterfaceBinding::fixed(Ipv4Addr::LOCALHOST);
+        let socket_binder = Arc::new(crate::net::NoopSocketBinder);
         let ok = probe_ttl(
             vec![1],
             &server_name,
             Ipv4Addr::new(1, 1, 1, 1),
-            Ipv4Addr::LOCALHOST,
+            binding,
+            socket_binder,
             &flow_controller,
             &make_discovery_tls_connector(),
             Duration::from_secs(1),

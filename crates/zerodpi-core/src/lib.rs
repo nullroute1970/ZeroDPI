@@ -6,7 +6,7 @@
 //! - [`flow`]: flow keys, per-connection state, the shared flow table.
 //! - [`interceptor`]: traits that platform packet-interception backends implement.
 //! - [`methods`]: pluggable bypass methods.
-//! - [`net`]: small networking helpers (default-interface IP discovery).
+//! - [`net`]: physical-uplink binding and outbound socket helpers.
 //! - [`proxy`]: tokio TCP listener + bidirectional relay driving the bypass.
 //! - [`sni_scanner`]: DNS/TCP/TLS/HTTP probe + ranking for SNI candidates.
 //! - [`ip_scanner`]: 3-phase IP scanner (TCP→TLS→TTFB) used in `ip_bypass` mode.

@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -49,7 +49,9 @@ use crate::methods::mixed_case_sni::MixedCaseSni;
 use crate::methods::sni_boundary_frag::{write_boundary_split, SniBoundaryFrag};
 use crate::methods::tcp_segmentation::{read_one_tls_record, write_fragmented, TcpSegmentation};
 use crate::methods::tls_padding::TlsPadding;
-use crate::net::InterfaceIp;
+use crate::net::{
+    bound_tcp_socket, connect_bound, InterfaceBinding, InterfaceBindingWatch, OutboundSocketBinder,
+};
 use crate::tls_template::build_client_hello;
 
 // ---------------------------------------------------------------------------
@@ -267,7 +269,7 @@ enum BypassProgress {
 
 #[derive(Debug)]
 struct InterceptConnectionTarget {
-    interface_ip: Ipv4Addr,
+    binding: InterfaceBinding,
     connect_ip: Ipv4Addr,
     fake_client_hello: Vec<u8>,
 }
@@ -288,9 +290,10 @@ fn emit(tx: &Option<ProxyEventSender>, event: ProxyEvent) {
 /// keep a SYN attempt alive for minutes while the network is down.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn connect_with_timeout<F>(timeout: Duration, connect: F) -> anyhow::Result<TcpStream>
+async fn connect_with_timeout<F, E>(timeout: Duration, connect: F) -> anyhow::Result<TcpStream>
 where
-    F: std::future::Future<Output = std::io::Result<TcpStream>>,
+    F: std::future::Future<Output = Result<TcpStream, E>>,
+    E: Into<anyhow::Error>,
 {
     match tokio::time::timeout(timeout, connect).await {
         Ok(Ok(stream)) => Ok(stream),
@@ -568,7 +571,8 @@ mod rand_lite {
 pub async fn run_proxy(
     cfg: Arc<Config>,
     active_target: SharedSniTarget,
-    interface_ip: InterfaceIp,
+    interface_binding: InterfaceBindingWatch,
+    socket_binder: Arc<dyn OutboundSocketBinder>,
     flow_controller: Arc<dyn FlowController>,
     event_tx: Option<ProxyEventSender>,
 ) -> anyhow::Result<()> {
@@ -602,11 +606,20 @@ pub async fn run_proxy(
         if cfg.BYPASS_METHOD.is_socket_only() {
             let cfg = cfg.clone();
             let connect_ip = active_target.read().unwrap().ip;
+            let binding = interface_binding.current();
+            let socket_binder = socket_binder.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_tcp_seg_connection_with_ip(cfg, connect_ip, incoming, peer, event_tx)
-                        .await
+                if let Err(e) = handle_tcp_seg_connection_with_ip(
+                    cfg,
+                    connect_ip,
+                    binding,
+                    socket_binder,
+                    incoming,
+                    peer,
+                    event_tx,
+                )
+                .await
                 {
                     warn!(%peer, error = %e, "tls_frag connection failed");
                 }
@@ -616,18 +629,20 @@ pub async fn run_proxy(
 
         let target = active_target.read().unwrap().clone();
         let flow_controller = flow_controller.clone();
+        let socket_binder = socket_binder.clone();
         let event_tx = event_tx.clone();
-        let current_interface_ip = interface_ip.current();
+        let current_binding = interface_binding.current();
         let connection_settings = ConnectionSettings::from_config(&cfg);
         let fake_client_hello = fresh_fake_client_hello(target.sni.as_bytes());
         tokio::spawn(async move {
             if let Err(e) = handle_intercept_connection(
                 InterceptConnectionTarget {
-                    interface_ip: current_interface_ip,
+                    binding: current_binding,
                     connect_ip: target.ip,
                     fake_client_hello,
                 },
                 flow_controller,
+                socket_binder,
                 incoming,
                 peer,
                 event_tx,
@@ -644,18 +659,19 @@ pub async fn run_proxy(
 async fn handle_intercept_connection(
     target: InterceptConnectionTarget,
     flow_controller: Arc<dyn FlowController>,
+    socket_binder: Arc<dyn OutboundSocketBinder>,
     mut incoming: TcpStream,
     peer: SocketAddr,
     event_tx: Option<ProxyEventSender>,
     settings: ConnectionSettings,
 ) -> anyhow::Result<()> {
     let connect_port = CONNECT_PORT;
-    let interface_ip = target.interface_ip;
+    let binding = target.binding;
+    let interface_ip = binding.ip;
     let connect_ip = target.connect_ip;
 
-    // Build outbound socket bound to the host's interface IP, kernel-chosen port.
-    let socket = TcpSocket::new_v4()?;
-    socket.bind(SocketAddr::from((interface_ip, 0)))?;
+    // Build outbound socket bound to the selected physical interface and IP.
+    let socket = bound_tcp_socket(socket_binder.as_ref(), &binding)?;
     let local = socket.local_addr()?;
     let src_port = local.port();
 
@@ -996,7 +1012,8 @@ async fn handle_intercept_connection(
 pub async fn run_ip_bypass_plus_proxy(
     cfg: Arc<Config>,
     active_ip: Arc<RwLock<IpAddr>>,
-    interface_ip: InterfaceIp,
+    interface_binding: InterfaceBindingWatch,
+    socket_binder: Arc<dyn OutboundSocketBinder>,
     flow_controller: Arc<dyn FlowController>,
     event_tx: Option<ProxyEventSender>,
 ) -> anyhow::Result<()> {
@@ -1035,11 +1052,20 @@ pub async fn run_ip_bypass_plus_proxy(
 
         if cfg.BYPASS_METHOD.is_socket_only() {
             let cfg = cfg.clone();
+            let binding = interface_binding.current();
+            let socket_binder = socket_binder.clone();
             let event_tx = event_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_tcp_seg_connection_with_ip(cfg, connect_ip, incoming, peer, event_tx)
-                        .await
+                if let Err(e) = handle_tcp_seg_connection_with_ip(
+                    cfg,
+                    connect_ip,
+                    binding,
+                    socket_binder,
+                    incoming,
+                    peer,
+                    event_tx,
+                )
+                .await
                 {
                     warn!(%peer, error = %e, "ip_bypass_plus tls_frag connection failed");
                 }
@@ -1048,17 +1074,19 @@ pub async fn run_ip_bypass_plus_proxy(
         }
 
         let flow_controller = flow_controller.clone();
+        let socket_binder = socket_binder.clone();
         let event_tx = event_tx.clone();
-        let current_interface_ip = interface_ip.current();
+        let current_binding = interface_binding.current();
         let connection_settings = ConnectionSettings::from_config(&cfg);
         tokio::spawn(async move {
             if let Err(e) = handle_intercept_connection(
                 InterceptConnectionTarget {
-                    interface_ip: current_interface_ip,
+                    binding: current_binding,
                     connect_ip,
                     fake_client_hello: Vec::new(),
                 },
                 flow_controller,
+                socket_binder,
                 incoming,
                 peer,
                 event_tx,
@@ -1101,6 +1129,8 @@ impl<F: FnOnce()> Drop for ScopeGuard<F> {
 async fn handle_tcp_seg_connection_with_ip(
     cfg: Arc<Config>,
     connect_ip: Ipv4Addr,
+    binding: InterfaceBinding,
+    socket_binder: Arc<dyn OutboundSocketBinder>,
     mut incoming: TcpStream,
     peer: SocketAddr,
     event_tx: Option<ProxyEventSender>,
@@ -1121,7 +1151,7 @@ async fn handle_tcp_seg_connection_with_ip(
     // Connect to upstream.
     let mut outgoing = match connect_with_timeout(
         UPSTREAM_CONNECT_TIMEOUT,
-        TcpStream::connect(connect_addr),
+        connect_bound(socket_binder.as_ref(), &binding, connect_addr),
     )
     .await
     {
@@ -1550,6 +1580,8 @@ async fn copy_counting(
 pub async fn run_ip_bypass_proxy(
     cfg: Arc<Config>,
     active_ip: Arc<RwLock<IpAddr>>,
+    interface_binding: InterfaceBindingWatch,
+    socket_binder: Arc<dyn OutboundSocketBinder>,
     event_tx: Option<ProxyEventSender>,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT)
@@ -1578,6 +1610,8 @@ pub async fn run_ip_bypass_proxy(
         debug!(%peer, "ip_bypass: accepted");
 
         let ip = *active_ip.read().unwrap();
+        let binding = interface_binding.current();
+        let socket_binder = socket_binder.clone();
         let event_tx = event_tx.clone();
         let src_port = peer.port();
         let relay_max_lifetime = configured_relay_max_lifetime(&cfg);
@@ -1585,6 +1619,8 @@ pub async fn run_ip_bypass_proxy(
         tokio::spawn(async move {
             if let Err(e) = handle_ip_bypass_connection(
                 ip,
+                binding,
+                socket_binder,
                 incoming,
                 peer,
                 src_port,
@@ -1599,8 +1635,11 @@ pub async fn run_ip_bypass_proxy(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_ip_bypass_connection(
     connect_ip: IpAddr,
+    binding: InterfaceBinding,
+    socket_binder: Arc<dyn OutboundSocketBinder>,
     incoming: TcpStream,
     peer: SocketAddr,
     src_port: u16,
@@ -1619,7 +1658,7 @@ async fn handle_ip_bypass_connection(
 
     let outgoing = match connect_with_timeout(
         UPSTREAM_CONNECT_TIMEOUT,
-        TcpStream::connect(connect_addr),
+        connect_bound(socket_binder.as_ref(), &binding, connect_addr),
     )
     .await
     {

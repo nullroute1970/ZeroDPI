@@ -35,13 +35,13 @@ use std::time::{Duration, Instant};
 
 use serde::ser::SerializeStruct;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Semaphore};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
 use crate::dns::DnsResolver;
+use crate::net::OutboundNetwork;
 
 /// All probe results for one (SNI, IP) combination.
 #[derive(Debug, Clone)]
@@ -147,9 +147,10 @@ async fn probe_sni_upload(
     timeout: Duration,
     config: &crate::config::Config,
     connector: Arc<TlsConnector>,
+    network: OutboundNetwork,
 ) -> Option<f64> {
     let addr = SocketAddr::from((ip, 443u16));
-    let tcp_stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+    let tcp_stream = tokio::time::timeout(timeout, network.connect(addr))
         .await
         .ok()?
         .ok()?;
@@ -194,15 +195,17 @@ pub async fn probe_sni_candidate(
     ip: Ipv4Addr,
     timeout: Duration,
     config: Arc<crate::config::Config>,
+    network: OutboundNetwork,
 ) -> SniProbeEntry {
     let connector = Arc::new(make_tls_connector());
-    probe_sni_ip(sni.to_owned(), ip, timeout, config, connector).await
+    probe_sni_ip(sni.to_owned(), ip, timeout, config, connector, network).await
 }
 
 pub async fn scan_sni_list(
     path: &Path,
     timeout: Duration,
     config: Arc<crate::config::Config>,
+    network: OutboundNetwork,
     progress_tx: Option<mpsc::UnboundedSender<SniProbeEntry>>,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
     let content = std::fs::read_to_string(path)
@@ -227,9 +230,10 @@ pub async fn scan_sni_list(
         let tx = progress_tx.clone();
         let sem = semaphore.clone();
         let cfg = config.clone();
+        let network = network.clone();
         let resolver = resolver.clone();
         handles.push(tokio::spawn(async move {
-            probe_sni(sni, timeout, cfg, resolver, connector, tx, sem).await
+            probe_sni(sni, timeout, cfg, resolver, connector, network, tx, sem).await
         }));
     }
 
@@ -267,12 +271,14 @@ pub fn make_tls_connector() -> TlsConnector {
 
 /// Resolve `sni` to all IPv4 addresses and probe each one.  Returns an empty
 /// `Vec` if DNS resolution fails or times out.
+#[allow(clippy::too_many_arguments)]
 async fn probe_sni(
     sni: String,
     timeout: Duration,
     config: Arc<crate::config::Config>,
     resolver: Arc<DnsResolver>,
     connector: Arc<TlsConnector>,
+    network: OutboundNetwork,
     progress_tx: Option<mpsc::UnboundedSender<SniProbeEntry>>,
     semaphore: Arc<Semaphore>,
 ) -> Vec<SniProbeEntry> {
@@ -297,11 +303,12 @@ async fn probe_sni(
         let tx = progress_tx.clone();
         let sem = semaphore.clone();
         let cfg = config.clone();
+        let network = network.clone();
         tasks.push(tokio::spawn(async move {
             // Acquire a permit before starting the TCP/TLS/HTTP probe so the
             // total number of concurrent connections stays bounded.
             let _permit = sem.acquire().await.expect("semaphore never closed");
-            let entry = probe_sni_ip(sni, ip, timeout, cfg, connector).await;
+            let entry = probe_sni_ip(sni, ip, timeout, cfg, connector, network).await;
             // Emit the result to the live-progress channel immediately.
             if let Some(ref tx) = tx {
                 let _ = tx.send(entry.clone());
@@ -327,12 +334,13 @@ async fn probe_sni_ip(
     timeout: Duration,
     config: Arc<crate::config::Config>,
     connector: Arc<TlsConnector>,
+    network: OutboundNetwork,
 ) -> SniProbeEntry {
     let addr = SocketAddr::from((ip, 443u16));
 
     // --- TCP connect ---
     let tcp_start = Instant::now();
-    let tcp_stream = match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+    let tcp_stream = match tokio::time::timeout(timeout, network.connect(addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             debug!(sni = %sni, %ip, error = %e, "TCP connect failed");
@@ -441,7 +449,7 @@ async fn probe_sni_ip(
     };
 
     let upload_bps = if ttfb_ms.is_some() {
-        probe_sni_upload(&sni, ip, timeout, &config, connector).await
+        probe_sni_upload(&sni, ip, timeout, &config, connector, network).await
     } else {
         None
     };
@@ -652,6 +660,10 @@ mod candidate_tests {
             "127.0.0.1".parse().unwrap(),
             std::time::Duration::from_millis(200),
             Arc::new(cfg),
+            OutboundNetwork::new(
+                crate::net::InterfaceBinding::fixed(std::net::Ipv4Addr::LOCALHOST),
+                Arc::new(crate::net::NoopSocketBinder),
+            ),
         )
         .await;
         assert_eq!(entry.sni, "example.com");

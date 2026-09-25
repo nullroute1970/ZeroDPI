@@ -1,7 +1,6 @@
 //! Ownership and in-place rebuild of the live packet-interception plane.
 
 use std::future::Future;
-use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +14,7 @@ use zerodpi_core::flow::{FlowController, FlowTable, LocalFlowController};
 use zerodpi_core::handler::Handler;
 use zerodpi_core::interceptor::{FilterSpec, InterceptorShutdown, PacketInterceptor};
 use zerodpi_core::methods::BypassMethod;
+use zerodpi_core::net::InterfaceBinding;
 use zerodpi_core::proxy::CONNECT_PORT;
 use zerodpi_platform::DefaultInterceptor;
 
@@ -24,7 +24,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A live data plane that can be rebuilt for a new interface address.
 pub trait DataPlane: Send + Sync {
-    fn rebuild<'a>(&'a self, interface_ip: Ipv4Addr) -> BoxFuture<'a, Result<()>>;
+    fn rebuild<'a>(&'a self, binding: InterfaceBinding) -> BoxFuture<'a, Result<()>>;
     fn stop<'a>(&'a self) -> BoxFuture<'a, Result<()>>;
     /// True when the remote root helper is gone and no rebuild can succeed.
     fn remote_disconnected(&self) -> bool {
@@ -41,9 +41,9 @@ pub trait DataPlane: Send + Sync {
 const INTERCEPTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Build the local filter used by every intercept mode.
-pub fn interceptor_filter(cfg: &Config, interface_ip: Ipv4Addr) -> FilterSpec {
+pub fn interceptor_filter(cfg: &Config, binding: &InterfaceBinding) -> FilterSpec {
     FilterSpec {
-        interface_ip,
+        interface_ip: binding.ip,
         remote_ip: None,
         remote_port: CONNECT_PORT,
         queue_num: cfg.NFQUEUE_NUM,
@@ -88,7 +88,7 @@ impl DataPlaneController {
         cfg: Arc<Config>,
         flows: FlowTable,
         method: Arc<dyn BypassMethod>,
-        interface_ip: Ipv4Addr,
+        binding: InterfaceBinding,
     ) -> Result<Self> {
         let flow_controller: Arc<dyn FlowController> =
             Arc::new(LocalFlowController::new(flows.clone()));
@@ -101,7 +101,7 @@ impl DataPlaneController {
             done_rx: None,
             armed: false,
         };
-        plane.open(interface_ip)?;
+        plane.open(binding)?;
         Ok(Self {
             inner: Mutex::new(Inner::Local(plane)),
             remote_helper: None,
@@ -113,10 +113,10 @@ impl DataPlaneController {
         cfg: Arc<Config>,
         helper: RemoteHelperClient,
         flow_controller: Arc<dyn FlowController>,
-        interface_ip: Ipv4Addr,
+        binding: InterfaceBinding,
     ) -> Result<Self> {
         helper
-            .configure(interceptor_config(&cfg, interface_ip, None, CONNECT_PORT))
+            .configure(interceptor_config(&cfg, binding.ip, None, CONNECT_PORT))
             .await
             .context("configure root helper interceptor")?;
         helper
@@ -143,14 +143,14 @@ impl DataPlaneController {
 }
 
 impl DataPlane for DataPlaneController {
-    fn rebuild<'a>(&'a self, interface_ip: Ipv4Addr) -> BoxFuture<'a, Result<()>> {
+    fn rebuild<'a>(&'a self, binding: InterfaceBinding) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
             match &mut *inner {
                 Inner::Local(plane) => {
                     stop_local(plane).await?;
                     plane.flow_controller.reset();
-                    plane.open(interface_ip)?;
+                    plane.open(binding)?;
                     Ok(())
                 }
                 Inner::Remote(plane) => {
@@ -164,7 +164,7 @@ impl DataPlane for DataPlaneController {
                         .helper
                         .configure(interceptor_config(
                             &plane.cfg,
-                            interface_ip,
+                            binding.ip,
                             None,
                             CONNECT_PORT,
                         ))
@@ -214,8 +214,8 @@ impl DataPlane for DataPlaneController {
 }
 
 impl LocalPlane {
-    fn open(&mut self, interface_ip: Ipv4Addr) -> Result<()> {
-        let filter = interceptor_filter(&self.cfg, interface_ip);
+    fn open(&mut self, binding: InterfaceBinding) -> Result<()> {
+        let filter = interceptor_filter(&self.cfg, &binding);
         let interceptor = DefaultInterceptor::open(filter).context("open packet interceptor")?;
         let handler = Handler::new(self.flows.clone(), self.method.clone());
         let (done_tx, done_rx) = oneshot::channel();
@@ -234,7 +234,7 @@ impl LocalPlane {
         self.shutdown = Some(shutdown);
         self.done_rx = Some(done_rx);
         self.armed = true;
-        info!(%interface_ip, "packet interceptor open");
+        info!(interface_ip = %binding.ip, interface_name = %binding.if_name, "packet interceptor open");
         Ok(())
     }
 }
@@ -310,7 +310,8 @@ mod tests {
     #[test]
     fn interceptor_filter_matches_the_legacy_shape() {
         let cfg = Arc::new(crate::config_for_tests());
-        let filter = interceptor_filter(&cfg, Ipv4Addr::new(10, 0, 0, 5));
+        let binding = InterfaceBinding::fixed(Ipv4Addr::new(10, 0, 0, 5));
+        let filter = interceptor_filter(&cfg, &binding);
         assert_eq!(filter.interface_ip, Ipv4Addr::new(10, 0, 0, 5));
         assert_eq!(filter.remote_ip, None);
         assert_eq!(filter.remote_port, zerodpi_core::proxy::CONNECT_PORT);
@@ -321,7 +322,10 @@ mod tests {
     #[tokio::test]
     async fn none_plane_rebuild_and_stop_are_noops() {
         let plane = DataPlaneController::none();
-        plane.rebuild(Ipv4Addr::LOCALHOST).await.unwrap();
+        plane
+            .rebuild(InterfaceBinding::fixed(Ipv4Addr::LOCALHOST))
+            .await
+            .unwrap();
         plane.stop().await.unwrap();
         assert!(!plane.remote_disconnected());
     }

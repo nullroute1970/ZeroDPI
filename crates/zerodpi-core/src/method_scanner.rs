@@ -18,6 +18,7 @@ use crate::flow::{new_flow_table, FlowController, LocalFlowController};
 use crate::handler::Handler;
 use crate::interceptor::{FilterSpec, InterceptorShutdown, PacketInterceptor};
 use crate::methods::build_method;
+use crate::net::OutboundNetwork;
 use crate::proxy::{run_proxy, ActiveSniTarget, CONNECT_PORT};
 use crate::sni_scanner::make_tls_connector;
 
@@ -258,7 +259,9 @@ pub async fn direct_probe(
     http_path: &str,
     timeout: Duration,
 ) -> MethodSampleResult {
-    // --- TCP connect to the engine's listen port ---
+    // This is a control-plane connection to ZeroDPI's own local listener, not
+    // an upstream connection. The proxy task created by run_one_method binds
+    // its actual upstream socket through OutboundNetwork.
     let tcp_stream = match tokio::time::timeout(timeout, TcpStream::connect(connect_addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
@@ -393,7 +396,7 @@ pub async fn run_method_tests<F, I>(
     config: Arc<Config>,
     target: MethodScanTarget,
     methods: Vec<String>,
-    interface_ip: std::net::Ipv4Addr,
+    network: OutboundNetwork,
     progress_tx: Option<mpsc::UnboundedSender<MethodScanEvent>>,
     interceptor_factory: F,
 ) -> anyhow::Result<Vec<MethodScanEntry>>
@@ -417,7 +420,7 @@ where
             &target,
             method,
             index,
-            interface_ip,
+            network.clone(),
             progress_tx.as_ref(),
             connect_addr,
             &interceptor_factory,
@@ -438,7 +441,7 @@ async fn run_one_method<F, I>(
     target: &MethodScanTarget,
     method: &str,
     method_index: usize,
-    interface_ip: std::net::Ipv4Addr,
+    network: OutboundNetwork,
     progress_tx: Option<&mpsc::UnboundedSender<MethodScanEvent>>,
     connect_addr: SocketAddr,
     interceptor_factory: &F,
@@ -482,7 +485,7 @@ where
         };
         let method_arc: Arc<dyn crate::methods::BypassMethod> = Arc::from(method_box);
         let filter = FilterSpec {
-            interface_ip,
+            interface_ip: network.binding.ip,
             remote_ip: Some(target.ip),
             remote_port: CONNECT_PORT,
             queue_num: cfg.NFQUEUE_NUM,
@@ -520,11 +523,14 @@ where
     let proxy_cfg = cfg.clone();
     let proxy_target = active_target.clone();
     let proxy_fc = flow_controller.clone();
+    let proxy_binding = crate::net::InterfaceBindingWatch::fixed(network.binding.clone());
+    let proxy_binder = network.binder.clone();
     let proxy_task = tokio::spawn(async move {
         let _ = run_proxy(
             proxy_cfg,
             proxy_target,
-            crate::net::InterfaceIp::fixed(interface_ip),
+            proxy_binding,
+            proxy_binder,
             proxy_fc,
             None,
         )

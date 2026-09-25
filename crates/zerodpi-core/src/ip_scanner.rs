@@ -27,9 +27,10 @@ use std::time::{Duration, Instant};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::ser::SerializeStruct;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, trace};
+
+use crate::net::OutboundNetwork;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -272,13 +273,14 @@ pub async fn probe_ip_candidate(
     scan_sni: Arc<str>,
     timeout: Duration,
     config: Arc<crate::config::Config>,
+    network: OutboundNetwork,
 ) -> IpProbeEntry {
     let addr = SocketAddr::new(ip, SCAN_PORT);
     let start = Instant::now();
-    match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+    match tokio::time::timeout(timeout, network.connect(addr)).await {
         Ok(Ok(_)) => {
             let tcp_ms = start.elapsed().as_millis() as u64;
-            probe_tls_ttfb(ip, tcp_ms, &scan_sni, timeout, config).await
+            probe_tls_ttfb(ip, tcp_ms, &scan_sni, timeout, config, network).await
         }
         _ => {
             let mut entry = IpProbeEntry {
@@ -304,6 +306,7 @@ pub async fn scan_ip_list(
     scan_sni: Arc<str>,
     timeout: Duration,
     config: Arc<crate::config::Config>,
+    network: OutboundNetwork,
     progress_tx: Option<mpsc::UnboundedSender<IpScanEvent>>,
 ) -> Vec<IpProbeEntry> {
     if ips.is_empty() {
@@ -324,11 +327,12 @@ pub async fn scan_ip_list(
     for ip in ips {
         let sem = sem1.clone();
         let tx = p1_tx.clone();
+        let network = network.clone();
         tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let addr = SocketAddr::new(ip, SCAN_PORT);
             let start = Instant::now();
-            let result = tokio::time::timeout(timeout, TcpStream::connect(addr)).await;
+            let result = tokio::time::timeout(timeout, network.connect(addr)).await;
             let tcp_ms = match result {
                 Ok(Ok(_)) => Some(start.elapsed().as_millis() as u64),
                 _ => None,
@@ -355,9 +359,10 @@ pub async fn scan_ip_list(
             let ptx = progress_tx.clone();
             let sni = scan_sni.clone();
             let cfg = config.clone();
+            let network = network.clone();
             tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                let entry = probe_tls_ttfb(ip, ms, &sni, timeout, cfg).await;
+                let entry = probe_tls_ttfb(ip, ms, &sni, timeout, cfg, network).await;
                 if let Some(ref t) = ptx {
                     let _ = t.send(IpScanEvent::ProbeComplete(entry.clone()));
                 }
@@ -421,11 +426,12 @@ async fn probe_tls_ttfb(
     sni: &str,
     timeout: Duration,
     config: Arc<crate::config::Config>,
+    network: OutboundNetwork,
 ) -> IpProbeEntry {
     let addr = SocketAddr::new(ip, SCAN_PORT);
 
     // Re-connect for TLS (phase 1 stream has already been dropped).
-    let stream = match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+    let stream = match tokio::time::timeout(timeout, network.connect(addr)).await {
         Ok(Ok(s)) => s,
         _ => {
             return IpProbeEntry {
@@ -542,7 +548,7 @@ async fn probe_tls_ttfb(
     };
 
     let upload_bps = if ttfb_ms.is_some() {
-        probe_ip_upload(ip, sni, timeout, &config, &connector).await
+        probe_ip_upload(ip, sni, timeout, &config, &connector, network).await
     } else {
         None
     };
@@ -590,9 +596,10 @@ async fn probe_ip_upload(
     timeout: Duration,
     config: &crate::config::Config,
     connector: &tokio_rustls::TlsConnector,
+    network: OutboundNetwork,
 ) -> Option<f64> {
     let addr = SocketAddr::new(ip, SCAN_PORT);
-    let tcp_stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+    let tcp_stream = tokio::time::timeout(timeout, network.connect(addr))
         .await
         .ok()?
         .ok()?;
@@ -774,6 +781,10 @@ mod candidate_tests {
             Arc::from("example.com"),
             std::time::Duration::from_millis(200),
             Arc::new(cfg),
+            OutboundNetwork::new(
+                crate::net::InterfaceBinding::fixed(std::net::Ipv4Addr::LOCALHOST),
+                Arc::new(crate::net::NoopSocketBinder),
+            ),
         )
         .await;
         let expected_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();

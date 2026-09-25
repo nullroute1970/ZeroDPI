@@ -1,9 +1,8 @@
 //! Network change detection.
 //!
-//! The monitor answers one question: did the local routing situation change?
-//! The canonical new address is discovered by the caller with
-//! `default_interface_ipv4`, so platform event payloads are deliberately
-//! ignored — only the event kind matters.
+//! The monitor answers one question: did the physical outbound binding change?
+//! Platform event payloads are deliberately ignored — only the event kind
+//! matters, and the settled probe resolves the physical uplink again.
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -13,7 +12,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::broadcast;
 use tracing::warn;
-use zerodpi_core::net::{default_interface_ipv4, NetworkChangeSource};
+use zerodpi_core::net::{InterfaceBinding, NetworkChangeSource};
 
 mod platform;
 
@@ -91,15 +90,15 @@ impl SettleState {
 /// Emits `true` once per real address/up-state transition.
 #[derive(Debug, Default)]
 pub struct ChangeFilter {
-    last: Option<Ipv4Addr>,
+    last: Option<InterfaceBinding>,
 }
 
 impl ChangeFilter {
-    pub fn seed(&mut self, value: Option<Ipv4Addr>) {
+    pub fn seed(&mut self, value: Option<InterfaceBinding>) {
         self.last = value;
     }
 
-    pub fn observe(&mut self, value: Option<Ipv4Addr>) -> bool {
+    pub fn observe(&mut self, value: Option<InterfaceBinding>) -> bool {
         if value != self.last {
             self.last = value;
             true
@@ -136,8 +135,8 @@ pub(crate) struct SourceParts<S: NetworkSource> {
 /// One monitor iteration. Exposed for platform wiring and tests.
 pub(crate) fn run_loop<S: NetworkSource>(
     mut source: S,
-    probe: impl Fn() -> Option<Ipv4Addr>,
-    seed: Option<Ipv4Addr>,
+    probe: impl Fn() -> Option<InterfaceBinding>,
+    seed: Option<InterfaceBinding>,
     settle: Duration,
     poll_interval: Duration,
     should_run: impl Fn() -> bool,
@@ -184,11 +183,11 @@ impl NetworkMonitor {
     /// Start detection.
     ///
     /// `probe_target` is the active relay IPv4 address (0 = unknown); the
-    /// canonical interface address is discovered with
-    /// `default_interface_ipv4`. `initial` is the address probed at startup.
+    /// physical uplink binding is resolved by the platform resolver.
+    /// `initial` is the binding probed at startup.
     pub fn start(
         probe_target: Arc<AtomicU32>,
-        initial: Option<Ipv4Addr>,
+        initial: Option<InterfaceBinding>,
         settle: Duration,
         poll_interval: Duration,
     ) -> Result<Self> {
@@ -215,7 +214,7 @@ impl NetworkMonitor {
             if raw == 0 {
                 return None;
             }
-            default_interface_ipv4(Ipv4Addr::from(raw)).ok()
+            crate::uplink::resolve_physical_binding(Ipv4Addr::from(raw)).ok()
         };
         // Seed the filter from the startup probe so the first safety-net tick
         // does not emit a spurious change for an address we already know.
@@ -359,8 +358,15 @@ mod tests {
         let mut filter = ChangeFilter::default();
         filter.seed(None);
         assert!(!filter.observe(None));
-        assert!(filter.observe(Some("10.0.0.1".parse().unwrap())));
-        assert!(!filter.observe(Some("10.0.0.1".parse().unwrap())));
+        let first = InterfaceBinding::new("10.0.0.1".parse().unwrap(), 7, "Wi-Fi");
+        let second = InterfaceBinding::new("10.0.0.1".parse().unwrap(), 7, "Wi-Fi");
+        assert!(filter.observe(Some(first)));
+        assert!(!filter.observe(Some(second)));
+        assert!(filter.observe(Some(InterfaceBinding::new(
+            "10.0.0.1".parse().unwrap(),
+            8,
+            "Ethernet",
+        ))));
         assert!(filter.observe(None));
     }
     #[test]

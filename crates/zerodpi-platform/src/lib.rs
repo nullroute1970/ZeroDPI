@@ -12,6 +12,7 @@
 //! zerodpi-core for the list syntax and combination limits.
 
 pub mod netmon;
+pub mod uplink;
 
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),

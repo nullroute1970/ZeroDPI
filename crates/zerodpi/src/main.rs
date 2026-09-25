@@ -42,7 +42,7 @@ use zerodpi_core::method_scanner::{
     rank_entries, run_method_tests, MethodScanEvent, MethodScanReport, MethodScanTarget,
 };
 use zerodpi_core::methods::build_method;
-use zerodpi_core::net::default_interface_ipv4;
+use zerodpi_core::net::{interface_binding_channel, InterfaceBindingWatch, OutboundNetwork};
 use zerodpi_core::proxy::{
     run_ip_bypass_plus_proxy, run_ip_bypass_proxy, run_proxy, ActiveSniTarget, ProxyEvent,
     ProxyEventSender, RelayEndReason, RescanKind, CONNECT_PORT,
@@ -52,6 +52,7 @@ use zerodpi_core::proxy_tester::{
     ProxyTestEntry,
 };
 use zerodpi_core::sni_scanner::{scan_sni_list, SniProbeEntry};
+use zerodpi_platform::uplink::{platform_socket_binder, resolve_physical_binding};
 use zerodpi_platform::{ensure_packet_interception_access, DefaultInterceptor};
 
 use helper_client::{interceptor_config, RemoteHelperClient};
@@ -401,6 +402,8 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         .enable_all()
         .build()?;
 
+    let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
+
     // ---- step 1: obtain a sorted list of probe results ----
     let sorted_entries: Vec<SniProbeEntry> = if let Some(ref forced_sni) = cfg.SELECTED_SNI {
         // Skip scanning; just resolve the forced SNI.
@@ -418,14 +421,16 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                 cfg_clone,
                 &path,
                 scan_timeout,
+                scan_network.clone(),
                 &events,
                 ScanKind::Sni,
             ))?;
             log_sni_scan_results("headless scan", &entries);
             entries
         } else {
+            let progress_network = scan_network.clone();
             rt.block_on(async move {
-                scan_sni_list_with_progress(cfg_clone, &path, scan_timeout).await
+                scan_sni_list_with_progress(cfg_clone, &path, scan_timeout, progress_network).await
             })?
         };
         if entries.is_empty() {
@@ -478,11 +483,18 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     let connect_ip = selected.ip;
 
     // ---- step 3: start the proxy ----
-    let interface_ip = default_interface_ipv4(connect_ip)
-        .context("could not determine local interface IP for upstream")?;
-    info!(%interface_ip, %connect_ip, sni = %selected.sni, "starting proxy");
-
-    let (interface_ip_handle, interface_ip) = zerodpi_core::net::interface_ip_channel(interface_ip);
+    let initial_binding = resolve_physical_binding(connect_ip)
+        .context("could not determine physical uplink for upstream")?;
+    let socket_binder = scan_network.binder.clone();
+    let (interface_binding_handle, interface_binding) =
+        interface_binding_channel(initial_binding.clone());
+    info!(
+        interface_ip = %initial_binding.ip,
+        interface_name = %initial_binding.if_name,
+        %connect_ip,
+        sni = %selected.sni,
+        "starting proxy"
+    );
     let mut low_ttl_handle: Option<Arc<AtomicU8>> = None;
 
     let (flow_controller, data_plane_controller): (
@@ -500,7 +512,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                 cfg.clone(),
                 helper.clone(),
                 Arc::new(helper.clone()),
-                interface_ip.current(),
+                interface_binding.current(),
             ))
             .context("prepare root helper interceptor")?;
         info!(
@@ -519,7 +531,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
             cfg.clone(),
             flows.clone(),
             method,
-            interface_ip.current(),
+            interface_binding.current(),
         )
         .context("open packet interceptor")?;
         (
@@ -548,7 +560,8 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                     settings: LowTtlDiscovery::from_config(&cfg),
                     connector: zerodpi_core::low_ttl_discover::make_discovery_tls_connector(),
                     flow_controller: flow_controller.clone(),
-                    interface_ip: interface_ip.clone(),
+                    interface_binding: interface_binding.clone(),
+                    socket_binder: socket_binder.clone(),
                     applier: LowTtlApplier::Local(handle),
                 })
             } else if let Some(helper) = remote_helper.clone() {
@@ -556,7 +569,8 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                     settings: LowTtlDiscovery::from_config(&cfg),
                     connector: zerodpi_core::low_ttl_discover::make_discovery_tls_connector(),
                     flow_controller: flow_controller.clone(),
-                    interface_ip: interface_ip.clone(),
+                    interface_binding: interface_binding.clone(),
+                    socket_binder: socket_binder.clone(),
                     applier: LowTtlApplier::Remote(helper),
                 })
             } else {
@@ -604,6 +618,8 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         let rescan_events = events.clone();
         let rescan_discovery = low_ttl_discovery_state.clone();
         let background_probe_target = probe_target.clone();
+        let background_binding = interface_binding.clone();
+        let background_binder = socket_binder.clone();
         rt.spawn(async move {
             background_rescan(
                 rescan_cfg,
@@ -611,6 +627,8 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                 interval,
                 background_probe_target,
                 rescan_discovery,
+                background_binding,
+                background_binder,
                 active_target,
                 rescan_event_tx,
                 rescan_events,
@@ -623,7 +641,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     // ---- step 5: network recovery ----
     let monitor = zerodpi_platform::netmon::NetworkMonitor::start(
         probe_target.clone(),
-        Some(interface_ip.current()),
+        Some(interface_binding.current()),
         network_recovery::SETTLE,
         network_recovery::POLL_INTERVAL,
     )
@@ -631,6 +649,8 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
 
     let cfg_verify = cfg.clone();
     let verify_target = active_target.clone();
+    let verify_binding = interface_binding.clone();
+    let verify_binder = socket_binder.clone();
     let verify: Arc<dyn Fn() -> network_recovery::BoxFuture<'static, bool> + Send + Sync> =
         Arc::new(move || {
             let cfg = cfg_verify.clone();
@@ -638,12 +658,15 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                 let target = verify_target.read().unwrap();
                 (target.sni.to_string(), target.ip)
             };
+            let binding = verify_binding.clone();
+            let socket_binder = verify_binder.clone();
             Box::pin(async move {
                 zerodpi_core::sni_scanner::probe_sni_candidate(
                     &sni,
                     ip,
                     Duration::from_secs(cfg.SCAN_TIMEOUT_SECS),
                     cfg,
+                    OutboundNetwork::new(binding.current(), socket_binder),
                 )
                 .await
                 .tls_ok
@@ -657,6 +680,8 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     let rescan_event_tx = event_tx.clone();
     let rescan_events = events.clone();
     let rescan_probe_target = probe_target.clone();
+    let rescan_binding = interface_binding.clone();
+    let rescan_binder = socket_binder.clone();
     let rescan: Arc<
         dyn Fn() -> network_recovery::BoxFuture<'static, network_recovery::RescanOutcome>
             + Send
@@ -669,6 +694,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         let tx = Some(rescan_event_tx.clone());
         let events = rescan_events.clone();
         let probe_target = rescan_probe_target.clone();
+        let network = OutboundNetwork::new(rescan_binding.current(), rescan_binder.clone());
         Box::pin(async move {
             rescan_sni_once(
                 cfg,
@@ -678,6 +704,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
                 tx,
                 events,
                 no_tui,
+                network,
                 &probe_target,
             )
             .await
@@ -685,7 +712,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     });
 
     let recovery_env = Arc::new(network_recovery::MainRecoveryEnv::new(
-        interface_ip_handle.clone(),
+        interface_binding_handle.clone(),
         data_plane_controller.clone(),
         network_recovery::RecoveryCallbacks { verify, rescan },
         events.clone(),
@@ -695,7 +722,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         recovery_env,
         probe_target,
         cfg.AUTO_SELECT && cfg.SELECTED_SNI.is_none(),
-        Some(interface_ip.current()),
+        Some(interface_binding.current()),
     );
     let recovery_handle = rt.spawn(coordinator.run(monitor.events()));
 
@@ -705,11 +732,14 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     // Spawn the proxy on the tokio runtime's worker threads so the main
     // thread is free to drive the ratatui dashboard.
     let dashboard_event_tx = Some(event_tx.clone());
+    let proxy_binding = interface_binding.clone();
+    let proxy_binder = socket_binder.clone();
     let proxy_handle = rt.spawn(async move {
         run_proxy(
             cfg,
             active_target,
-            interface_ip.clone(),
+            proxy_binding,
+            proxy_binder,
             flow_controller,
             dashboard_event_tx,
         )
@@ -794,6 +824,7 @@ async fn scan_sni_list_with_progress(
     cfg: Arc<Config>,
     path: &std::path::Path,
     timeout: Duration,
+    network: OutboundNetwork,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
     let total_hostnames = count_hostnames(path);
     let path_owned = path.to_owned();
@@ -802,8 +833,10 @@ async fn scan_sni_list_with_progress(
 
     // Spawn scanner; it sends each result over `tx` as it arrives.
     let cfg_clone = cfg.clone();
-    let scan_handle =
-        tokio::spawn(async move { scan_sni_list(&path_owned, timeout, cfg_clone, Some(tx)).await });
+    let network = network.clone();
+    let scan_handle = tokio::spawn(async move {
+        scan_sni_list(&path_owned, timeout, cfg_clone, network, Some(tx)).await
+    });
 
     let mut terminal = tui::enter_tui()?;
     let (arrived, aborted) = tui::run_scan_progress(&mut terminal, &mut rx, total_hostnames)?;
@@ -854,6 +887,7 @@ async fn scan_sni_list_headless(
     cfg: Arc<Config>,
     path: &Path,
     timeout: Duration,
+    network: OutboundNetwork,
     events: &RuntimeEventEmitter,
     scan: ScanKind,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
@@ -865,7 +899,7 @@ async fn scan_sni_list_headless(
     });
 
     if !events.enabled() {
-        let entries = scan_sni_list(path, timeout, cfg, None).await?;
+        let entries = scan_sni_list(path, timeout, cfg, network, None).await?;
         events.emit(RuntimeEvent::ScanCompleted {
             scan,
             results: entries.len(),
@@ -891,7 +925,7 @@ async fn scan_sni_list_headless(
         }
     });
 
-    let entries = scan_sni_list(path, timeout, cfg, Some(tx)).await?;
+    let entries = scan_sni_list(path, timeout, cfg, network, Some(tx)).await?;
     let _ = progress_handle.await;
     events.emit(RuntimeEvent::ScanCompleted {
         scan,
@@ -905,6 +939,7 @@ async fn scan_ip_list_headless(
     scan_sni: Arc<str>,
     timeout: Duration,
     cfg: Arc<Config>,
+    network: OutboundNetwork,
     events: &RuntimeEventEmitter,
     path: Option<&Path>,
 ) -> Vec<IpProbeEntry> {
@@ -916,7 +951,7 @@ async fn scan_ip_list_headless(
     });
 
     if !events.enabled() {
-        let entries = scan_ip_list(ips, scan_sni, timeout, cfg, None).await;
+        let entries = scan_ip_list(ips, scan_sni, timeout, cfg, network, None).await;
         events.emit(RuntimeEvent::ScanCompleted {
             scan: ScanKind::Ip,
             results: entries.len(),
@@ -957,7 +992,7 @@ async fn scan_ip_list_headless(
         }
     });
 
-    let entries = scan_ip_list(ips, scan_sni, timeout, cfg, Some(tx)).await;
+    let entries = scan_ip_list(ips, scan_sni, timeout, cfg, network, Some(tx)).await;
     let _ = progress_handle.await;
     events.emit(RuntimeEvent::ScanCompleted {
         scan: ScanKind::Ip,
@@ -1065,7 +1100,8 @@ struct LowTtlDiscoveryState {
     settings: LowTtlDiscovery,
     connector: tokio_rustls::TlsConnector,
     flow_controller: Arc<dyn FlowController>,
-    interface_ip: zerodpi_core::net::InterfaceIp,
+    interface_binding: InterfaceBindingWatch,
+    socket_binder: Arc<dyn zerodpi_core::net::OutboundSocketBinder>,
     applier: LowTtlApplier,
 }
 
@@ -1075,7 +1111,8 @@ impl LowTtlDiscoveryState {
             self.settings,
             sni,
             connect_ip,
-            self.interface_ip.current(),
+            self.interface_binding.current(),
+            self.socket_binder.clone(),
             self.flow_controller.clone(),
             self.connector.clone(),
         )
@@ -1120,6 +1157,8 @@ async fn background_rescan(
     interval_secs: u64,
     probe_target: Arc<std::sync::atomic::AtomicU32>,
     rescan_discovery: Option<LowTtlDiscoveryState>,
+    interface_binding: InterfaceBindingWatch,
+    socket_binder: Arc<dyn zerodpi_core::net::OutboundSocketBinder>,
     active_target: Arc<std::sync::RwLock<ActiveSniTarget>>,
     event_tx: Option<ProxyEventSender>,
     events: RuntimeEventEmitter,
@@ -1139,6 +1178,7 @@ async fn background_rescan(
             },
         );
         tokio::time::sleep(interval).await;
+        let network = OutboundNetwork::new(interface_binding.current(), socket_binder.clone());
         let _ = rescan_sni_once(
             cfg.clone(),
             path.clone(),
@@ -1147,6 +1187,7 @@ async fn background_rescan(
             event_tx.clone(),
             events.clone(),
             headless,
+            network,
             &probe_target,
         )
         .await;
@@ -1163,6 +1204,7 @@ async fn rescan_sni_once(
     event_tx: Option<ProxyEventSender>,
     events: RuntimeEventEmitter,
     headless: bool,
+    network: OutboundNetwork,
     probe_target: &std::sync::atomic::AtomicU32,
 ) -> network_recovery::RescanOutcome {
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
@@ -1184,7 +1226,7 @@ async fn rescan_sni_once(
     let mut switched = false;
     let mut scan_summary: Option<(usize, Option<u8>)> = None;
     let cfg_clone = cfg.clone();
-    match scan_sni_list(&path, scan_timeout, cfg_clone, None).await {
+    match scan_sni_list(&path, scan_timeout, cfg_clone, network, None).await {
         Ok(entries) => {
             scan_summary = Some((entries.len(), entries.first().map(|e| e.score)));
             if headless {
@@ -1699,72 +1741,87 @@ fn ip_bypass_main(
     };
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+    let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
 
     // ---- step 1: obtain active IP ----
-    let (active_ip, active_score): (std::net::IpAddr, Option<u8>) = if let Some(ref forced_ip) =
-        cfg.SELECTED_IP
-    {
-        let ip: std::net::IpAddr = forced_ip
-            .parse()
-            .with_context(|| format!("parsing SELECTED_IP '{forced_ip}'"))?;
-        info!(%ip, "SELECTED_IP set — skipping scan");
-        (ip, None)
-    } else {
-        let ips = load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS)
-            .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
-        if ips.is_empty() {
-            anyhow::bail!(
-                "ip_list '{}' is empty — add at least one IP or CIDR",
-                ip_list_path.display()
-            );
-        }
-        let total_ips = ips.len();
-        info!(total_ips, "scanning IP list");
-
-        let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
-        let cfg_clone = cfg.clone();
-        let entries = if no_tui {
-            let entries = rt.block_on(scan_ip_list_headless(
-                ips,
-                scan_sni,
-                scan_timeout,
-                cfg_clone,
-                &events,
-                Some(&ip_list_path),
-            ));
-            log_ip_scan_results("headless IP scan", &entries);
-            Ok(entries)
+    let (active_ip, active_score): (std::net::IpAddr, Option<u8>) =
+        if let Some(ref forced_ip) = cfg.SELECTED_IP {
+            let ip: std::net::IpAddr = forced_ip
+                .parse()
+                .with_context(|| format!("parsing SELECTED_IP '{forced_ip}'"))?;
+            info!(%ip, "SELECTED_IP set — skipping scan");
+            (ip, None)
         } else {
-            scan_ip_list_with_ip_progress(cfg_clone, &rt, ips, scan_sni, scan_timeout, total_ips)
-        }?;
+            let ips = load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS)
+                .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
+            if ips.is_empty() {
+                anyhow::bail!(
+                    "ip_list '{}' is empty — add at least one IP or CIDR",
+                    ip_list_path.display()
+                );
+            }
+            let total_ips = ips.len();
+            info!(total_ips, "scanning IP list");
 
-        if entries.is_empty() {
-            anyhow::bail!("no IPs passed the scan — check connectivity or ip_list");
-        }
+            let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
+            let cfg_clone = cfg.clone();
+            let entries = if no_tui {
+                let entries = rt.block_on(scan_ip_list_headless(
+                    ips,
+                    scan_sni,
+                    scan_timeout,
+                    cfg_clone,
+                    scan_network.clone(),
+                    &events,
+                    Some(&ip_list_path),
+                ));
+                log_ip_scan_results("headless IP scan", &entries);
+                Ok(entries)
+            } else {
+                scan_ip_list_with_ip_progress(
+                    cfg_clone,
+                    &rt,
+                    ips,
+                    scan_sni,
+                    scan_timeout,
+                    total_ips,
+                    scan_network.clone(),
+                )
+            }?;
 
-        if no_tui && !cfg.AUTO_SELECT {
-            warn!("--no-tui cannot show the IP selection table; auto-selecting rank-1");
-        }
-        let selected_entry: IpProbeEntry = if cfg.AUTO_SELECT || no_tui {
-            let best = entries.into_iter().next().context("no probe results")?;
-            info!(ip = %best.ip, score = best.score, "auto-selected IP");
-            best
-        } else {
-            let mut terminal = tui::enter_tui()?;
-            let result = tui::run_ip_selection(&mut terminal, &entries);
-            tui::leave_tui(terminal)?;
-            let entry = result.context("IP selection")?;
-            info!(ip = %entry.ip, score = entry.score, "selected IP");
-            entry
+            if entries.is_empty() {
+                anyhow::bail!("no IPs passed the scan — check connectivity or ip_list");
+            }
+
+            if no_tui && !cfg.AUTO_SELECT {
+                warn!("--no-tui cannot show the IP selection table; auto-selecting rank-1");
+            }
+            let selected_entry: IpProbeEntry = if cfg.AUTO_SELECT || no_tui {
+                let best = entries.into_iter().next().context("no probe results")?;
+                info!(ip = %best.ip, score = best.score, "auto-selected IP");
+                best
+            } else {
+                let mut terminal = tui::enter_tui()?;
+                let result = tui::run_ip_selection(&mut terminal, &entries);
+                tui::leave_tui(terminal)?;
+                let entry = result.context("IP selection")?;
+                info!(ip = %entry.ip, score = entry.score, "selected IP");
+                entry
+            };
+            (selected_entry.ip, Some(selected_entry.score))
         };
-        (selected_entry.ip, Some(selected_entry.score))
-    };
     events.emit(RuntimeEvent::SelectedTarget {
         target: TargetKind::Ip,
         sni: None,
         ip: active_ip.to_string(),
         score: active_score,
     });
+
+    let initial_binding = resolve_physical_binding(monitor_probe_target(active_ip))
+        .context("could not determine physical uplink")?;
+    let socket_binder = scan_network.binder.clone();
+    let (interface_binding_handle, interface_binding) =
+        interface_binding_channel(initial_binding.clone());
 
     let active_ip_arc = Arc::new(std::sync::RwLock::new(active_ip));
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
@@ -1785,6 +1842,8 @@ fn ip_bypass_main(
         };
         let rescan_events = events.clone();
         let background_probe_target = probe_target.clone();
+        let background_binding = interface_binding.clone();
+        let background_binder = socket_binder.clone();
         rt.spawn(async move {
             background_ip_rescan(
                 rescan_cfg,
@@ -1795,6 +1854,8 @@ fn ip_bypass_main(
                 rescan_event_tx,
                 rescan_events,
                 no_tui,
+                background_binding,
+                background_binder,
                 IpRescanPolicy {
                     mode_label: "ip_bypass",
                     ipv4_only: false,
@@ -1808,7 +1869,7 @@ fn ip_bypass_main(
         Arc::new(data_plane::DataPlaneController::none());
     let monitor = zerodpi_platform::netmon::NetworkMonitor::start(
         probe_target.clone(),
-        default_interface_ipv4(monitor_probe_target(active_ip)).ok(),
+        Some(initial_binding.clone()),
         network_recovery::SETTLE,
         network_recovery::POLL_INTERVAL,
     )
@@ -1816,16 +1877,21 @@ fn ip_bypass_main(
 
     let cfg_verify = cfg.clone();
     let verify_active = active_ip_arc.clone();
+    let verify_binding = interface_binding.clone();
+    let verify_binder = socket_binder.clone();
     let verify: Arc<dyn Fn() -> network_recovery::BoxFuture<'static, bool> + Send + Sync> =
         Arc::new(move || {
             let cfg = cfg_verify.clone();
             let ip = *verify_active.read().unwrap();
+            let binding = verify_binding.clone();
+            let socket_binder = verify_binder.clone();
             Box::pin(async move {
                 zerodpi_core::ip_scanner::probe_ip_candidate(
                     ip,
                     Arc::from(cfg.IP_SCAN_SNI.as_str()),
                     Duration::from_secs(cfg.SCAN_TIMEOUT_SECS),
                     cfg,
+                    OutboundNetwork::new(binding.current(), socket_binder),
                 )
                 .await
                 .tls_ok
@@ -1838,6 +1904,8 @@ fn ip_bypass_main(
     let rescan_event_tx = event_tx.clone();
     let rescan_events = events.clone();
     let rescan_probe_target = probe_target.clone();
+    let rescan_binding = interface_binding.clone();
+    let rescan_binder = socket_binder.clone();
     let rescan: Arc<
         dyn Fn() -> network_recovery::BoxFuture<'static, network_recovery::RescanOutcome>
             + Send
@@ -1849,6 +1917,7 @@ fn ip_bypass_main(
         let tx = Some(rescan_event_tx.clone());
         let events = rescan_events.clone();
         let probe_target = rescan_probe_target.clone();
+        let network = OutboundNetwork::new(rescan_binding.current(), rescan_binder.clone());
         Box::pin(async move {
             rescan_ip_once(
                 cfg,
@@ -1857,6 +1926,7 @@ fn ip_bypass_main(
                 tx,
                 events,
                 no_tui,
+                network,
                 IpRescanPolicy {
                     mode_label: "ip_bypass",
                     ipv4_only: false,
@@ -1868,7 +1938,7 @@ fn ip_bypass_main(
     });
 
     let recovery_env = Arc::new(network_recovery::MainRecoveryEnv::new(
-        zerodpi_core::net::interface_ip_channel(monitor_probe_target(active_ip)).0,
+        interface_binding_handle.clone(),
         data_plane_controller.clone(),
         network_recovery::RecoveryCallbacks { verify, rescan },
         events.clone(),
@@ -1878,7 +1948,7 @@ fn ip_bypass_main(
         recovery_env,
         probe_target,
         cfg.AUTO_SELECT && cfg.SELECTED_IP.is_none(),
-        default_interface_ipv4(monitor_probe_target(active_ip)).ok(),
+        Some(initial_binding),
     );
     let recovery_handle = rt.spawn(coordinator.run(monitor.events()));
 
@@ -1889,8 +1959,18 @@ fn ip_bypass_main(
     let proxy_active = active_ip_arc.clone();
 
     let dashboard_event_tx = Some(event_tx.clone());
-    let proxy_handle =
-        rt.spawn(async move { run_ip_bypass_proxy(cfg, proxy_active, dashboard_event_tx).await });
+    let proxy_binding = interface_binding.clone();
+    let proxy_binder = socket_binder.clone();
+    let proxy_handle = rt.spawn(async move {
+        run_ip_bypass_proxy(
+            cfg,
+            proxy_active,
+            proxy_binding,
+            proxy_binder,
+            dashboard_event_tx,
+        )
+        .await
+    });
 
     if no_tui {
         let result = rt.block_on(run_headless_proxy(
@@ -1942,6 +2022,7 @@ fn ip_bypass_plus_main(
     };
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+    let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
 
     // ---- step 1: obtain active IPv4 ----
     let (active_ip, active_score): (IpAddr, Option<u8>) = if let Some(ref forced_ip) =
@@ -1974,13 +2055,22 @@ fn ip_bypass_plus_main(
                 scan_sni,
                 scan_timeout,
                 cfg_clone,
+                scan_network.clone(),
                 &events,
                 Some(&ip_list_path),
             ));
             log_ip_scan_results("ip_bypass_plus: headless IP scan", &entries);
             Ok(entries)
         } else {
-            scan_ip_list_with_ip_progress(cfg_clone, &rt, ips, scan_sni, scan_timeout, total_ips)
+            scan_ip_list_with_ip_progress(
+                cfg_clone,
+                &rt,
+                ips,
+                scan_sni,
+                scan_timeout,
+                total_ips,
+                scan_network.clone(),
+            )
         }?;
 
         if entries.is_empty() {
@@ -2012,8 +2102,11 @@ fn ip_bypass_plus_main(
     });
 
     let active_v4 = require_ipv4_target(active_ip, "ip_bypass_plus")?;
-    let interface_ip = default_interface_ipv4(active_v4)
-        .context("could not determine local interface IP for upstream")?;
+    let initial_binding =
+        resolve_physical_binding(active_v4).context("could not determine physical uplink")?;
+    let socket_binder = scan_network.binder.clone();
+    let (interface_binding_handle, interface_binding) =
+        interface_binding_channel(initial_binding.clone());
 
     let active_ip_arc = Arc::new(std::sync::RwLock::new(active_ip));
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
@@ -2032,6 +2125,8 @@ fn ip_bypass_plus_main(
         };
         let rescan_events = events.clone();
         let background_probe_target = probe_target.clone();
+        let background_binding = interface_binding.clone();
+        let background_binder = socket_binder.clone();
         rt.spawn(async move {
             background_ip_rescan(
                 rescan_cfg,
@@ -2042,6 +2137,8 @@ fn ip_bypass_plus_main(
                 rescan_event_tx,
                 rescan_events,
                 no_tui,
+                background_binding,
+                background_binder,
                 IpRescanPolicy {
                     mode_label: "ip_bypass_plus",
                     ipv4_only: true,
@@ -2053,12 +2150,11 @@ fn ip_bypass_plus_main(
 
     info!(
         %active_v4,
-        %interface_ip,
+        interface_ip = %initial_binding.ip,
+        interface_name = %initial_binding.if_name,
         method = %cfg.BYPASS_METHOD,
         "ip_bypass_plus: starting proxy"
     );
-
-    let (interface_ip_handle, interface_ip) = zerodpi_core::net::interface_ip_channel(interface_ip);
 
     // ---- step 3: optional packet interceptor ----
     let (flow_controller, data_plane_controller): (
@@ -2076,7 +2172,7 @@ fn ip_bypass_plus_main(
                 cfg.clone(),
                 helper.clone(),
                 Arc::new(helper.clone()),
-                interface_ip.current(),
+                interface_binding.current(),
             ))
             .context("prepare root helper interceptor")?;
         (Arc::new(helper.clone()), Arc::new(controller))
@@ -2089,7 +2185,7 @@ fn ip_bypass_plus_main(
             cfg.clone(),
             flows.clone(),
             method,
-            interface_ip.current(),
+            interface_binding.current(),
         )
         .context("open packet interceptor")?;
         (
@@ -2101,7 +2197,7 @@ fn ip_bypass_plus_main(
     // ---- step 4: network recovery ----
     let monitor = zerodpi_platform::netmon::NetworkMonitor::start(
         probe_target.clone(),
-        Some(interface_ip.current()),
+        Some(interface_binding.current()),
         network_recovery::SETTLE,
         network_recovery::POLL_INTERVAL,
     )
@@ -2109,16 +2205,20 @@ fn ip_bypass_plus_main(
 
     let cfg_verify = cfg.clone();
     let verify_active = active_ip_arc.clone();
+    let verify_binding = interface_binding.clone();
+    let verify_binder = socket_binder.clone();
     let verify: Arc<dyn Fn() -> network_recovery::BoxFuture<'static, bool> + Send + Sync> =
         Arc::new(move || {
             let cfg = cfg_verify.clone();
             let ip = *verify_active.read().unwrap();
+            let network = OutboundNetwork::new(verify_binding.current(), verify_binder.clone());
             Box::pin(async move {
                 zerodpi_core::ip_scanner::probe_ip_candidate(
                     ip,
                     Arc::from(cfg.IP_SCAN_SNI.as_str()),
                     Duration::from_secs(cfg.SCAN_TIMEOUT_SECS),
                     cfg,
+                    network,
                 )
                 .await
                 .tls_ok
@@ -2131,6 +2231,8 @@ fn ip_bypass_plus_main(
     let rescan_event_tx = event_tx.clone();
     let rescan_events = events.clone();
     let rescan_probe_target = probe_target.clone();
+    let rescan_binding = interface_binding.clone();
+    let rescan_binder = socket_binder.clone();
     let rescan: Arc<
         dyn Fn() -> network_recovery::BoxFuture<'static, network_recovery::RescanOutcome>
             + Send
@@ -2142,6 +2244,7 @@ fn ip_bypass_plus_main(
         let tx = Some(rescan_event_tx.clone());
         let events = rescan_events.clone();
         let probe_target = rescan_probe_target.clone();
+        let network = OutboundNetwork::new(rescan_binding.current(), rescan_binder.clone());
         Box::pin(async move {
             rescan_ip_once(
                 cfg,
@@ -2150,6 +2253,7 @@ fn ip_bypass_plus_main(
                 tx,
                 events,
                 no_tui,
+                network,
                 IpRescanPolicy {
                     mode_label: "ip_bypass_plus",
                     ipv4_only: true,
@@ -2161,7 +2265,7 @@ fn ip_bypass_plus_main(
     });
 
     let recovery_env = Arc::new(network_recovery::MainRecoveryEnv::new(
-        interface_ip_handle.clone(),
+        interface_binding_handle.clone(),
         data_plane_controller.clone(),
         network_recovery::RecoveryCallbacks { verify, rescan },
         events.clone(),
@@ -2171,7 +2275,7 @@ fn ip_bypass_plus_main(
         recovery_env,
         probe_target,
         cfg.AUTO_SELECT && cfg.SELECTED_IP.is_none(),
-        Some(interface_ip.current()),
+        Some(interface_binding.current()),
     );
     let recovery_handle = rt.spawn(coordinator.run(monitor.events()));
 
@@ -2183,7 +2287,8 @@ fn ip_bypass_plus_main(
         run_ip_bypass_plus_proxy(
             cfg,
             proxy_active,
-            interface_ip.clone(),
+            interface_binding,
+            socket_binder,
             flow_controller,
             dashboard_event_tx,
         )
@@ -2226,6 +2331,12 @@ fn monitor_probe_target(active: IpAddr) -> Ipv4Addr {
     }
 }
 
+fn physical_network(target: Ipv4Addr) -> Result<OutboundNetwork> {
+    let binding = resolve_physical_binding(target)
+        .context("could not resolve an operational physical uplink")?;
+    Ok(OutboundNetwork::new(binding, platform_socket_binder()))
+}
+
 /// Store the monitor probe target for an active relay address.
 fn store_probe_target(probe_target: &std::sync::atomic::AtomicU32, active: IpAddr) {
     probe_target.store(
@@ -2261,11 +2372,14 @@ fn scan_ip_list_with_ip_progress(
     scan_sni: Arc<str>,
     timeout: Duration,
     total_ips: usize,
+    network: OutboundNetwork,
 ) -> anyhow::Result<Vec<IpProbeEntry>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<IpScanEvent>();
     let cfg_clone = cfg.clone();
-    let scan_handle =
-        rt.spawn(async move { scan_ip_list(ips, scan_sni, timeout, cfg_clone, Some(tx)).await });
+    let network = network.clone();
+    let scan_handle = rt.spawn(async move {
+        scan_ip_list(ips, scan_sni, timeout, cfg_clone, network, Some(tx)).await
+    });
 
     let mut terminal = tui::enter_tui()?;
     let (arrived, aborted) = tui::run_ip_scan_progress(&mut terminal, &mut rx, total_ips)?;
@@ -2320,6 +2434,8 @@ async fn background_ip_rescan(
     event_tx: Option<ProxyEventSender>,
     events: RuntimeEventEmitter,
     headless: bool,
+    interface_binding: InterfaceBindingWatch,
+    socket_binder: Arc<dyn zerodpi_core::net::OutboundSocketBinder>,
     policy: IpRescanPolicy,
 ) {
     let interval = Duration::from_secs(interval_secs);
@@ -2336,6 +2452,7 @@ async fn background_ip_rescan(
             },
         );
         tokio::time::sleep(interval).await;
+        let network = OutboundNetwork::new(interface_binding.current(), socket_binder.clone());
         let _ = rescan_ip_once(
             cfg.clone(),
             ip_list_path.clone(),
@@ -2343,6 +2460,7 @@ async fn background_ip_rescan(
             event_tx.clone(),
             events.clone(),
             headless,
+            network,
             policy,
             &probe_target,
         )
@@ -2359,6 +2477,7 @@ async fn rescan_ip_once(
     event_tx: Option<ProxyEventSender>,
     events: RuntimeEventEmitter,
     headless: bool,
+    network: OutboundNetwork,
     policy: IpRescanPolicy,
     probe_target: &std::sync::atomic::AtomicU32,
 ) -> network_recovery::RescanOutcome {
@@ -2432,7 +2551,15 @@ async fn rescan_ip_once(
         }
     }
     let cfg_clone = cfg.clone();
-    let entries = scan_ip_list(ips, scan_sni.clone(), scan_timeout, cfg_clone, None).await;
+    let entries = scan_ip_list(
+        ips,
+        scan_sni.clone(),
+        scan_timeout,
+        cfg_clone,
+        network,
+        None,
+    )
+    .await;
     if entries.is_empty() {
         warn!(
             mode = policy.mode_label,
@@ -2533,6 +2660,7 @@ fn sni_scan_main(
     };
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+    let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
 
     info!(path = %sni_list_path.display(), "sni_scan: scanning SNI list");
 
@@ -2544,13 +2672,15 @@ fn sni_scan_main(
             cfg_clone,
             &path,
             scan_timeout,
+            scan_network.clone(),
             &events,
             ScanKind::Sni,
         ))?
     } else {
         let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
-        let scan_handle =
-            rt.spawn(async move { scan_sni_list(&path, scan_timeout, cfg_clone, Some(tx)).await });
+        let scan_handle = rt.spawn(async move {
+            scan_sni_list(&path, scan_timeout, cfg_clone, scan_network, Some(tx)).await
+        });
 
         let mut terminal = tui::enter_tui()?;
         let (arrived, aborted) = tui::run_scan_progress(&mut terminal, &mut rx, total_hostnames)?;
@@ -2626,6 +2756,7 @@ fn ip_scan_main(
     };
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+    let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
     let ips = load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS)
         .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
     if ips.is_empty() {
@@ -2646,13 +2777,22 @@ fn ip_scan_main(
             scan_sni,
             scan_timeout,
             cfg_clone,
+            scan_network.clone(),
             &events,
             Some(&ip_list_path),
         ))
     } else {
         let (tx, mut rx) = mpsc::unbounded_channel::<IpScanEvent>();
         let scan_handle = rt.spawn(async move {
-            scan_ip_list(ips, scan_sni, scan_timeout, cfg_clone, Some(tx)).await
+            scan_ip_list(
+                ips,
+                scan_sni,
+                scan_timeout,
+                cfg_clone,
+                scan_network,
+                Some(tx),
+            )
+            .await
         });
 
         let mut terminal = tui::enter_tui()?;
@@ -2729,6 +2869,7 @@ fn sni_method_scan_main(
     };
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+    let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
     info!(path = %sni_list_path.display(), "sni_method_scan: Phase 0 — scanning SNI list");
 
     let sorted = if no_tui {
@@ -2736,6 +2877,7 @@ fn sni_method_scan_main(
             cfg.clone(),
             &sni_list_path,
             scan_timeout,
+            scan_network.clone(),
             &events,
             ScanKind::Sni,
         ))?
@@ -2744,8 +2886,9 @@ fn sni_method_scan_main(
         let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
         let path = sni_list_path.clone();
         let cfg_clone = cfg.clone();
-        let scan_handle =
-            rt.spawn(async move { scan_sni_list(&path, scan_timeout, cfg_clone, Some(tx)).await });
+        let scan_handle = rt.spawn(async move {
+            scan_sni_list(&path, scan_timeout, cfg_clone, scan_network, Some(tx)).await
+        });
 
         let mut terminal = tui::enter_tui()?;
         let (arrived, aborted) = tui::run_scan_progress(&mut terminal, &mut rx, total_hostnames)?;
@@ -2824,6 +2967,7 @@ fn ip_method_scan_main(
     };
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+    let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
     let ips = load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS)
         .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
     if ips.is_empty() {
@@ -2843,13 +2987,22 @@ fn ip_method_scan_main(
             scan_sni,
             scan_timeout,
             cfg_clone,
+            scan_network.clone(),
             &events,
             Some(&ip_list_path),
         ))
     } else {
         let (tx, mut rx) = mpsc::unbounded_channel::<IpScanEvent>();
         let scan_handle = rt.spawn(async move {
-            scan_ip_list(ips, scan_sni, scan_timeout, cfg_clone, Some(tx)).await
+            scan_ip_list(
+                ips,
+                scan_sni,
+                scan_timeout,
+                cfg_clone,
+                scan_network,
+                Some(tx),
+            )
+            .await
         });
 
         let mut terminal = tui::enter_tui()?;
@@ -2925,8 +3078,8 @@ fn method_scan_phase1(
     target: MethodScanTarget,
     mode_name: &str,
 ) -> Result<()> {
-    let interface_ip = default_interface_ipv4(target.ip)
-        .context("method scan: could not determine local interface IP")?;
+    let network =
+        physical_network(target.ip).context("method scan: could not determine physical uplink")?;
 
     let methods: Vec<String> = cfg.METHOD_SCAN_METHODS.iter().map(str::to_owned).collect();
     let total_methods = methods.len();
@@ -2954,7 +3107,7 @@ fn method_scan_phase1(
                 cfg_for_phase1,
                 target_for_phase1,
                 methods_for_phase1,
-                interface_ip,
+                network,
                 Some(tx),
                 DefaultInterceptor::open,
             )
@@ -3161,6 +3314,7 @@ fn proxy_scan_main(
     };
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+    let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
 
     // ---- Phase 1: SNI scan ----
     info!(path = %sni_list_path.display(), "proxy_scan: Phase 1 — scanning SNI list");
@@ -3171,14 +3325,16 @@ fn proxy_scan_main(
             cfg_clone,
             &path,
             scan_timeout,
+            scan_network.clone(),
             &events,
             ScanKind::Sni,
         ))?
     } else {
         let total_hostnames = count_hostnames(&sni_list_path);
         let (tx1, mut rx1) = mpsc::unbounded_channel::<SniProbeEntry>();
-        let scan_handle =
-            rt.spawn(async move { scan_sni_list(&path, scan_timeout, cfg_clone, Some(tx1)).await });
+        let scan_handle = rt.spawn(async move {
+            scan_sni_list(&path, scan_timeout, cfg_clone, scan_network, Some(tx1)).await
+        });
 
         let mut terminal = tui::enter_tui()?;
         let (arrived, aborted) = tui::run_scan_progress(&mut terminal, &mut rx1, total_hostnames)?;
@@ -3244,6 +3400,8 @@ fn proxy_scan_main(
         cfg.PROXY_TEST_SOCKS5_HOST, cfg.PROXY_TEST_SOCKS5_PORT
     );
     rt.block_on(async {
+        // The SOCKS5 endpoint is a local control-plane service. The candidate
+        // traffic it creates is bound in proxy_tester through OutboundNetwork.
         tokio::time::timeout(
             Duration::from_secs(5),
             tokio::net::TcpStream::connect(&socks5_addr),
@@ -3262,8 +3420,9 @@ fn proxy_scan_main(
 
     // ---- Determine interface IP using first candidate's Cloudflare IP ----
     let first_ip = candidates[0].ip;
-    let interface_ip =
-        default_interface_ipv4(first_ip).context("could not determine local interface IP")?;
+    let proxy_network = physical_network(first_ip)
+        .context("could not determine physical uplink for proxy tests")?;
+    let interface_ip = proxy_network.binding.ip;
 
     // ---- Phase 2: proxy test per candidate ----
     info!(
@@ -3275,6 +3434,7 @@ fn proxy_scan_main(
     let cfg_for_phase2 = cfg.clone();
     let candidates_for_phase2 = candidates.clone();
     let helper_for_phase2 = remote_helper;
+    let network_for_phase2 = proxy_network;
     let total_proxy_tests = candidates.len();
 
     // Each candidate spins up an OS thread (WinDivert/NFQUEUE), so we run
@@ -3290,6 +3450,7 @@ fn proxy_scan_main(
             for candidate in &candidates_for_phase2 {
                 let cfg_c = cfg_for_phase2.clone();
                 let tx_c = tx2.clone();
+                let network = network_for_phase2.clone();
 
                 let entry = if let Some(helper) = helper_for_phase2.as_ref() {
                     let config = interceptor_config(
@@ -3311,7 +3472,7 @@ fn proxy_scan_main(
                         let entry = test_candidate_with_flow_controller(
                             candidate,
                             cfg_c.clone(),
-                            interface_ip,
+                            network.clone(),
                             controller,
                         )
                         .await;
@@ -3321,7 +3482,7 @@ fn proxy_scan_main(
                         entry
                     }
                 } else {
-                    test_candidate_full(candidate, cfg_c, interface_ip, |filter| {
+                    test_candidate_full(candidate, cfg_c, network, |filter| {
                         DefaultInterceptor::open(filter)
                     })
                     .await
@@ -3769,6 +3930,10 @@ mod tests {
             None,
             RuntimeEventEmitter::default(),
             true,
+            OutboundNetwork::new(
+                zerodpi_core::net::InterfaceBinding::fixed(Ipv4Addr::LOCALHOST),
+                Arc::new(zerodpi_core::net::NoopSocketBinder),
+            ),
             &probe_target,
         )
         .await;

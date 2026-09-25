@@ -1215,16 +1215,16 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
         ProxyEvent::NetworkStatus { status } => {
             state.network_status = Some(match status {
                 zerodpi_core::proxy::NetworkStatus::Online { interface_ip } => {
-                    format!("Network: {interface_ip}")
+                    interface_ip.to_string()
                 }
                 zerodpi_core::proxy::NetworkStatus::Changing { interface_ip } => {
-                    format!("Network: changing to {interface_ip}")
+                    format!("changing to {interface_ip}")
                 }
                 zerodpi_core::proxy::NetworkStatus::Recovering { attempt } => {
-                    format!("Network: recovering (attempt {attempt})")
+                    format!("recovering (attempt {attempt})")
                 }
                 zerodpi_core::proxy::NetworkStatus::Unavailable { message } => {
-                    format!("Network: unavailable ({message})")
+                    format!("unavailable ({message})")
                 }
             });
         }
@@ -2565,6 +2565,21 @@ mod tests {
         let err = state.last_error.as_ref().expect("last_error should be set");
         assert_eq!(err.src_port, 99);
         assert_eq!(err.message, "connection refused");
+    }
+
+    #[test]
+    fn apply_event_stores_network_status_without_rendering_label() {
+        let mut state = dashboard_state(vec![]);
+        apply_event(
+            ProxyEvent::NetworkStatus {
+                status: zerodpi_core::proxy::NetworkStatus::Online {
+                    interface_ip: "192.168.0.222".parse().unwrap(),
+                },
+            },
+            &mut state,
+        );
+
+        assert_eq!(state.network_status.as_deref(), Some("192.168.0.222"));
     }
 
     #[test]

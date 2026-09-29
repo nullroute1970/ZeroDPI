@@ -12,6 +12,17 @@ use anyhow::Result;
 use tokio::net::TcpSocket;
 use zerodpi_core::net::{InterfaceBinding, OutboundSocketBinder};
 
+#[cfg(any(target_os = "android", test))]
+fn interface_names_from_proc_net_dev(contents: &str) -> Vec<String> {
+    contents
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, _)| name.trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -263,9 +274,14 @@ mod imp {
     use super::*;
     use anyhow::Context;
     use std::collections::HashMap;
-    use std::ffi::{CStr, CString};
+    #[cfg(target_os = "linux")]
+    use std::ffi::CStr;
+    use std::ffi::CString;
     use std::fs;
     use std::os::fd::AsRawFd;
+    #[cfg(target_os = "android")]
+    use std::os::fd::{FromRawFd, OwnedFd};
+    #[cfg(target_os = "linux")]
     use std::ptr;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,6 +311,7 @@ mod imp {
             })
     }
 
+    #[cfg(target_os = "linux")]
     fn enumerate_candidates(route_metrics: &HashMap<String, u32>) -> Result<Vec<Candidate>> {
         let mut addresses = ptr::null_mut();
         if unsafe { libc::getifaddrs(&mut addresses) } != 0 {
@@ -342,8 +359,89 @@ mod imp {
         Ok(candidates)
     }
 
+    #[cfg(target_os = "android")]
+    fn enumerate_candidates(route_metrics: &HashMap<String, u32>) -> Result<Vec<Candidate>> {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("open interface query socket");
+        }
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        let contents = fs::read_to_string("/proc/net/dev").context("read /proc/net/dev")?;
+        let mut candidates = Vec::new();
+
+        for name in interface_names_from_proc_net_dev(&contents) {
+            if !is_physical_interface(&name) {
+                continue;
+            }
+
+            let name_c = CString::new(name.as_str()).context("interface name contains NUL")?;
+            let if_index = unsafe { libc::if_nametoindex(name_c.as_ptr()) };
+            if if_index == 0 {
+                continue;
+            }
+
+            let mut flags_request = interface_request(&name)?;
+            let flags_result = unsafe {
+                libc::ioctl(
+                    socket.as_raw_fd(),
+                    libc::SIOCGIFFLAGS as libc::Ioctl,
+                    &mut flags_request,
+                )
+            };
+            if flags_result != 0 {
+                continue;
+            }
+            let flags = unsafe { flags_request.ifr_ifru.ifru_flags } as libc::c_int;
+            if flags & libc::IFF_UP == 0 {
+                continue;
+            }
+
+            let mut address_request = interface_request(&name)?;
+            let address_result = unsafe {
+                libc::ioctl(
+                    socket.as_raw_fd(),
+                    libc::SIOCGIFADDR as libc::Ioctl,
+                    &mut address_request,
+                )
+            };
+            if address_result != 0 {
+                continue;
+            }
+
+            let ip = unsafe { sockaddr_ipv4(&address_request.ifr_ifru.ifru_addr) };
+            let Some(ip) = ip.filter(|ip| is_usable_ipv4(*ip)) else {
+                continue;
+            };
+
+            let kind_rank = interface_kind_rank(&name);
+            let metric = route_metrics.get(&name).copied().unwrap_or(u32::MAX / 2);
+            candidates.push(Candidate {
+                binding: InterfaceBinding::new(ip, if_index, name),
+                metric,
+                kind_rank,
+            });
+        }
+
+        Ok(candidates)
+    }
+
+    #[cfg(target_os = "android")]
+    fn interface_request(name: &str) -> Result<libc::ifreq> {
+        if name.len() >= libc::IFNAMSIZ as usize {
+            anyhow::bail!("interface name is too long: {name}");
+        }
+
+        let mut request = unsafe { std::mem::zeroed::<libc::ifreq>() };
+        for (slot, byte) in request.ifr_name.iter_mut().zip(name.bytes()) {
+            *slot = byte as libc::c_char;
+        }
+        Ok(request)
+    }
+
+    #[cfg(target_os = "linux")]
     struct IfAddrsGuard(*mut libc::ifaddrs);
 
+    #[cfg(target_os = "linux")]
     impl Drop for IfAddrsGuard {
         fn drop(&mut self) {
             if !self.0.is_null() {
@@ -526,4 +624,23 @@ pub use imp::{resolve_physical_binding, PlatformSocketBinder};
 
 pub fn platform_socket_binder() -> Arc<dyn OutboundSocketBinder> {
     Arc::new(PlatformSocketBinder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_proc_net_dev_interface_names() {
+        let contents = "Inter-| Receive                                                | Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n    lo:  123       4    0    0    0     0          0         0      123       4    0    0    0     0       0          0\n  wlan0: 456       7    0    0    0     0          0         0      456       7    0    0    0     0       0          0\nrmnet_data0: 789  8    0    0    0     0          0         0      789       8    0    0    0     0       0          0\n";
+
+        assert_eq!(
+            interface_names_from_proc_net_dev(contents),
+            vec![
+                "lo".to_owned(),
+                "wlan0".to_owned(),
+                "rmnet_data0".to_owned()
+            ]
+        );
+    }
 }

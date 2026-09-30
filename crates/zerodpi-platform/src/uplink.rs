@@ -12,17 +12,6 @@ use anyhow::Result;
 use tokio::net::TcpSocket;
 use zerodpi_core::net::{InterfaceBinding, OutboundSocketBinder};
 
-#[cfg(any(target_os = "android", test))]
-fn interface_names_from_proc_net_dev(contents: &str) -> Vec<String> {
-    contents
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, _)| name.trim())
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -274,10 +263,11 @@ mod imp {
     use super::*;
     use anyhow::Context;
     use std::collections::HashMap;
-    #[cfg(target_os = "linux")]
     use std::ffi::CStr;
     use std::ffi::CString;
     use std::fs;
+    #[cfg(target_os = "android")]
+    use std::mem::{size_of, MaybeUninit};
     use std::os::fd::AsRawFd;
     #[cfg(target_os = "android")]
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -366,10 +356,9 @@ mod imp {
             return Err(std::io::Error::last_os_error()).context("open interface query socket");
         }
         let socket = unsafe { OwnedFd::from_raw_fd(fd) };
-        let contents = fs::read_to_string("/proc/net/dev").context("read /proc/net/dev")?;
         let mut candidates = Vec::new();
 
-        for name in interface_names_from_proc_net_dev(&contents) {
+        for (name, ip) in enumerate_interface_addresses()? {
             if !is_physical_interface(&name) {
                 continue;
             }
@@ -396,22 +385,9 @@ mod imp {
                 continue;
             }
 
-            let mut address_request = interface_request(&name)?;
-            let address_result = unsafe {
-                libc::ioctl(
-                    socket.as_raw_fd(),
-                    libc::SIOCGIFADDR as libc::Ioctl,
-                    &mut address_request,
-                )
-            };
-            if address_result != 0 {
+            if !is_usable_ipv4(ip) {
                 continue;
             }
-
-            let ip = unsafe { sockaddr_ipv4(&address_request.ifr_ifru.ifru_addr) };
-            let Some(ip) = ip.filter(|ip| is_usable_ipv4(*ip)) else {
-                continue;
-            };
 
             let kind_rank = interface_kind_rank(&name);
             let metric = route_metrics.get(&name).copied().unwrap_or(u32::MAX / 2);
@@ -425,9 +401,75 @@ mod imp {
         Ok(candidates)
     }
 
+    /// Enumerate IPv4 interface addresses through the socket ioctl API.
+    ///
+    /// Android denies direct access to `/proc/net/dev` for ordinary app
+    /// processes. `SIOCGIFCONF` is available with the API-23 NDK baseline and
+    /// returns the same interface/address pairs without requiring procfs.
+    #[cfg(target_os = "android")]
+    fn enumerate_interface_addresses() -> Result<Vec<(String, Ipv4Addr)>> {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("open interface query socket");
+        }
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut capacity = 16usize;
+
+        loop {
+            let mut buffer: Vec<MaybeUninit<libc::ifreq>> =
+                std::iter::repeat_with(MaybeUninit::uninit)
+                    .take(capacity)
+                    .collect();
+            let buffer_len = buffer
+                .len()
+                .checked_mul(size_of::<libc::ifreq>())
+                .context("interface query buffer size overflow")?;
+            let buffer_len =
+                libc::c_int::try_from(buffer_len).context("interface query buffer is too large")?;
+            let mut request = libc::ifconf {
+                ifc_len: buffer_len,
+                ifc_ifcu: unsafe { std::mem::zeroed() },
+            };
+            request.ifc_ifcu.ifcu_req = buffer.as_mut_ptr().cast();
+
+            let result = unsafe {
+                libc::ioctl(
+                    socket.as_raw_fd(),
+                    libc::SIOCGIFCONF as libc::Ioctl,
+                    &mut request,
+                )
+            };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error()).context("enumerate interfaces");
+            }
+
+            let reported_len = usize::try_from(request.ifc_len)
+                .context("interface query returned a negative length")?;
+            let entry_size = size_of::<libc::ifreq>();
+            let entry_count = (reported_len.min(buffer_len as usize)) / entry_size;
+            let mut interfaces = Vec::with_capacity(entry_count);
+            for entry in buffer.iter().take(entry_count) {
+                let entry = unsafe { entry.assume_init_ref() };
+                let name = unsafe { CStr::from_ptr(entry.ifr_name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                if let Some(ip) = unsafe { sockaddr_ipv4(&entry.ifr_ifru.ifru_addr) } {
+                    interfaces.push((name, ip));
+                }
+            }
+
+            if reported_len < buffer_len as usize {
+                return Ok(interfaces);
+            }
+            capacity = capacity
+                .checked_mul(2)
+                .context("interface query returned too many interfaces")?;
+        }
+    }
+
     #[cfg(target_os = "android")]
     fn interface_request(name: &str) -> Result<libc::ifreq> {
-        if name.len() >= libc::IFNAMSIZ as usize {
+        if name.len() >= libc::IFNAMSIZ {
             anyhow::bail!("interface name is too long: {name}");
         }
 
@@ -582,6 +624,16 @@ mod imp {
     mod tests {
         use super::*;
 
+        #[cfg(target_os = "android")]
+        #[test]
+        fn enumerates_ipv4_interfaces_with_ioctl_without_proc_net_dev() {
+            let interfaces = enumerate_interface_addresses().expect("enumerate interfaces");
+
+            assert!(interfaces
+                .iter()
+                .any(|(name, ip)| name == "lo" && *ip == Ipv4Addr::LOCALHOST));
+        }
+
         #[test]
         fn rejects_virtual_interface_names() {
             assert!(!is_physical_interface("tun0"));
@@ -605,7 +657,7 @@ mod imp {
                 std::env::temp_dir().join(format!("zerodpi-route-test-{}", std::process::id()));
             std::fs::write(&path, text).unwrap();
             let contents = std::fs::read_to_string(&path).unwrap();
-            let mut metrics = HashMap::new();
+            let mut metrics: HashMap<String, u32> = HashMap::new();
             for line in contents.lines().skip(1) {
                 let fields: Vec<_> = line.split_whitespace().collect();
                 let metric = fields[6].parse::<u32>().unwrap();
@@ -624,23 +676,4 @@ pub use imp::{resolve_physical_binding, PlatformSocketBinder};
 
 pub fn platform_socket_binder() -> Arc<dyn OutboundSocketBinder> {
     Arc::new(PlatformSocketBinder)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_proc_net_dev_interface_names() {
-        let contents = "Inter-| Receive                                                | Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n    lo:  123       4    0    0    0     0          0         0      123       4    0    0    0     0       0          0\n  wlan0: 456       7    0    0    0     0          0         0      456       7    0    0    0     0       0          0\nrmnet_data0: 789  8    0    0    0     0          0         0      789       8    0    0    0     0       0          0\n";
-
-        assert_eq!(
-            interface_names_from_proc_net_dev(contents),
-            vec![
-                "lo".to_owned(),
-                "wlan0".to_owned(),
-                "rmnet_data0".to_owned()
-            ]
-        );
-    }
 }

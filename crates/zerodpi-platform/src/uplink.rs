@@ -589,6 +589,11 @@ mod imp {
         !ip.is_unspecified() && !ip.is_loopback() && !ip.is_link_local()
     }
 
+    #[cfg(target_os = "android")]
+    fn should_fallback_to_source_binding(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::PermissionDenied
+    }
+
     #[derive(Clone, Copy, Debug, Default)]
     pub struct PlatformSocketBinder;
 
@@ -609,7 +614,19 @@ mod imp {
                 )
             };
             if result != 0 {
-                return Err(std::io::Error::last_os_error()).with_context(|| {
+                let error = std::io::Error::last_os_error();
+                #[cfg(target_os = "android")]
+                if should_fallback_to_source_binding(&error) {
+                    tracing::debug!(
+                        interface = %binding.if_name,
+                        source = %binding.ip,
+                        error = %error,
+                        "SO_BINDTODEVICE unavailable; using source-address binding"
+                    );
+                    return Ok(());
+                }
+
+                return Err(error).with_context(|| {
                     format!(
                         "bind outbound socket to {} ({})",
                         binding.if_name, binding.ip
@@ -632,6 +649,16 @@ mod imp {
             assert!(interfaces
                 .iter()
                 .any(|(name, ip)| name == "lo" && *ip == Ipv4Addr::LOCALHOST));
+        }
+
+        #[cfg(target_os = "android")]
+        #[test]
+        fn treats_bind_to_device_permission_error_as_source_binding_fallback() {
+            let permission_denied = std::io::Error::from_raw_os_error(libc::EPERM);
+            let missing_device = std::io::Error::from_raw_os_error(libc::ENODEV);
+
+            assert!(should_fallback_to_source_binding(&permission_denied));
+            assert!(!should_fallback_to_source_binding(&missing_device));
         }
 
         #[test]

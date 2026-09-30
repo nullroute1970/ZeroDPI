@@ -210,9 +210,16 @@ impl FlowController for LocalFlowController {
         low_ttl_override: Option<u8>,
     ) -> FlowRegistrationFuture<'_> {
         Box::pin(async move {
-            let entry = FlowEntry::new(fake_data, low_ttl_override);
-            self.flows.insert(key, entry.clone());
-            Ok(entry)
+            match self.flows.entry(key) {
+                dashmap::mapref::entry::Entry::Vacant(slot) => {
+                    let entry = FlowEntry::new(fake_data, low_ttl_override);
+                    slot.insert(entry.clone());
+                    Ok(entry)
+                }
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    anyhow::bail!("flow is already registered: {key:?}")
+                }
+            }
         })
     }
 
@@ -235,6 +242,27 @@ impl FlowController for LocalFlowController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn duplicate_registration_preserves_existing_flow() {
+        let controller = LocalFlowController::new(new_flow_table());
+        let key = FlowKey {
+            src_ip: Ipv4Addr::LOCALHOST,
+            src_port: 1234,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            dst_port: 443,
+        };
+        let original = controller
+            .register_flow(key, vec![1], Some(5))
+            .await
+            .unwrap();
+        assert!(controller
+            .register_flow(key, vec![2], Some(7))
+            .await
+            .is_err());
+        let stored = controller.flows.get(&key).unwrap();
+        assert!(Arc::ptr_eq(stored.value(), &original));
+    }
 
     #[test]
     fn flow_entry_carries_low_ttl_override() {

@@ -248,12 +248,14 @@ fn bypass_progress(entry: &FlowEntry) -> bool {
 async fn wait_for_bypass_progress(entry: &FlowEntry, timeout: Duration) -> bool {
     tokio::time::timeout(timeout, async {
         loop {
+            let finished = entry.notify.notified();
+            let ready = entry.ready_for_data.notified();
             if bypass_progress(entry) {
                 return;
             }
             tokio::select! {
-                _ = entry.notify.notified() => {}
-                _ = entry.ready_for_data.notified() => {}
+                _ = finished => {}
+                _ = ready => {}
             }
         }
     })

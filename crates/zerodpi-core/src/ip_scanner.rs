@@ -26,8 +26,9 @@ use std::time::{Duration, Instant};
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::ser::SerializeStruct;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tracing::{debug, trace};
 
 use crate::net::OutboundNetwork;
@@ -280,25 +281,40 @@ pub async fn probe_ip_candidate(
     match tokio::time::timeout(timeout, network.connect(addr)).await {
         Ok(Ok(_)) => {
             let tcp_ms = start.elapsed().as_millis() as u64;
-            probe_tls_ttfb(ip, tcp_ms, &scan_sni, timeout, config, network).await
-        }
-        _ => {
-            let mut entry = IpProbeEntry {
+            probe_tls_ttfb(
                 ip,
-                tcp_latency_ms: None,
-                tls_ok: false,
-                tls_latency_ms: None,
-                cert_valid: false,
-                ttfb_ms: None,
-                download_bps: None,
-                upload_bps: None,
-                http_status: None,
-                score: 0,
-            };
-            entry.score = compute_score(&entry, &config);
-            entry
+                tcp_ms,
+                &scan_sni,
+                timeout,
+                config,
+                network,
+                make_tls_connector(),
+            )
+            .await
         }
+        _ => tcp_only_entry(ip, None, &config),
     }
+}
+
+fn tcp_only_entry(
+    ip: IpAddr,
+    tcp_latency_ms: Option<u64>,
+    config: &crate::config::Config,
+) -> IpProbeEntry {
+    let mut entry = IpProbeEntry {
+        ip,
+        tcp_latency_ms,
+        tls_ok: false,
+        tls_latency_ms: None,
+        cert_valid: false,
+        ttfb_ms: None,
+        download_bps: None,
+        upload_bps: None,
+        http_status: None,
+        score: 0,
+    };
+    entry.score = compute_score(&entry, config);
+    entry
 }
 
 pub async fn scan_ip_list(
@@ -313,98 +329,79 @@ pub async fn scan_ip_list(
         return Vec::new();
     }
 
-    // -----------------------------------------------------------------------
-    // Phase 1: TCP connect (all IPs, high concurrency)
-    // Phase 2+3 is pipelined: each TLS probe starts as soon as its TCP
-    // result arrives, without waiting for all of Phase 1 to finish.
-    // -----------------------------------------------------------------------
-    let sem1 = Arc::new(Semaphore::new(config.IP_MAX_P1_CONCURRENT));
-    let sem2 = Arc::new(Semaphore::new(config.IP_MAX_P2_CONCURRENT));
-    let (p1_tx, mut p1_rx) = mpsc::unbounded_channel::<(IpAddr, Option<u64>)>();
-    let (p2_tx, mut p2_rx) = mpsc::unbounded_channel::<IpProbeEntry>();
+    // Bound task creation as well as active connections. JoinSet aborts all
+    // workers if the scan is cancelled; bounded backlog applies backpressure
+    // when TLS/HTTP probes are slower than the TCP phase.
+    let p1_limit = config.IP_MAX_P1_CONCURRENT.max(1);
+    let p2_limit = config.IP_MAX_P2_CONCURRENT.max(1);
+    let mut connector = None;
+    let mut p1 = JoinSet::new();
+    let mut p2 = JoinSet::new();
+    let mut pending = std::collections::VecDeque::new();
+    let mut all = Vec::with_capacity(ips.len());
+    let mut ips = ips.into_iter().peekable();
+    let mut tcp_tested = 0;
 
-    let total = ips.len();
-    for ip in ips {
-        let sem = sem1.clone();
-        let tx = p1_tx.clone();
-        let network = network.clone();
-        tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            let addr = SocketAddr::new(ip, SCAN_PORT);
-            let start = Instant::now();
-            let result = tokio::time::timeout(timeout, network.connect(addr)).await;
-            let tcp_ms = match result {
-                Ok(Ok(_)) => Some(start.elapsed().as_millis() as u64),
-                _ => None,
+    loop {
+        while p2.len() < p2_limit {
+            let Some((ip, ms)) = pending.pop_front() else {
+                break;
             };
-            let _ = tx.send((ip, tcp_ms));
-        });
-    }
-    drop(p1_tx);
-
-    // Process Phase 1 results as they arrive; immediately pipeline into Phase 2.
-    let mut tcp_results: Vec<(IpAddr, Option<u64>)> = Vec::with_capacity(total);
-    let mut tcp_tested: usize = 0;
-    while let Some((ip, tcp_ms)) = p1_rx.recv().await {
-        tcp_tested += 1;
-        tcp_results.push((ip, tcp_ms));
-
-        if let Some(ref ptx) = progress_tx {
-            let _ = ptx.send(IpScanEvent::TcpDone { tcp_tested });
-        }
-
-        if let Some(ms) = tcp_ms {
-            let sem = sem2.clone();
-            let tx = p2_tx.clone();
-            let ptx = progress_tx.clone();
             let sni = scan_sni.clone();
             let cfg = config.clone();
             let network = network.clone();
-            tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                let entry = probe_tls_ttfb(ip, ms, &sni, timeout, cfg, network).await;
-                if let Some(ref t) = ptx {
-                    let _ = t.send(IpScanEvent::ProbeComplete(entry.clone()));
-                }
-                let _ = tx.send(entry);
+            let connector = connector.get_or_insert_with(make_tls_connector).clone();
+            p2.spawn(async move {
+                probe_tls_ttfb(ip, ms, &sni, timeout, cfg, network, connector).await
             });
         }
-    }
-    // All Phase 1 done — drop p2_tx so p2_rx closes when all spawns finish.
-    drop(p2_tx);
-
-    let mut tls_results: std::collections::HashMap<IpAddr, IpProbeEntry> =
-        std::collections::HashMap::new();
-    while let Some(entry) = p2_rx.recv().await {
-        tls_results.insert(entry.ip, entry);
-    }
-
-    // Build final list: merge TCP failures + TLS results.
-    let mut all: Vec<IpProbeEntry> = tcp_results
-        .into_iter()
-        .map(|(ip, tcp_ms)| {
-            if let Some(entry) = tls_results.remove(&ip) {
-                entry
-            } else {
-                // TCP-only survivor that was dropped during phase 2 (shouldn't
-                // happen), or a TCP failure.
-                let mut e = IpProbeEntry {
-                    ip,
-                    tcp_latency_ms: tcp_ms,
-                    tls_ok: false,
-                    tls_latency_ms: None,
-                    cert_valid: false,
-                    ttfb_ms: None,
-                    download_bps: None,
-                    upload_bps: None,
-                    http_status: None,
-                    score: 0,
+        while p1.len() < p1_limit && pending.len() < p2_limit {
+            let Some(ip) = ips.next() else { break };
+            let network = network.clone();
+            p1.spawn(async move {
+                let start = Instant::now();
+                let result =
+                    tokio::time::timeout(timeout, network.connect(SocketAddr::new(ip, SCAN_PORT)))
+                        .await;
+                let tcp_ms = match result {
+                    Ok(Ok(_)) => Some(start.elapsed().as_millis() as u64),
+                    _ => None,
                 };
-                e.score = compute_score(&e, &config);
-                e
+                (ip, tcp_ms)
+            });
+        }
+        if p1.is_empty() && p2.is_empty() && pending.is_empty() && ips.peek().is_none() {
+            break;
+        }
+        tokio::select! {
+            result = p1.join_next(), if !p1.is_empty() => {
+                match result.expect("nonempty TCP task set") {
+                    Ok((ip, tcp_ms)) => {
+                        tcp_tested += 1;
+                        if let Some(ref tx) = progress_tx {
+                            let _ = tx.send(IpScanEvent::TcpDone { tcp_tested });
+                        }
+                        match tcp_ms {
+                            Some(ms) => pending.push_back((ip, ms)),
+                            None => all.push(tcp_only_entry(ip, None, &config)),
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "TCP probe task failed"),
+                }
             }
-        })
-        .collect();
+            result = p2.join_next(), if !p2.is_empty() => {
+                match result.expect("nonempty TLS task set") {
+                    Ok(entry) => {
+                        if let Some(ref tx) = progress_tx {
+                            let _ = tx.send(IpScanEvent::ProbeComplete(entry.clone()));
+                        }
+                        all.push(entry);
+                    }
+                    Err(error) => tracing::warn!(%error, "TLS probe task failed"),
+                }
+            }
+        }
+    }
 
     all.sort_by(|a, b| {
         b.score.cmp(&a.score).then_with(|| {
@@ -427,46 +424,16 @@ async fn probe_tls_ttfb(
     timeout: Duration,
     config: Arc<crate::config::Config>,
     network: OutboundNetwork,
+    connector: tokio_rustls::TlsConnector,
 ) -> IpProbeEntry {
     let addr = SocketAddr::new(ip, SCAN_PORT);
-
-    // Re-connect for TLS (phase 1 stream has already been dropped).
     let stream = match tokio::time::timeout(timeout, network.connect(addr)).await {
         Ok(Ok(s)) => s,
-        _ => {
-            return IpProbeEntry {
-                ip,
-                tcp_latency_ms: Some(tcp_latency_ms),
-                tls_ok: false,
-                tls_latency_ms: None,
-                cert_valid: false,
-                ttfb_ms: None,
-                download_bps: None,
-                upload_bps: None,
-                http_status: None,
-                score: 0,
-            };
-        }
+        _ => return tcp_only_entry(ip, Some(tcp_latency_ms), &config),
     };
-
-    let connector = make_tls_connector();
-
     let server_name = match rustls::pki_types::ServerName::try_from(sni.to_owned()) {
         Ok(n) => n,
-        Err(_) => {
-            return IpProbeEntry {
-                ip,
-                tcp_latency_ms: Some(tcp_latency_ms),
-                tls_ok: false,
-                tls_latency_ms: None,
-                cert_valid: false,
-                ttfb_ms: None,
-                download_bps: None,
-                upload_bps: None,
-                http_status: None,
-                score: 0,
-            };
-        }
+        Err(_) => return tcp_only_entry(ip, Some(tcp_latency_ms), &config),
     };
 
     let tls_start = Instant::now();
@@ -506,43 +473,8 @@ async fn probe_tls_ttfb(
         .is_ok_and(|r| r.is_ok());
 
     let (ttfb_ms, download_bps, http_status) = if write_ok {
-        let mut buf = vec![0u8; config.SCAN_DOWNLOAD_CAP];
-        let mut total_read = 0usize;
-        let mut ttfb: Option<u64> = None;
-        let mut status: Option<u16> = None;
-
-        loop {
-            let remaining = config.SCAN_DOWNLOAD_CAP - total_read;
-            if remaining == 0 {
-                break;
-            }
-            match tokio::time::timeout(timeout, stream.read(&mut buf[total_read..])).await {
-                Ok(Ok(0)) | Err(_) => break,
-                Ok(Ok(n)) => {
-                    if ttfb.is_none() {
-                        ttfb = Some(req_start.elapsed().as_millis() as u64);
-                        // Parse HTTP status from the first response chunk.
-                        if let Ok(text) = std::str::from_utf8(&buf[..n]) {
-                            status = parse_http_status(text);
-                        }
-                    }
-                    total_read += n;
-                }
-                Ok(Err(_)) => break,
-            }
-        }
-
-        let speed = if total_read > 0 {
-            let elapsed = req_start.elapsed().as_secs_f64();
-            if elapsed > 0.0 {
-                Some(total_read as f64 / elapsed)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        (ttfb, speed, status)
+        crate::scanner_http::measure_download(stream, req_start, config.SCAN_DOWNLOAD_CAP, timeout)
+            .await
     } else {
         (None, None, None)
     };
@@ -567,15 +499,6 @@ async fn probe_tls_ttfb(
     };
     entry.score = compute_score(&entry, &config);
     entry
-}
-
-/// Extract the HTTP status code from the beginning of an HTTP/1.x response.
-fn parse_http_status(text: &str) -> Option<u16> {
-    // "HTTP/1.1 200 OK\r\n..."
-    let line = text.lines().next()?;
-    let mut parts = line.splitn(3, ' ');
-    parts.next(); // "HTTP/1.x"
-    parts.next()?.parse::<u16>().ok()
 }
 
 fn make_tls_connector() -> tokio_rustls::TlsConnector {
@@ -769,6 +692,72 @@ mod candidate_tests {
     use std::sync::Arc;
 
     use super::*;
+
+    struct RejectingBinder(std::sync::atomic::AtomicUsize);
+
+    impl crate::net::OutboundSocketBinder for RejectingBinder {
+        fn configure(
+            &self,
+            _socket: &tokio::net::TcpSocket,
+            _binding: &crate::net::InterfaceBinding,
+        ) -> anyhow::Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("test rejects outbound socket")
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_reconnect_failure_keeps_tcp_score() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let config = Arc::new(crate::config::test_support::minimal_config());
+        let network = OutboundNetwork::new(
+            crate::net::InterfaceBinding::fixed(std::net::Ipv4Addr::LOCALHOST),
+            Arc::new(RejectingBinder(std::sync::atomic::AtomicUsize::new(0))),
+        );
+        let entry = probe_tls_ttfb(
+            "192.0.2.1".parse().unwrap(),
+            100,
+            "example.com",
+            Duration::from_secs(1),
+            config,
+            network,
+            make_tls_connector(),
+        )
+        .await;
+        assert_eq!(entry.tcp_latency_ms, Some(100));
+        assert_eq!(entry.score, 20);
+    }
+
+    #[tokio::test]
+    async fn cancelled_ip_scan_does_not_start_queued_connections() {
+        use std::future::Future;
+        use std::task::Poll;
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let binder = Arc::new(RejectingBinder(std::sync::atomic::AtomicUsize::new(0)));
+        let network = OutboundNetwork::new(
+            crate::net::InterfaceBinding::fixed(std::net::Ipv4Addr::LOCALHOST),
+            binder.clone(),
+        );
+        let ips = (1..=100)
+            .map(|n| IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, n)))
+            .collect();
+        let mut scan = Box::pin(scan_ip_list(
+            ips,
+            Arc::from("example.com"),
+            Duration::from_secs(1),
+            Arc::new(crate::config::test_support::minimal_config()),
+            network,
+            None,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(scan.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(scan);
+        tokio::task::yield_now().await;
+        assert_eq!(binder.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 
     #[tokio::test]
     async fn candidate_probe_returns_an_entry_for_a_closed_port() {

@@ -1386,6 +1386,29 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        for (field, value) in [
+            ("SNI_MAX_CONCURRENT", self.SNI_MAX_CONCURRENT),
+            ("IP_MAX_P1_CONCURRENT", self.IP_MAX_P1_CONCURRENT),
+            ("IP_MAX_P2_CONCURRENT", self.IP_MAX_P2_CONCURRENT),
+        ] {
+            if value == 0 || value > tokio::sync::Semaphore::MAX_PERMITS {
+                anyhow::bail!(
+                    "{field} must be between 1 and {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                );
+            }
+        }
+        for (field, value) in [
+            ("TCP_LATENCY_CAP_MS", self.TCP_LATENCY_CAP_MS),
+            ("TLS_LATENCY_CAP_MS", self.TLS_LATENCY_CAP_MS),
+            ("TTFB_CAP_MS", self.TTFB_CAP_MS),
+            ("PROXY_TEST_LATENCY_CAP_MS", self.PROXY_TEST_LATENCY_CAP_MS),
+            ("PROXY_TEST_TTFB_CAP_MS", self.PROXY_TEST_TTFB_CAP_MS),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                anyhow::bail!("{field} must be a finite value > 0");
+            }
+        }
         if self.CUSTOM_DNS_ENABLED {
             let server = self.CUSTOM_DNS_SERVER.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("CUSTOM_DNS_SERVER is required when CUSTOM_DNS_ENABLED is true")
@@ -1680,6 +1703,46 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_invalid_scanner_concurrency() {
+        for field in [
+            "SNI_MAX_CONCURRENT",
+            "IP_MAX_P1_CONCURRENT",
+            "IP_MAX_P2_CONCURRENT",
+        ] {
+            for value in [0, tokio::sync::Semaphore::MAX_PERMITS + 1] {
+                let cfg: Config = toml::from_str(&format!(
+                    "LISTEN_HOST=\"127.0.0.1\"\nLISTEN_PORT=44444\n{field}={value}"
+                ))
+                .unwrap();
+                let error = cfg
+                    .validate()
+                    .expect_err("invalid concurrency must be rejected");
+                assert!(error.to_string().contains(field));
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_latency_scoring_caps() {
+        for field in [
+            "TCP_LATENCY_CAP_MS",
+            "TLS_LATENCY_CAP_MS",
+            "TTFB_CAP_MS",
+            "PROXY_TEST_LATENCY_CAP_MS",
+            "PROXY_TEST_TTFB_CAP_MS",
+        ] {
+            for value in ["0.0", "-1.0", "nan", "inf"] {
+                let cfg: Config = toml::from_str(&format!(
+                    "LISTEN_HOST=\"127.0.0.1\"\nLISTEN_PORT=44444\n{field}={value}"
+                ))
+                .unwrap();
+                let error = cfg.validate().expect_err("invalid cap must be rejected");
+                assert!(error.to_string().contains(field));
+            }
+        }
+    }
 
     #[derive(Deserialize)]
     struct MethodWrapper {

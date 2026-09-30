@@ -34,8 +34,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::ser::SerializeStruct;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinSet;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
@@ -223,25 +224,28 @@ pub async fn scan_sni_list(
 
     let connector = Arc::new(make_tls_connector());
     let resolver = Arc::new(DnsResolver::from_config(&config, timeout)?);
-    let semaphore = Arc::new(Semaphore::new(config.SNI_MAX_CONCURRENT));
-    let mut handles = Vec::new();
-    for sni in hostnames {
-        let connector = connector.clone();
-        let tx = progress_tx.clone();
-        let sem = semaphore.clone();
-        let cfg = config.clone();
-        let network = network.clone();
-        let resolver = resolver.clone();
-        handles.push(tokio::spawn(async move {
-            probe_sni(sni, timeout, cfg, resolver, connector, network, tx, sem).await
-        }));
-    }
-
-    let mut results: Vec<SniProbeEntry> = Vec::new();
-    for h in handles {
-        match h.await {
-            Ok(entries) => results.extend(entries),
-            Err(e) => warn!("probe task panicked: {e}"),
+    let limit = config.SNI_MAX_CONCURRENT.max(1);
+    let semaphore = Arc::new(Semaphore::new(limit));
+    let mut tasks = JoinSet::new();
+    let mut hostnames = hostnames.into_iter();
+    let mut results = Vec::new();
+    loop {
+        while tasks.len() < limit {
+            let Some(sni) = hostnames.next() else { break };
+            let connector = connector.clone();
+            let tx = progress_tx.clone();
+            let sem = semaphore.clone();
+            let cfg = config.clone();
+            let network = network.clone();
+            let resolver = resolver.clone();
+            tasks.spawn(async move {
+                probe_sni(sni, timeout, cfg, resolver, connector, network, tx, sem).await
+            });
+        }
+        match tasks.join_next().await {
+            Some(Ok(entries)) => results.extend(entries),
+            Some(Err(error)) => warn!(%error, "SNI probe task failed"),
+            None => break,
         }
     }
 
@@ -296,32 +300,41 @@ async fn probe_sni(
         }
     };
 
-    let mut tasks = Vec::new();
+    let mut tasks = JoinSet::new();
+    let mut out = Vec::new();
     for ip in addrs {
+        // Acquire before spawning, so queued addresses do not each allocate
+        // a task. Owned permits are released on completion or cancellation.
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore never closed");
         let sni = sni.clone();
         let connector = connector.clone();
         let tx = progress_tx.clone();
-        let sem = semaphore.clone();
         let cfg = config.clone();
         let network = network.clone();
-        tasks.push(tokio::spawn(async move {
-            // Acquire a permit before starting the TCP/TLS/HTTP probe so the
-            // total number of concurrent connections stays bounded.
-            let _permit = sem.acquire().await.expect("semaphore never closed");
+        tasks.spawn(async move {
+            let _permit = permit;
             let entry = probe_sni_ip(sni, ip, timeout, cfg, connector, network).await;
-            // Emit the result to the live-progress channel immediately.
             if let Some(ref tx) = tx {
                 let _ = tx.send(entry.clone());
             }
             entry
-        }));
+        });
+        if tasks.len() >= config.SNI_MAX_CONCURRENT.max(1) {
+            match tasks.join_next().await {
+                Some(Ok(entry)) => out.push(entry),
+                Some(Err(error)) => warn!(%error, "IP probe task failed"),
+                None => unreachable!("nonempty IP task set"),
+            }
+        }
     }
-
-    let mut out = Vec::new();
-    for t in tasks {
-        match t.await {
+    while let Some(result) = tasks.join_next().await {
+        match result {
             Ok(entry) => out.push(entry),
-            Err(e) => warn!("ip probe task panicked: {e}"),
+            Err(error) => warn!(%error, "IP probe task failed"),
         }
     }
     out
@@ -405,42 +418,13 @@ async fn probe_sni_ip(
         .is_ok_and(|r| r.is_ok());
 
         if write_ok {
-            let mut buf = vec![0u8; config.SCAN_DOWNLOAD_CAP];
-            let mut total_read = 0usize;
-            let mut ttfb: Option<u64> = None;
-            let mut status: Option<u16> = None;
-
-            loop {
-                let remaining = config.SCAN_DOWNLOAD_CAP - total_read;
-                if remaining == 0 {
-                    break;
-                }
-                match tokio::time::timeout(timeout, stream.read(&mut buf[total_read..])).await {
-                    Ok(Ok(0)) | Err(_) => break,
-                    Ok(Ok(n)) => {
-                        if ttfb.is_none() {
-                            ttfb = Some(req_start.elapsed().as_millis() as u64);
-                            if let Ok(text) = std::str::from_utf8(&buf[..n]) {
-                                status = parse_http_status(text);
-                            }
-                        }
-                        total_read += n;
-                    }
-                    Ok(Err(_)) => break,
-                }
-            }
-
-            let speed = if total_read > 0 {
-                let elapsed = req_start.elapsed().as_secs_f64();
-                if elapsed > 0.0 {
-                    Some(total_read as f64 / elapsed)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            (ttfb, speed, status)
+            crate::scanner_http::measure_download(
+                &mut stream,
+                req_start,
+                config.SCAN_DOWNLOAD_CAP,
+                timeout,
+            )
+            .await
         } else {
             (None, None, None)
         }
@@ -487,14 +471,6 @@ fn blank(sni: &str, ip: Ipv4Addr) -> SniProbeEntry {
     }
 }
 
-/// Parse the HTTP status code from the beginning of an HTTP/1.x response.
-fn parse_http_status(text: &str) -> Option<u16> {
-    let line = text.lines().next()?;
-    let mut parts = line.splitn(3, ' ');
-    parts.next(); // "HTTP/1.x"
-    parts.next()?.parse::<u16>().ok()
-}
-
 /// Compute the composite score (unified 0–100 formula) and store it in `entry.score`.
 fn compute_score(entry: &mut SniProbeEntry, config: &crate::config::Config) {
     let tcp_pts = match entry.tcp_latency_ms {
@@ -534,6 +510,7 @@ fn compute_score(entry: &mut SniProbeEntry, config: &crate::config::Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner_http::parse_http_status;
 
     fn dummy_config() -> crate::config::Config {
         toml::from_str("LISTEN_HOST=\"0.0.0.0\"\nLISTEN_PORT=443").unwrap()
@@ -648,6 +625,84 @@ mod candidate_tests {
     use std::sync::Arc;
 
     use super::*;
+
+    async fn dns_scan_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        tokio::net::UdpSocket,
+        Arc<crate::config::Config>,
+        OutboundNetwork,
+    ) {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let server = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let mut config = crate::config::test_support::minimal_config();
+        config.CUSTOM_DNS_ENABLED = true;
+        config.CUSTOM_DNS_SERVER = Some(server.local_addr().unwrap().to_string());
+        config.SNI_MAX_CONCURRENT = 2;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snis.txt");
+        std::fs::write(
+            &path,
+            (0..32)
+                .map(|n| format!("host{n}.test\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let network = OutboundNetwork::new(
+            crate::net::InterfaceBinding::fixed(Ipv4Addr::LOCALHOST),
+            Arc::new(crate::net::NoopSocketBinder),
+        );
+        (dir, path, server, Arc::new(config), network)
+    }
+
+    #[tokio::test]
+    async fn cancelled_sni_scan_does_not_start_queued_dns_queries() {
+        use std::future::Future;
+        use std::task::Poll;
+        let (_dir, path, server, config, network) = dns_scan_fixture().await;
+        let mut scan = Box::pin(scan_sni_list(
+            &path,
+            Duration::from_secs(10),
+            config,
+            network,
+            None,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(scan.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(scan);
+        let mut buf = [0; 512];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "cancelled scan kept sending DNS queries"
+        );
+    }
+
+    #[tokio::test]
+    async fn sni_scan_bounds_concurrent_dns_queries() {
+        let (_dir, path, server, config, network) = dns_scan_fixture().await;
+        let task = tokio::spawn(async move {
+            scan_sni_list(&path, Duration::from_secs(10), config, network, None).await
+        });
+        let mut buf = [0; 512];
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let extra =
+            tokio::time::timeout(Duration::from_millis(100), server.recv_from(&mut buf)).await;
+        task.abort();
+        let _ = task.await;
+        assert!(extra.is_err(), "DNS fanout exceeded SNI_MAX_CONCURRENT");
+    }
 
     #[tokio::test]
     async fn candidate_probe_returns_an_entry_for_a_closed_port() {

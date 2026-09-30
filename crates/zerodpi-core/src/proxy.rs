@@ -40,6 +40,7 @@ use anyhow::Context;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, TlsFragPackets};
@@ -459,12 +460,16 @@ async fn wait_for_initial_bypass_progress(
 ) -> Option<BypassProgress> {
     tokio::time::timeout(timeout, async {
         loop {
+            // Subscribe before checking state: the intercept thread may signal
+            // notify_waiters between the check and the first await.
+            let finished = entry.notify.notified();
+            let ready = entry.ready_for_data.notified();
             if let Some(progress) = current_bypass_progress(entry) {
                 return progress;
             }
             tokio::select! {
-                _ = entry.notify.notified() => {}
-                _ = entry.ready_for_data.notified() => {}
+                _ = finished => {}
+                _ = ready => {}
             }
         }
     })
@@ -475,10 +480,11 @@ async fn wait_for_initial_bypass_progress(
 async fn wait_for_bypass_completion(entry: &FlowEntry, timeout: Duration) -> Option<BypassOutcome> {
     tokio::time::timeout(timeout, async {
         loop {
+            let finished = entry.notify.notified();
             if let Some(outcome) = entry.state.lock().outcome {
                 return outcome;
             }
-            entry.notify.notified().await;
+            finished.await;
         }
     })
     .await
@@ -591,8 +597,9 @@ pub async fn run_proxy(
         },
     );
 
+    let mut connections = JoinSet::new();
     loop {
-        let (incoming, peer) = match listener.accept().await {
+        let (incoming, peer) = match accept_connection(&listener, &mut connections).await {
             Ok(x) => x,
             Err(e) => {
                 warn!(error = %e, "accept failed");
@@ -609,7 +616,7 @@ pub async fn run_proxy(
             let binding = interface_binding.current();
             let socket_binder = socket_binder.clone();
             let event_tx = event_tx.clone();
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 if let Err(e) = handle_tcp_seg_connection_with_ip(
                     cfg,
                     connect_ip,
@@ -634,7 +641,7 @@ pub async fn run_proxy(
         let current_binding = interface_binding.current();
         let connection_settings = ConnectionSettings::from_config(&cfg);
         let fake_client_hello = fresh_fake_client_hello(target.sni.as_bytes());
-        tokio::spawn(async move {
+        connections.spawn(async move {
             if let Err(e) = handle_intercept_connection(
                 InterceptConnectionTarget {
                     binding: current_binding,
@@ -653,6 +660,30 @@ pub async fn run_proxy(
                 warn!(%peer, error = %e, "connection failed");
             }
         });
+    }
+}
+
+// Owning connection workers makes listener cancellation propagate to all
+// accepted connections. Reap completed workers while waiting for new clients.
+async fn accept_connection(
+    listener: &TcpListener,
+    connections: &mut JoinSet<()>,
+) -> std::io::Result<(TcpStream, SocketAddr)> {
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                if accepted.is_err() {
+                    // Avoid a tight retry/log loop when OS resources are exhausted.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                return accepted;
+            }
+            result = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = result {
+                    warn!(%error, "proxy connection task failed");
+                }
+            }
+        }
     }
 }
 
@@ -1032,8 +1063,9 @@ pub async fn run_ip_bypass_plus_proxy(
         },
     );
 
+    let mut connections = JoinSet::new();
     loop {
-        let (incoming, peer) = match listener.accept().await {
+        let (incoming, peer) = match accept_connection(&listener, &mut connections).await {
             Ok(x) => x,
             Err(e) => {
                 warn!(error = %e, "ip_bypass_plus: accept failed");
@@ -1055,7 +1087,7 @@ pub async fn run_ip_bypass_plus_proxy(
             let binding = interface_binding.current();
             let socket_binder = socket_binder.clone();
             let event_tx = event_tx.clone();
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 if let Err(e) = handle_tcp_seg_connection_with_ip(
                     cfg,
                     connect_ip,
@@ -1078,7 +1110,7 @@ pub async fn run_ip_bypass_plus_proxy(
         let event_tx = event_tx.clone();
         let current_binding = interface_binding.current();
         let connection_settings = ConnectionSettings::from_config(&cfg);
-        tokio::spawn(async move {
+        connections.spawn(async move {
             if let Err(e) = handle_intercept_connection(
                 InterceptConnectionTarget {
                     binding: current_binding,
@@ -1396,97 +1428,61 @@ async fn counting_relay_with_client_fragmentation(
     let c2s_atomic = Arc::new(AtomicU64::new(0));
     let s2c_atomic = Arc::new(AtomicU64::new(0));
 
-    let mut c2s_task = tokio::spawn(copy_counting_client_to_server(
-        inc_rd,
-        out_wr,
-        c2s_atomic.clone(),
-        client_fragmentation,
-    ));
-    let mut s2c_task = tokio::spawn(copy_counting(out_rd, inc_wr, s2c_atomic.clone()));
+    // Keep both copy futures in this task. Dropping/cancelling the relay now
+    // drops the socket halves immediately instead of detaching child tasks.
+    let c2s =
+        copy_counting_client_to_server(inc_rd, out_wr, c2s_atomic.clone(), client_fragmentation);
+    let s2c = copy_counting(out_rd, inc_wr, s2c_atomic.clone());
+    tokio::pin!(c2s, s2c);
 
-    // Progress ticker — only spawned in interactive mode.
-    let ticker = event_tx.as_ref().map(|tx| {
-        let tx = tx.clone();
-        let c = c2s_atomic.clone();
-        let s = s2c_atomic.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            interval.tick().await; // skip immediate first tick
-            loop {
-                interval.tick().await;
-                let _ = tx.send(ProxyEvent::RelayProgress {
-                    src_port,
-                    c2s_bytes: c.load(Ordering::Relaxed),
-                    s2c_bytes: s.load(Ordering::Relaxed),
-                });
-            }
-        })
-    });
-
-    let result = if let Some(max_lifetime) = max_lifetime {
-        let mut c2s_done: Option<(u64, bool)> = None;
-        let mut s2c_done: Option<(u64, bool)> = None;
-        let deadline = tokio::time::sleep(max_lifetime);
-        tokio::pin!(deadline);
-
-        loop {
-            tokio::select! {
-                _ = &mut deadline => {
-                    if c2s_done.is_none() {
-                        c2s_task.abort();
-                    }
-                    if s2c_done.is_none() {
-                        s2c_task.abort();
-                    }
-                    break RelayResult {
-                        c2s_bytes: c2s_done.map(|(bytes, _)| bytes).unwrap_or_else(|| c2s_atomic.load(Ordering::Relaxed)),
-                        s2c_bytes: s2c_done.map(|(bytes, _)| bytes).unwrap_or_else(|| s2c_atomic.load(Ordering::Relaxed)),
-                        reason: RelayEndReason::MaxLifetime,
-                    };
-                }
-                c2s_result = &mut c2s_task, if c2s_done.is_none() => {
-                    c2s_done = Some(c2s_result.unwrap_or((0, false)));
-                    if let (Some((c2s_bytes, c2s_err)), Some((s2c_bytes, s2c_err))) = (c2s_done, s2c_done) {
-                        break RelayResult {
-                            c2s_bytes,
-                            s2c_bytes,
-                            reason: if c2s_err || s2c_err { RelayEndReason::NetworkError } else { RelayEndReason::Completed },
-                        };
-                    }
-                }
-                s2c_result = &mut s2c_task, if s2c_done.is_none() => {
-                    s2c_done = Some(s2c_result.unwrap_or((0, false)));
-                    if let (Some((c2s_bytes, c2s_err)), Some((s2c_bytes, s2c_err))) = (c2s_done, s2c_done) {
-                        break RelayResult {
-                            c2s_bytes,
-                            s2c_bytes,
-                            reason: if c2s_err || s2c_err { RelayEndReason::NetworkError } else { RelayEndReason::Completed },
-                        };
-                    }
-                }
-            }
-        }
-    } else {
-        let (c2s_result, s2c_result) = tokio::join!(c2s_task, s2c_task);
-        let (c2s_bytes, c2s_err) = c2s_result.unwrap_or((0, false));
-        let (s2c_bytes, s2c_err) = s2c_result.unwrap_or((0, false));
-        RelayResult {
-            c2s_bytes,
-            s2c_bytes,
-            reason: if c2s_err || s2c_err {
-                RelayEndReason::NetworkError
-            } else {
-                RelayEndReason::Completed
-            },
+    let deadline = async {
+        match max_lifetime {
+            Some(duration) => tokio::time::sleep(duration).await,
+            None => std::future::pending::<()>().await,
         }
     };
+    tokio::pin!(deadline);
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await; // skip immediate first tick
 
-    if let Some(t) = ticker {
-        t.abort();
+    let mut c2s_done = false;
+    let mut s2c_done = false;
+    let reason = loop {
+        tokio::select! {
+            _ = &mut deadline => break RelayEndReason::MaxLifetime,
+            (_, error) = &mut c2s, if !c2s_done => {
+                if error {
+                    break RelayEndReason::NetworkError;
+                }
+                c2s_done = true;
+                if s2c_done {
+                    break RelayEndReason::Completed;
+                }
+            }
+            (_, error) = &mut s2c, if !s2c_done => {
+                if error {
+                    break RelayEndReason::NetworkError;
+                }
+                s2c_done = true;
+                if c2s_done {
+                    break RelayEndReason::Completed;
+                }
+            }
+            _ = interval.tick(), if event_tx.is_some() => {
+                emit(event_tx, ProxyEvent::RelayProgress {
+                    src_port,
+                    c2s_bytes: c2s_atomic.load(Ordering::Relaxed),
+                    s2c_bytes: s2c_atomic.load(Ordering::Relaxed),
+                });
+            }
+        }
+    };
+    RelayResult {
+        c2s_bytes: c2s_atomic.load(Ordering::Relaxed),
+        s2c_bytes: s2c_atomic.load(Ordering::Relaxed),
+        reason,
     }
-
-    result
 }
 
 /// Copy all bytes from `reader` to `writer`, updating `counter` after each
@@ -1599,8 +1595,9 @@ pub async fn run_ip_bypass_proxy(
         },
     );
 
+    let mut connections = JoinSet::new();
     loop {
-        let (incoming, peer) = match listener.accept().await {
+        let (incoming, peer) = match accept_connection(&listener, &mut connections).await {
             Ok(x) => x,
             Err(e) => {
                 warn!(error = %e, "ip_bypass: accept failed");
@@ -1616,7 +1613,7 @@ pub async fn run_ip_bypass_proxy(
         let src_port = peer.port();
         let relay_max_lifetime = configured_relay_max_lifetime(&cfg);
 
-        tokio::spawn(async move {
+        connections.spawn(async move {
             if let Err(e) = handle_ip_bypass_connection(
                 ip,
                 binding,
@@ -1712,6 +1709,73 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWrite;
 
+    struct PendingFlowController(parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+
+    impl FlowController for PendingFlowController {
+        fn register_flow(
+            &self,
+            _key: FlowKey,
+            _fake_data: Vec<u8>,
+            _ttl: Option<u8>,
+        ) -> crate::flow::FlowRegistrationFuture<'_> {
+            Box::pin(async move {
+                if let Some(tx) = self.0.lock().take() {
+                    let _ = tx.send(());
+                }
+                std::future::pending().await
+            })
+        }
+        fn flow_exists(&self, _key: FlowKey) -> bool {
+            false
+        }
+        fn remove_flow(&self, _key: FlowKey) {}
+        fn reset(&self) {}
+    }
+
+    #[tokio::test]
+    async fn cancelling_proxy_closes_inflight_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let mut config = crate::config::test_support::minimal_config();
+        config.LISTEN_HOST = "127.0.0.1".to_owned();
+        config.LISTEN_PORT = addr.port();
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+        let controller = Arc::new(PendingFlowController(parking_lot::Mutex::new(Some(
+            registered_tx,
+        ))));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_proxy(
+            Arc::new(config),
+            Arc::new(RwLock::new(ActiveSniTarget::new(
+                "example.com",
+                Ipv4Addr::LOCALHOST,
+                100,
+            ))),
+            InterfaceBindingWatch::fixed(InterfaceBinding::fixed(Ipv4Addr::LOCALHOST)),
+            Arc::new(crate::net::NoopSocketBinder),
+            controller,
+            Some(event_tx),
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(ProxyEvent::ListenerStarted { .. })
+        ));
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), registered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let mut buf = [0; 1];
+        let closed = tokio::time::timeout(Duration::from_millis(200), client.read(&mut buf)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0))),
+            "proxy cancellation left its connection task running"
+        );
+    }
+
     async fn tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1787,6 +1851,66 @@ mod tests {
         assert_eq!(result.reason, RelayEndReason::Completed);
         assert_eq!(result.c2s_bytes, 4);
         assert_eq!(result.s2c_bytes, 4);
+    }
+
+    #[tokio::test]
+    async fn cancelling_relay_closes_both_sockets() {
+        let (mut client, incoming) = tcp_pair().await;
+        let (mut upstream, outgoing) = tcp_pair().await;
+        let relay = tokio::spawn(counting_relay(incoming, outgoing, &None, 1234, None));
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0; 4];
+        upstream.read_exact(&mut buf).await.unwrap();
+        relay.abort();
+        assert!(relay.await.unwrap_err().is_cancelled());
+        let closed = tokio::time::timeout(Duration::from_millis(200), async {
+            assert_eq!(client.read(&mut buf).await.unwrap(), 0);
+            assert_eq!(upstream.read(&mut buf).await.unwrap(), 0);
+        })
+        .await;
+        assert!(closed.is_ok(), "cancelled relay left sockets open");
+    }
+
+    #[tokio::test]
+    async fn relay_preserves_response_after_client_half_close() {
+        let (mut client, incoming) = tcp_pair().await;
+        let (mut upstream, outgoing) = tcp_pair().await;
+        let relay = tokio::spawn(counting_relay(incoming, outgoing, &None, 1234, None));
+        client.write_all(b"request").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut request = Vec::new();
+        upstream.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, b"request");
+        upstream.write_all(b"response").await.unwrap();
+        upstream.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, b"response");
+        let result = relay.await.unwrap();
+        assert_eq!(result.reason, RelayEndReason::Completed);
+        assert_eq!((result.c2s_bytes, result.s2c_bytes), (7, 8));
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn relay_stops_other_direction_after_connection_reset() {
+        let (mut client, incoming) = tcp_pair().await;
+        let (mut upstream, outgoing) = tcp_pair().await;
+        let relay = tokio::spawn(counting_relay(incoming, outgoing, &None, 1234, None));
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0; 4];
+        upstream.read_exact(&mut buf).await.unwrap();
+        client.set_linger(Some(Duration::ZERO)).unwrap();
+        drop(client);
+        let result = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.reason, RelayEndReason::NetworkError);
+        assert_eq!(result.c2s_bytes, 4);
     }
 
     #[tokio::test]

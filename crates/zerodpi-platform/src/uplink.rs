@@ -313,6 +313,8 @@ mod imp {
 
         while !current.is_null() {
             let entry = unsafe { &*current };
+            // Advance before filtering so rejected interfaces cannot stall traversal.
+            current = entry.ifa_next;
             if !entry.ifa_name.is_null()
                 && !entry.ifa_addr.is_null()
                 && (entry.ifa_flags & libc::IFF_UP as u32) != 0
@@ -342,7 +344,6 @@ mod imp {
                     }
                 }
             }
-            current = unsafe { (*current).ifa_next };
         }
 
         drop(guard);
@@ -640,6 +641,46 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn enumerates_candidates_without_hanging_on_loopback() {
+            const CHILD_ENV: &str = "ZERODPI_TEST_ENUMERATE_CANDIDATES";
+            if std::env::var_os(CHILD_ENV).is_some() {
+                let candidates =
+                    enumerate_candidates(&HashMap::new()).expect("enumerate interfaces");
+                assert!(candidates.iter().all(|candidate| {
+                    candidate.binding.if_name.as_ref() != "lo"
+                        && !candidate.binding.ip.is_loopback()
+                }));
+                return;
+            }
+
+            // Run the real getifaddrs traversal in a child so a regression
+            // fails promptly instead of leaving the entire test suite stuck.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "uplink::imp::tests::enumerates_candidates_without_hanging_on_loopback",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .spawn()
+                .expect("start interface enumeration test");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().expect("wait for interface enumeration") {
+                    assert!(status.success(), "interface enumeration failed: {status}");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().expect("stop stuck interface enumeration");
+                    child.wait().expect("reap interface enumeration test");
+                    panic!("interface enumeration hung while skipping loopback");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
 
         #[cfg(target_os = "android")]
         #[test]

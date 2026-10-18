@@ -909,6 +909,15 @@ object ZeroDpiConfigSchema {
             section = ConfigSection.FakeTls, validationRule = "true or false.",
             rootImpact = ConfigRootImpact.PacketInterceptionOnly,
             helpText = "Forward the real ClientHello behind the fake_tls decoy."),
+        field(name = "FAKE_TLS_REPEATS", type = ConfigFieldType.USize, defaultValue = "1",
+            section = ConfigSection.FakeTls, validationRule = "Must be from 1 through 8.",
+            rootImpact = ConfigRootImpact.PacketInterceptionOnly,
+            helpText = "Decoy copies emitted before the real data (fakedsplit/fakeddisorder)."),
+        field(name = "FAKE_TLS_CHAIN_DELAY_MS", type = ConfigFieldType.IntegerRange, defaultValue = "0",
+            section = ConfigSection.FakeTls,
+            validationRule = "Must be >= 0 and <= 100; an integer or an inclusive range.",
+            rootImpact = ConfigRootImpact.PacketInterceptionOnly,
+            helpText = "Gap between the last decoy copy and the real data packet."),
         field(name = "IP_FRAG_SIZE", type = ConfigFieldType.USize, defaultValue = "24",
             section = ConfigSection.IpFrag, validationRule = "Must be >= 8 and a multiple of 8.",
             rootImpact = ConfigRootImpact.PacketInterceptionOnly,
@@ -1110,24 +1119,22 @@ object ZeroDpiConfigToml {
 
     fun validateMethodCombination(methods: List<String>): String? {
         fun has(vararg names: String) = names.any { it in methods }
+        val shapers = listOf("ip_frag", "disorder", "seqovl").filter { it in methods }
         return when {
             has("tls_record_split") && has("sni_boundary_frag") ->
                 "BYPASS_METHOD \"tls_record_split\" cannot be combined with \"sni_boundary_frag\"."
             has("urg_sni_split") && methods.size > 1 &&
-                methods.any { it != "urg_sni_split" && it !in setOf("tls_frag", "tls_record_frag") } ->
-                "BYPASS_METHOD \"urg_sni_split\" can only be combined with \"tls_frag\" or \"tls_record_frag\"."
+                methods.any { it != "urg_sni_split" && it != "tls_frag" } ->
+                "BYPASS_METHOD \"urg_sni_split\" can only be combined with \"tls_frag\"."
             has("sni_boundary_frag") && methods.size > 1 &&
                 methods.any { it == "tls_record_frag" || it == "urg_sni_split" } ->
                 "BYPASS_METHOD \"sni_boundary_frag\" cannot be combined with \"tls_record_frag\" or \"urg_sni_split\"."
-            has("fake_tls") && (has("tls_record_frag") || has("urg_sni_split")) ->
-                "BYPASS_METHOD \"fake_tls\" cannot be combined with \"tls_record_frag\" or \"urg_sni_split\"."
-            has("ip_frag") && (has("tls_record_frag") || has("fake_tls") || has("urg_sni_split")) ->
-                "BYPASS_METHOD \"ip_frag\" cannot be combined with \"tls_record_frag\", \"fake_tls\", or \"urg_sni_split\"."
-            has("disorder") && (has("tls_record_frag") || has("fake_tls") || has("ip_frag") || has("urg_sni_split")) ->
-                "BYPASS_METHOD \"disorder\" cannot be combined with \"tls_record_frag\", \"fake_tls\", \"ip_frag\", or \"urg_sni_split\"."
-            has("seqovl") &&
-                methods.any { it != "seqovl" && it in setOf("tls_record_frag", "fake_tls", "ip_frag", "disorder", "urg_sni_split", "sni_boundary_frag") } ->
-                "BYPASS_METHOD \"seqovl\" cannot be combined with \"tls_record_frag\", \"fake_tls\", \"ip_frag\", \"disorder\", \"urg_sni_split\", or \"sni_boundary_frag\"."
+            has("seqovl") && has("sni_boundary_frag") ->
+                "BYPASS_METHOD \"seqovl\" cannot be combined with \"sni_boundary_frag\"."
+            shapers.size > 1 ->
+                "BYPASS_METHOD may contain at most one of \"ip_frag\", \"disorder\", \"seqovl\" (each decides how the first data packet is emitted)."
+            has("urg_sni_split") && (has("tls_record_frag") || shapers.isNotEmpty()) ->
+                "BYPASS_METHOD \"urg_sni_split\" cannot be chained with \"tls_record_frag\" or an emission shaper."
             else -> null
         }
     }
@@ -1470,8 +1477,37 @@ object ZeroDpiConfigToml {
             }
         }
         whenValid("BYPASS_METHOD") {
-            validateMethodCombination(config.methodList("BYPASS_METHOD"))?.let {
+            val methods = config.methodList("BYPASS_METHOD")
+            validateMethodCombination(methods)?.let {
                 issues += ConfigValidationIssue("BYPASS_METHOD", it)
+            }
+            val chainShapers = setOf("ip_frag", "disorder", "seqovl")
+            val chainedFakeTls = "fake_tls" in methods &&
+                ("tls_record_frag" in methods || methods.any { it in chainShapers })
+            if (chainedFakeTls && config.text("FAKE_TLS_FORWARD_REAL") == "false") {
+                issues += ConfigValidationIssue(
+                    "FAKE_TLS_FORWARD_REAL",
+                    "FAKE_TLS_FORWARD_REAL must be true when \"fake_tls\" is chained with another data-stage method.",
+                )
+            }
+        }
+        whenValid("FAKE_TLS_REPEATS") {
+            val repeats = config.integer("FAKE_TLS_REPEATS")
+            requireField("FAKE_TLS_REPEATS", repeats in 1L..8L, "FAKE_TLS_REPEATS must be between 1 and 8.")
+        }
+        whenValid("FAKE_TLS_CHAIN_DELAY_MS") {
+            val text = config.text("FAKE_TLS_CHAIN_DELAY_MS").trim()
+            validateIntegerRange(text, min = 0)?.let {
+                issues += ConfigValidationIssue("FAKE_TLS_CHAIN_DELAY_MS", "FAKE_TLS_CHAIN_DELAY_MS $it")
+            }
+            integerRangePattern.matchEntire(text)?.let { match ->
+                val start = match.groupValues[1].toLongOrNull()
+                val end = match.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() }?.toLongOrNull()
+                requireField(
+                    "FAKE_TLS_CHAIN_DELAY_MS",
+                    listOfNotNull(start, end).all { it <= 100L },
+                    "FAKE_TLS_CHAIN_DELAY_MS must be <= 100.",
+                )
             }
         }
         whenValid("METHOD_SCAN_METHODS") {

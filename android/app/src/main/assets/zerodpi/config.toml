@@ -405,21 +405,24 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   packet: TLS-record fragmentation inside the interceptor and TCP-level
 #   write segmentation inside the proxy respectively.  A list containing
 #   "tls_frag" alongside other methods still uses packet interception.
-# - "fake_tls" adds a data-stage decoy injection.  It combines with
-#   handshake-stage fake-packet methods and with the socket-side methods,
-#   but is mutually exclusive with "tls_record_frag" and "urg_sni_split"
-#   (all three own the first data packet).
+# - "fake_tls" adds a data-stage decoy injection.  On its own it replaces the
+#   first data packet with the decoy and forwards the real ClientHello after it
+#   (dual emission).  Combined with one of "tls_record_frag", "ip_frag",
+#   "disorder", or "seqovl" it becomes the DECOY in front of that method, which
+#   then shapes the real ClientHello: ["fake_tls", "disorder"] behaves like
+#   zapret's fakeddisorder and ["fake_tls", "seqovl"] like a fakedsplit with
+#   sequence overlap.  Chaining requires FAKE_TLS_FORWARD_REAL = true.
 # - "ip_frag" adds a data-stage IP fragmentation.  It combines with
-#   handshake-stage fake-packet methods and with the socket-side methods,
-#   but is mutually exclusive with "tls_record_frag", "fake_tls", and
-#   "urg_sni_split" (all own the first data packet).
-# - "disorder" adds a data-stage out-of-order TCP segmentation.  It
-#   combines with handshake-stage fake-packet methods and with the
-#   socket-side methods, but is mutually exclusive with "tls_record_frag",
-#   "fake_tls", "ip_frag", and "urg_sni_split" (all own the first data
-#   packet).  Setting SEQOVL_SIZE above zero adds a TCP sequence overlap to it.
+#   handshake-stage fake-packet methods, with the socket-side methods, with
+#   "fake_tls" (decoy in front) and with "tls_record_frag" (which rewrites the
+#   payload it fragments), but not with another emission shaper.
+# - "disorder" adds a data-stage out-of-order TCP segmentation.  It combines
+#   with handshake-stage fake-packet methods, with the socket-side methods,
+#   with "fake_tls" (decoy in front) and with "tls_record_frag" (payload
+#   rewrite), but not with another emission shaper.  Setting SEQOVL_SIZE above
+#   zero adds a TCP sequence overlap to it.
 # - "seqovl" adds a data-stage TCP sequence overlap.  It combines with
-#   handshake-stage fake-packet methods and with the socket-side methods
+#   handshake-stage fake-packet methods, with the socket-side methods
 #   "tls_frag", "tls_padding", "mixed_case_sni", and "ccs_prefix", but is
 #   mutually exclusive with "tls_record_frag", "fake_tls", "ip_frag",
 #   "disorder", and "urg_sni_split" (all own the first data packet), and with
@@ -460,14 +463,16 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 # - "tls_record_split" cannot be combined with "sni_boundary_frag" (both cut
 #   the first ClientHello at the SNI boundary); use TLS_RECORD_SPLIT_DELAY_MS
 #   to also separate the two records across TCP segments.
-# - "fake_tls" cannot be combined with "tls_record_frag" or
-#   "urg_sni_split".
-# - "ip_frag" cannot be combined with "tls_record_frag", "fake_tls", or
-#   "urg_sni_split".
-# - "disorder" cannot be combined with "tls_record_frag", "fake_tls",
-#   "ip_frag", or "urg_sni_split".
-# - "seqovl" cannot be combined with "tls_record_frag", "fake_tls",
-#   "ip_frag", "disorder", "urg_sni_split", or "sni_boundary_frag".
+# - "fake_tls" + another data-stage method requires
+#   FAKE_TLS_FORWARD_REAL = true (the chained method shapes the real
+#   ClientHello that dual emission forwards).
+# - At most one of "ip_frag", "disorder", "seqovl" may be listed: each decides
+#   how the first data packet is emitted, and one packet cannot be both
+#   IPv4-fragmented and TCP-segmented.  "fake_tls" (decoy) and
+#   "tls_record_frag" (payload rewrite) may accompany one of them.
+# - "urg_sni_split" can only be combined with "tls_frag"; its TCP urgent
+#   pointer is per-segment, so it cannot be chained with a payload rewrite or
+#   an emission shaper.
 # - MODE = "ip_bypass_plus" supports only "tls_record_frag", "tls_frag",
 #   "tls_padding", "mixed_case_sni", "sni_boundary_frag", "ccs_prefix",
 #   "ip_frag", "disorder", or "seqovl" so the upstream VPN client's real SNI
@@ -884,7 +889,30 @@ FAKE_TLS_COMPLETE_IMMEDIATELY = true
 # false           — the first data packet itself becomes the decoy; the real
 #                   ClientHello reaches the server via TCP retransmission
 #                   (adds roughly one retransmission timeout, ~200 ms).
+#
+# Must be true when "fake_tls" is chained with another data-stage method
+# ("tls_record_frag", "ip_frag", "disorder", or "seqovl"), because the chained
+# method shapes the real ClientHello that dual emission forwards.
 FAKE_TLS_FORWARD_REAL = true
+
+# Number of identical decoy copies emitted before the real data packet.
+#
+# More copies give a DPI more chances to classify the flow benign before the
+# real ClientHello arrives.  This is the zapret --dpi-desync-repeats
+# equivalent; it matters most for ["fake_tls", "disorder"] (fakeddisorder) and
+# ["fake_tls", "seqovl"].  Standalone "fake_tls" ignores it, because its decoy
+# replaces the first data packet instead of preceding it.
+#
+# Must be between 1 and 8.  Default: 1.
+FAKE_TLS_REPEATS = 1
+
+# Delay between the last decoy copy and the real data packet, in milliseconds.
+#
+# The wait happens inside the packet-capture loop, so it also delays other
+# flows' packets: keep it small and leave it at 0 unless timing is known to
+# matter.  Accepts a fixed integer or an inclusive range string ("2-5").
+# Must be >= 0 and <= 100.  Default: 0.
+FAKE_TLS_CHAIN_DELAY_MS = 0
 # ---------------------------------------------------------------------------
 # ip_frag method parameters
 # ---------------------------------------------------------------------------

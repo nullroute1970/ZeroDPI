@@ -212,7 +212,14 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
         return None;
     }
     let mut handshake: Vec<Box<dyn BypassMethod>> = Vec::new();
-    let mut data: Option<Box<dyn BypassMethod>> = None;
+    let mut data: Vec<Box<dyn BypassMethod>> = Vec::new();
+    // `fake_tls` becomes a decoy in front of another data-stage method instead
+    // of replacing the first data packet (data-stage chaining).
+    let chained_fake_tls = list.contains("fake_tls")
+        && (list.contains("tls_record_frag")
+            || crate::config::EMISSION_SHAPERS
+                .iter()
+                .any(|m| list.contains(m)));
     for name in list.iter() {
         match name {
             "tls_frag" => {}          // socket side; handled directly in proxy.rs
@@ -221,11 +228,13 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
             "mixed_case_sni" => {}    // socket side; handled directly in proxy.rs
             "sni_boundary_frag" => {} // socket side; handled directly in proxy.rs
             "tls_record_split" => {}  // socket side; handled directly in proxy.rs
-            "tls_record_frag" => data = Some(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
-            "fake_tls" => data = Some(Box::new(fake_tls::FakeTls::new(cfg))),
-            "ip_frag" => data = Some(Box::new(ip_frag::IpFrag::new(cfg))),
-            "disorder" => data = Some(Box::new(disorder::Disorder::new(cfg))),
-            "seqovl" => data = Some(Box::new(seqovl::Seqovl::new(cfg))),
+            "tls_record_frag" => data.push(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
+            "fake_tls" => data.push(Box::new(
+                fake_tls::FakeTls::new(cfg).chained(chained_fake_tls),
+            )),
+            "ip_frag" => data.push(Box::new(ip_frag::IpFrag::new(cfg))),
+            "disorder" => data.push(Box::new(disorder::Disorder::new(cfg))),
+            "seqovl" => data.push(Box::new(seqovl::Seqovl::new(cfg))),
             "wrong_seq" => handshake.push(Box::new(wrong_seq::WrongSeq::new(cfg))),
             "wrong_ack" => handshake.push(Box::new(wrong_ack::WrongAck::new(cfg))),
             "wrong_checksum" => handshake.push(Box::new(wrong_checksum::WrongChecksum::new(cfg))),
@@ -495,6 +504,29 @@ mod tests {
         let cfg = cfg_with_method(r#"BYPASS_METHOD = ["disorder", "tls_frag"]"#);
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "disorder + tls_frag");
+    }
+
+    #[test]
+    fn build_fakeddisorder_combo() {
+        // Data-stage chaining: decoy + shaped real packet.
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["fake_tls", "disorder"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "fake_tls + disorder");
+    }
+
+    #[test]
+    fn build_fake_tls_with_seqovl_combo() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["fake_tls", "seqovl"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "fake_tls + seqovl");
+    }
+
+    #[test]
+    fn build_record_frag_with_disorder_combo() {
+        // Payload rewrite + emission shaper, no decoy.
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["tls_record_frag", "disorder"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "tls_record_frag + disorder");
     }
 
     #[test]

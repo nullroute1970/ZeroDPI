@@ -140,6 +140,39 @@ impl PacketInterceptor for NfqInterceptor {
                     msg.set_verdict(NfqVerdict::Drop);
                 }
                 Verdict::AcceptModified => {
+                    // Data-stage chaining: inject the decoy copies through the
+                    // raw socket before the shaped real packet, so a DPI
+                    // classifies the flow benign before the real ClientHello.
+                    if let Some(decoy) = view.decoy.as_ref() {
+                        let decoy_view = view.decoy_view(decoy);
+                        match build_modified(payload, &layout, &decoy_view) {
+                            Ok(decoy_bytes) => match &self.raw_socket {
+                                Some(fd) => {
+                                    for _ in 0..decoy.repeats.max(1) {
+                                        if let Err(e) = send_raw_packet(*fd, &decoy_bytes) {
+                                            warn!(error = %e, "decoy injection failed");
+                                            break;
+                                        }
+                                    }
+                                    if decoy.delay_ms > 0 {
+                                        // Bounded by
+                                        // MAX_FAKE_TLS_CHAIN_DELAY_MS; default
+                                        // 0 never reaches this branch.
+                                        std::thread::sleep(Duration::from_millis(decoy.delay_ms));
+                                    }
+                                }
+                                None => {
+                                    if !RAW_INJECTION_UNAVAILABLE_WARNED
+                                        .swap(true, Ordering::SeqCst)
+                                    {
+                                        warn!("raw socket unavailable; chained decoy skipped (the shaped real packet is still emitted)");
+                                    }
+                                }
+                            },
+                            Err(e) => warn!(error = %e, "decoy build failed; skipping decoy"),
+                        }
+                    }
+
                     let new_bytes = match build_modified(payload, &layout, &view) {
                         Ok(b) => b,
                         Err(e) => {
@@ -412,6 +445,7 @@ fn parse_view<'a>(direction: Direction, buf: &'a [u8]) -> Result<(PacketView<'a>
         bump_ipv4_ident: false,
         corrupt_tcp_checksum_delta: None,
         emit_original_after: false,
+        decoy: None,
         ip_frag_payload_size: None,
         disorder_spec: None,
         new_ipv4_ttl: None,
@@ -987,6 +1021,7 @@ mod tests {
             bump_ipv4_ident: true,
             corrupt_tcp_checksum_delta: None,
             emit_original_after: false,
+            decoy: None,
             ip_frag_payload_size: None,
             disorder_spec: None,
             new_ipv4_ttl: None,

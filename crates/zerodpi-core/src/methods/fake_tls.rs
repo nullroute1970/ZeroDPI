@@ -11,13 +11,29 @@
 //! The upstream server discards the out-of-window segment, and the real
 //! ClientHello reaches it via TCP retransmission (single-packet mode) or is
 //! forwarded immediately after the decoy (dual-emission mode, Phase 2).
+//!
+//! ## Chained mode
+//!
+//! When `fake_tls` is chained with another data-stage method (`tls_record_frag`,
+//! `ip_frag`, `disorder`, and/or `seqovl`), the decoy cannot *replace* the
+//! first data packet: the chained method has to shape the real ClientHello. In
+//! that mode `fake_tls` stages [`PacketView::decoy`] instead, and the backend
+//! emits `FAKE_TLS_REPEATS` decoy copies — with `FAKE_TLS_CHAIN_DELAY_MS`
+//! between the last copy and the real data — before the shaped real packet.
+//! This is what makes `["fake_tls", "disorder"]` behave like zapret's
+//! `fakeddisorder` and `["fake_tls", "seqovl"]` like a fakedsplit with sequence
+//! overlap.
+//!
+//! Chaining requires `FAKE_TLS_FORWARD_REAL = true` (enforced by
+//! `Config::validate`), because the real packet only exists in dual-emission
+//! mode.
 
 use tracing::trace;
 
 use super::{BypassMethod, MethodAction};
-use crate::config::Config;
+use crate::config::{Config, Int32Range};
 use crate::flow::FlowState;
-use crate::interceptor::PacketView;
+use crate::interceptor::{DecoyPacket, PacketView};
 
 pub struct FakeTls {
     /// Extra bytes subtracted from the injected seq number on top of
@@ -31,6 +47,14 @@ pub struct FakeTls {
     complete_immediately: bool,
     /// Whether to forward the original packet after the decoy (dual emission).
     forward_real: bool,
+    /// `true` when another data-stage method shapes the real packet, so the
+    /// decoy is staged in [`PacketView::decoy`] instead of replacing the
+    /// packet.
+    chained: bool,
+    /// Number of decoy copies emitted in chained mode.
+    repeats: usize,
+    /// Delay between the last decoy copy and the real data.
+    chain_delay_ms: Int32Range,
 }
 
 impl FakeTls {
@@ -41,7 +65,16 @@ impl FakeTls {
             bump_ip_ident: cfg.FAKE_TLS_BUMP_IP_IDENT,
             complete_immediately: cfg.FAKE_TLS_COMPLETE_IMMEDIATELY,
             forward_real: cfg.FAKE_TLS_FORWARD_REAL,
+            chained: false,
+            repeats: cfg.FAKE_TLS_REPEATS,
+            chain_delay_ms: cfg.FAKE_TLS_CHAIN_DELAY_MS,
         }
+    }
+
+    /// Mark this instance as chained with another data-stage method.
+    pub fn chained(mut self, chained: bool) -> Self {
+        self.chained = chained;
+        self
     }
 }
 
@@ -64,6 +97,12 @@ impl BypassMethod for FakeTls {
     }
 
     fn on_first_data_packet(&self, flow: &FlowState, pkt: &mut PacketView<'_>) -> MethodAction {
+        // In fragment-all chains the handler re-invokes this hook for every
+        // subsequent data packet; the decoy belongs to the first one only.
+        if self.chained && flow.first_data_modified {
+            return MethodAction::CompleteAndAccept;
+        }
+
         let syn_seq = flow
             .syn_seq
             .expect("syn_seq must be set before the first data packet");
@@ -78,6 +117,37 @@ impl BypassMethod for FakeTls {
 
         let mut flags = pkt.flags;
         flags.psh = self.set_psh;
+
+        if self.chained {
+            // The chained method owns the primary packet's mutations, so the
+            // decoy is staged separately and emitted before it.
+            let delay_ms = super::tcp_segmentation::sample_i32(
+                self.chain_delay_ms,
+                &mut super::tcp_segmentation::FragmentRng::new(),
+            )
+            .max(0) as u64;
+            pkt.decoy = Some(DecoyPacket {
+                seq: new_seq,
+                payload,
+                flags,
+                bump_ipv4_ident: self.bump_ip_ident,
+                repeats: self.repeats,
+                delay_ms,
+            });
+            trace!(
+                target = "zerodpi::fake_tls",
+                syn_seq,
+                new_seq,
+                payload_len,
+                repeats = self.repeats,
+                delay_ms,
+                "staged chained decoy TLS record injection"
+            );
+            return MethodAction::EmitFakeAndAccept {
+                complete_immediately: self.complete_immediately,
+                continue_with_data: false,
+            };
+        }
 
         pkt.new_seq = Some(new_seq);
         pkt.new_flags = Some(flags);
@@ -149,6 +219,7 @@ mod tests {
             bump_ipv4_ident: false,
             corrupt_tcp_checksum_delta: None,
             emit_original_after: false,
+            decoy: None,
             ip_frag_payload_size: None,
             disorder_spec: None,
             new_ipv4_ttl: None,
@@ -222,6 +293,72 @@ mod tests {
 
         // 10 + 1 - 517 - 0 wraps mod 2^32
         assert_eq!(pkt.new_seq, Some(11u32.wrapping_sub(517)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Chained mode (fake_tls + another data-stage method)
+    // -----------------------------------------------------------------------
+
+    fn chain_cfg() -> Config {
+        let mut cfg = default_cfg();
+        cfg.FAKE_TLS_REPEATS = 3;
+        cfg
+    }
+
+    #[test]
+    fn chained_mode_stages_a_decoy_instead_of_the_primary() {
+        let state = handshake_state();
+        let payload: &'static [u8] = Box::leak(vec![0x16u8; 517].into_boxed_slice());
+        let mut pkt = data_pkt(payload);
+
+        let action = FakeTls::new(&chain_cfg())
+            .chained(true)
+            .on_first_data_packet(&state, &mut pkt);
+
+        assert_eq!(action, MethodAction::emit_and_complete());
+        let decoy = pkt.decoy.as_ref().expect("decoy must be staged");
+        assert_eq!(decoy.seq, 484); // 1000 + 1 - 517
+        assert_eq!(decoy.payload.len(), 517);
+        assert!(decoy.flags.psh);
+        assert!(decoy.bump_ipv4_ident);
+        assert_eq!(decoy.repeats, 3);
+        assert_eq!(decoy.delay_ms, 0);
+
+        // The primary packet is left to the chained method.
+        assert!(pkt.new_payload.is_none());
+        assert_eq!(pkt.new_seq, None);
+        assert!(pkt.new_flags.is_none());
+        assert!(!pkt.bump_ipv4_ident);
+        assert!(!pkt.emit_original_after);
+    }
+
+    #[test]
+    fn chained_mode_does_not_repeat_the_decoy_on_later_packets() {
+        let mut state = handshake_state();
+        state.first_data_modified = true;
+        let payload: &'static [u8] = Box::leak(vec![0x16u8; 517].into_boxed_slice());
+        let mut pkt = data_pkt(payload);
+
+        let action = FakeTls::new(&chain_cfg())
+            .chained(true)
+            .on_first_data_packet(&state, &mut pkt);
+
+        assert_eq!(action, MethodAction::complete_and_accept());
+        assert_eq!(pkt.decoy, None);
+    }
+
+    #[test]
+    fn standalone_mode_ignores_the_repeat_setting() {
+        // Without a chained method the decoy replaces the packet, so `repeats`
+        // and the chain delay do not apply.
+        let state = handshake_state();
+        let payload: &'static [u8] = Box::leak(vec![0x16u8; 517].into_boxed_slice());
+        let mut pkt = data_pkt(payload);
+
+        FakeTls::new(&chain_cfg()).on_first_data_packet(&state, &mut pkt);
+
+        assert_eq!(pkt.decoy, None);
+        assert!(pkt.new_payload.is_some());
     }
 
     #[test]

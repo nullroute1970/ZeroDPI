@@ -30,7 +30,10 @@ use crate::interceptor::PacketView;
 
 pub struct CompositeMethod {
     pub handshake_methods: Vec<Box<dyn BypassMethod>>,
-    pub data_method: Option<Box<dyn BypassMethod>>,
+    /// Data-stage members, run in configured order. Chaining `fake_tls` with a
+    /// shaping method is what makes `fakedsplit`/`fakeddisorder` possible:
+    /// `fake_tls` stages the decoy, the shaping method stages the real packet.
+    pub data_methods: Vec<Box<dyn BypassMethod>>,
     pub segments_first_client_hello: bool,
     pub pads_first_client_hello: bool,
     pub mixed_case_sni_first_hello: bool,
@@ -42,13 +45,13 @@ pub struct CompositeMethod {
 impl CompositeMethod {
     pub fn new(
         handshake_methods: Vec<Box<dyn BypassMethod>>,
-        data_method: Option<Box<dyn BypassMethod>>,
+        data_methods: Vec<Box<dyn BypassMethod>>,
         segments_first_client_hello: bool,
         pads_first_client_hello: bool,
     ) -> Self {
         Self {
             handshake_methods,
-            data_method,
+            data_methods,
             segments_first_client_hello,
             pads_first_client_hello,
             mixed_case_sni_first_hello: false,
@@ -93,7 +96,7 @@ impl CompositeMethod {
 impl BypassMethod for CompositeMethod {
     fn name(&self) -> String {
         let mut parts: Vec<String> = self.handshake_methods.iter().map(|m| m.name()).collect();
-        if let Some(data_method) = &self.data_method {
+        for data_method in &self.data_methods {
             parts.push(data_method.name());
         }
         if self.segments_first_client_hello {
@@ -153,7 +156,7 @@ impl BypassMethod for CompositeMethod {
         pkt.new_flags = first_flags;
         pkt.bump_ipv4_ident = first_bump_ident;
 
-        if self.data_method.is_some()
+        if !self.data_methods.is_empty()
             || self.segments_first_client_hello
             || self.pads_first_client_hello
             || self.splits_first_client_hello
@@ -183,8 +186,41 @@ impl BypassMethod for CompositeMethod {
     }
 
     fn on_first_data_packet(&self, flow: &FlowState, pkt: &mut PacketView<'_>) -> MethodAction {
-        if let Some(data_method) = &self.data_method {
-            data_method.on_first_data_packet(flow, pkt)
+        if self.data_methods.is_empty() {
+            return MethodAction::complete_and_accept();
+        }
+
+        // Chain the members in configured order. `fake_tls` stages
+        // `PacketView::decoy` and a shaping method stages the primary packet,
+        // so their mutations are disjoint and order does not matter.
+        let mut saw_emit = false;
+        let mut complete_immediately = true;
+        let mut continue_with_data = false;
+
+        for method in &self.data_methods {
+            match method.on_first_data_packet(flow, pkt) {
+                MethodAction::EmitFakeAndAccept {
+                    complete_immediately: immediate,
+                    continue_with_data: more,
+                } => {
+                    saw_emit = true;
+                    // Wait for the server whenever any member wants to.
+                    complete_immediately &= immediate;
+                    // Fragment-all mode is sticky.
+                    continue_with_data |= more;
+                }
+                MethodAction::AbortAndAccept => return MethodAction::abort_and_accept(),
+                // A member that bailed out contributes nothing; keep going so a
+                // staged decoy or the other member's shaping is still emitted.
+                MethodAction::CompleteAndAccept | MethodAction::PassThrough => {}
+            }
+        }
+
+        if saw_emit {
+            MethodAction::EmitFakeAndAccept {
+                complete_immediately,
+                continue_with_data,
+            }
         } else {
             MethodAction::complete_and_accept()
         }
@@ -199,6 +235,8 @@ mod tests {
     use crate::config::Config;
     use crate::flow::FlowState;
     use crate::interceptor::{Direction, PacketView, TcpFlags};
+    use crate::methods::disorder::Disorder;
+    use crate::methods::fake_tls::FakeTls;
     use crate::methods::low_ttl::LowTtl;
     use crate::methods::tls_record_frag::TlsRecordFrag;
     use crate::methods::wrong_checksum::WrongChecksum;
@@ -242,6 +280,7 @@ mod tests {
             bump_ipv4_ident: false,
             corrupt_tcp_checksum_delta: None,
             emit_original_after: false,
+            decoy: None,
             ip_frag_payload_size: None,
             disorder_spec: None,
             new_ipv4_ttl: None,
@@ -261,7 +300,7 @@ mod tests {
         let cfg = cfg_with("");
         let m = CompositeMethod::new(
             vec![Box::new(WrongSeq::new(&cfg)), Box::new(LowTtl::new(&cfg))],
-            None,
+            vec![],
             true,
             true,
         );
@@ -271,7 +310,7 @@ mod tests {
     #[test]
     fn wrong_seq_plus_tls_frag_matches_old_combo() {
         let cfg = cfg_with("");
-        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, true, false);
+        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], vec![], true, false);
 
         let mut packet = pkt(&[], 0);
         let action = m.on_handshake_complete_ack(&handshake_state(), &mut packet);
@@ -293,7 +332,7 @@ mod tests {
         let cfg = cfg_with("WRONG_MD5_SET_PSH = false\nWRONG_MD5_COMPLETE_IMMEDIATELY = false");
         let m = CompositeMethod::new(
             vec![Box::new(WrongSeq::new(&cfg)), Box::new(WrongMd5::new(&cfg))],
-            None,
+            vec![],
             false,
             false,
         );
@@ -311,7 +350,7 @@ mod tests {
         let cfg = cfg_with("WRONG_MD5_COMPLETE_IMMEDIATELY = true");
         let m = CompositeMethod::new(
             vec![Box::new(WrongSeq::new(&cfg)), Box::new(WrongMd5::new(&cfg))],
-            None,
+            vec![],
             false,
             false,
         );
@@ -326,7 +365,7 @@ mod tests {
         let cfg = cfg_with("LOW_TTL_VALUE = 5\nLOW_TTL_COMPLETE_IMMEDIATELY = false");
         let m = CompositeMethod::new(
             vec![Box::new(WrongSeq::new(&cfg)), Box::new(LowTtl::new(&cfg))],
-            None,
+            vec![],
             false,
             false,
         );
@@ -342,7 +381,7 @@ mod tests {
     #[test]
     fn wrong_seq_plus_sni_boundary_frag_waits_for_data_stage() {
         let cfg = cfg_with("");
-        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, false, false)
+        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], vec![], false, false)
             .with_sni_boundary_split(true);
 
         let mut packet = pkt(&[], 0);
@@ -362,14 +401,14 @@ mod tests {
     #[test]
     fn name_omits_sni_boundary_frag_when_not_set() {
         let cfg = cfg_with("");
-        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, false, false);
+        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], vec![], false, false);
         assert_eq!(m.name(), "wrong_seq");
     }
 
     #[test]
     fn wrong_seq_plus_tls_padding_waits_for_data_stage() {
         let cfg = cfg_with("");
-        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, false, true);
+        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], vec![], false, true);
 
         let mut packet = pkt(&[], 0);
         let action = m.on_handshake_complete_ack(&handshake_state(), &mut packet);
@@ -385,7 +424,7 @@ mod tests {
                 Box::new(WrongChecksum::new(&cfg)),
                 Box::new(WrongSeq::new(&cfg)),
             ],
-            None,
+            vec![],
             false,
             false,
         );
@@ -400,7 +439,7 @@ mod tests {
                 Box::new(WrongSeq::new(&cfg)),
                 Box::new(WrongChecksum::new(&cfg)),
             ],
-            None,
+            vec![],
             false,
             false,
         );
@@ -418,7 +457,7 @@ mod tests {
                 Box::new(WrongSeq::new(&cfg)),
                 Box::new(WrongTimestamp::new(&cfg)),
             ],
-            None,
+            vec![],
             false,
             false,
         );
@@ -433,7 +472,7 @@ mod tests {
         let cfg = cfg_with("");
         let m = CompositeMethod::new(
             vec![Box::new(WrongTimestamp::new(&cfg))],
-            None,
+            vec![],
             false,
             false,
         );
@@ -445,10 +484,11 @@ mod tests {
     #[test]
     fn forwards_low_ttl_handle_when_present() {
         let cfg = cfg_with("");
-        let with_ttl = CompositeMethod::new(vec![Box::new(LowTtl::new(&cfg))], None, false, false);
+        let with_ttl =
+            CompositeMethod::new(vec![Box::new(LowTtl::new(&cfg))], vec![], false, false);
         assert!(with_ttl.low_ttl_handle().is_some());
         let without_ttl =
-            CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, false, false);
+            CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], vec![], false, false);
         assert!(without_ttl.low_ttl_handle().is_none());
     }
 
@@ -457,7 +497,7 @@ mod tests {
         let cfg = cfg_with("");
         let m = CompositeMethod::new(
             vec![],
-            Some(Box::new(TlsRecordFrag::new(&cfg))),
+            vec![Box::new(TlsRecordFrag::new(&cfg))],
             false,
             false,
         );
@@ -478,7 +518,7 @@ mod tests {
     #[test]
     fn wrong_seq_plus_ccs_prefix_waits_for_data_stage() {
         let cfg = cfg_with("");
-        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, false, false)
+        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], vec![], false, false)
             .with_ccs_prefix(true);
 
         let mut packet = pkt(&[], 0);
@@ -490,7 +530,89 @@ mod tests {
     #[test]
     fn name_omits_ccs_prefix_when_not_set() {
         let cfg = cfg_with("");
-        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], None, false, false);
+        let m = CompositeMethod::new(vec![Box::new(WrongSeq::new(&cfg))], vec![], false, false);
         assert_eq!(m.name(), "wrong_seq");
+    }
+
+    #[test]
+    fn chains_fake_tls_decoy_with_disorder_shaping() {
+        // `["fake_tls", "disorder"]` — zapret's fakeddisorder: the decoy is
+        // staged separately and disorder shapes the real ClientHello.
+        let cfg = cfg_with("");
+        let m = CompositeMethod::new(
+            vec![],
+            vec![
+                Box::new(FakeTls::new(&cfg).chained(true)),
+                Box::new(Disorder::new(&cfg)),
+            ],
+            false,
+            false,
+        );
+        assert_eq!(m.name(), "fake_tls + disorder");
+
+        let mut payload: Vec<u8> = vec![0x16, 0x03, 0x03, 0x02, 0x05];
+        payload.extend(std::iter::repeat(0xAA).take(517));
+        let payload: &'static [u8] = Box::leak(payload.into_boxed_slice());
+        let mut packet = pkt(payload, payload.len());
+
+        let action = m.on_first_data_packet(&handshake_state(), &mut packet);
+
+        assert_eq!(action, MethodAction::emit_and_complete());
+        // Decoy staged for the pre-packet emission...
+        assert!(packet.decoy.is_some());
+        // ...and the primary packet shaped by disorder, untouched by the decoy.
+        assert!(packet.disorder_spec.is_some());
+        assert!(packet.new_payload.is_none());
+        assert_eq!(packet.new_seq, None);
+    }
+
+    #[test]
+    fn chains_record_frag_with_disorder_without_a_decoy() {
+        // Payload rewrite + emission shaper: `tls_record_frag` rewrites the
+        // record, `disorder` segments the rewritten payload.
+        let cfg = cfg_with("");
+        let m = CompositeMethod::new(
+            vec![],
+            vec![
+                Box::new(TlsRecordFrag::new(&cfg)),
+                Box::new(Disorder::new(&cfg)),
+            ],
+            false,
+            false,
+        );
+        assert_eq!(m.name(), "tls_record_frag + disorder");
+
+        let mut payload: Vec<u8> = vec![0x16, 0x03, 0x03, 0x02, 0x05];
+        payload.extend(std::iter::repeat(0xAA).take(517));
+        let payload: &'static [u8] = Box::leak(payload.into_boxed_slice());
+        let mut packet = pkt(payload, payload.len());
+
+        m.on_first_data_packet(&handshake_state(), &mut packet);
+
+        assert_eq!(packet.decoy, None);
+        assert!(packet.new_payload.is_some());
+        assert!(packet.disorder_spec.is_some());
+    }
+
+    #[test]
+    fn chained_completion_waits_when_any_member_waits() {
+        let tc = cfg_with(r#"FAKE_TLS_COMPLETE_IMMEDIATELY = false"#);
+        let m = CompositeMethod::new(
+            vec![],
+            vec![
+                Box::new(FakeTls::new(&tc).chained(true)),
+                Box::new(Disorder::new(&tc)),
+            ],
+            false,
+            false,
+        );
+
+        let mut payload: Vec<u8> = vec![0x16, 0x03, 0x03, 0x02, 0x05];
+        payload.extend(std::iter::repeat(0xAA).take(517));
+        let payload: &'static [u8] = Box::leak(payload.into_boxed_slice());
+        let mut packet = pkt(payload, payload.len());
+
+        let action = m.on_first_data_packet(&handshake_state(), &mut packet);
+        assert_eq!(action, MethodAction::emit_and_wait_for_ack());
     }
 }

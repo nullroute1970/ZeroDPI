@@ -348,7 +348,7 @@ Methods are ranked by **success rate (desc), then average TTFB (asc)** — metho
 | `low_ttl` | Injects fake ClientHello (whitelisted SNI) with a low IP TTL so only the DPI middlebox sees it | ✅ Yes | DPI sitting between client and server on TTL-visible networks |
 | `tls_record_frag` | TLS Record Fragment: splits the real ClientHello record body into multiple tiny TLS records | ✅ Yes | DPI that can't reassemble TLS records |
 | `tls_record_split` | TLS Record Split at the SNI boundary: re-frames the real ClientHello as exactly two TLS records cut at the `server_name` extension, so the server reassembles the handshake message across records while a first-record-only DPI finds no SNI; optional inter-record delay also splits them across TCP segments | ❌ No | DPI that reassembles TCP but parses only the first TLS record |
-| `fake_tls` | Decoy TLS Record Injection: emits a decoy ClientHello record (whitelisted SNI) with an out-of-window TCP sequence number at the first data packet; record-parsing DPI sees only the decoy | ✅ Yes (WinDivert/NFQUEUE) | DPI that tracks TCP correctly but parses only TLS records |
+| `fake_tls` | Decoy TLS Record Injection: emits a decoy ClientHello record (whitelisted SNI) with an out-of-window TCP sequence number at the first data packet; record-parsing DPI sees only the decoy. Chained with a shaping method it becomes the decoy *in front of* the shaped real ClientHello (`fakedsplit`/`fakeddisorder`) | ✅ Yes (WinDivert/NFQUEUE) | DPI that tracks TCP correctly but parses only TLS records; chained: DPIs that also need the real data reshaped |
 | `ip_frag` | IP-Layer Fragment: splits the first outbound data packet (the real ClientHello) into small IPv4 fragments the server's kernel reassembles but fragmentation-blind DPI cannot read | ✅ Yes (WinDivert/NFQUEUE) | DPI that does not reassemble IP fragments |
 | `disorder` | Out-of-Order TCP Segmentation: splits the first outbound data packet (the real ClientHello) into 2–3 TCP segments with correct sequence numbers and emits them in reverse order, optionally delayed, so the server's kernel reassembles the stream while sequence-tracking DPI sees non-monotonic segments and no complete ClientHello | ✅ Yes (WinDivert/NFQUEUE) | DPI that tracks per-flow sequence state or inspects only the first segment |
 | `seqovl` | TCP Sequence Overlap: splits the first outbound data packet into 2–3 TCP segments and splices fake bytes in front of the first emitted segment with a rewound sequence number, so the server's stack trims or overwrites the prefix while stream-reassembling DPI reads fake bytes inside the ClientHello; the real SNI is preserved. `SEQOVL_SIZE` also adds the overlap to `disorder` | ✅ Yes (WinDivert/NFQUEUE) | DPI that reassembles the flow and parses all records, including DPIs that reject out-of-window decoys |
@@ -375,7 +375,7 @@ discards, or the server reassembles a stream the DPI cannot.
 | `low_ttl` | The decoy's TTL reaches the inline DPI middlebox but expires before the destination server: the DPI classifies the flow on the decoy, the server never receives it, and the real handshake completes via TCP retransmission |
 | `tls_record_frag` | Handshake messages may legally span multiple TLS records (RFC 5246 §6.2.1), so the server's TLS stack reassembles the ClientHello — a DPI that parses only the first record, or cannot reassemble records, never sees a complete SNI |
 | `tls_record_split` | Same RFC 8446 §5.1 rule, applied to exactly two records cut at the SNI extension: the server concatenates the record bodies and parses one ClientHello, while a DPI that reads only the first record — or assumes the ClientHello is always record 1 — finds no SNI. Because it rewrites the record framing on the byte stream, it also defeats DPIs that reassemble TCP before inspecting |
-| `fake_tls` | The decoy is a well-formed TLS record, so a record-parsing DPI sees a complete benign ClientHello as the first record; the out-of-window sequence number makes the server discard it, and the genuine ClientHello follows |
+| `fake_tls` | The decoy is a well-formed TLS record, so a record-parsing DPI sees a complete benign ClientHello as the first record; the out-of-window sequence number makes the server discard it, and the genuine ClientHello follows. Chained, the genuinely shaped real data follows the decoy copies, so the DPI has already committed to its benign verdict |
 | `ip_frag` | The destination kernel reassembles IPv4 fragments before the TLS stack sees them; a DPI that does not reassemble fragments (or gives up after a short budget) never reads a complete ClientHello |
 | `disorder` | The destination kernel reorders TCP segments; a DPI that tracks per-flow sequence state or inspects only the first segment sees non-monotonic segments and no complete ClientHello |
 | `seqovl` | The destination trims (ordered split) or overwrites (reverse split) the fake prefix because of TCP sequence-number rules, so its stream is the original ClientHello; a DPI that reassembles segments by concatenating payloads splices the fake bytes into the ClientHello and loses the SNI. Unlike the fake-packet family it needs no out-of-window decoy, so strict sequence validation does not defeat it |
@@ -404,19 +404,22 @@ packet → data-stage transform → socket-side transform.
 | `["wrong_seq", "seqovl"]` | Wrong-sequence fake ClientHello, then a TCP sequence overlap on the real ClientHello (nothing is replaced, the SNI is preserved) |
 | `["tls_record_split", "tls_frag"]` | Real ClientHello re-framed as two TLS records at the SNI boundary, then TCP-segmented — record-parsing **and** per-packet DPI, still without root |
 | `BYPASS_METHOD = "disorder"` + `SEQOVL_SIZE` | Reverse-order segmentation with the same sequence overlap applied to the first emitted segment |
+| `["fake_tls", "disorder"]` | **fakeddisorder**: decoy ClientHello first, then the real ClientHello as out-of-order TCP segments (`FAKE_TLS_REPEATS` copies the decoy) |
+| `["fake_tls", "seqovl"]` | **fakedsplit with sequence overlap**: decoy first, then the real ClientHello with a fake prefix spliced into the reassembled stream |
+| `["tls_record_frag", "disorder"]` | Real ClientHello re-recorded into small TLS records, then emitted as out-of-order TCP segments |
 
 ### 🚫 Combination Rules
 
 | Rule | Detail |
 |------|--------|
 | No empty list, no duplicates | The list must not be empty and must not contain duplicate method names (after alias expansion) |
-| `urg_sni_split` | Can only be used alone or together with `tls_frag` / `tls_record_frag`; it cannot be combined with other handshake-stage methods |
+| `urg_sni_split` | Can only be used alone or together with `tls_frag`; its TCP urgent pointer is per-segment, so it cannot be chained with a payload rewrite or an emission shaper |
 | `sni_boundary_frag` | Cannot be combined with `tls_record_frag`, `tls_record_split`, or `urg_sni_split`; it combines with the handshake fake-packet methods, and with `tls_frag`, `tls_padding`, `mixed_case_sni`, and `ccs_prefix` |
 | `tls_record_split` | Cannot be combined with `sni_boundary_frag` (both cut the first ClientHello at the SNI boundary; use `TLS_RECORD_SPLIT_DELAY_MS` to also separate the records across TCP segments). It combines with the handshake fake-packet methods and with `tls_frag`, `tls_padding`, `mixed_case_sni`, and `ccs_prefix` |
-| `fake_tls` | Cannot be combined with `tls_record_frag` or `urg_sni_split` |
-| `ip_frag` | Cannot be combined with `tls_record_frag`, `fake_tls`, or `urg_sni_split` |
-| `disorder` | Cannot be combined with `tls_record_frag`, `fake_tls`, `ip_frag`, or `urg_sni_split` |
-| `seqovl` | Cannot be combined with `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`, `urg_sni_split`, or `sni_boundary_frag` (each owns the first data packet); setting `SEQOVL_SIZE` on a `disorder` list is the supported way to combine the two. It does combine with the handshake fake-packet methods and with `tls_frag`, `tls_padding`, `mixed_case_sni`, and `ccs_prefix` |
+| One emission shaper | At most one of `ip_frag`, `disorder`, `seqovl` — each decides how the first data packet is put on the wire, and one packet cannot be both IPv4-fragmented and TCP-segmented |
+| `fake_tls` | Acts as a decoy in front of one of `tls_record_frag`, `ip_frag`, `disorder`, `seqovl`; chaining requires `FAKE_TLS_FORWARD_REAL = true` |
+| `tls_record_frag` | A payload rewrite: it may be shaped by one emission shaper (`["tls_record_frag", "disorder"]`) and may sit behind a `fake_tls` decoy |
+| `seqovl` | Cannot be combined with `sni_boundary_frag`; setting `SEQOVL_SIZE` on a `disorder` list is the supported way to add the overlap to `disorder`'s own segmentation |
 | `ccs_prefix` | Combines with every method except `urg_sni_split` (which keeps its existing restriction); included in the `ip_bypass_plus` real-SNI whitelist |
 | `ip_bypass_plus` | Supports only `tls_record_frag`, `tls_record_split`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, `disorder`, or `seqovl` so the VPN client's real SNI is preserved |
 | `LOW_TTL_DISCOVER` | Only takes effect when `low_ttl` is in the list; otherwise discovery is silently skipped |
@@ -432,12 +435,20 @@ behavior comes from the **first** listed handshake method; completion
 behavior (`wait for ACK` vs `complete immediately`) comes from the **last**
 listed handshake method.
 
-**2. Data stage — first-data-packet methods.** Each of `tls_record_frag`,
-`fake_tls`, `ip_frag`, `disorder`, and `seqovl` owns the first data packet,
-which is why they are mutually exclusive with one another. They combine with
-the handshake-stage fake-packet methods and with the socket-side methods
-below. `tls_record_frag` and/or `tls_frag` add the data stage after the fake
-packet.
+**2. Data stage — first-data-packet methods, and chaining.** `ip_frag`,
+`disorder`, and `seqovl` decide how the first data packet is *emitted* (IP
+fragments, TCP segments, or a sequence-overlapped split), so at most one of
+them can be active. `tls_record_frag` rewrites the payload, and `fake_tls`
+emits a decoy in front. These roles compose:
+
+| Listed | Wire behavior |
+|---|---|
+| `fake_tls` alone | the first data packet *becomes* the decoy; the real ClientHello follows it in dual-emission mode (`FAKE_TLS_FORWARD_REAL`) |
+| `fake_tls` + shaper/`tls_record_frag` | the decoy is emitted first (`FAKE_TLS_REPEATS` copies, then `FAKE_TLS_CHAIN_DELAY_MS`), and the real ClientHello is shaped by the chained method — zapret's `fakedsplit`/`fakeddisorder` |
+| `tls_record_frag` + shaper | one packet, rewritten into TLS records and then segmented/fragmented |
+
+All of them combine with the handshake-stage fake-packet methods and with the
+socket-side methods below.
 
 **3. Socket-side transforms.** `tls_padding` expands the real ClientHello
 with an RFC 7685 padding extension before it is written upstream,
@@ -534,7 +545,13 @@ to stronger or more specific methods only when needed.
   roughly one TCP retransmission timeout (~200 ms) while the real
   ClientHello is retransmitted. With `FAKE_TLS_FORWARD_REAL = true`
   (default) the decoy goes out first and the real ClientHello is forwarded
-  immediately after it — no added latency.
+  immediately after it — no added latency. `FAKE_TLS_REPEATS` (default `1`,
+  max `8`) emits several decoy copies before the real data, and
+  `FAKE_TLS_CHAIN_DELAY_MS` (default `0`, max `100`) inserts a gap between
+  the last copy and the real data; the gap runs inside the packet-capture
+  loop, so it briefly delays other flows' packets too. When chained with a
+  shaping method, `FAKE_TLS_FORWARD_REAL` must be `true` and the decoy is
+  emitted ahead of the shaped real ClientHello.
 - `ip_frag` requires Administrator/root (WinDivert/NFQUEUE) and is
   IPv4-only. The fragmenter clears the IPv4 DF bit so fragmentation is
   legal; some middleboxes drop all IP fragments, in which case `ip_frag`
@@ -1756,6 +1773,7 @@ Unit tests cover:
 | `wrong_seq` works on simple paths but fails on layered firewalls | Try `BYPASS_METHOD = ["wrong_seq", "tls_frag"]` for TCP-level fragmentation or `BYPASS_METHOD = ["wrong_seq", "tls_record_frag"]` for TLS-record fragmentation. Both keep the fake wrong-sequence stage for the first DPI layer. |
 | `wrong_md5` works partly but the real ClientHello is still blocked | Try `BYPASS_METHOD = ["wrong_md5", "tls_frag"]` so the fake TCP-MD5 stage is followed by TCP-level fragmentation of the real ClientHello. |
 | `wrong_seq`, `wrong_ack`, `wrong_timestamp`, `wrong_checksum`, or `wrong_md5` (alone or combined) does not work | Try `tls_record_frag` (TLS-record layer), then `tls_frag` (TCP layer). Different DPI devices fail on different TCP/TLS behaviors. |
+| `fake_tls` works partly but the real ClientHello is still blocked | Chain a shaping method: `BYPASS_METHOD = ["fake_tls", "disorder"]` (fakeddisorder) or `["fake_tls", "seqovl"]` (fakedsplit with overlap), then try `FAKE_TLS_REPEATS = 2`–`3`. |
 | The DPI reassembles the whole flow, so fake packets and fragmentation both fail | Try `BYPASS_METHOD = "seqovl"` (tune `SEQOVL_SIZE`, try `8`–`128`), or keep `disorder` and add `SEQOVL_SIZE` to it. Neither replaces the real ClientHello, so the SNI is preserved. |
 | `tls_frag` and `sni_boundary_frag` both fail, but the DPI clearly is not blocking the IP | The DPI probably reassembles TCP and parses TLS records. Try `BYPASS_METHOD = "tls_record_split"` — it rewrites the record framing rather than the TCP segmentation, and needs no root. |
 | `seqovl` connects on some servers but not others | Set `SEQOVL_REVERSE = false` (the ordered default). The reverse variant relies on last-received-wins overlap handling, which Windows-hosted servers do not implement. |

@@ -105,8 +105,10 @@ Composites: `wrong_seq_wrong_md5`, `wrong_seq_tls_frag`,
 
 **Gap summary:** the fake-packet injection family (ByeDPI `--wrong-seq`
 etc.) is fully covered; TCP segmentation (`tls_frag`), padding, boundary
-splitting, and record-level splitting (`tls_record_split`) are covered; and
-`seqovl` (§4.7) covers the sequence-overlap axis. What is missing versus the
+splitting, and record-level splitting (`tls_record_split`) are covered;
+`seqovl` (§4.7) covers the sequence-overlap axis; and **data-stage chaining**
+(exercised by `fake_tls` + a shaper, i.e. zapret's `fakedsplit` /
+`fakeddisorder` shapes) is supported too. What is missing versus the
 comparable tools is `fake_tls` variant B (socket-side forged record length)
 and `tcp_opt_pad`.
 
@@ -124,6 +126,16 @@ lose) against implementation cost in ZeroDPI's architecture.
 **Status (2026-08-16):** Variant A implemented (`fake_tls`, interceptor,
 data stage, dual-packet emission with `FAKE_TLS_FORWARD_REAL`). Variant B
 remains a not-implemented follow-up candidate.
+
+**Status (2026-09-30):** `fake_tls` also gained **data-stage chaining**.
+Listing it with one of `tls_record_frag`, `ip_frag`, `disorder`, or `seqovl`
+stages the decoy in `PacketView::decoy` instead of replacing the first data
+packet; the chained method then shapes the real ClientHello, and the backend
+emits `FAKE_TLS_REPEATS` decoy copies (with `FAKE_TLS_CHAIN_DELAY_MS` before
+the real data). This is what makes `["fake_tls", "disorder"]` behave like
+zapret's `fakeddisorder` and `["fake_tls", "seqovl"]` like a fakedsplit with
+sequence overlap. Chaining requires `FAKE_TLS_FORWARD_REAL = true`; two
+emission shapers (`ip_frag`/`disorder`/`seqovl`) still cannot both apply.
 
 **Overview.** Inject a decoy TLS record containing a ClientHello with a
 whitelisted/benign SNI so that the DPI keys its classification on the decoy,
@@ -527,7 +539,10 @@ Build in this order:
    `disorder` modifier.
 6. **`tls_record_split`** — ✅ implemented (§4.5), socket-side and effective
    against DPIs that reassemble TCP but parse only the first TLS record.
-7. **`tcp_opt_pad`** — the only remaining cheap candidate.
+7. **Data-stage chaining** — ✅ implemented (see §4.1): `fake_tls` can now act
+   as a decoy in front of `tls_record_frag`/`ip_frag`/`disorder`/`seqovl`,
+   covering the `fakedsplit`/`fakeddisorder` strategy space.
+8. **`tcp_opt_pad`** — the only remaining cheap candidate.
 
 Skip §5 entirely. Do not attempt §6.
 

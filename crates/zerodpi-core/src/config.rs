@@ -267,8 +267,12 @@ pub const DEFAULT_SEQOVL_SIZE: usize = 32;
 /// Largest accepted `SEQOVL_SIZE` (and fixed-pattern length).
 pub const MAX_SEQOVL_SIZE: usize = 1024;
 
-/// Methods that own the first outbound data packet. Only one of them can be
-/// active per connection, because the handler runs a single data stage.
+/// Every method that participates in the first-outbound-data-packet stage.
+///
+/// Up to two of them may be configured: `fake_tls` (decoy) plus one other, which
+/// may itself be `tls_record_frag` (payload rewrite) chained with one entry of
+/// [`EMISSION_SHAPERS`]. Validation enforces those rules; this list is the
+/// canonical set for documentation and tooling.
 pub const DATA_STAGE_METHODS: &[&str] = &[
     "tls_record_frag",
     "fake_tls",
@@ -277,6 +281,21 @@ pub const DATA_STAGE_METHODS: &[&str] = &[
     "seqovl",
     "urg_sni_split",
 ];
+
+/// Data-stage methods that decide *how* the first outbound data packet is put
+/// on the wire. At most one of them may be configured, because a single packet
+/// cannot be both IPv4-fragmented and TCP-segmented.
+///
+/// They may be chained with `fake_tls` (as a decoy in front) and with
+/// `tls_record_frag` (which rewrites the payload they shape).
+pub const EMISSION_SHAPERS: &[&str] = &["ip_frag", "disorder", "seqovl"];
+
+/// Largest accepted `FAKE_TLS_REPEATS`.
+pub const MAX_FAKE_TLS_REPEATS: usize = 8;
+
+/// Largest accepted `FAKE_TLS_CHAIN_DELAY_MS`, bounding how long the packet
+/// capture loop may be blocked between the decoy and the real data.
+pub const MAX_FAKE_TLS_CHAIN_DELAY_MS: i32 = 100;
 
 /// Expand a combo alias into its base method names; other names pass through.
 fn expand_method_alias(name: &str) -> Vec<String> {
@@ -871,8 +890,35 @@ pub struct Config {
     /// on TCP retransmission. Requires backend dual-emission support
     /// (WinDivert send; raw socket on Linux/Android); backends without it
     /// fall back to single-packet emission.  Default: `true`.
+    ///
+    /// Must be `true` when `fake_tls` is chained with another data-stage
+    /// method (`tls_record_frag`, `ip_frag`, `disorder`, `seqovl`), because the
+    /// chained method shapes the real ClientHello that dual emission forwards.
     #[serde(default = "default_true")]
     pub FAKE_TLS_FORWARD_REAL: bool,
+
+    /// Number of identical decoy copies `fake_tls` emits before the real data.
+    ///
+    /// More copies give a DPI more chances to classify the flow benign before
+    /// the real ClientHello arrives, at the cost of extra upstream packets.
+    /// Useful with chained strategies such as `["fake_tls", "disorder"]`
+    /// (zapret's `fakeddisorder`) and `["fake_tls", "seqovl"]`.
+    /// Must be `>= 1` and `<= MAX_FAKE_TLS_REPEATS`. Default: `1`.
+    #[serde(default = "default_fake_tls_repeats")]
+    pub FAKE_TLS_REPEATS: usize,
+
+    /// Delay range, in milliseconds, between the last decoy copy and the real
+    /// data packet.
+    ///
+    /// A small gap lets a per-packet DPI commit to its benign verdict before the
+    /// real ClientHello arrives. The delay runs inside the packet-capture loop,
+    /// so it also delays other flows' packets while it waits: keep it small and
+    /// leave it at `0` unless timing is known to matter. Accepts an integer
+    /// (`0`) or an inclusive range string (`"2-5"`); a fresh value is sampled
+    /// per connection. Must be `>= 0` and `<= MAX_FAKE_TLS_CHAIN_DELAY_MS`.
+    /// Default: `0`.
+    #[serde(default = "default_zero_range")]
+    pub FAKE_TLS_CHAIN_DELAY_MS: Int32Range,
 
     // -----------------------------------------------------------------------
     // ip_frag method parameters
@@ -1398,6 +1444,9 @@ fn default_linux_firewall_backend() -> String {
 fn default_true() -> bool {
     true
 }
+fn default_fake_tls_repeats() -> usize {
+    1
+}
 fn default_wrong_checksum_delta() -> u16 {
     1
 }
@@ -1674,10 +1723,10 @@ impl Config {
                 && !self
                     .BYPASS_METHOD
                     .iter()
-                    .all(|m| m == "urg_sni_split" || matches!(m, "tls_frag" | "tls_record_frag"))
+                    .all(|m| m == "urg_sni_split" || m == "tls_frag")
             {
                 anyhow::bail!(
-                    "BYPASS_METHOD \"urg_sni_split\" can only be combined with \"tls_frag\" or \"tls_record_frag\""
+                    "BYPASS_METHOD \"urg_sni_split\" can only be combined with \"tls_frag\" (its TCP urgent pointer is per-segment, so it cannot be chained with a payload rewrite or an emission shaper)"
                 );
             }
             if self.BYPASS_METHOD.contains("sni_boundary_frag")
@@ -1705,45 +1754,46 @@ impl Config {
                     "BYPASS_METHOD \"sni_boundary_frag\" cannot be combined with \"tls_record_frag\" or \"urg_sni_split\""
                 );
             }
-            if self.BYPASS_METHOD.contains("fake_tls")
-                && (self.BYPASS_METHOD.contains("tls_record_frag")
-                    || self.BYPASS_METHOD.contains("urg_sni_split"))
+            // Data-stage chaining. `fake_tls` may act as a decoy in front of one
+            // other data-stage method, and `tls_record_frag` (a payload rewrite)
+            // may be shaped by one emission shaper. Two emission shapers cannot
+            // both apply to the same packet.
             {
-                anyhow::bail!(
-                    "BYPASS_METHOD \"fake_tls\" cannot be combined with \"tls_record_frag\" or \"urg_sni_split\""
-                );
-            }
-            if self.BYPASS_METHOD.contains("ip_frag")
-                && (self.BYPASS_METHOD.contains("tls_record_frag")
-                    || self.BYPASS_METHOD.contains("fake_tls")
-                    || self.BYPASS_METHOD.contains("urg_sni_split"))
-            {
-                anyhow::bail!(
-                    "BYPASS_METHOD \"ip_frag\" cannot be combined with \"tls_record_frag\", \"fake_tls\", or \"urg_sni_split\""
-                );
-            }
-            if self.BYPASS_METHOD.contains("disorder")
-                && (self.BYPASS_METHOD.contains("tls_record_frag")
-                    || self.BYPASS_METHOD.contains("fake_tls")
-                    || self.BYPASS_METHOD.contains("ip_frag")
-                    || self.BYPASS_METHOD.contains("urg_sni_split"))
-            {
-                anyhow::bail!(
-                    "BYPASS_METHOD \"disorder\" cannot be combined with \"tls_record_frag\", \"fake_tls\", \"ip_frag\", or \"urg_sni_split\""
-                );
-            }
-            if self.BYPASS_METHOD.contains("seqovl") {
-                if let Some(other) = DATA_STAGE_METHODS
+                let shapers: Vec<&str> = EMISSION_SHAPERS
                     .iter()
                     .copied()
-                    .filter(|m| *m != "seqovl")
-                    .find(|m| self.BYPASS_METHOD.contains(m))
+                    .filter(|m| self.BYPASS_METHOD.contains(m))
+                    .collect();
+                if shapers.len() > 1 {
+                    anyhow::bail!(
+                        "BYPASS_METHOD may contain at most one of \"ip_frag\", \"disorder\", \"seqovl\" (each decides how the first data packet is emitted), got {shapers:?}"
+                    );
+                }
+                if self.BYPASS_METHOD.contains("urg_sni_split")
+                    && (self.BYPASS_METHOD.contains("tls_record_frag") || !shapers.is_empty())
                 {
                     anyhow::bail!(
-                        "BYPASS_METHOD \"seqovl\" cannot be combined with \"{other}\" (both own the first outbound data packet)"
+                        "BYPASS_METHOD \"urg_sni_split\" cannot be chained with \"tls_record_frag\" or an emission shaper (its TCP urgent pointer is per-segment)"
+                    );
+                }
+                let chained = self.BYPASS_METHOD.contains("fake_tls")
+                    && (self.BYPASS_METHOD.contains("tls_record_frag") || !shapers.is_empty());
+                if chained && !self.FAKE_TLS_FORWARD_REAL {
+                    anyhow::bail!(
+                        "BYPASS_METHOD \"fake_tls\" chained with another data-stage method requires FAKE_TLS_FORWARD_REAL = true so the real ClientHello can be shaped after the decoy"
                     );
                 }
             }
+        }
+        if self.FAKE_TLS_REPEATS == 0 || self.FAKE_TLS_REPEATS > MAX_FAKE_TLS_REPEATS {
+            anyhow::bail!("FAKE_TLS_REPEATS must be between 1 and {MAX_FAKE_TLS_REPEATS}");
+        }
+        self.FAKE_TLS_CHAIN_DELAY_MS
+            .validate_at_least("FAKE_TLS_CHAIN_DELAY_MS", 0)?;
+        if self.FAKE_TLS_CHAIN_DELAY_MS.max > MAX_FAKE_TLS_CHAIN_DELAY_MS {
+            anyhow::bail!(
+                "FAKE_TLS_CHAIN_DELAY_MS must be <= {MAX_FAKE_TLS_CHAIN_DELAY_MS} (it blocks the packet-capture loop)"
+            );
         }
         if self.WRONG_CHECKSUM_DELTA == 0 {
             anyhow::bail!("WRONG_CHECKSUM_DELTA must be >= 1");
@@ -2821,11 +2871,81 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ip_frag_with_other_data_stage_methods() {
+    fn rejects_two_emission_shapers() {
         for combo in [
-            r#"["ip_frag", "tls_record_frag"]"#,
-            r#"["ip_frag", "fake_tls"]"#,
-            r#"["ip_frag", "urg_sni_split"]"#,
+            r#"["ip_frag", "disorder"]"#,
+            r#"["ip_frag", "seqovl"]"#,
+            r#"["disorder", "seqovl"]"#,
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   BYPASS_METHOD = {combo}"#
+            ))
+            .unwrap();
+            let error = cfg.validate().expect_err("two shapers must be rejected");
+            assert!(
+                error.to_string().contains("at most one"),
+                "combo {combo}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_data_stage_chaining() {
+        for combo in [
+            r#"["fake_tls", "disorder"]"#,
+            r#"["fake_tls", "ip_frag"]"#,
+            r#"["fake_tls", "seqovl"]"#,
+            r#"["fake_tls", "tls_record_frag"]"#,
+            r#"["tls_record_frag", "disorder"]"#,
+            r#"["tls_record_frag", "ip_frag"]"#,
+            r#"["tls_record_frag", "seqovl"]"#,
+            r#"["fake_tls", "tls_record_frag", "disorder"]"#,
+            r#"["wrong_seq", "fake_tls", "disorder"]"#,
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   BYPASS_METHOD = {combo}"#
+            ))
+            .unwrap();
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("combo {combo} should validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn rejects_chained_fake_tls_without_forward_real() {
+        for combo in [
+            r#"["fake_tls", "disorder"]"#,
+            r#"["fake_tls", "seqovl"]"#,
+            r#"["fake_tls", "tls_record_frag"]"#,
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   BYPASS_METHOD = {combo}
+                   FAKE_TLS_FORWARD_REAL = false"#
+            ))
+            .unwrap();
+            let error = cfg
+                .validate()
+                .expect_err("chained fake_tls needs dual emission");
+            assert!(
+                error.to_string().contains("FAKE_TLS_FORWARD_REAL"),
+                "combo {combo}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_urg_sni_split_chained_with_data_stage() {
+        for combo in [
+            r#"["urg_sni_split", "tls_record_frag"]"#,
+            r#"["urg_sni_split", "disorder"]"#,
+            r#"["urg_sni_split", "seqovl"]"#,
+            r#"["fake_tls", "urg_sni_split"]"#,
         ] {
             let cfg: Config = toml::from_str(&format!(
                 r#"LISTEN_HOST = "127.0.0.1"
@@ -2835,6 +2955,60 @@ mod tests {
             .unwrap();
             assert!(cfg.validate().is_err(), "combo {combo} should be rejected");
         }
+    }
+
+    #[test]
+    fn parses_fake_tls_chaining_fields() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = ["fake_tls", "disorder"]
+               FAKE_TLS_REPEATS = 3
+               FAKE_TLS_CHAIN_DELAY_MS = "2-5""#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.FAKE_TLS_REPEATS, 3);
+        assert_eq!(cfg.FAKE_TLS_CHAIN_DELAY_MS, Int32Range { min: 2, max: 5 });
+    }
+
+    #[test]
+    fn fake_tls_chaining_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.FAKE_TLS_REPEATS, 1);
+        assert_eq!(cfg.FAKE_TLS_CHAIN_DELAY_MS, Int32Range::exact(0));
+    }
+
+    #[test]
+    fn rejects_invalid_fake_tls_repeats() {
+        for repeats in ["0", "9"] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   FAKE_TLS_REPEATS = {repeats}"#
+            ))
+            .unwrap();
+            let error = cfg.validate().expect_err("invalid FAKE_TLS_REPEATS");
+            assert!(error.to_string().contains("FAKE_TLS_REPEATS"));
+        }
+    }
+
+    #[test]
+    fn rejects_excessive_fake_tls_chain_delay() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               FAKE_TLS_CHAIN_DELAY_MS = 101"#,
+        )
+        .unwrap();
+        let error = cfg
+            .validate()
+            .expect_err("excessive FAKE_TLS_CHAIN_DELAY_MS");
+        assert!(error.to_string().contains("FAKE_TLS_CHAIN_DELAY_MS"));
     }
 
     #[test]
@@ -3056,10 +3230,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_seqovl_with_other_data_stage_methods() {
+    fn rejects_seqovl_with_incompatible_data_stage_methods() {
         for combo in [
-            r#"["seqovl", "tls_record_frag"]"#,
-            r#"["seqovl", "fake_tls"]"#,
             r#"["seqovl", "ip_frag"]"#,
             r#"["seqovl", "disorder"]"#,
             r#"["seqovl", "urg_sni_split"]"#,
@@ -3195,11 +3367,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_disorder_with_other_data_stage_methods() {
+    fn rejects_disorder_with_incompatible_data_stage_methods() {
         for combo in [
             r#"["disorder", "ip_frag"]"#,
-            r#"["disorder", "fake_tls"]"#,
-            r#"["disorder", "tls_record_frag"]"#,
+            r#"["disorder", "seqovl"]"#,
             r#"["disorder", "urg_sni_split"]"#,
         ] {
             let cfg: Config = toml::from_str(&format!(
@@ -3239,14 +3410,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fake_tls_with_tls_record_frag() {
+    fn accepts_fake_tls_chained_with_tls_record_frag() {
+        // `fake_tls` + `tls_record_frag` used to be rejected; chaining makes it
+        // a decoy in front of a re-recorded real ClientHello.
         let cfg: Config = toml::from_str(
             r#"LISTEN_HOST = "127.0.0.1"
                LISTEN_PORT = 44444
                BYPASS_METHOD = ["fake_tls", "tls_record_frag"]"#,
         )
         .unwrap();
-        assert!(cfg.validate().is_err());
+        cfg.validate().unwrap();
     }
 
     #[test]

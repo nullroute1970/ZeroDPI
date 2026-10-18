@@ -91,6 +91,36 @@ impl OverlapFake {
     }
 }
 
+/// A decoy packet emitted *before* the real data packet (data-stage chaining).
+///
+/// `fake_tls` normally rewrites the first data packet itself into the decoy and
+/// relies on `emit_original_after` to forward the real ClientHello afterwards.
+/// That cannot work when another data-stage method has to shape the real
+/// packet: the shaper's staged mutations apply to the packet being emitted.
+/// Chaining therefore separates the two roles — `fake_tls` stages this decoy,
+/// the chained method stages the primary (real) packet — so the backend can
+/// emit the decoy copies first and the shaped real packet second.
+///
+/// This is what turns `["fake_tls", "disorder"]` into zapret's
+/// `fakeddisorder`, and `["fake_tls", "seqovl"]` into a fakedsplit with
+/// sequence overlap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoyPacket {
+    /// TCP sequence number for the decoy, placed behind the server's
+    /// `rcv_nxt` so the destination discards it.
+    pub seq: u32,
+    /// Decoy payload — the whitelisted-SNI ClientHello record.
+    pub payload: Vec<u8>,
+    /// TCP flags to stamp on the decoy copies.
+    pub flags: TcpFlags,
+    /// Increment the decoy's IPv4 Identification field.
+    pub bump_ipv4_ident: bool,
+    /// Number of identical copies to emit before the primary packet (>= 1).
+    pub repeats: usize,
+    /// Milliseconds to wait after the last copy, before the primary packet.
+    pub delay_ms: u64,
+}
+
 /// Staged TCP segmentation request (`disorder` and `seqovl` methods).
 ///
 /// The backend splits the rebuilt packet's TCP payload into `segments`
@@ -120,7 +150,7 @@ pub struct DisorderSpec {
 /// Backends construct this from their native packet representation and apply
 /// the staged mutations (`new_*`, `replace_tcp_options`,
 /// `append_tcp_options`, `bump_ipv4_ident`, `new_ipv4_ttl`,
-/// `corrupt_tcp_checksum_delta`, `emit_original_after`,
+/// `corrupt_tcp_checksum_delta`, `emit_original_after`, `decoy`,
 /// `ip_frag_payload_size`, `disorder_spec`) when the handler
 /// returns [`Verdict::AcceptModified`].
 #[derive(Debug, Clone)]
@@ -172,6 +202,13 @@ pub struct PacketView<'a> {
     /// ahead of the real ClientHello. Backends without dual-emission support
     /// (e.g. no raw socket on Linux) fall back to single modified emission.
     pub emit_original_after: bool,
+    /// Decoy packet to emit *before* the primary packet (data-stage chaining).
+    ///
+    /// Set by `fake_tls` when it is chained with another data-stage method:
+    /// the primary packet is then shaped by that method instead of being
+    /// forwarded untouched. `None` keeps the historical single-packet
+    /// emission model.
+    pub decoy: Option<DecoyPacket>,
     /// When the verdict is `AcceptModified`, split the rebuilt packet into
     /// IPv4 fragments whose IP payload (TCP header + TCP payload) is at most
     /// this many bytes, and emit the fragments instead of the whole packet.
@@ -197,6 +234,43 @@ pub struct PacketView<'a> {
 }
 
 impl PacketView<'_> {
+    /// Build the view used to rebuild the decoy packet.
+    ///
+    /// The decoy reuses the captured packet's IP/TCP headers and options but
+    /// takes its own sequence number, payload, flags, and IPv4 Identification
+    /// bump; every other staged mutation (including the primary packet's
+    /// shaping requests) is cleared so the decoy is always a single plain
+    /// segment.
+    pub fn decoy_view<'a>(&'a self, decoy: &DecoyPacket) -> PacketView<'a> {
+        PacketView {
+            direction: self.direction,
+            src_ip: self.src_ip,
+            dst_ip: self.dst_ip,
+            src_port: self.src_port,
+            dst_port: self.dst_port,
+            seq: self.seq,
+            ack: self.ack,
+            flags: self.flags,
+            payload_len: self.payload_len,
+            payload: self.payload,
+            tcp_options: self.tcp_options,
+            new_seq: Some(decoy.seq),
+            new_ack: None,
+            new_flags: Some(decoy.flags),
+            new_urgent_pointer: None,
+            new_payload: Some(decoy.payload.clone()),
+            replace_tcp_options: None,
+            append_tcp_options: Vec::new(),
+            bump_ipv4_ident: decoy.bump_ipv4_ident,
+            corrupt_tcp_checksum_delta: None,
+            emit_original_after: false,
+            decoy: None,
+            ip_frag_payload_size: None,
+            disorder_spec: None,
+            new_ipv4_ttl: None,
+        }
+    }
+
     /// True if this is a bare ACK (ACK set, no payload, no other control bits).
     pub fn is_bare_ack(&self) -> bool {
         self.flags.ack
@@ -363,13 +437,80 @@ mod tests {
             bump_ipv4_ident: false,
             corrupt_tcp_checksum_delta: None,
             emit_original_after: false,
+            decoy: None,
             ip_frag_payload_size: None,
             disorder_spec: None,
             new_ipv4_ttl: None,
             new_urgent_pointer: None,
         };
         assert!(!view.emit_original_after);
+        assert_eq!(view.decoy, None);
         assert_eq!(view.ip_frag_payload_size, None);
         assert_eq!(view.disorder_spec, None);
+    }
+
+    #[test]
+    fn decoy_view_overrides_payload_and_clears_shaping() {
+        let view = PacketView {
+            direction: Direction::Outbound,
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            dst_ip: Ipv4Addr::new(1, 2, 3, 4),
+            src_port: 12345,
+            dst_port: 443,
+            seq: 1001,
+            ack: 5001,
+            flags: TcpFlags::default(),
+            payload_len: 0,
+            payload: &[],
+            tcp_options: &[],
+            new_seq: Some(999),
+            new_ack: Some(1),
+            new_flags: None,
+            new_payload: Some(vec![0xFF]),
+            replace_tcp_options: None,
+            append_tcp_options: vec![1, 1, 1, 1],
+            bump_ipv4_ident: false,
+            corrupt_tcp_checksum_delta: Some(1),
+            emit_original_after: true,
+            decoy: None,
+            ip_frag_payload_size: Some(24),
+            disorder_spec: None,
+            new_ipv4_ttl: Some(5),
+            new_urgent_pointer: Some(2),
+        };
+        let decoy = DecoyPacket {
+            seq: 7,
+            payload: vec![0xAA, 0xBB],
+            flags: TcpFlags {
+                ack: true,
+                psh: true,
+                ..Default::default()
+            },
+            bump_ipv4_ident: true,
+            repeats: 2,
+            delay_ms: 5,
+        };
+
+        let decoy_view = view.decoy_view(&decoy);
+
+        assert_eq!(decoy_view.new_seq, Some(7));
+        assert_eq!(decoy_view.new_payload.as_deref(), Some(&[0xAA, 0xBB][..]));
+        assert!(decoy_view.new_flags.unwrap().psh);
+        assert!(decoy_view.bump_ipv4_ident);
+
+        // Everything that belongs to the primary packet is cleared.
+        assert_eq!(decoy_view.new_ack, None);
+        assert_eq!(decoy_view.new_ipv4_ttl, None);
+        assert_eq!(decoy_view.new_urgent_pointer, None);
+        assert!(decoy_view.append_tcp_options.is_empty());
+        assert_eq!(decoy_view.corrupt_tcp_checksum_delta, None);
+        assert!(!decoy_view.emit_original_after);
+        assert_eq!(decoy_view.decoy, None);
+        assert_eq!(decoy_view.ip_frag_payload_size, None);
+        assert_eq!(decoy_view.disorder_spec, None);
+
+        // The original view is untouched.
+        assert_eq!(view.new_seq, Some(999));
+        assert_eq!(view.ip_frag_payload_size, Some(24));
     }
 }

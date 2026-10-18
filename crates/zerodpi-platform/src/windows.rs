@@ -73,6 +73,33 @@ impl PacketInterceptor for WinDivertInterceptor {
                     // Don't send: WinDivert drops packets that aren't reinjected.
                 }
                 Verdict::AcceptModified => {
+                    // Data-stage chaining: emit the decoy copies before the
+                    // shaped real packet, so a DPI classifies the flow benign
+                    // before it sees the real ClientHello.
+                    if let Some(decoy) = view.decoy.as_ref() {
+                        let decoy_view = view.decoy_view(decoy);
+                        match build_modified(&packet.data, &layout, &decoy_view) {
+                            Ok(decoy_bytes) => {
+                                for _ in 0..decoy.repeats.max(1) {
+                                    let decoy_pkt = WinDivertPacket::<NetworkLayer> {
+                                        address: packet.address.clone(),
+                                        data: Cow::Owned(decoy_bytes.clone()),
+                                    };
+                                    if let Err(e) = self.divert.send(&decoy_pkt) {
+                                        debug!(error = %e, "decoy send failed");
+                                        break;
+                                    }
+                                }
+                                if decoy.delay_ms > 0 {
+                                    // Bounded by MAX_FAKE_TLS_CHAIN_DELAY_MS;
+                                    // default 0 never reaches this branch.
+                                    std::thread::sleep(Duration::from_millis(decoy.delay_ms));
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "decoy build failed; skipping decoy"),
+                        }
+                    }
+
                     let new_bytes = match build_modified(&packet.data, &layout, &view) {
                         Ok(b) => b,
                         Err(e) => {
@@ -287,6 +314,7 @@ fn parse_view<'a>(direction: Direction, buf: &'a [u8]) -> Result<(PacketView<'a>
         bump_ipv4_ident: false,
         corrupt_tcp_checksum_delta: None,
         emit_original_after: false,
+        decoy: None,
         ip_frag_payload_size: None,
         disorder_spec: None,
         new_ipv4_ttl: None,
@@ -429,6 +457,7 @@ mod tests {
             bump_ipv4_ident: true,
             corrupt_tcp_checksum_delta: Some(11),
             emit_original_after: false,
+            decoy: None,
             ip_frag_payload_size: None,
             disorder_spec: None,
             new_ipv4_ttl: None,

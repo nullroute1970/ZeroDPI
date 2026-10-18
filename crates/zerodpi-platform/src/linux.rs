@@ -183,12 +183,9 @@ impl PacketInterceptor for NfqInterceptor {
                                 msg.set_verdict(NfqVerdict::Accept);
                             }
                         }
-                    } else if let Some(spec) = view.disorder_spec {
-                        let segments = zerodpi_core::tcp_segment::split_tcp_payload(
-                            &new_bytes,
-                            spec.segments,
-                            spec.reverse,
-                        );
+                    } else if let Some(spec) = view.disorder_spec.as_ref() {
+                        let segments =
+                            zerodpi_core::tcp_segment::split_tcp_payload(&new_bytes, spec);
                         match &self.raw_socket {
                             Some(fd) if segments.len() > 1 => {
                                 // Emit the first segment synchronously; the
@@ -1625,14 +1622,16 @@ mod tests {
             total_len: buf.len(),
         };
         let mut view = make_view();
-        view.disorder_spec = Some(DisorderSpec {
+        let spec = DisorderSpec {
             segments: 2,
             reverse: true,
             delay_ms: 0,
-        });
+            overlap: None,
+        };
+        view.disorder_spec = Some(spec.clone());
 
         let out = build_modified(&buf, &layout, &view).unwrap();
-        let segments = split_tcp_payload(&out, 2, true);
+        let segments = split_tcp_payload(&out, &spec);
         assert_eq!(segments.len(), 2);
 
         // Reverse emission: the tail chunk (258 bytes) goes out first with

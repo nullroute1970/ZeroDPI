@@ -23,6 +23,7 @@ enum class ConfigSection(val title: String) {
     FakeTls("fake_tls"),
     IpFrag("ip_frag"),
     Disorder("disorder"),
+    Seqovl("seqovl"),
     UrgSniSplit("urg_sni_split"),
     SniBoundaryFrag("sni_boundary_frag"),
     TlsPadding("tls_padding"),
@@ -233,6 +234,7 @@ object ZeroDpiConfigSchema {
         "fake_tls",
         "ip_frag",
         "disorder",
+        "seqovl",
         "tls_frag",
         "ccs_prefix",
         "tls_padding",
@@ -911,6 +913,28 @@ object ZeroDpiConfigSchema {
             section = ConfigSection.Disorder, validationRule = "true or false.",
             rootImpact = ConfigRootImpact.PacketInterceptionOnly,
             helpText = "Re-chunk only the first outbound data packet (false = fragment-all)."),
+        field(name = "SEQOVL_SIZE", type = ConfigFieldType.OptionalText, defaultValue = "",
+            section = ConfigSection.Seqovl,
+            validationRule = "Empty, or 0-1024 (0 disables the overlap).",
+            rootImpact = ConfigRootImpact.PacketInterceptionOnly,
+            helpText = "Fake prefix bytes for seqovl; empty uses 32 for seqovl and off for disorder."),
+        field(name = "SEQOVL_PATTERN", type = ConfigFieldType.OptionalText, defaultValue = "",
+            section = ConfigSection.Seqovl,
+            validationRule = "Empty, or an even number of hex digits (e.g. 0x1603).",
+            rootImpact = ConfigRootImpact.PacketInterceptionOnly,
+            helpText = "Fixed overlap prefix; empty generates a random pattern per connection."),
+        field(name = "SEQOVL_SEGMENTS", type = ConfigFieldType.USize, defaultValue = "2",
+            section = ConfigSection.Seqovl, validationRule = "Must be 2 or 3.",
+            rootImpact = ConfigRootImpact.PacketInterceptionOnly,
+            helpText = "TCP segments the standalone seqovl method splits the packet into."),
+        field(name = "SEQOVL_REVERSE", type = ConfigFieldType.Boolean, defaultValue = "false",
+            section = ConfigSection.Seqovl, validationRule = "true or false.",
+            rootImpact = ConfigRootImpact.PacketInterceptionOnly,
+            helpText = "Emit seqovl segments in reverse order (false = portable ordered split)."),
+        field(name = "SEQOVL_DELAY_MS", type = ConfigFieldType.UInt64, defaultValue = "0",
+            section = ConfigSection.Seqovl, validationRule = "Must be <= 1000.",
+            rootImpact = ConfigRootImpact.PacketInterceptionOnly,
+            helpText = "Delay between seqovl segment emissions."),
         field(name = "SNI_SPLIT_DUMMY_BYTE", type = ConfigFieldType.UInt8, defaultValue = "0",
             section = ConfigSection.UrgSniSplit, validationRule = "0-255 integer.",
             rootImpact = ConfigRootImpact.PacketInterceptionOnly,
@@ -1079,6 +1103,9 @@ object ZeroDpiConfigToml {
                 "BYPASS_METHOD \"ip_frag\" cannot be combined with \"tls_record_frag\", \"fake_tls\", or \"urg_sni_split\"."
             has("disorder") && (has("tls_record_frag") || has("fake_tls") || has("ip_frag") || has("urg_sni_split")) ->
                 "BYPASS_METHOD \"disorder\" cannot be combined with \"tls_record_frag\", \"fake_tls\", \"ip_frag\", or \"urg_sni_split\"."
+            has("seqovl") &&
+                methods.any { it != "seqovl" && it in setOf("tls_record_frag", "fake_tls", "ip_frag", "disorder", "urg_sni_split", "sni_boundary_frag") } ->
+                "BYPASS_METHOD \"seqovl\" cannot be combined with \"tls_record_frag\", \"fake_tls\", \"ip_frag\", \"disorder\", \"urg_sni_split\", or \"sni_boundary_frag\"."
             else -> null
         }
     }
@@ -1401,7 +1428,7 @@ object ZeroDpiConfigToml {
             if (mode == "ip_bypass_plus") {
                 val allowed = setOf(
                     "tls_record_frag", "tls_frag", "tls_padding", "mixed_case_sni",
-                    "sni_boundary_frag", "ccs_prefix", "ip_frag", "disorder",
+                    "sni_boundary_frag", "ccs_prefix", "ip_frag", "disorder", "seqovl",
                 )
                 val rejected = methods.filter { it !in allowed }
                 if (rejected.isNotEmpty()) {
@@ -1453,6 +1480,35 @@ object ZeroDpiConfigToml {
         }
         whenValid("DISORDER_DELAY_MS") {
             requireField("DISORDER_DELAY_MS", config.integer("DISORDER_DELAY_MS") <= 1000, "DISORDER_DELAY_MS must be <= 1000.")
+        }
+        whenValid("SEQOVL_SIZE") {
+            val text = config.text("SEQOVL_SIZE").trim()
+            if (text.isNotEmpty()) {
+                val size = text.toLongOrNull()
+                requireField("SEQOVL_SIZE", size != null, "SEQOVL_SIZE must be an integer.")
+                if (size != null) {
+                    requireField("SEQOVL_SIZE", size <= 1024, "SEQOVL_SIZE must be <= 1024.")
+                }
+            }
+        }
+        whenValid("SEQOVL_PATTERN") {
+            val text = config.text("SEQOVL_PATTERN").trim()
+            if (text.isNotEmpty()) {
+                val digits = text.removePrefix("0x").removePrefix("0X")
+                    .filterNot { it == ':' || it == '-' || it == '_' || it == ' ' }
+                requireField(
+                    "SEQOVL_PATTERN",
+                    digits.isNotEmpty() && digits.length % 2 == 0 && digits.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' },
+                    "SEQOVL_PATTERN must be an even number of hex digits.",
+                )
+            }
+        }
+        whenValid("SEQOVL_SEGMENTS") {
+            val segments = config.integer("SEQOVL_SEGMENTS")
+            requireField("SEQOVL_SEGMENTS", segments == 2L || segments == 3L, "SEQOVL_SEGMENTS must be 2 or 3.")
+        }
+        whenValid("SEQOVL_DELAY_MS") {
+            requireField("SEQOVL_DELAY_MS", config.integer("SEQOVL_DELAY_MS") <= 1000, "SEQOVL_DELAY_MS must be <= 1000.")
         }
         whenValid("TLS_PADDING_SIZE") {
             validateIntegerRange(config.text("TLS_PADDING_SIZE"), min = 1)?.let {

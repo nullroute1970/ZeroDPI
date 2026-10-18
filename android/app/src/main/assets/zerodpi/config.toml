@@ -28,7 +28,7 @@ LISTEN_PORT = 44444
 #                      BYPASS_METHOD ("tls_record_frag", "tls_frag",
 #                      "tls_padding", "mixed_case_sni", "sni_boundary_frag",
 #                      "ccs_prefix",
-#                      "ip_frag", or "disorder").
+#                      "ip_frag", "disorder", or "seqovl").
 # - "sni_scan"      — scan sni_list.txt and display/save results, then exit.
 # - "ip_scan"       — scan ip_list.txt and display/save results, then exit.
 # - "proxy_scan"    — scan sni_list.txt (Phase 1), then test each working SNI
@@ -288,6 +288,26 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     data packet is re-chunked.  Requires WinDivert/NFQUEUE interception
 #     (Administrator/root, IPv4-only).
 #
+#   "seqovl"
+#     TCP Sequence Overlap.  Does NOT inject any fake packet and does NOT
+#     replace the real ClientHello bytes, so the SNI is preserved.  Instead,
+#     it intercepts the first outbound data packet, splits it into
+#     SEQOVL_SEGMENTS TCP segments with correct sequence numbers, and splices
+#     SEQOVL_SIZE fake bytes in front of the segment emitted first, rewinding
+#     that segment's TCP sequence number by the same amount.  The destination's
+#     TCP stack therefore still reconstructs the original stream (it trims the
+#     out-of-window prefix in the default ordered mode, or overwrites it in
+#     SEQOVL_REVERSE = true mode), while a DPI that reassembles the flow by
+#     concatenating segments sees the fake bytes inside the ClientHello and
+#     cannot extract the SNI.  Unlike the fake-packet family (wrong_seq, low_ttl,
+#     fake_tls) this needs no out-of-window decoy, so it keeps working on DPIs
+#     that validate TCP sequence numbers strictly.  Requires WinDivert/NFQUEUE
+#     interception (Administrator/root, IPv4-only).
+#
+#     SEQOVL_SIZE also acts as a "disorder" modifier: set it above zero and
+#     list "disorder" instead to get the same overlap on top of disorder's
+#     reverse-order segmentation (disorder keeps its own DISORDER_* settings).
+#
 #   "urg_sni_split"
 #     TCP Urgent + SNI byte splice.  Does NOT inject any fake packet.  Instead,
 #     it intercepts the first outbound data packet carrying the real TLS
@@ -357,6 +377,7 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   ["wrong_seq", "tls_frag"]         -> fake ClientHello + TCP-level fragmentation (default)
 #   ["wrong_md5", "tls_frag"]         -> TCP-MD5 fake ClientHello + TCP-level fragmentation
 #   ["wrong_seq", "tls_record_frag"]  -> fake ClientHello + TLS-record fragmentation
+#   ["wrong_seq", "seqovl"]           -> fake ClientHello + TCP sequence overlap (SNI preserved)
 #
 # Combining methods:
 #
@@ -381,7 +402,13 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   combines with handshake-stage fake-packet methods and with the
 #   socket-side methods, but is mutually exclusive with "tls_record_frag",
 #   "fake_tls", "ip_frag", and "urg_sni_split" (all own the first data
-#   packet).
+#   packet).  Setting SEQOVL_SIZE above zero adds a TCP sequence overlap to it.
+# - "seqovl" adds a data-stage TCP sequence overlap.  It combines with
+#   handshake-stage fake-packet methods and with the socket-side methods
+#   "tls_frag", "tls_padding", "mixed_case_sni", and "ccs_prefix", but is
+#   mutually exclusive with "tls_record_frag", "fake_tls", "ip_frag",
+#   "disorder", and "urg_sni_split" (all own the first data packet), and with
+#   "sni_boundary_frag".
 # - "tls_padding" adds a socket-side data stage: the real ClientHello is
 #   expanded with an RFC 7685 padding extension before it is written to the
 #   upstream socket.  It combines with handshake-stage methods and with
@@ -417,10 +444,12 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   "urg_sni_split".
 # - "disorder" cannot be combined with "tls_record_frag", "fake_tls",
 #   "ip_frag", or "urg_sni_split".
+# - "seqovl" cannot be combined with "tls_record_frag", "fake_tls",
+#   "ip_frag", "disorder", "urg_sni_split", or "sni_boundary_frag".
 # - MODE = "ip_bypass_plus" supports only "tls_record_frag", "tls_frag",
 #   "tls_padding", "mixed_case_sni", "sni_boundary_frag", "ccs_prefix",
-#   "ip_frag", or "disorder" so the upstream VPN client's real SNI is
-#   preserved.
+#   "ip_frag", "disorder", or "seqovl" so the upstream VPN client's real SNI
+#   is preserved.
 # - LOW_TTL_DISCOVER only takes effect when "low_ttl" is in the list;
 #   otherwise discovery is silently skipped.
 #
@@ -866,6 +895,87 @@ DISORDER_REVERSE = true
 #                   segment-hostile middlebox breaks the flow; use only when
 #                   the DPI inspects more than the first packet.
 DISORDER_ONLY_FIRST_PACKET = true
+
+# ---------------------------------------------------------------------------
+# seqovl method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "seqovl" (alone or combined with
+# handshake fake-packet methods and/or socket-side methods).
+#
+# Setting SEQOVL_SIZE (or SEQOVL_PATTERN) above zero also turns "disorder" into
+# a seqovl modifier: "disorder" keeps its own DISORDER_SEGMENTS /
+# DISORDER_REVERSE / DISORDER_DELAY_MS geometry and gains the same overlap.
+#
+# seqovl splits the outbound data packet carrying the ClientHello into
+# SEQOVL_SEGMENTS TCP segments and splices SEQOVL_SIZE fake bytes in front of
+# the segment emitted first, rewinding that segment's TCP sequence number by
+# the same amount.  The destination's TCP stack still rebuilds the original
+# stream, but a DPI that reassembles the flow sees the fake bytes inside the
+# ClientHello.  The real ClientHello bytes are untouched — the SNI is
+# preserved.
+
+# Number of fake prefix bytes.
+#
+# Leave this setting empty to use the built-in default: "seqovl" then uses 32
+# bytes with a random pattern, while "disorder" stays overlap-free.
+#
+#   0   — overlap disabled (with "seqovl" the payload is still split)
+#   N   — N fake bytes, 1 <= N <= 1024
+#
+# Larger prefixes garble more of the reassembled ClientHello for the DPI, at
+# the cost of one extra segment's worth of bytes on the wire.
+SEQOVL_SIZE = ""
+
+# Optional fixed overlap prefix, as a hex string.
+#
+# When empty (default), a fresh pseudo-random pattern is generated per
+# connection, which is harder for a DPI to fingerprint.  Set it only to replay
+# a specific pattern known to work on your network.
+#
+# When set, the pattern length also selects the overlap size if SEQOVL_SIZE is
+# empty, so this setting alone is enough to enable the overlap.  When both are
+# set they must agree, and the two bytes of a hex pair may be separated by
+# ":", "-", "_", or spaces for readability.
+#
+# Examples:  "0x1603",  "1603",  "de:ad:be:ef"
+SEQOVL_PATTERN = ""
+
+# Number of TCP segments the standalone "seqovl" method splits the first data
+# packet into.  Valid values: 2 or 3.  Default: 2.
+#
+# Ignored when the overlap is applied through "disorder", which keeps
+# DISORDER_SEGMENTS.
+SEQOVL_SEGMENTS = 2
+
+# Whether the standalone "seqovl" method emits its segments in reverse
+# (non-monotonic sequence-number) order.
+#
+# false (default) — ordered split: the fake prefix starts below the server's
+#                   rcv_nxt, so every TCP stack trims it.  This is the widely
+#                   portable variant.
+# true            — reverse split: the prefix lands inside the range covered by
+#                   the segment emitted afterwards, which overwrites it (Unix
+#                   hosts keep the last received copy).  More aggressive against
+#                   sequence-tracking DPIs, but servers that keep the first
+#                   received copy of overlapping data (notably Windows-hosted
+#                   servers) would see the corrupted stream.  The prefix must be
+#                   smaller than a segment for this to be used; otherwise it is
+#                   omitted and the split proceeds without overlap.
+#
+# Ignored when the overlap is applied through "disorder", which keeps
+# DISORDER_REVERSE.
+SEQOVL_REVERSE = false
+
+# Delay in milliseconds between standalone "seqovl" segment emissions.
+#
+# 0 (default) — emit all segments back-to-back.  Larger values widen the window
+# in which the DPI sees only part of the stream, at the cost of connection-setup
+# latency.  Must be <= 1000.
+#
+# Ignored when the overlap is applied through "disorder", which keeps
+# DISORDER_DELAY_MS.
+SEQOVL_DELAY_MS = 0
+
 # ---------------------------------------------------------------------------
 # urg_sni_split method parameters
 # ---------------------------------------------------------------------------

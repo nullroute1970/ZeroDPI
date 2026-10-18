@@ -11,7 +11,7 @@
 
 ## 1. Purpose and scope
 
-ZeroDPI currently ships 12 combinable bypass methods (see §3). This document
+ZeroDPI currently ships 17 combinable bypass methods (see §3). This document
 surveys the remaining techniques used by comparable open-source tools
 (ByeDPI, GoodbyeDPI, zapret) plus a few standards-backed ideas that those
 tools do not use, and assesses each one against ZeroDPI's two plugin
@@ -95,6 +95,7 @@ Windows, no NFQUEUE on Linux). Current members: `tls_frag`, `tls_padding`,
 | `sni_boundary_frag` | socket | split first record into two TCP segments cut at the SNI extension boundary, with delay |
 | `ccs_prefix` | socket | dummy ChangeCipherSpec record before the ClientHello; first-record DPIs see no SNI (RFC 8446 §4.1.3) |
 | `disorder` | interceptor, data stage | split the first data packet's payload into 2–3 TCP segments with correct sequence numbers and emit them in reverse order (optionally delayed); the server's kernel reassembles, sequence-tracking DPI sees non-monotonic segments |
+| `seqovl` | interceptor, data stage | splice fake bytes in front of the first emitted segment with a rewound sequence number; the destination trims or overwrites the prefix, while a flow-reassembling DPI reads fake bytes inside the ClientHello. Also a `disorder` modifier via `SEQOVL_SIZE` |
 
 Composites: `wrong_seq_wrong_md5`, `wrong_seq_tls_frag`,
 `wrong_md5_tls_frag`, `wrong_seq_tls_record_frag`, `wrong_seq_tls_padding`,
@@ -103,7 +104,8 @@ Composites: `wrong_seq_wrong_md5`, `wrong_seq_tls_frag`,
 
 **Gap summary:** the fake-packet injection family (ByeDPI `--wrong-seq`
 etc.) is fully covered; TCP segmentation (`tls_frag`), padding, and
-boundary splitting are covered. What is missing versus the comparable tools
+boundary splitting are covered; and `seqovl` (§4.7) now covers the
+sequence-overlap axis. What is missing versus the comparable tools
 is `fake_tls` variant B (socket-side forged record length) and record-level
 tricks such as `tls_record_split` and `tcp_opt_pad`.
 
@@ -399,6 +401,65 @@ composite lists, not a headline method.
 
 ---
 
+### 4.7 `seqovl` — TCP sequence overlap *(high value, moderate effort)*
+
+**Status (2026-09-30):** Implemented (`seqovl`, interceptor, data stage, plus
+a `disorder` modifier via `SEQOVL_SIZE`; ordered split by default, reverse
+split via `SEQOVL_REVERSE`; random per-connection prefix with an optional
+`SEQOVL_PATTERN` hex override). Config group: `SEQOVL_SIZE`,
+`SEQOVL_PATTERN`, `SEQOVL_SEGMENTS`, `SEQOVL_REVERSE`, `SEQOVL_DELAY_MS`.
+
+**Overview.** Split the first outbound data packet into 2–3 TCP segments and
+splice *N* fake bytes in front of the segment emitted first, rewinding that
+segment's TCP sequence number by *N*. The fake bytes therefore occupy the
+stream range immediately before the segment's real first byte.
+
+**Why it evades.** Everything else in the existing catalogue either relies on
+the DPI mis-parsing an individual packet (`ip_frag`, `tls_frag`,
+`sni_boundary_frag`, `disorder`) or on injecting a decoy that the server
+discards (`wrong_seq`, `low_ttl`, `fake_tls`). `seqovl` attacks the
+*reassembled* view instead: a DPI that concatenates segment payloads by
+sequence number reads the fake prefix spliced into the ClientHello, so the
+record length field and handshake header land in the wrong place and the SNI
+cannot be extracted. The destination's TCP stack still rebuilds the original
+stream, because the per-byte sequence-number rules discard the duplicate
+range:
+
+- **Ordered split** (`SEQOVL_REVERSE = false`): the prefix starts below the
+  server's `rcv_nxt`, so the kernel trims it. Portable to every stack,
+  including Windows-hosted servers.
+- **Reverse split**: the prefix lands inside the range covered by the segment
+  emitted afterwards, which overwrites it (Unix hosts keep the last received
+  copy). Requires `SEQOVL_SIZE` to be smaller than a segment. Zapret
+  documents that Windows-hosted servers keep the *first* copy instead, so this
+  variant is host-O/S-dependent.
+
+Crucially, `seqovl` keeps the real ClientHello bytes untouched and needs no
+out-of-window decoy. It therefore works on networks whose DPI validates TCP
+sequence numbers strictly — precisely where the whole fake-packet family
+degrades to a no-op — and it stays eligible for `MODE = "ip_bypass_plus"`
+because the SNI is preserved.
+
+**ZeroDPI integration.** Interceptor-side, data stage. Reuses the multi-packet
+emission plumbing introduced for `ip_frag`/`disorder`:
+`DisorderSpec` gained an `overlap: Option<OverlapFake>` field, and
+`tcp_segment::split_tcp_payload` splices the prefix and rewinds the sequence
+number of the first emitted segment. `seqovl` and `disorder` are the two
+`BypassMethod`s that stage it; the prefix is materialized from a
+per-connection `splitmix64` seed or from the configured hex pattern, so
+emission stays deterministic and testable.
+
+**Risks.** Middleboxes that drop overlapping segments fail the connection
+(bounded and recoverable by removing the method). The reverse variant does not
+work against Windows-hosted servers. Both are documented in `README.md` and
+`config.toml`.
+
+**References.** zapret `--dpi-desync-split-seqovl`,
+`--dpi-desync-split-seqovl-pattern` ("seqovl adds to one of the original
+segment seqovl bytes to the beginning and decreases sequence number").
+
+---
+
 ## 5. Marginal candidates (not recommended)
 
 | Candidate | Why not |
@@ -429,11 +490,12 @@ composite lists, not a headline method.
 | `ip_frag` | IP-layer fragmentation | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | medium* | high |
 | `ccs_prefix` | TLS middlebox compat | socket | everywhere | small — ✅ implemented | moderate |
 | `disorder` | out-of-order segmentation | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | medium–large* — ✅ implemented | moderate |
+| `seqovl` | TCP sequence overlap | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | medium* — ✅ implemented | high |
 | `tls_record_split` | record-level handshake split | socket | everywhere | small–medium | moderate |
 | `tcp_opt_pad` | TCP option junk | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | small | low |
 
 \* Requires the multi-packet emission infrastructure in the interceptor
-(implemented with `ip_frag`, reused by `disorder`).
+(implemented with `ip_frag`, reused by `disorder` and `seqovl`).
 
 ---
 
@@ -448,7 +510,9 @@ Build in this order:
 3. **`ip_frag`** — ✅ implemented, including the multi-packet emission
    plumbing, so `disorder` (4) becomes cheap follow-up.
 4. **`disorder`** — ✅ implemented (reuses the emission plumbing).
-5. **`tls_record_split`** / **`tcp_opt_pad`** — cheap additions once the
+5. **`seqovl`** — ✅ implemented (§4.7), both as a standalone method and as a
+   `disorder` modifier.
+6. **`tls_record_split`** / **`tcp_opt_pad`** — cheap additions once the
    pattern for socket-side and option-staging methods is established.
 
 Skip §5 entirely. Do not attempt §6.

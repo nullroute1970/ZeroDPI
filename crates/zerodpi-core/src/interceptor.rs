@@ -31,7 +31,67 @@ pub struct TcpFlags {
     pub urg: bool,
 }
 
-/// Staged out-of-order TCP segmentation request (`disorder` method).
+/// Fake prefix spliced in front of the first emitted TCP segment
+/// (`seqovl` method, and `disorder` when `SEQOVL_SIZE` is non-zero).
+///
+/// The segment's TCP sequence number is decremented by `bytes` so the fake
+/// prefix occupies the byte range immediately *before* the segment's real
+/// first byte. What the destination accepts therefore depends on the
+/// emission order:
+///
+/// - **Ordered split** (`reverse = false`): the prefix starts below the
+///   server's `rcv_nxt`, so the kernel trims it and the real bytes are
+///   accepted unchanged.
+/// - **Reverse split** (`reverse = true`): the prefix lands inside the range
+///   covered by the segment emitted *after* it, which then overwrites it
+///   (Unix hosts keep the last received copy). This is why the reverse mode
+///   requires `bytes` to be smaller than the following segment.
+///
+/// A DPI that reassembles segments by concatenating payloads sees the fake
+/// prefix spliced into the ClientHello and cannot recover the SNI, while the
+/// destination's TCP stack reconstructs the original stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlapFake {
+    /// Number of fake bytes prepended to emission-order segment 0.
+    pub bytes: usize,
+    /// Fixed prefix bytes. `None` means a pseudo-random pattern derived from
+    /// `seed`, refreshed per packet.
+    pub pattern: Option<Arc<[u8]>>,
+    /// Seed for the pseudo-random pattern. Ignored when `pattern` is set.
+    pub seed: u64,
+}
+
+impl OverlapFake {
+    /// Produce exactly `bytes` fake prefix bytes.
+    ///
+    /// A configured `pattern` is used verbatim (clamped to `bytes`); without
+    /// one the bytes come from a `splitmix64` stream seeded by `seed`, so the
+    /// same spec always yields the same prefix and the emission path stays
+    /// deterministic and testable.
+    pub fn materialize(&self) -> Vec<u8> {
+        if let Some(pattern) = &self.pattern {
+            let mut out = Vec::with_capacity(self.bytes);
+            out.extend_from_slice(pattern);
+            out.resize(self.bytes, 0);
+            return out;
+        }
+
+        let mut out = Vec::with_capacity(self.bytes);
+        let mut state = self.seed;
+        while out.len() < self.bytes {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let take = (self.bytes - out.len()).min(8);
+            out.extend_from_slice(&z.to_le_bytes()[..take]);
+        }
+        out
+    }
+}
+
+/// Staged TCP segmentation request (`disorder` and `seqovl` methods).
 ///
 /// The backend splits the rebuilt packet's TCP payload into `segments`
 /// non-empty equal chunks, advances each chunk's TCP sequence number by its
@@ -40,7 +100,10 @@ pub struct TcpFlags {
 /// the capture loop; the remaining segments are injected by a short-lived
 /// background thread sleeping `delay_ms` between sends, so the capture loop
 /// never blocks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// When `overlap` is set, the first emitted segment additionally carries the
+/// fake prefix described by [`OverlapFake`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisorderSpec {
     /// Number of segments to split the payload into (2 or 3).
     pub segments: usize,
@@ -48,6 +111,8 @@ pub struct DisorderSpec {
     pub reverse: bool,
     /// Delay in milliseconds between consecutive segment emissions.
     pub delay_ms: u64,
+    /// Optional fake prefix spliced in front of the first emitted segment.
+    pub overlap: Option<OverlapFake>,
 }
 
 /// A read/write view of a captured TCP/IPv4 packet.

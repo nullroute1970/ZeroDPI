@@ -17,6 +17,16 @@
 //! platform backend splits the rebuilt packet and emits the segments. The
 //! real ClientHello bytes are untouched — the SNI is preserved.
 //!
+//! ## `seqovl` modifier
+//!
+//! When `SEQOVL_SIZE` (or `SEQOVL_PATTERN`) is configured, `disorder` also
+//! splices a fake prefix in front of the segment it emits first and rewinds
+//! that segment's TCP sequence number by the prefix length — the TCP sequence
+//! overlap of [`super::seqovl`]. The destination still reconstructs the
+//! original stream, but a DPI that reassembles the flow sees the fake bytes
+//! inside the ClientHello. `disorder` keeps its own `DISORDER_*` geometry and
+//! emission order in this mode; see `SEQOVL_*` for the prefix itself.
+//!
 //! ## Configuration
 //!
 //! | Key | Type | Default | Description |
@@ -25,13 +35,14 @@
 //! | `DISORDER_DELAY_MS` | `u64` | `0` | Delay between segment emissions. |
 //! | `DISORDER_REVERSE` | `bool` | `true` | Emit segments in reverse order. |
 //! | `DISORDER_ONLY_FIRST_PACKET` | `bool` | `true` | Re-chunk only the first data packet. |
+//! | `SEQOVL_SIZE` / `SEQOVL_PATTERN` | see config | unset | Optional fake prefix (see the `seqovl` modifier above). |
 
 use tracing::trace;
 
-use super::{BypassMethod, MethodAction};
+use super::{seqovl, BypassMethod, MethodAction};
 use crate::config::Config;
 use crate::flow::FlowState;
-use crate::interceptor::{DisorderSpec, PacketView};
+use crate::interceptor::{DisorderSpec, OverlapFake, PacketView};
 
 pub struct Disorder {
     /// Number of segments to split each data packet into (2 or 3).
@@ -43,6 +54,8 @@ pub struct Disorder {
     /// `false` = fragment-all mode: keep re-chunking every outbound data
     /// packet until the connection closes.
     only_first_packet: bool,
+    /// Optional `seqovl` prefix spliced in front of the first emitted segment.
+    overlap: Option<OverlapFake>,
 }
 
 impl Disorder {
@@ -52,6 +65,9 @@ impl Disorder {
             reverse: cfg.DISORDER_REVERSE,
             delay_ms: cfg.DISORDER_DELAY_MS,
             only_first_packet: cfg.DISORDER_ONLY_FIRST_PACKET,
+            // `0` as the fallback keeps `disorder` byte-identical to its old
+            // behaviour unless the operator opts into the overlap.
+            overlap: seqovl::overlap_from_config(cfg, 0),
         }
     }
 }
@@ -80,12 +96,14 @@ impl BypassMethod for Disorder {
                 segments: self.segments,
                 reverse: self.reverse,
                 delay_ms: self.delay_ms,
+                overlap: self.overlap.clone(),
             });
             trace!(
                 target = "zerodpi::disorder",
                 segments = self.segments,
                 reverse = self.reverse,
                 delay_ms = self.delay_ms,
+                overlap_bytes = self.overlap.as_ref().map(|o| o.bytes).unwrap_or(0),
                 payload_len = pkt.payload_len,
                 only_first_packet = self.only_first_packet,
                 "staged out-of-order TCP segmentation"
@@ -188,6 +206,7 @@ mod tests {
                 segments: 2,
                 reverse: true,
                 delay_ms: 0,
+                overlap: None,
             })
         );
         assert!(pkt.new_payload.is_none()); // real ClientHello bytes untouched
@@ -220,6 +239,7 @@ mod tests {
                 segments: 3,
                 reverse: true,
                 delay_ms: 0,
+                overlap: None,
             })
         );
     }
@@ -240,6 +260,7 @@ mod tests {
                 segments: 2,
                 reverse: false,
                 delay_ms: 0,
+                overlap: None,
             })
         );
     }
@@ -260,6 +281,7 @@ mod tests {
                 segments: 2,
                 reverse: true,
                 delay_ms: 15,
+                overlap: None,
             })
         );
     }
@@ -303,5 +325,34 @@ mod tests {
             }
         );
         assert_eq!(pkt.disorder_spec, None);
+    }
+
+    #[test]
+    fn seqovl_modifier_is_off_by_default() {
+        let state = FlowState::new(vec![], None);
+        let payload: &'static [u8] = Box::leak(vec![0u8; 517].into_boxed_slice());
+        let mut pkt = data_pkt(payload);
+
+        Disorder::new(&default_cfg()).on_first_data_packet(&state, &mut pkt);
+
+        assert_eq!(pkt.disorder_spec.as_ref().unwrap().overlap, None);
+    }
+
+    #[test]
+    fn seqovl_modifier_is_staged_when_size_is_set() {
+        let mut cfg = default_cfg();
+        cfg.SEQOVL_SIZE = Some(16);
+        let state = FlowState::new(vec![], None);
+        let payload: &'static [u8] = Box::leak(vec![0u8; 517].into_boxed_slice());
+        let mut pkt = data_pkt(payload);
+
+        Disorder::new(&cfg).on_first_data_packet(&state, &mut pkt);
+
+        let spec = pkt.disorder_spec.as_ref().unwrap();
+        // disorder keeps its own segmentation geometry and emission order.
+        assert_eq!(spec.segments, 2);
+        assert!(spec.reverse);
+        assert_eq!(spec.delay_ms, 0);
+        assert_eq!(spec.overlap.as_ref().unwrap().bytes, 16);
     }
 }

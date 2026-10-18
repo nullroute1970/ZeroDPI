@@ -52,7 +52,7 @@ It is not a replacement VPN client. It is a local TCP relay that your existing V
 
 | Feature | Description |
 |---------|-------------|
-| 🧩 **16 combinable bypass methods** | `wrong_seq`, `wrong_ack`, `wrong_checksum`, `wrong_md5`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `urg_sni_split`, `sni_boundary_frag`, `ccs_prefix` — combinable via `BYPASS_METHOD = ["wrong_seq", "tls_frag"]` |
+| 🧩 **17 combinable bypass methods** | `wrong_seq`, `wrong_ack`, `wrong_checksum`, `wrong_md5`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`, `seqovl`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `urg_sni_split`, `sni_boundary_frag`, `ccs_prefix` — combinable via `BYPASS_METHOD = ["wrong_seq", "tls_frag"]` |
 | 🎯 **8 operating modes** | `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan`, `sni_method_scan`, `ip_method_scan` |
 | 🖥️ **TUI dashboard** | Ratatui-powered live progress, selection tables, and connection monitoring |
 | 🔄 **Auto-rescan** | Background re-scanning hot-swaps the best target without restart |
@@ -226,7 +226,7 @@ Copy or deploy the whole generated directory, not only the binary.
 |------|------------------|-------|
 | Bypass DPI for a TLS VPN behind a CDN | `sni_spoof` | Best default. Scans SNI candidates, selects an SNI/IP pair, then relays VPN traffic. |
 | Use a scanned relay IP without SNI spoofing | `ip_bypass` | No packet interception. Useful when you have IPs or CIDR ranges to test directly. |
-| Use a scanned IPv4 plus real-SNI fragmentation | `ip_bypass_plus` | Preserves the VPN client's real SNI; supports only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, or `disorder`. |
+| Use a scanned IPv4 plus real-SNI fragmentation | `ip_bypass_plus` | Preserves the VPN client's real SNI; supports only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, `disorder`, or `seqovl`. |
 | Audit SNI candidates only | `sni_scan` | Runs the SNI scanner, displays or saves results, then exits. |
 | Audit IP/CIDR candidates only | `ip_scan` | Runs the IP scanner, displays or saves results, then exits. |
 | Measure real VPN performance through an existing SOCKS5 client | `proxy_scan` | Tests candidates through V2RayN/sing-box and blends scanner score with end-to-end proxy results. |
@@ -240,7 +240,7 @@ Mode-specific inputs:
 |------|:---:|:---:|:---:|:---:|
 | `sni_spoof` | Yes, unless `SELECTED_SNI` is set | No | Yes | Yes |
 | `ip_bypass` | No | Yes, unless `SELECTED_IP` is set | Yes | No |
-| `ip_bypass_plus` | No | Yes, unless `SELECTED_IP` is set | Yes | Yes, only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, or `disorder` |
+| `ip_bypass_plus` | No | Yes, unless `SELECTED_IP` is set | Yes | Yes, only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, `disorder`, or `seqovl` |
 | `sni_scan` | Yes | No | No | No relay; scan only |
 | `ip_scan` | No | Yes | No | No |
 | `proxy_scan` | Yes | No | Temporary per-candidate tests | Yes, except standalone proxy scoring still depends on your SOCKS5 proxy |
@@ -280,7 +280,7 @@ No packet interception, no SNI manipulation. Scans a list of IPs (or CIDR ranges
 
 ### 3️⃣ `ip_bypass_plus` — IP Relay Plus Real-SNI Fragmentation
 
-Scans an IPv4 list, selects a target, then relays the VPN client's real TLS stream while applying a bypass method that does not inject or replace SNI. Use `BYPASS_METHOD = "tls_record_frag"` for TLS-record fragmentation with WinDivert/NFQUEUE, `BYPASS_METHOD = "ip_frag"` for IP-layer fragmentation with WinDivert/NFQUEUE, `BYPASS_METHOD = "disorder"` for out-of-order TCP segmentation with WinDivert/NFQUEUE, or `BYPASS_METHOD = "tls_frag"` / `BYPASS_METHOD = "tls_padding"` / `BYPASS_METHOD = "mixed_case_sni"` / `BYPASS_METHOD = "sni_boundary_frag"` / `BYPASS_METHOD = "ccs_prefix"` for socket-only transforms.
+Scans an IPv4 list, selects a target, then relays the VPN client's real TLS stream while applying a bypass method that does not inject or replace SNI. Use `BYPASS_METHOD = "tls_record_frag"` for TLS-record fragmentation with WinDivert/NFQUEUE, `BYPASS_METHOD = "ip_frag"` for IP-layer fragmentation with WinDivert/NFQUEUE, `BYPASS_METHOD = "disorder"` for out-of-order TCP segmentation with WinDivert/NFQUEUE, `BYPASS_METHOD = "seqovl"` for a TCP sequence overlap with WinDivert/NFQUEUE, or `BYPASS_METHOD = "tls_frag"` / `BYPASS_METHOD = "tls_padding"` / `BYPASS_METHOD = "mixed_case_sni"` / `BYPASS_METHOD = "sni_boundary_frag"` / `BYPASS_METHOD = "ccs_prefix"` for socket-only transforms.
 
 ```
 🖥️ Local apps → 🌐 VPN App → 🔄 ZeroDPI (ip_bypass_plus) → 🌍 Selected IPv4 :443
@@ -350,6 +350,7 @@ Methods are ranked by **success rate (desc), then average TTFB (asc)** — metho
 | `fake_tls` | Decoy TLS Record Injection: emits a decoy ClientHello record (whitelisted SNI) with an out-of-window TCP sequence number at the first data packet; record-parsing DPI sees only the decoy | ✅ Yes (WinDivert/NFQUEUE) | DPI that tracks TCP correctly but parses only TLS records |
 | `ip_frag` | IP-Layer Fragment: splits the first outbound data packet (the real ClientHello) into small IPv4 fragments the server's kernel reassembles but fragmentation-blind DPI cannot read | ✅ Yes (WinDivert/NFQUEUE) | DPI that does not reassemble IP fragments |
 | `disorder` | Out-of-Order TCP Segmentation: splits the first outbound data packet (the real ClientHello) into 2–3 TCP segments with correct sequence numbers and emits them in reverse order, optionally delayed, so the server's kernel reassembles the stream while sequence-tracking DPI sees non-monotonic segments and no complete ClientHello | ✅ Yes (WinDivert/NFQUEUE) | DPI that tracks per-flow sequence state or inspects only the first segment |
+| `seqovl` | TCP Sequence Overlap: splits the first outbound data packet into 2–3 TCP segments and splices fake bytes in front of the first emitted segment with a rewound sequence number, so the server's stack trims or overwrites the prefix while stream-reassembling DPI reads fake bytes inside the ClientHello; the real SNI is preserved. `SEQOVL_SIZE` also adds the overlap to `disorder` | ✅ Yes (WinDivert/NFQUEUE) | DPI that reassembles the flow and parses all records, including DPIs that reject out-of-window decoys |
 | `urg_sni_split` | Splicing a dummy byte into the middle of the real SNI and marking it with the TCP URG flag, so the server strips the byte while DPI reads a mangled name | ✅ Yes | Byte-scanning stateless DPI that ignores TCP urgent data |
 | `tls_frag` | TLS Fragment: writes selected client data in small TCP chunks without changing TLS bytes | ❌ No | DPI that inspects individual TCP segments |
 | `tls_padding` | TLS ClientHello Padding Expansion: inserts an RFC 7685 padding extension into the real ClientHello so the SNI lands past the DPI's inspection window (before SNI by default) or the record exceeds its buffer (after) | ❌ No | DPI that inspects only the first N bytes of the stream |
@@ -375,6 +376,7 @@ discards, or the server reassembles a stream the DPI cannot.
 | `fake_tls` | The decoy is a well-formed TLS record, so a record-parsing DPI sees a complete benign ClientHello as the first record; the out-of-window sequence number makes the server discard it, and the genuine ClientHello follows |
 | `ip_frag` | The destination kernel reassembles IPv4 fragments before the TLS stack sees them; a DPI that does not reassemble fragments (or gives up after a short budget) never reads a complete ClientHello |
 | `disorder` | The destination kernel reorders TCP segments; a DPI that tracks per-flow sequence state or inspects only the first segment sees non-monotonic segments and no complete ClientHello |
+| `seqovl` | The destination trims (ordered split) or overwrites (reverse split) the fake prefix because of TCP sequence-number rules, so its stream is the original ClientHello; a DPI that reassembles segments by concatenating payloads splices the fake bytes into the ClientHello and loses the SNI. Unlike the fake-packet family it needs no out-of-window decoy, so strict sequence validation does not defeat it |
 | `urg_sni_split` | The server's TCP stack strips the urgent byte, so its TLS stream is the original ClientHello; a DPI reading raw bytes sees a mangled SNI |
 | `tls_frag` | The TLS bytes are unchanged, but a DPI that inspects individual TCP segments never sees the full ClientHello in a single segment |
 | `tls_padding` | The server skips the unknown RFC 7685 padding extension and parses the SNI normally; the padding pushes the SNI bytes past the DPI's inspection window or record buffer |
@@ -397,6 +399,8 @@ packet → data-stage transform → socket-side transform.
 | `["wrong_seq", "tls_frag"]` | Wrong-sequence fake ClientHello, then TCP-level fragmentation of the real client data |
 | `["wrong_md5", "tls_frag"]` | TCP-MD5 fake ClientHello, then TCP-level fragmentation of the real client data |
 | `["wrong_seq", "tls_record_frag"]` | Wrong-sequence fake ClientHello, then TLS-record fragmentation of the real ClientHello |
+| `["wrong_seq", "seqovl"]` | Wrong-sequence fake ClientHello, then a TCP sequence overlap on the real ClientHello (nothing is replaced, the SNI is preserved) |
+| `BYPASS_METHOD = "disorder"` + `SEQOVL_SIZE` | Reverse-order segmentation with the same sequence overlap applied to the first emitted segment |
 
 ### 🚫 Combination Rules
 
@@ -408,8 +412,9 @@ packet → data-stage transform → socket-side transform.
 | `fake_tls` | Cannot be combined with `tls_record_frag` or `urg_sni_split` |
 | `ip_frag` | Cannot be combined with `tls_record_frag`, `fake_tls`, or `urg_sni_split` |
 | `disorder` | Cannot be combined with `tls_record_frag`, `fake_tls`, `ip_frag`, or `urg_sni_split` |
+| `seqovl` | Cannot be combined with `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`, `urg_sni_split`, or `sni_boundary_frag` (each owns the first data packet); setting `SEQOVL_SIZE` on a `disorder` list is the supported way to combine the two. It does combine with the handshake fake-packet methods and with `tls_frag`, `tls_padding`, `mixed_case_sni`, and `ccs_prefix` |
 | `ccs_prefix` | Combines with every method except `urg_sni_split` (which keeps its existing restriction); included in the `ip_bypass_plus` real-SNI whitelist |
-| `ip_bypass_plus` | Supports only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, or `ip_frag` so the VPN client's real SNI is preserved |
+| `ip_bypass_plus` | Supports only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, `disorder`, or `seqovl` so the VPN client's real SNI is preserved |
 | `LOW_TTL_DISCOVER` | Only takes effect when `low_ttl` is in the list; otherwise discovery is silently skipped |
 
 ### 🧩 How a Combination Executes
@@ -424,10 +429,10 @@ behavior (`wait for ACK` vs `complete immediately`) comes from the **last**
 listed handshake method.
 
 **2. Data stage — first-data-packet methods.** Each of `tls_record_frag`,
-`fake_tls`, `ip_frag`, and `disorder` owns the first data packet, which is
-why they are mutually exclusive with one another. They combine with the
-handshake-stage fake-packet methods and with the socket-side methods below.
-`tls_record_frag` and/or `tls_frag` add the data stage after the fake
+`fake_tls`, `ip_frag`, `disorder`, and `seqovl` owns the first data packet,
+which is why they are mutually exclusive with one another. They combine with
+the handshake-stage fake-packet methods and with the socket-side methods
+below. `tls_record_frag` and/or `tls_frag` add the data stage after the fake
 packet.
 
 **3. Socket-side transforms.** `tls_padding` expands the real ClientHello
@@ -439,7 +444,7 @@ ChangeCipherSpec record as the very first upstream bytes.
 
 **4. Interceptor requirement.** A list containing any interceptor method
 (fake-packet family, `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`,
-or `urg_sni_split`) still uses packet interception; a list containing only
+`seqovl`, or `urg_sni_split`) still uses packet interception; a list containing only
 `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, and/or
 `ccs_prefix` skips the interceptor entirely.
 
@@ -474,12 +479,14 @@ to stronger or more specific methods only when needed.
 | DPI classifies flows on the first TLS record only | `ccs_prefix` |
 | DPI reassembles TLS records but not IP fragments | `ip_frag` (increase `IP_FRAG_SIZE` for DPI with a small reassembly budget) |
 | DPI reassembles IP fragments but chokes on out-of-order TCP segments | `disorder` (tune `DISORDER_SEGMENTS` / `DISORDER_DELAY_MS`) |
+| DPI reassembles the whole TCP flow and parses every record, so packet tricks and fragmentation do not help | `seqovl` (the fake prefix corrupts the reassembled stream; tune `SEQOVL_SIZE`), or `["disorder", ...]` with `SEQOVL_SIZE` set |
+| DPI reassembles the flow *and* rejects out-of-window decoys, so the fake-packet family fails | `seqovl` — it needs no decoy and keeps the real SNI |
 
 ### 4️⃣ Preserve the Real SNI
 
 | Situation | Try |
 |-----------|-----|
-| You need a scanned IPv4 target but must preserve the VPN client's real SNI | `MODE = "ip_bypass_plus"` with `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, or `disorder` |
+| You need a scanned IPv4 target but must preserve the VPN client's real SNI | `MODE = "ip_bypass_plus"` with `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, `disorder`, or `seqovl` |
 | You only need the fastest reachable IP and not SNI spoofing | `MODE = "ip_bypass"` |
 
 ### 5️⃣ Layer Two Methods
@@ -547,6 +554,18 @@ to stronger or more specific methods only when needed.
   URG flag. The destination server's TCP stack extracts the urgent byte, so
   its TLS stream is the original ClientHello; DPI that reads raw bytes sees
   a mangled SNI.
+- `seqovl` requires Administrator/root (WinDivert/NFQUEUE) and is
+  IPv4-only. It keeps the real ClientHello bytes and only changes how the
+  flow is segmented on the wire: the first emitted segment gains
+  `SEQOVL_SIZE` fake bytes and a sequence number rewound by the same amount.
+  In the default ordered mode (`SEQOVL_REVERSE = false`) the prefix falls
+  below the server's `rcv_nxt` and every TCP stack trims it, so this variant
+  also works against Windows-hosted servers. The reverse variant requires the
+  prefix to be smaller than a segment and relies on last-received-wins
+  overlap handling, which Windows-hosted servers do not provide. Setting
+  `SEQOVL_SIZE` above zero with `disorder` in the list applies the same
+  overlap to disorder's reverse-order segmentation (it keeps the
+  `DISORDER_*` settings).
 
 **Socket-side methods (no packet interception):**
 
@@ -688,7 +707,7 @@ IP_SCAN_SNI = "cloudflare.com"
 AUTO_SELECT = true
 ```
 
-For TLS-record fragmentation instead, set `BYPASS_METHOD = "tls_record_frag"` and run with packet interception privileges. For IP-layer fragmentation, set `BYPASS_METHOD = "ip_frag"` and run with packet interception privileges. For out-of-order TCP segmentation, set `BYPASS_METHOD = "disorder"` and run with packet interception privileges. For a socket-only padding transform, set `BYPASS_METHOD = "tls_padding"`.
+For TLS-record fragmentation instead, set `BYPASS_METHOD = "tls_record_frag"` and run with packet interception privileges. For IP-layer fragmentation, set `BYPASS_METHOD = "ip_frag"` and run with packet interception privileges. For out-of-order TCP segmentation, set `BYPASS_METHOD = "disorder"` and run with packet interception privileges. For a TCP sequence overlap (fake bytes spliced into the reassembled ClientHello without replacing it), set `BYPASS_METHOD = "seqovl"` and run with packet interception privileges. For a socket-only padding transform, set `BYPASS_METHOD = "tls_padding"`.
 
 ### 📌 Fixed Candidate After a Successful Scan
 
@@ -824,7 +843,7 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `BYPASS_METHOD` | `string` or array of strings | `["wrong_seq", "tls_frag"]` | One or more of `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `urg_sni_split`, `sni_boundary_frag`, `ccs_prefix`; combinations are written as lists (see "Combining Bypass Methods"); `ip_bypass_plus` allows only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, or `disorder` |
+| `BYPASS_METHOD` | `string` or array of strings | `["wrong_seq", "tls_frag"]` | One or more of `wrong_seq`, `wrong_checksum`, `wrong_md5`, `wrong_ack`, `wrong_timestamp`, `low_ttl`, `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`, `seqovl`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `urg_sni_split`, `sni_boundary_frag`, `ccs_prefix`; combinations are written as lists (see "Combining Bypass Methods"); `ip_bypass_plus` allows only `tls_record_frag`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, `disorder`, or `seqovl` |
 | `BYPASS_TIMEOUT_SECS` | `u64` | `20` | Time to wait for bypass setup before giving up |
 | `RELAY_MAX_LIFETIME_SECS` | `u64` | `0` | Rotate established relays after this many seconds (`0` = disabled/default) |
 | `NFQUEUE_NUM` | `u16` | `1` | (Linux) NFQUEUE queue number |
@@ -938,6 +957,25 @@ outbound data packet until the connection closes.
 In a `["wrong_seq", "disorder"]` combination, both the `wrong_seq` and
 `disorder` parameter groups apply.
 
+#### `seqovl` Parameters
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `SEQOVL_SIZE` | `usize` | unset | Fake prefix bytes spliced in front of the first emitted segment. Unset means `32` for `seqovl` and *disabled* for the `disorder` modifier; `0` disables the overlap everywhere (the split still happens). Max `1024` |
+| `SEQOVL_PATTERN` | hex string | unset (random) | Fixed prefix, e.g. `"0x1603"`, `"1603"`, or `"de:ad:be:ef"`. Unset means a fresh pseudo-random pattern per connection. When set, its length also selects the overlap size if `SEQOVL_SIZE` is unset; when both are set they must match |
+| `SEQOVL_SEGMENTS` | `usize` | `2` | Number of segments (`2`–`3`) for the standalone method |
+| `SEQOVL_REVERSE` | `bool` | `false` | Reverse (non-monotonic) emission order. `false` is the portable variant: the prefix falls below the server's `rcv_nxt` and every stack trims it |
+| `SEQOVL_DELAY_MS` | `u64` | `0` | Delay between segment emissions in ms (max `1000`) |
+
+`SEQOVL_SEGMENTS`, `SEQOVL_REVERSE`, and `SEQOVL_DELAY_MS` apply only to the
+standalone `seqovl` method. `SEQOVL_SIZE` and `SEQOVL_PATTERN` apply to both
+surfaces: listing `disorder` with `SEQOVL_SIZE` above zero adds the same
+overlap to `disorder`, which keeps its `DISORDER_SEGMENTS`,
+`DISORDER_REVERSE`, and `DISORDER_DELAY_MS` geometry.
+
+In a `["wrong_seq", "seqovl"]` combination, both the `wrong_seq` and
+`seqovl` parameter groups apply.
+
 #### `urg_sni_split` Parameters
 
 | Field | Type | Default | Description |
@@ -1032,7 +1070,7 @@ The JSON report written to `METHOD_SCAN_OUTPUT` contains:
 }
 ```
 
-> ⚠️ Interceptor-based methods (`wrong_seq`, `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`, `low_ttl`, `urg_sni_split`, …) need **Administrator/root** privileges (WinDivert on Windows, NFQUEUE on Linux/Android) exactly like the normal bypass modes. Without privileges, each such method fails with an explanatory `last_error` in the report, while socket-only methods (`tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`) still test fine.
+> ⚠️ Interceptor-based methods (`wrong_seq`, `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`, `seqovl`, `low_ttl`, `urg_sni_split`, …) need **Administrator/root** privileges (WinDivert on Windows, NFQUEUE on Linux/Android) exactly like the normal bypass modes. Without privileges, each such method fails with an explanatory `last_error` in the report, while socket-only methods (`tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`) still test fine.
 
 > 🔌 Platform impact: no changes to NFQUEUE/WinDivert behavior. Method scans open the packet interceptor once per method with a 200 ms gap between methods, the same pattern as `proxy_scan`.
 
@@ -1457,11 +1495,12 @@ On Android, `tls_frag`, `tls_padding`, or `ccs_prefix` are the simplest methods 
 ### 📱 Android app
 
 The Android app exposes the full core configuration: all eight operating
-modes (including `sni_method_scan` / `ip_method_scan`), all sixteen base
+modes (including `sni_method_scan` / `ip_method_scan`), all seventeen base
 bypass methods as a multi-select list (`BYPASS_METHOD`), and every
 per-method parameter group (`low_ttl`, `fake_tls`, `ip_frag`, `disorder`,
-`urg_sni_split`, `sni_boundary_frag`, `tls_padding`, `mixed_case_sni`,
-`ccs_prefix`) under Configure → Advanced. When a method-scan mode is
+`seqovl`, `urg_sni_split`, `sni_boundary_frag`, `tls_padding`,
+`mixed_case_sni`, `ccs_prefix`) under Configure → Advanced. When a
+method-scan mode is
 selected, the Home tab shows live progress and a ranked results table
 read from `METHOD_SCAN_OUTPUT` (auto-filled to `method_scan_output.json`
 in the profile runtime directory when left blank). Socket-only methods
@@ -1656,7 +1695,7 @@ Unit tests cover:
 - 🗒️ ZeroDPI does not create candidate lists for you. Good results depend heavily on SNI/IP candidates that make sense for your network and upstream service.
 - ⏩ `SELECTED_SNI` skips probing. It can start faster, but it will not tell you whether the resolved edge is currently healthy.
 - 🛡️ `ip_bypass` does not spoof SNI. It relays the upstream VPN client's original TLS bytes to the selected IP.
-- ✂️ `ip_bypass_plus` also preserves the upstream VPN client's original SNI, but can fragment, pad, randomize the SNI case, boundary-split, or reorder the first real ClientHello with `tls_record_frag`, `ip_frag`, `disorder`, `tls_frag`, `tls_padding`, `mixed_case_sni`, or `sni_boundary_frag`.
+- ✂️ `ip_bypass_plus` also preserves the upstream VPN client's original SNI, but can fragment, pad, randomize the SNI case, boundary-split, reorder, or sequence-overlap the first real ClientHello with `tls_record_frag`, `ip_frag`, `disorder`, `seqovl`, `tls_frag`, `tls_padding`, `mixed_case_sni`, or `sni_boundary_frag`.
 - ⏱️ `wrong_timestamp` requires TCP timestamps to be negotiated by the host OS on the upstream connection. If the intercepted ACK has no Timestamp option, ZeroDPI aborts that bypass attempt.
 - ⚡ Very aggressive fragmentation (`TLS_FRAG_LENGTH = "1"` or `TLS_RECORD_FRAG_SIZE = 1`) can add overhead during connection setup.
 - 🧱 Firewall, antivirus, endpoint security, or kernel driver policy can block WinDivert/NFQUEUE even when ZeroDPI is configured correctly.
@@ -1676,6 +1715,9 @@ Unit tests cover:
 | `wrong_seq` works on simple paths but fails on layered firewalls | Try `BYPASS_METHOD = ["wrong_seq", "tls_frag"]` for TCP-level fragmentation or `BYPASS_METHOD = ["wrong_seq", "tls_record_frag"]` for TLS-record fragmentation. Both keep the fake wrong-sequence stage for the first DPI layer. |
 | `wrong_md5` works partly but the real ClientHello is still blocked | Try `BYPASS_METHOD = ["wrong_md5", "tls_frag"]` so the fake TCP-MD5 stage is followed by TCP-level fragmentation of the real ClientHello. |
 | `wrong_seq`, `wrong_ack`, `wrong_timestamp`, `wrong_checksum`, or `wrong_md5` (alone or combined) does not work | Try `tls_record_frag` (TLS-record layer), then `tls_frag` (TCP layer). Different DPI devices fail on different TCP/TLS behaviors. |
+| The DPI reassembles the whole flow, so fake packets and fragmentation both fail | Try `BYPASS_METHOD = "seqovl"` (tune `SEQOVL_SIZE`, try `8`–`128`), or keep `disorder` and add `SEQOVL_SIZE` to it. Neither replaces the real ClientHello, so the SNI is preserved. |
+| `seqovl` connects on some servers but not others | Set `SEQOVL_REVERSE = false` (the ordered default). The reverse variant relies on last-received-wins overlap handling, which Windows-hosted servers do not implement. |
+| `seqovl` connections fail outright | Some middleboxes drop overlapping segments. Remove the method from the list, or lower `SEQOVL_SIZE` so the prefix stays inside a single segment. |
 | Connections start but stall | Raise `BYPASS_TIMEOUT_SECS`, reduce `SNI_MAX_CONCURRENT`, and check whether the selected candidate has high TTFB or low speed. |
 | gRPC works after restart but fails after hours | Enable `RESCAN_INTERVAL_SECS` and set `RELAY_MAX_LIFETIME_SECS` to a positive value so long-lived relays reconnect through the latest working target. |
 | Scan-only mode works but relay mode fails | Confirm the VPN profile dials ZeroDPI, not the real server directly, and confirm the selected `BYPASS_METHOD` is supported on your platform. |

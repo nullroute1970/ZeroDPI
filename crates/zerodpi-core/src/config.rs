@@ -249,12 +249,32 @@ pub const BASE_BYPASS_METHODS: &[&str] = &[
     "fake_tls",
     "ip_frag",
     "disorder",
+    "seqovl",
     "tls_frag",
     "ccs_prefix",
     "tls_padding",
     "mixed_case_sni",
     "urg_sni_split",
     "sni_boundary_frag",
+];
+
+/// Overlap prefix size used by the standalone `seqovl` method when
+/// `SEQOVL_SIZE` is omitted. The `disorder` modifier stays disabled in that
+/// case, so existing `disorder` configs keep their behaviour.
+pub const DEFAULT_SEQOVL_SIZE: usize = 32;
+
+/// Largest accepted `SEQOVL_SIZE` (and fixed-pattern length).
+pub const MAX_SEQOVL_SIZE: usize = 1024;
+
+/// Methods that own the first outbound data packet. Only one of them can be
+/// active per connection, because the handler runs a single data stage.
+pub const DATA_STAGE_METHODS: &[&str] = &[
+    "tls_record_frag",
+    "fake_tls",
+    "ip_frag",
+    "disorder",
+    "seqovl",
+    "urg_sni_split",
 ];
 
 /// Expand a combo alias into its base method names; other names pass through.
@@ -505,6 +525,15 @@ pub struct Config {
     ///   single record contains the full SNI. No fake packet is injected; the
     ///   server reassembles normally.
     /// - `"ip_frag"` — IP-Layer Fragment (real ClientHello split into IPv4 fragments).
+    /// - `"seqovl"` — TCP Sequence Overlap. Splits the first outbound data
+    ///   packet into `SEQOVL_SEGMENTS` segments and splices `SEQOVL_SIZE`
+    ///   fake bytes in front of the first emitted segment, rewinding its TCP
+    ///   sequence number by that many bytes. The destination's TCP stack
+    ///   discards (ordered split) or overwrites (reverse split) the prefix and
+    ///   still receives the original stream, while a DPI that reassembles the
+    ///   flow sees the fake bytes inside the ClientHello and cannot extract the
+    ///   SNI. Also available as a `disorder` modifier by setting
+    ///   `SEQOVL_SIZE` above zero.
     /// - `"tls_frag"` — TLS Fragment / TCP-level fragmentation.
     ///   Splits a normal, intact TLS ClientHello record into multiple tiny TCP
     ///   segments so DPI cannot reassemble the SNI from any single packet.
@@ -865,6 +894,71 @@ pub struct Config {
     pub DISORDER_ONLY_FIRST_PACKET: bool,
 
     // -----------------------------------------------------------------------
+    // seqovl method parameters (standalone method and `disorder` modifier)
+    // -----------------------------------------------------------------------
+    /// Number of fake prefix bytes spliced in front of the first emitted TCP
+    /// segment by `seqovl`.
+    ///
+    /// The segment's TCP sequence number is rewound by this many bytes, so the
+    /// fake prefix occupies the stream range immediately before the segment's
+    /// real first byte. A DPI that reassembles the flow sees the fake bytes
+    /// spliced into the ClientHello and cannot extract the SNI, while the
+    /// destination's TCP stack discards or overwrites the prefix and still
+    /// receives the original stream.
+    ///
+    /// - omitted — `seqovl` uses [`DEFAULT_SEQOVL_SIZE`] (32) bytes with a
+    ///   random pattern; the `disorder` modifier stays disabled.
+    /// - `0` — overlap disabled (with `seqovl`, the payload is still split).
+    /// - `N` — `N` fake bytes. Must be `>= 1` and `<= MAX_SEQOVL_SIZE`.
+    ///
+    /// Setting this above zero while `disorder` is selected turns it into the
+    /// `disorder` modifier: `disorder`'s own segmentation settings are used and
+    /// the overlap is added to its first emitted segment.
+    #[serde(default, deserialize_with = "empty_string_as_none_usize")]
+    pub SEQOVL_SIZE: Option<usize>,
+
+    /// Optional fixed overlap prefix, as a hex string (e.g. `"0x1603"` or
+    /// `"16:03:03:01"`). When omitted, a fresh pseudo-random pattern is used
+    /// per connection, which is harder for a DPI to fingerprint.
+    ///
+    /// When set, the pattern length also selects the overlap size if
+    /// `SEQOVL_SIZE` is omitted, so `SEQOVL_PATTERN` alone is enough to enable
+    /// the overlap. When both are set, they must agree.
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub SEQOVL_PATTERN: Option<String>,
+
+    /// Number of TCP segments the standalone `seqovl` method splits the first
+    /// data packet into. Valid values: `2` or `3`. Default: `2`.
+    ///
+    /// Ignored when `seqovl` is used through `disorder`; `disorder` keeps
+    /// `DISORDER_SEGMENTS`.
+    #[serde(default = "default_seqovl_segments")]
+    pub SEQOVL_SEGMENTS: usize,
+
+    /// Whether the standalone `seqovl` method emits its segments in reverse
+    /// (non-monotonic sequence-number) order. Default: `false`.
+    ///
+    /// The ordered default is the widely portable variant: the fake prefix
+    /// starts below the server's `rcv_nxt`, so every TCP stack trims it. The
+    /// reverse variant is more aggressive against sequence-tracking DPIs but
+    /// requires the prefix to be smaller than a segment, and does not work
+    /// against servers that keep the first received copy of overlapping data
+    /// (notably Windows-hosted servers).
+    ///
+    /// Ignored when `seqovl` is used through `disorder`; `disorder` keeps
+    /// `DISORDER_REVERSE`.
+    #[serde(default)]
+    pub SEQOVL_REVERSE: bool,
+
+    /// Delay in milliseconds between standalone `seqovl` segment emissions.
+    /// Must be `<= 1000`. Default: `0` (back-to-back).
+    ///
+    /// Ignored when `seqovl` is used through `disorder`; `disorder` keeps
+    /// `DISORDER_DELAY_MS`.
+    #[serde(default)]
+    pub SEQOVL_DELAY_MS: u64,
+
+    // -----------------------------------------------------------------------
     // urg_sni_split method parameters
     // -----------------------------------------------------------------------
     /// The 1-byte dummy payload `urg_sni_split` inserts into the middle of the
@@ -1202,6 +1296,39 @@ where
     }
 }
 
+/// Accept an integer, a numeric string, or an empty string for an optional
+/// `usize` field.
+///
+/// The TOML editor in the Android app writes optional fields as `NAME = ""`,
+/// so an empty string must decode to `None` rather than failing to parse. A
+/// bare integer keeps the desktop configuration idiomatic.
+fn empty_string_as_none_usize<'de, D>(de: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Int(usize),
+        Text(String),
+    }
+
+    match Repr::deserialize(de)? {
+        Repr::Int(value) => Ok(Some(value)),
+        Repr::Text(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                trimmed
+                    .parse::<usize>()
+                    .map(Some)
+                    .map_err(|_| de::Error::custom(format!("'{value}' is not a valid usize")))
+            }
+        }
+    }
+}
+
 fn default_sni_list() -> String {
     "sni_list.txt".into()
 }
@@ -1263,6 +1390,9 @@ fn default_ip_frag_size() -> usize {
     24
 }
 fn default_disorder_segments() -> usize {
+    2
+}
+fn default_seqovl_segments() -> usize {
     2
 }
 fn default_sni_split_dummy_byte() -> u8 {
@@ -1559,6 +1689,18 @@ impl Config {
                     "BYPASS_METHOD \"disorder\" cannot be combined with \"tls_record_frag\", \"fake_tls\", \"ip_frag\", or \"urg_sni_split\""
                 );
             }
+            if self.BYPASS_METHOD.contains("seqovl") {
+                if let Some(other) = DATA_STAGE_METHODS
+                    .iter()
+                    .copied()
+                    .filter(|m| *m != "seqovl")
+                    .find(|m| self.BYPASS_METHOD.contains(m))
+                {
+                    anyhow::bail!(
+                        "BYPASS_METHOD \"seqovl\" cannot be combined with \"{other}\" (both own the first outbound data packet)"
+                    );
+                }
+            }
         }
         if self.WRONG_CHECKSUM_DELTA == 0 {
             anyhow::bail!("WRONG_CHECKSUM_DELTA must be >= 1");
@@ -1600,6 +1742,32 @@ impl Config {
         }
         if self.DISORDER_DELAY_MS > 1000 {
             anyhow::bail!("DISORDER_DELAY_MS must be <= 1000");
+        }
+        if let Some(size) = self.SEQOVL_SIZE {
+            if size > MAX_SEQOVL_SIZE {
+                anyhow::bail!("SEQOVL_SIZE must be <= {MAX_SEQOVL_SIZE}");
+            }
+        }
+        if self.SEQOVL_SEGMENTS < 2 || self.SEQOVL_SEGMENTS > 3 {
+            anyhow::bail!("SEQOVL_SEGMENTS must be 2 or 3");
+        }
+        if self.SEQOVL_DELAY_MS > 1000 {
+            anyhow::bail!("SEQOVL_DELAY_MS must be <= 1000");
+        }
+        if let Some(ref pattern) = self.SEQOVL_PATTERN {
+            let bytes = crate::methods::seqovl::parse_hex_pattern(pattern)
+                .map_err(|e| anyhow::anyhow!("SEQOVL_PATTERN is invalid: {e}"))?;
+            if bytes.len() > MAX_SEQOVL_SIZE {
+                anyhow::bail!("SEQOVL_PATTERN must be at most {MAX_SEQOVL_SIZE} bytes");
+            }
+            if let Some(size) = self.SEQOVL_SIZE {
+                if size != bytes.len() {
+                    anyhow::bail!(
+                        "SEQOVL_PATTERN is {} bytes but SEQOVL_SIZE is {size}; they must match",
+                        bytes.len()
+                    );
+                }
+            }
         }
         if self.TCP_SEG_SIZE == 0 {
             anyhow::bail!("TCP_SEG_SIZE must be >= 1");
@@ -1657,11 +1825,12 @@ impl Config {
                         | "ccs_prefix"
                         | "ip_frag"
                         | "disorder"
+                        | "seqovl"
                 )
             })
         {
             anyhow::bail!(
-                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", \"tls_padding\", \"mixed_case_sni\", \"sni_boundary_frag\", \"ccs_prefix\", \"ip_frag\", or \"disorder\""
+                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", \"tls_padding\", \"mixed_case_sni\", \"sni_boundary_frag\", \"ccs_prefix\", \"ip_frag\", \"disorder\", or \"seqovl\""
             );
         }
         if !(0.0..=1.0).contains(&self.PROXY_TEST_SNI_WEIGHT) {
@@ -2551,6 +2720,253 @@ mod tests {
         assert_eq!(cfg.DISORDER_DELAY_MS, 0);
         assert!(cfg.DISORDER_REVERSE);
         assert!(cfg.DISORDER_ONLY_FIRST_PACKET);
+    }
+
+    #[test]
+    fn parses_seqovl_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        // `None` keeps `disorder` overlap-free while `seqovl` falls back to
+        // DEFAULT_SEQOVL_SIZE.
+        assert_eq!(cfg.SEQOVL_SIZE, None);
+        assert_eq!(cfg.SEQOVL_PATTERN, None);
+        assert_eq!(cfg.SEQOVL_SEGMENTS, 2);
+        assert!(!cfg.SEQOVL_REVERSE, "ordered split is the portable default");
+        assert_eq!(cfg.SEQOVL_DELAY_MS, 0);
+    }
+
+    #[test]
+    fn parses_seqovl_overrides() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "seqovl"
+               SEQOVL_SIZE = 4
+               SEQOVL_PATTERN = "0xde:ad:be:ef"
+               SEQOVL_SEGMENTS = 3
+               SEQOVL_REVERSE = true
+               SEQOVL_DELAY_MS = 20"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.SEQOVL_SIZE, Some(4));
+        assert_eq!(cfg.SEQOVL_PATTERN.as_deref(), Some("0xde:ad:be:ef"));
+        assert_eq!(cfg.SEQOVL_SEGMENTS, 3);
+        assert!(cfg.SEQOVL_REVERSE);
+        assert_eq!(cfg.SEQOVL_DELAY_MS, 20);
+    }
+
+    #[test]
+    fn parses_empty_seqovl_pattern_as_none() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               SEQOVL_PATTERN = """#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.SEQOVL_PATTERN, None);
+    }
+
+    #[test]
+    fn parses_empty_seqovl_size_as_none() {
+        // The Android config editor writes optional fields as `NAME = ""`.
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               SEQOVL_SIZE = "" "#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.SEQOVL_SIZE, None);
+    }
+
+    #[test]
+    fn parses_numeric_string_seqovl_size() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               SEQOVL_SIZE = "24""#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.SEQOVL_SIZE, Some(24));
+    }
+
+    #[test]
+    fn rejects_non_numeric_seqovl_size() {
+        let error = toml::from_str::<Config>(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               SEQOVL_SIZE = "wide""#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("usize"));
+    }
+
+    #[test]
+    fn rejects_invalid_seqovl_size() {
+        let size = MAX_SEQOVL_SIZE + 1;
+        let cfg: Config = toml::from_str(&format!(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               SEQOVL_SIZE = {size}"#
+        ))
+        .unwrap();
+        let error = cfg.validate().expect_err("oversized SEQOVL_SIZE");
+        assert!(error.to_string().contains("SEQOVL_SIZE"));
+    }
+
+    #[test]
+    fn rejects_invalid_seqovl_segments() {
+        for segments in [1, 4] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   SEQOVL_SEGMENTS = {segments}"#
+            ))
+            .unwrap();
+            let error = cfg.validate().expect_err("invalid SEQOVL_SEGMENTS");
+            assert!(error.to_string().contains("SEQOVL_SEGMENTS"));
+        }
+    }
+
+    #[test]
+    fn rejects_excessive_seqovl_delay() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               SEQOVL_DELAY_MS = 1001"#,
+        )
+        .unwrap();
+        let error = cfg.validate().expect_err("excessive SEQOVL_DELAY_MS");
+        assert!(error.to_string().contains("SEQOVL_DELAY_MS"));
+    }
+
+    #[test]
+    fn rejects_invalid_seqovl_pattern() {
+        for pattern in ["zz", "0x", "16:0"] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   SEQOVL_PATTERN = "{pattern}""#
+            ))
+            .unwrap();
+            let error = cfg.validate().expect_err("invalid SEQOVL_PATTERN");
+            assert!(error.to_string().contains("SEQOVL_PATTERN"));
+        }
+    }
+
+    #[test]
+    fn rejects_seqovl_pattern_size_mismatch() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               SEQOVL_SIZE = 8
+               SEQOVL_PATTERN = "0x1603""#,
+        )
+        .unwrap();
+        let error = cfg.validate().expect_err("pattern/size mismatch");
+        assert!(error.to_string().contains("SEQOVL_PATTERN"));
+    }
+
+    #[test]
+    fn rejects_seqovl_with_other_data_stage_methods() {
+        for combo in [
+            r#"["seqovl", "tls_record_frag"]"#,
+            r#"["seqovl", "fake_tls"]"#,
+            r#"["seqovl", "ip_frag"]"#,
+            r#"["seqovl", "disorder"]"#,
+            r#"["seqovl", "urg_sni_split"]"#,
+            r#"["seqovl", "sni_boundary_frag"]"#,
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   BYPASS_METHOD = {combo}"#
+            ))
+            .unwrap();
+            assert!(
+                cfg.validate().is_err(),
+                "combo {combo} should fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_seqovl_combos() {
+        for method in [
+            r#""seqovl""#,
+            r#"["seqovl", "wrong_seq"]"#,
+            r#"["seqovl", "wrong_ack"]"#,
+            r#"["seqovl", "low_ttl"]"#,
+            r#"["seqovl", "tls_frag"]"#,
+            r#"["seqovl", "tls_padding"]"#,
+            r#"["seqovl", "mixed_case_sni"]"#,
+            r#"["seqovl", "ccs_prefix"]"#,
+            r#"["seqovl", "wrong_seq", "tls_frag"]"#,
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   BYPASS_METHOD = {method}"#
+            ))
+            .unwrap();
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("combo {method} should validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn seqovl_requires_the_interceptor() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "seqovl""#,
+        )
+        .unwrap();
+        assert!(!cfg.BYPASS_METHOD.is_socket_only());
+        assert!(cfg.BYPASS_METHOD.requires_interceptor());
+    }
+
+    #[test]
+    fn seqovl_modifier_keeps_disorder_selected() {
+        // The overlap is expressed through SEQOVL_SIZE; the method list stays
+        // `disorder` so nothing else about the flow changes.
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "disorder"
+               SEQOVL_SIZE = 16"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.BYPASS_METHOD, "disorder");
+        assert_eq!(cfg.SEQOVL_SIZE, Some(16));
+    }
+
+    #[test]
+    fn repository_config_toml_parses_and_validates() {
+        let cfg: Config = toml::from_str(include_str!("../../../config.toml"))
+            .expect("shipped config.toml must parse");
+        cfg.validate()
+            .expect("shipped config.toml must pass validation");
+    }
+
+    #[test]
+    fn ip_bypass_plus_accepts_seqovl() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               MODE = "ip_bypass_plus"
+               BYPASS_METHOD = "seqovl""#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]

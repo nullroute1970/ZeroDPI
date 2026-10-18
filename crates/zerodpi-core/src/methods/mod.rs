@@ -14,10 +14,11 @@
 //!   `wrong_timestamp`, and the first stage of combo methods act here (fake
 //!   injection).
 //! - [`BypassMethod::on_first_data_packet`] — fires on the first outbound
-//!   data packet.  `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`
-//!   and the second stage of
+//!   data packet.  `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`,
+//!   `seqovl` and the second stage of
 //!   `wrong_seq_tls_record_frag` act here (TLS record fragmentation / decoy
-//!   injection / IP fragmentation / out-of-order TCP segmentation).  The
+//!   injection / IP fragmentation / out-of-order TCP segmentation / TCP
+//!   sequence overlap).  The
 //!   second stage of `wrong_seq_tls_frag` and
 //!   `wrong_md5_tls_frag` completes when it observes the first
 //!   TCP-segmented data packet.
@@ -60,6 +61,7 @@ pub mod fake_tls;
 pub mod ip_frag;
 pub mod low_ttl;
 pub mod mixed_case_sni;
+pub mod seqovl;
 pub mod sni;
 pub mod sni_boundary_frag;
 pub mod tcp_segmentation;
@@ -191,7 +193,8 @@ pub trait BypassMethod: Send + Sync + 'static {
 /// Returns `Some(method)` when the configured list contains any
 /// interceptor-based method (`wrong_seq`, `wrong_ack`, `wrong_checksum`,
 /// `wrong_md5`, `wrong_timestamp`, `low_ttl`, `urg_sni_split`,
-/// `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`) and `None` for socket-only lists (`["tls_frag"]`,
+/// `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`, `seqovl`) and `None`
+/// for socket-only lists (`["tls_frag"]`,
 /// `["tls_padding"]`, `["mixed_case_sni"]`, `["sni_boundary_frag"]`, `["ccs_prefix"]`, or
 /// combinations) or empty lists.
 /// Callers should validate the method list via
@@ -214,6 +217,7 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
             "fake_tls" => data = Some(Box::new(fake_tls::FakeTls::new(cfg))),
             "ip_frag" => data = Some(Box::new(ip_frag::IpFrag::new(cfg))),
             "disorder" => data = Some(Box::new(disorder::Disorder::new(cfg))),
+            "seqovl" => data = Some(Box::new(seqovl::Seqovl::new(cfg))),
             "wrong_seq" => handshake.push(Box::new(wrong_seq::WrongSeq::new(cfg))),
             "wrong_ack" => handshake.push(Box::new(wrong_ack::WrongAck::new(cfg))),
             "wrong_checksum" => handshake.push(Box::new(wrong_checksum::WrongChecksum::new(cfg))),
@@ -433,6 +437,27 @@ mod tests {
         let cfg = cfg_with_method(r#"BYPASS_METHOD = ["wrong_seq", "disorder"]"#);
         let method = build_method(&cfg).unwrap();
         assert_eq!(method.name(), "wrong_seq + disorder");
+    }
+
+    #[test]
+    fn build_seqovl_method() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "seqovl""#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "seqovl");
+    }
+
+    #[test]
+    fn build_wrong_seq_seqovl_method() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["wrong_seq", "seqovl"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "wrong_seq + seqovl");
+    }
+
+    #[test]
+    fn build_seqovl_with_socket_method() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["seqovl", "tls_frag"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "seqovl + tls_frag");
     }
 
     #[test]

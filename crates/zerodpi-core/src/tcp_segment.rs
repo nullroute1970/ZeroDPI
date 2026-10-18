@@ -5,24 +5,36 @@
 //! [`split_tcp_payload`] to split it into standalone TCP segments before
 //! emission.
 
+use crate::interceptor::{DisorderSpec, OverlapFake};
 use crate::ip_fragment::ipv4_header_checksum;
 
-/// Split a rebuilt TCP/IPv4 packet's payload into `segments` non-empty
-/// chunks and return one standalone TCP segment per chunk, in emission
-/// order: chunk order `[0..n)` when `reverse` is false, `[n-1..0]` when it
-/// is true.
+/// Split a rebuilt TCP/IPv4 packet's payload into non-empty chunks and return
+/// one standalone TCP segment per chunk, in emission order: chunk order
+/// `[0..n)` when [`DisorderSpec::reverse`] is false, `[n-1..0]` when it is
+/// true.
 ///
 /// The chunk size is `ceil(payload_len / segments)`, so the last chunk
-/// absorbs the remainder and all chunks are non-empty. Splitting is
-/// skipped — the input packet is returned unchanged as a single-element
-/// `Vec` — when the buffer does not hold a valid minimal IPv4+TCP header,
-/// `segments < 2`, or the payload is too small for `segments` non-empty
-/// chunks.
+/// absorbs the remainder and all chunks are non-empty. Splitting is skipped —
+/// the input packet is returned unchanged as a single-element `Vec` — when the
+/// buffer does not hold a valid minimal IPv4+TCP header,
+/// [`DisorderSpec::segments`] is less than 2, or the payload is too small for
+/// that many non-empty chunks.
+///
+/// When [`DisorderSpec::overlap`] carries a non-zero [`OverlapFake::bytes`],
+/// the segment emitted *first* also carries the fake prefix in front of its
+/// payload and its TCP sequence number is rewound by the prefix length, so the
+/// fake bytes occupy the stream range immediately before the segment's real
+/// first byte. Whether the destination trims or overwrites that range depends
+/// on the emission order; see [`OverlapFake`]. The prefix is omitted when it
+/// could not be recovered: in reverse mode it must fit strictly inside the
+/// segment emitted after it (`bytes < chunk`), and it must leave the packet
+/// within the 65535-byte IPv4 limit.
 ///
 /// Every emitted segment has:
 ///
 /// - the TCP sequence number advanced by the chunk's byte offset within
-///   the original payload (mod 2^32),
+///   the original payload (mod 2^32), and rewound by the overlap prefix length
+///   on the segment that carries one,
 /// - the PSH flag kept only on the chunk that ends the in-sequence payload
 ///   (cleared on the others),
 /// - the IPv4 total-length field updated and the IPv4 header checksum
@@ -30,7 +42,7 @@ use crate::ip_fragment::ipv4_header_checksum;
 /// - the TCP checksum recomputed over the pseudo-header, TCP header, and
 ///   chunk,
 /// - the original IPv4 identification field and TCP options preserved.
-pub fn split_tcp_payload(bytes: &[u8], segments: usize, reverse: bool) -> Vec<Vec<u8>> {
+pub fn split_tcp_payload(bytes: &[u8], spec: &DisorderSpec) -> Vec<Vec<u8>> {
     let unchanged = || vec![bytes.to_vec()];
     let Some(&first) = bytes.first() else {
         return unchanged();
@@ -47,10 +59,10 @@ pub fn split_tcp_payload(bytes: &[u8], segments: usize, reverse: bool) -> Vec<Ve
     }
     let payload_off = ihl + tcp_hdr_len;
     let payload = &bytes[payload_off..];
-    if segments < 2 || payload.len() < segments {
+    if spec.segments < 2 || payload.len() < spec.segments {
         return unchanged();
     }
-    let chunk = payload.len().div_ceil(segments);
+    let chunk = payload.len().div_ceil(spec.segments);
     let orig_seq = u32::from_be_bytes([
         bytes[ihl + 4],
         bytes[ihl + 5],
@@ -58,20 +70,44 @@ pub fn split_tcp_payload(bytes: &[u8], segments: usize, reverse: bool) -> Vec<Ve
         bytes[ihl + 7],
     ]);
 
-    let mut built = Vec::with_capacity(segments);
+    // The segment emitted first is the tail in reverse mode and the head
+    // otherwise; that is the one carrying the overlap prefix.
+    let chunk_count = payload.len().div_ceil(chunk);
+    let overlap_index = if spec.reverse { chunk_count - 1 } else { 0 };
+    let prefix = spec
+        .overlap
+        .as_ref()
+        .map(OverlapFake::materialize)
+        .filter(|prefix| !prefix.is_empty())
+        // Reverse mode: the prefix occupies the tail of the range covered by
+        // the segment emitted afterwards, which overwrites it. It must fit
+        // strictly inside that range so no real byte is clobbered.
+        .filter(|prefix| !spec.reverse || prefix.len() < chunk)
+        .filter(|prefix| payload_off + chunk + prefix.len() <= usize::from(u16::MAX));
+
+    let mut built = Vec::with_capacity(chunk_count);
     let mut offset = 0usize;
-    for part in payload.chunks(chunk) {
-        let mut seg = Vec::with_capacity(payload_off + part.len());
+    for (index, part) in payload.chunks(chunk).enumerate() {
+        let prefix = prefix
+            .as_deref()
+            .filter(|_| index == overlap_index)
+            .unwrap_or_default();
+
+        let mut seg = Vec::with_capacity(payload_off + prefix.len() + part.len());
         seg.extend_from_slice(&bytes[..payload_off]);
+        seg.extend_from_slice(prefix);
         seg.extend_from_slice(part);
 
-        // IPv4 total length: header + this chunk.
-        let total = (payload_off + part.len()) as u16;
+        // IPv4 total length: header + overlap prefix + this chunk.
+        let total = (payload_off + prefix.len() + part.len()) as u16;
         seg[2] = (total >> 8) as u8;
         seg[3] = total as u8;
 
-        // TCP sequence number: original + in-stream byte offset.
-        let seq = orig_seq.wrapping_add(offset as u32);
+        // TCP sequence number: original + in-stream byte offset, rewound by
+        // the overlap prefix so the fake bytes sit before the real first byte.
+        let seq = orig_seq
+            .wrapping_add(offset as u32)
+            .wrapping_sub(prefix.len() as u32);
         seg[ihl + 4..ihl + 8].copy_from_slice(&seq.to_be_bytes());
 
         // PSH only on the chunk that ends the in-sequence payload.
@@ -100,7 +136,7 @@ pub fn split_tcp_payload(bytes: &[u8], segments: usize, reverse: bool) -> Vec<Ve
         built.push(seg);
         offset += part.len();
     }
-    if reverse {
+    if spec.reverse {
         built.reverse();
     }
     built
@@ -209,10 +245,37 @@ mod tests {
         u32::from_be_bytes([seg[ihl + 4], seg[ihl + 5], seg[ihl + 6], seg[ihl + 7]])
     }
 
+    fn spec(segments: usize, reverse: bool) -> DisorderSpec {
+        DisorderSpec {
+            segments,
+            reverse,
+            delay_ms: 0,
+            overlap: None,
+        }
+    }
+
+    fn overlap_spec(
+        segments: usize,
+        reverse: bool,
+        bytes: usize,
+        pattern: &'static [u8],
+    ) -> DisorderSpec {
+        DisorderSpec {
+            segments,
+            reverse,
+            delay_ms: 0,
+            overlap: Some(OverlapFake {
+                bytes,
+                pattern: Some(std::sync::Arc::from(pattern)),
+                seed: 0,
+            }),
+        }
+    }
+
     #[test]
     fn reverse_emits_tail_first_with_correct_seqs() {
         let pkt = tcp_packet(&[0xAB; 517], 1001, true);
-        let segs = split_tcp_payload(&pkt, 2, true);
+        let segs = split_tcp_payload(&pkt, &spec(2, true));
         assert_eq!(segs.len(), 2);
 
         // chunk = ceil(517 / 2) = 259: head 259 bytes @ seq 1001, tail 258.
@@ -226,7 +289,7 @@ mod tests {
     #[test]
     fn forward_emits_in_order() {
         let pkt = tcp_packet(&[0xAB; 517], 1001, true);
-        let segs = split_tcp_payload(&pkt, 2, false);
+        let segs = split_tcp_payload(&pkt, &spec(2, false));
         assert_eq!(segs.len(), 2);
         assert_eq!(payload_of(&segs[0]), &[0xAB; 259]);
         assert_eq!(seq_of(&segs[0]), 1001);
@@ -237,7 +300,7 @@ mod tests {
     #[test]
     fn three_segments_advance_seq_by_chunk_offsets() {
         let pkt = tcp_packet(&[0xAB; 517], 1001, true);
-        let segs = split_tcp_payload(&pkt, 3, true);
+        let segs = split_tcp_payload(&pkt, &spec(3, true));
         assert_eq!(segs.len(), 3);
         // chunk = ceil(517 / 3) = 173; offsets 0, 173, 346.
         // Reverse emission: offset 346 first, offset 0 last.
@@ -252,7 +315,7 @@ mod tests {
     #[test]
     fn psh_only_on_segment_ending_payload() {
         let pkt = tcp_packet(&[0xAB; 517], 1001, true);
-        let segs = split_tcp_payload(&pkt, 2, true);
+        let segs = split_tcp_payload(&pkt, &spec(2, true));
         // Emitted first: the tail chunk ends the in-sequence payload — PSH kept.
         let tail_flags = segs[0][33];
         assert_eq!(tail_flags & 0x08, 0x08);
@@ -264,7 +327,7 @@ mod tests {
     #[test]
     fn checksums_valid_on_every_segment() {
         let pkt = tcp_packet(&[0xAB; 517], 1001, true);
-        for seg in split_tcp_payload(&pkt, 3, true) {
+        for seg in split_tcp_payload(&pkt, &spec(3, true)) {
             assert_eq!(ipv4_header_checksum(&seg[..20]), 0, "IPv4 checksum");
             assert_eq!(tcp_checksum(&seg, 20, 20), 0, "TCP checksum");
         }
@@ -273,7 +336,7 @@ mod tests {
     #[test]
     fn total_length_matches_segment_size() {
         let pkt = tcp_packet(&[0xAB; 517], 1001, true);
-        for seg in split_tcp_payload(&pkt, 2, true) {
+        for seg in split_tcp_payload(&pkt, &spec(2, true)) {
             let total = u16::from_be_bytes([seg[2], seg[3]]) as usize;
             assert_eq!(total, seg.len());
         }
@@ -282,19 +345,22 @@ mod tests {
     #[test]
     fn payload_too_small_returns_input_unchanged() {
         let pkt = tcp_packet(&[0xAB; 1], 1001, true);
-        assert_eq!(split_tcp_payload(&pkt, 2, true), vec![pkt.clone()]);
+        assert_eq!(split_tcp_payload(&pkt, &spec(2, true)), vec![pkt.clone()]);
     }
 
     #[test]
     fn single_segment_request_returns_input_unchanged() {
         let pkt = tcp_packet(&[0xAB; 517], 1001, true);
-        assert_eq!(split_tcp_payload(&pkt, 1, true), vec![pkt.clone()]);
+        assert_eq!(split_tcp_payload(&pkt, &spec(1, true)), vec![pkt.clone()]);
     }
 
     #[test]
     fn short_buffer_returns_input_unchanged() {
         let bytes = vec![0x45, 0x00, 0x00, 0x14, 0x00, 0x01];
-        assert_eq!(split_tcp_payload(&bytes, 2, true), vec![bytes.clone()]);
+        assert_eq!(
+            split_tcp_payload(&bytes, &spec(2, true)),
+            vec![bytes.clone()]
+        );
     }
 
     #[test]
@@ -302,7 +368,7 @@ mod tests {
         // 4 bytes of TCP options -> 24-byte TCP header (data offset 6).
         let options: &[u8] = &[0x01, 0x01, 0x08, 0x0A];
         let pkt = tcp_packet_with_options(&[0xAB; 517], 1001, true, options);
-        let segs = split_tcp_payload(&pkt, 2, true);
+        let segs = split_tcp_payload(&pkt, &spec(2, true));
         assert_eq!(segs.len(), 2);
         for seg in &segs {
             assert_eq!(u16::from_be_bytes([seg[4], seg[5]]), 0x5678, "ident");
@@ -315,5 +381,122 @@ mod tests {
         // segment is the tail at seq 1001 + 259.
         assert_eq!(payload_of(&segs[0]), &[0xAB; 258]);
         assert_eq!(seq_of(&segs[0]), 1001 + 259);
+    }
+
+    // -----------------------------------------------------------------------
+    // seqovl (overlap) tests
+    // -----------------------------------------------------------------------
+
+    const FAKE: [u8; 4] = [0xEE; 4];
+
+    #[test]
+    fn ordered_overlap_prefixes_head_and_rewinds_seq() {
+        let pkt = tcp_packet(&[0xAB; 517], 1001, true);
+        let segs = split_tcp_payload(&pkt, &overlap_spec(2, false, 4, &FAKE));
+        assert_eq!(segs.len(), 2);
+
+        // chunk = 259 -> emission order is head, tail. The head carries the
+        // 4 fake bytes and starts at seq 1001 - 4, i.e. below rcv_nxt, so the
+        // server trims the prefix and the real bytes still land at 1001.
+        assert_eq!(payload_of(&segs[0]).len(), 4 + 259);
+        assert_eq!(&payload_of(&segs[0])[..4], &FAKE);
+        assert_eq!(&payload_of(&segs[0])[4..], &[0xAB; 259]);
+        assert_eq!(seq_of(&segs[0]), 1001 - 4);
+
+        // The tail is untouched and carries no prefix.
+        assert_eq!(payload_of(&segs[1]), &[0xAB; 258]);
+        assert_eq!(seq_of(&segs[1]), 1001 + 259);
+    }
+
+    #[test]
+    fn reverse_overlap_prefixes_tail_and_rewinds_seq() {
+        let pkt = tcp_packet(&[0xAB; 517], 1001, true);
+        let segs = split_tcp_payload(&pkt, &overlap_spec(2, true, 4, &FAKE));
+        assert_eq!(segs.len(), 2);
+
+        // The tail is emitted first with the prefix in front of it; its seq is
+        // rewound into the last 4 bytes of the head's range.
+        assert_eq!(&payload_of(&segs[0])[..4], &FAKE);
+        assert_eq!(&payload_of(&segs[0])[4..], &[0xAB; 258]);
+        assert_eq!(seq_of(&segs[0]), 1001 + 259 - 4);
+
+        // The head is emitted second and overwrites the fake range.
+        assert_eq!(payload_of(&segs[1]), &[0xAB; 259]);
+        assert_eq!(seq_of(&segs[1]), 1001);
+        // The fake range is inside the head's range: [1001, 1001 + 259).
+        assert!(seq_of(&segs[0]) >= 1001);
+        assert!(seq_of(&segs[0]) + 4 <= 1001 + 259);
+    }
+
+    #[test]
+    fn reverse_overlap_omitted_when_not_smaller_than_chunk() {
+        let pkt = tcp_packet(&[0xAB; 517], 1001, true);
+        // chunk = 259, so a 259-byte prefix would clobber real head bytes.
+        let segs = split_tcp_payload(&pkt, &overlap_spec(2, true, 259, &FAKE));
+        let plain = split_tcp_payload(&pkt, &spec(2, true));
+        assert_eq!(segs, plain);
+        assert_eq!(seq_of(&segs[0]), 1001 + 259);
+    }
+
+    #[test]
+    fn ordered_overlap_may_exceed_chunk_size() {
+        let pkt = tcp_packet(&[0xAB; 517], 1001, true);
+        // Ordered mode needs no overwrite, so a prefix larger than one chunk
+        // is legal — it simply sits below rcv_nxt.
+        let segs = split_tcp_payload(&pkt, &overlap_spec(2, false, 400, &FAKE));
+        assert_eq!(segs.len(), 2);
+        assert_eq!(payload_of(&segs[0]).len(), 400 + 259);
+        assert_eq!(seq_of(&segs[0]), 1001u32.wrapping_sub(400));
+    }
+
+    #[test]
+    fn overlap_segments_keep_valid_checksums() {
+        let pkt = tcp_packet(&[0xAB; 517], 1001, true);
+        for reverse in [false, true] {
+            for seg in split_tcp_payload(&pkt, &overlap_spec(2, reverse, 8, &FAKE)) {
+                assert_eq!(ipv4_header_checksum(&seg[..20]), 0, "IPv4 checksum");
+                assert_eq!(tcp_checksum(&seg, 20, 20), 0, "TCP checksum");
+                let total = u16::from_be_bytes([seg[2], seg[3]]) as usize;
+                assert_eq!(total, seg.len());
+            }
+        }
+    }
+
+    #[test]
+    fn random_overlap_pattern_is_deterministic_and_sized() {
+        let fake = OverlapFake {
+            bytes: 13,
+            pattern: None,
+            seed: 0x5EED_5EED,
+        };
+        let first = fake.materialize();
+        assert_eq!(first.len(), 13);
+        assert_eq!(first, fake.materialize(), "same seed must be stable");
+
+        let other = OverlapFake {
+            bytes: 13,
+            pattern: None,
+            seed: 0x5EED_5EEE,
+        }
+        .materialize();
+        assert_ne!(first, other, "distinct seeds must differ");
+    }
+
+    #[test]
+    fn fixed_overlap_pattern_is_clamped_to_size() {
+        let fake = OverlapFake {
+            bytes: 2,
+            pattern: Some(std::sync::Arc::from(&FAKE[..])),
+            seed: 0,
+        };
+        assert_eq!(fake.materialize(), vec![0xEE, 0xEE]);
+
+        // A pattern shorter than the configured size is zero-padded.
+        let padded = OverlapFake {
+            bytes: 6,
+            pattern: Some(std::sync::Arc::from(&FAKE[..2])),
+            seed: 0,
+        };
+        assert_eq!(padded.materialize(), vec![0xEE, 0xEE, 0, 0, 0, 0]);
     }
 }

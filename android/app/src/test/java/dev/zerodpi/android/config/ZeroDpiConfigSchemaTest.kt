@@ -218,7 +218,7 @@ class ZeroDpiConfigSchemaTest {
     @Test
     fun methodScanDefaultsMatchCore() {
         val state = ZeroDpiConfigToml.analyze("")
-        assertEquals(16, state.config.methodList("METHOD_SCAN_METHODS").size)
+        assertEquals(17, state.config.methodList("METHOD_SCAN_METHODS").size)
         assertEquals("3", state.valueFor("METHOD_SCAN_SAMPLES"))
         assertEquals("1000", state.valueFor("METHOD_SCAN_INTERVAL_MS"))
         assertEquals("10", state.valueFor("METHOD_SCAN_TIMEOUT_SECS"))

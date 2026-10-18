@@ -2,6 +2,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
+use zerodpi_core::proxy::RelayProgress;
 
 pub const CONTRACT_VERSION: u8 = 1;
 
@@ -38,6 +39,35 @@ impl RuntimeEventEmitter {
             let _ = writer.flush();
         }
     }
+
+    /// Keep the v1 JSON lines while locking and flushing stdout once per sample.
+    pub fn emit_relay_progress(&self, entries: Vec<RelayProgress>) {
+        let Some(writer) = &self.writer else {
+            return;
+        };
+        let Ok(mut writer) = writer.lock() else {
+            return;
+        };
+        let _ = write_relay_progress(&mut *writer, entries);
+    }
+}
+
+fn write_relay_progress(writer: &mut impl Write, entries: Vec<RelayProgress>) -> io::Result<()> {
+    let mut writer = io::BufWriter::new(writer);
+    for entry in entries {
+        serde_json::to_writer(
+            &mut writer,
+            &RuntimeEvent::RelayBytes {
+                src_port: entry.src_port,
+                c2s_bytes: entry.c2s_bytes,
+                s2c_bytes: entry.s2c_bytes,
+                is_final: false,
+            },
+        )
+        .map_err(io::Error::other)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()
 }
 
 #[derive(Debug, Serialize)]
@@ -185,6 +215,50 @@ pub enum BypassStatus {
 #[cfg(test)]
 mod tests {
     use super::{RuntimeEvent, ScanKind};
+
+    #[test]
+    fn batched_relay_progress_preserves_json_lines_and_flushes_once() {
+        #[derive(Default)]
+        struct Output {
+            bytes: Vec<u8>,
+            flushes: usize,
+            writes: usize,
+        }
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        let mut output = Output::default();
+        super::write_relay_progress(
+            &mut output,
+            vec![
+                zerodpi_core::proxy::RelayProgress {
+                    src_port: 1234,
+                    c2s_bytes: 100,
+                    s2c_bytes: 200,
+                },
+                zerodpi_core::proxy::RelayProgress {
+                    src_port: 1235,
+                    c2s_bytes: 300,
+                    s2c_bytes: 400,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(output.bytes).unwrap(), concat!(
+            "{\"event\":\"relay_bytes\",\"src_port\":1234,\"c2s_bytes\":100,\"s2c_bytes\":200,\"final\":false}\n",
+            "{\"event\":\"relay_bytes\",\"src_port\":1235,\"c2s_bytes\":300,\"s2c_bytes\":400,\"final\":false}\n",
+        ));
+        assert_eq!(output.flushes, 1);
+        assert_eq!(output.writes, 1);
+    }
 
     #[test]
     fn serializes_next_scan_schedule() {

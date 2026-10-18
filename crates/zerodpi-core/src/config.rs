@@ -474,6 +474,11 @@ pub struct Config {
     /// Local port the proxy listens on.
     pub LISTEN_PORT: u16,
 
+    /// Disable Nagle on both relay sockets. Bypass methods that require
+    /// immediate writes can still enable TCP_NODELAY upstream when this is false.
+    #[serde(default = "default_true")]
+    pub TCP_NODELAY: bool,
+
     /// Path to the SNI list file (one hostname per line).
     /// Relative paths are resolved from the directory that contains `config.toml`.
     #[serde(default = "default_sni_list")]
@@ -1968,6 +1973,21 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_nodelay_defaults_to_enabled_and_can_be_disabled() {
+        for (option, expected) in [
+            ("", true),
+            ("TCP_NODELAY = true", true),
+            ("TCP_NODELAY = false", false),
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\n{option}"
+            ))
+            .unwrap();
+            assert_eq!(serde_json::to_value(cfg).unwrap()["TCP_NODELAY"], expected);
+        }
+    }
 
     #[test]
     fn rejects_invalid_scanner_concurrency() {

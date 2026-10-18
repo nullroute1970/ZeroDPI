@@ -44,8 +44,8 @@ use zerodpi_core::method_scanner::{
 use zerodpi_core::methods::build_method;
 use zerodpi_core::net::{interface_binding_channel, InterfaceBindingWatch, OutboundNetwork};
 use zerodpi_core::proxy::{
-    run_ip_bypass_plus_proxy, run_ip_bypass_proxy, run_proxy, ActiveSniTarget, ProxyEvent,
-    ProxyEventSender, RelayEndReason, RescanKind, CONNECT_PORT,
+    proxy_event_channel, run_ip_bypass_plus_proxy, run_ip_bypass_proxy, run_proxy, ActiveSniTarget,
+    ProxyEvent, ProxyEventReceiver, ProxyEventSender, RelayEndReason, RescanKind, CONNECT_PORT,
 };
 use zerodpi_core::proxy_tester::{
     failed_candidate_entry, test_candidate_full, test_candidate_with_flow_controller,
@@ -540,7 +540,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         )
     };
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
+    let (event_tx, mut event_rx) = proxy_event_channel(!no_tui || events.enabled());
 
     // ---- step 3b: automatic LOW_TTL_VALUE discovery ----
     let low_ttl_discovery_state = match decide_low_ttl_discovery(&cfg) {
@@ -1479,7 +1479,7 @@ fn rootless_alternatives() -> Vec<String> {
 
 async fn run_headless_proxy(
     proxy_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
-    event_rx: mpsc::UnboundedReceiver<ProxyEvent>,
+    event_rx: ProxyEventReceiver,
     data_plane: Arc<dyn data_plane::DataPlane>,
     events: RuntimeEventEmitter,
 ) -> anyhow::Result<()> {
@@ -1515,10 +1515,7 @@ async fn run_headless_proxy(
     }
 }
 
-async fn log_headless_proxy_events(
-    mut event_rx: mpsc::UnboundedReceiver<ProxyEvent>,
-    events: RuntimeEventEmitter,
-) {
+async fn log_headless_proxy_events(mut event_rx: ProxyEventReceiver, events: RuntimeEventEmitter) {
     while let Some(event) = event_rx.recv().await {
         match event {
             ProxyEvent::ListenerStarted { mode, listen_addr } => {
@@ -1626,6 +1623,9 @@ async fn log_headless_proxy_events(
                     s2c_bytes,
                     is_final: false,
                 });
+            }
+            ProxyEvent::RelayProgressBatch { entries, .. } => {
+                events.emit_relay_progress(entries);
             }
             ProxyEvent::SniTargetChanged { sni, ip, score } => {
                 events.emit(RuntimeEvent::ActiveTargetChanged {
@@ -1824,7 +1824,7 @@ fn ip_bypass_main(
         interface_binding_channel(initial_binding.clone());
 
     let active_ip_arc = Arc::new(std::sync::RwLock::new(active_ip));
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
+    let (event_tx, mut event_rx) = proxy_event_channel(!no_tui || events.enabled());
 
     // ---- step 2: optional background IP rescan ----
     let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(
@@ -2109,7 +2109,7 @@ fn ip_bypass_plus_main(
         interface_binding_channel(initial_binding.clone());
 
     let active_ip_arc = Arc::new(std::sync::RwLock::new(active_ip));
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
+    let (event_tx, mut event_rx) = proxy_event_channel(!no_tui || events.enabled());
 
     // ---- step 2: optional background IPv4 rescan ----
     let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(active_v4)));
@@ -3890,7 +3890,7 @@ mod tests {
 
     #[test]
     fn rescan_event_sender_forwards_and_ignores_when_absent() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = proxy_event_channel(false);
         send_rescan_event(
             &Some(tx),
             ProxyEvent::RescanStarted {

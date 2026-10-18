@@ -16,6 +16,11 @@ LISTEN_HOST = "127.0.0.1"
 # instead of pointing it directly at your VPN server.
 LISTEN_PORT = 44444
 
+# Disable Nagle on both local and upstream relay sockets for lower latency.
+# Set false for A/B testing. Bypass-required TCP_NODELAY and TCP_SEG_NODELAY
+# still take precedence on the upstream socket.
+TCP_NODELAY = true
+
 # ---------------------------------------------------------------------------
 # Operating Mode
 # ---------------------------------------------------------------------------

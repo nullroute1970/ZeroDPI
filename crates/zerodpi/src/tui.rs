@@ -15,7 +15,7 @@
 //! from the running proxy and displays per-connection status, byte counters,
 //! and aggregate stats.  Press ↑/↓ (or j/k) to scroll the log; q/Esc to quit.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Stdout};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,7 +40,7 @@ use zerodpi_core::ip_scanner::{IpProbeEntry, IpScanEvent};
 use zerodpi_core::method_scanner::{MethodScanEntry, MethodScanEvent, MethodScanReport};
 #[cfg(test)]
 use zerodpi_core::proxy::RescanKind;
-use zerodpi_core::proxy::{ProxyEvent, RelayEndReason};
+use zerodpi_core::proxy::{ProxyEvent, ProxyEventReceiver, RelayEndReason, RelayProgress};
 use zerodpi_core::sni_scanner::SniProbeEntry;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -968,7 +968,7 @@ fn aggregate_throughput(records: &VecDeque<ConnectionRecord>) -> (f64, f64) {
 /// exits.
 pub fn run_dashboard(
     terminal: &mut Term,
-    rx: &mut mpsc::UnboundedReceiver<ProxyEvent>,
+    rx: &mut ProxyEventReceiver,
     info: &DashboardInfo,
     cfg: &Config,
 ) -> anyhow::Result<()> {
@@ -1187,15 +1187,34 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
             s2c_bytes,
         } => {
             if let Some(r) = find_record(&mut state.records, src_port) {
-                let now = Instant::now();
-                if let Some((prev_time, prev_c2s, prev_s2c)) = r.last_snapshot {
-                    let secs = now.duration_since(prev_time).as_secs_f64().max(0.001);
-                    r.rate_c2s_bps = c2s_bytes.saturating_sub(prev_c2s) as f64 / secs;
-                    r.rate_s2c_bps = s2c_bytes.saturating_sub(prev_s2c) as f64 / secs;
+                apply_relay_progress(
+                    r,
+                    RelayProgress {
+                        src_port,
+                        c2s_bytes,
+                        s2c_bytes,
+                    },
+                    Instant::now(),
+                );
+            }
+        }
+        ProxyEvent::RelayProgressBatch {
+            sampled_at,
+            entries,
+        } => {
+            let mut progress: HashMap<_, _> = entries
+                .into_iter()
+                .map(|entry| (entry.src_port, entry))
+                .collect();
+            // Records are newest first. Apply each port once, ignoring finished rows.
+            for record in state
+                .records
+                .iter_mut()
+                .filter(|record| matches!(record.status, ConnStatus::Relaying))
+            {
+                if let Some(entry) = progress.remove(&record.src_port) {
+                    apply_relay_progress(record, entry, sampled_at);
                 }
-                r.c2s_bytes = c2s_bytes;
-                r.s2c_bytes = s2c_bytes;
-                r.last_snapshot = Some((now, c2s_bytes, s2c_bytes));
             }
         }
         ProxyEvent::ConnectionError { src_port, error } => {
@@ -1269,6 +1288,27 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
     }
 
     prune_connection_records(&mut state.records);
+}
+
+fn apply_relay_progress(
+    record: &mut ConnectionRecord,
+    progress: RelayProgress,
+    sampled_at: Instant,
+) {
+    if !matches!(record.status, ConnStatus::Relaying) {
+        return;
+    }
+    if let Some((previous, c2s, s2c)) = record.last_snapshot {
+        if sampled_at <= previous {
+            return;
+        }
+        let seconds = sampled_at.duration_since(previous).as_secs_f64().max(0.001);
+        record.rate_c2s_bps = progress.c2s_bytes.saturating_sub(c2s) as f64 / seconds;
+        record.rate_s2c_bps = progress.s2c_bytes.saturating_sub(s2c) as f64 / seconds;
+    }
+    record.c2s_bytes = progress.c2s_bytes;
+    record.s2c_bytes = progress.s2c_bytes;
+    record.last_snapshot = Some((sampled_at, progress.c2s_bytes, progress.s2c_bytes));
 }
 
 fn find_record(
@@ -2327,6 +2367,84 @@ mod tests {
             start: Instant::now(),
             channel_closed: false,
         }
+    }
+
+    #[test]
+    fn progress_batch_updates_active_rows_and_resets_idle_rates() {
+        let sampled_at = Instant::now();
+        let mut active = record(ConnStatus::Relaying, 1.0, 1.0);
+        active.last_snapshot = Some((sampled_at - Duration::from_millis(500), 50, 100));
+        let mut done = record(ConnStatus::Done, 0.0, 0.0);
+        done.src_port = 444;
+        done.c2s_bytes = 999;
+        let mut state = dashboard_state(vec![active, done]);
+        apply_event(
+            ProxyEvent::RelayProgressBatch {
+                sampled_at,
+                entries: vec![
+                    RelayProgress {
+                        src_port: 443,
+                        c2s_bytes: 100,
+                        s2c_bytes: 200,
+                    },
+                    RelayProgress {
+                        src_port: 444,
+                        c2s_bytes: 1,
+                        s2c_bytes: 1,
+                    },
+                ],
+            },
+            &mut state,
+        );
+        let active = &state.records[0];
+        assert_eq!((active.c2s_bytes, active.s2c_bytes), (100, 200));
+        assert_eq!((active.rate_c2s_bps, active.rate_s2c_bps), (100.0, 200.0));
+        assert_eq!(state.records[1].c2s_bytes, 999);
+        apply_event(
+            ProxyEvent::RelayProgressBatch {
+                sampled_at: sampled_at + Duration::from_millis(500),
+                entries: vec![RelayProgress {
+                    src_port: 443,
+                    c2s_bytes: 100,
+                    s2c_bytes: 200,
+                }],
+            },
+            &mut state,
+        );
+        assert_eq!(state.records[0].rate_c2s_bps, 0.0);
+        assert_eq!(state.records[0].rate_s2c_bps, 0.0);
+    }
+
+    #[test]
+    fn progress_batch_cannot_overwrite_final_bytes() {
+        let mut state = dashboard_state(vec![record(ConnStatus::Relaying, 1.0, 1.0)]);
+        apply_event(
+            ProxyEvent::RelayFinished {
+                src_port: 443,
+                c2s_bytes: 100,
+                s2c_bytes: 200,
+                reason: RelayEndReason::Completed,
+            },
+            &mut state,
+        );
+        apply_event(
+            ProxyEvent::RelayProgressBatch {
+                sampled_at: Instant::now(),
+                entries: vec![RelayProgress {
+                    src_port: 443,
+                    c2s_bytes: 1,
+                    s2c_bytes: 2,
+                }],
+            },
+            &mut state,
+        );
+        assert_eq!(
+            (state.records[0].c2s_bytes, state.records[0].s2c_bytes),
+            (100, 200)
+        );
+        assert!(matches!(state.records[0].status, ConnStatus::Done));
+        assert_eq!(state.total_c2s, 100);
+        assert_eq!(state.total_s2c, 200);
     }
 
     #[test]

@@ -820,6 +820,7 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 |-------|------|---------|-------------|
 | `LISTEN_HOST` | `string` | `"127.0.0.1"` | IP address to bind the local TCP proxy |
 | `LISTEN_PORT` | `u16` | `44444` | TCP port for the local proxy |
+| `TCP_NODELAY` | `bool` | `true` | Disable Nagle on both relay sockets to reduce small-message latency |
 
 ### 🎮 Operating Mode
 
@@ -1051,6 +1052,18 @@ In a `["wrong_seq", "seqovl"]` combination, both the `wrong_seq` and
 | `TCP_SEG_NODELAY` | `bool` | `true` | Enable TCP_NODELAY to prevent Nagle coalescing |
 
 `TLS_FRAG_LENGTH` and `TLS_FRAG_INTERVAL_MS` use Xray-style range syntax: `5` means a fixed value, while `"1-5"` chooses a fresh random value in that inclusive range for each fragment chunk. Set `TLS_FRAG_INTERVAL_MS = "0"` to write chunks back-to-back; actual TCP packet coalescing still depends on `TCP_SEG_NODELAY`, MSS/MTU, and the host TCP stack.
+
+`TCP_NODELAY` applies to both accepted client sockets and upstream connections in
+all relay modes. Existing configurations that omit it default to `true`. To
+compare normal relay latency with Nagle enabled, set `TCP_NODELAY = false`.
+Upstream bypass requirements still take precedence: `tls_frag` with
+`TCP_SEG_NODELAY = true`, `sni_boundary_frag`, `tls_record_split`, and `ccs_prefix`
+enable upstream TCP_NODELAY even when the general option is false. A `tls_frag`
+A/B comparison therefore also needs `TCP_SEG_NODELAY = false` to enable Nagle
+upstream. Small writes may produce more TCP packets when TCP_NODELAY is enabled.
+
+See [relay performance measurements](docs/relay-performance.md) for the loopback
+benchmark, raw results, and the core event-channel API migration.
 
 When `tls_frag` is combined with a handshake-stage method (e.g. `["wrong_seq", "tls_frag"]` or `["wrong_md5", "tls_frag"]`), the handshake method's parameter group also applies.
 

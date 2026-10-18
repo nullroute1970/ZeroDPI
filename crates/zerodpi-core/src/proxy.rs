@@ -37,9 +37,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Context;
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -55,6 +54,9 @@ use crate::net::{
     bound_tcp_socket, connect_bound, InterfaceBinding, InterfaceBindingWatch, OutboundSocketBinder,
 };
 use crate::tls_template::build_client_hello;
+
+mod events;
+pub use events::{proxy_event_channel, ProxyEventReceiver, ProxyEventSender, RelayProgress};
 
 // ---------------------------------------------------------------------------
 // Active SNI target
@@ -128,11 +130,16 @@ pub enum ProxyEvent {
     /// A fatal error occurred before the relay could start (e.g. upstream
     /// TCP connect failed).
     ConnectionError { src_port: u16, error: String },
-    /// Periodic progress report while the relay is running (emitted every 500 ms).
+    /// Legacy per-connection progress report. New relays use `RelayProgressBatch`.
     RelayProgress {
         src_port: u16,
         c2s_bytes: u64,
         s2c_bytes: u64,
+    },
+    /// Current counters for active relays, sampled together by the receiver.
+    RelayProgressBatch {
+        sampled_at: std::time::Instant,
+        entries: Vec<RelayProgress>,
     },
     /// The active SNI-spoof target changed after a background rescan.
     SniTargetChanged {
@@ -177,10 +184,6 @@ pub enum RescanKind {
     Ip,
 }
 
-/// Sender half of the [`ProxyEvent`] channel; pass to [`run_proxy`] to enable
-/// the live dashboard.  When `None` is passed the proxy operates silently.
-pub type ProxyEventSender = mpsc::UnboundedSender<ProxyEvent>;
-
 /// Why a relay ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayEndReason {
@@ -203,6 +206,7 @@ struct RelayResult {
 
 #[derive(Debug, Clone, Copy)]
 struct ConnectionSettings {
+    upstream_nodelay: bool,
     bypass_timeout: Duration,
     max_lifetime: Option<Duration>,
     segment_first_client_hello: bool,
@@ -223,6 +227,7 @@ impl ConnectionSettings {
     fn from_config(cfg: &Config) -> Self {
         let tcp_segmentation = TcpSegmentation::new(cfg);
         Self {
+            upstream_nodelay: configured_upstream_nodelay(cfg),
             bypass_timeout: Duration::from_secs(cfg.BYPASS_TIMEOUT_SECS),
             max_lifetime: configured_relay_max_lifetime(cfg),
             segment_first_client_hello: cfg.BYPASS_METHOD.contains("tls_frag"),
@@ -297,13 +302,22 @@ fn emit(tx: &Option<ProxyEventSender>, event: ProxyEvent) {
 /// keep a SYN attempt alive for minutes while the network is down.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn connect_with_timeout<F, E>(timeout: Duration, connect: F) -> anyhow::Result<TcpStream>
+async fn connect_with_timeout<F, E>(
+    timeout: Duration,
+    connect: F,
+    nodelay: bool,
+) -> anyhow::Result<TcpStream>
 where
     F: std::future::Future<Output = Result<TcpStream, E>>,
     E: Into<anyhow::Error>,
 {
     match tokio::time::timeout(timeout, connect).await {
-        Ok(Ok(stream)) => Ok(stream),
+        Ok(Ok(stream)) => {
+            stream
+                .set_nodelay(nodelay)
+                .context("set TCP_NODELAY upstream")?;
+            Ok(stream)
+        }
         Ok(Err(error)) => Err(error.into()),
         Err(_) => anyhow::bail!("upstream connect timed out after {timeout:?}"),
     }
@@ -315,6 +329,14 @@ fn io_end_error(result: &std::io::Result<usize>) -> bool {
 
 fn configured_relay_max_lifetime(cfg: &Config) -> Option<Duration> {
     (cfg.RELAY_MAX_LIFETIME_SECS > 0).then(|| Duration::from_secs(cfg.RELAY_MAX_LIFETIME_SECS))
+}
+
+fn configured_upstream_nodelay(cfg: &Config) -> bool {
+    cfg.TCP_NODELAY
+        || (cfg.BYPASS_METHOD.contains("tls_frag") && cfg.TCP_SEG_NODELAY)
+        || cfg.BYPASS_METHOD.contains("sni_boundary_frag")
+        || cfg.BYPASS_METHOD.contains("tls_record_split")
+        || cfg.BYPASS_METHOD.contains("ccs_prefix")
 }
 
 async fn read_one_client_write(src: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
@@ -618,13 +640,14 @@ pub async fn run_proxy(
 
     let mut connections = JoinSet::new();
     loop {
-        let (incoming, peer) = match accept_connection(&listener, &mut connections).await {
-            Ok(x) => x,
-            Err(e) => {
-                warn!(error = %e, "accept failed");
-                continue;
-            }
-        };
+        let (incoming, peer) =
+            match accept_connection(&listener, &mut connections, cfg.TCP_NODELAY).await {
+                Ok(x) => x,
+                Err(e) => {
+                    warn!(error = %e, "accept failed");
+                    continue;
+                }
+            };
         debug!(%peer, "accepted");
 
         // Route to the socket-based path for tls_frag.
@@ -687,6 +710,7 @@ pub async fn run_proxy(
 async fn accept_connection(
     listener: &TcpListener,
     connections: &mut JoinSet<()>,
+    nodelay: bool,
 ) -> std::io::Result<(TcpStream, SocketAddr)> {
     loop {
         tokio::select! {
@@ -695,7 +719,10 @@ async fn accept_connection(
                     // Avoid a tight retry/log loop when OS resources are exhausted.
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                return accepted;
+                return accepted.and_then(|(stream, peer)| {
+                    stream.set_nodelay(nodelay)?;
+                    Ok((stream, peer))
+                });
             }
             result = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = result {
@@ -759,6 +786,7 @@ async fn handle_intercept_connection(
     let mut outgoing = match connect_with_timeout(
         UPSTREAM_CONNECT_TIMEOUT,
         socket.connect(SocketAddr::from((connect_ip, connect_port))),
+        settings.upstream_nodelay,
     )
     .await
     {
@@ -794,9 +822,6 @@ async fn handle_intercept_connection(
             // `ccs_prefix`: the dummy ChangeCipherSpec must be the very first
             // bytes written upstream, before any ClientHello write below.
             if let Some(ccs) = settings.ccs_prefix {
-                outgoing
-                    .set_nodelay(true)
-                    .context("ccs_prefix: set_nodelay on upstream socket")?;
                 if let Err(e) = write_ccs_prefix(&mut outgoing, ccs).await {
                     entry.finish(BypassOutcome::UnexpectedClose);
                     emit(
@@ -810,11 +835,6 @@ async fn handle_intercept_connection(
                 }
             }
             if let Some(boundary) = settings.sni_boundary_frag {
-                // The boundary split needs two cleanly separated segments.
-                outgoing
-                    .set_nodelay(true)
-                    .context("combo sni_boundary_frag: set_nodelay on upstream socket")?;
-
                 let client_hello = read_client_tls_record_with_timeout(
                     &mut incoming,
                     settings.bypass_timeout,
@@ -891,10 +911,6 @@ async fn handle_intercept_connection(
                 // first record finds no SNI while the server reassembles the
                 // handshake message across both records. A non-zero
                 // TLS_RECORD_SPLIT_DELAY_MS also separates them at the TCP layer.
-                outgoing
-                    .set_nodelay(true)
-                    .context("tls_record_split: set_nodelay on upstream socket")?;
-
                 let client_hello = read_client_tls_record_with_timeout(
                     &mut incoming,
                     settings.bypass_timeout,
@@ -937,12 +953,6 @@ async fn handle_intercept_connection(
                 }
             } else if settings.segment_first_client_hello {
                 let segmentation = settings.tcp_segmentation;
-                if segmentation.nodelay {
-                    outgoing
-                        .set_nodelay(true)
-                        .context("combo tls_frag: set_nodelay on upstream socket")?;
-                }
-
                 match segmentation.packets {
                     TlsFragPackets::TlsHello => {
                         let client_hello = read_client_tls_record_with_timeout(
@@ -1134,13 +1144,14 @@ pub async fn run_ip_bypass_plus_proxy(
 
     let mut connections = JoinSet::new();
     loop {
-        let (incoming, peer) = match accept_connection(&listener, &mut connections).await {
-            Ok(x) => x,
-            Err(e) => {
-                warn!(error = %e, "ip_bypass_plus: accept failed");
-                continue;
-            }
-        };
+        let (incoming, peer) =
+            match accept_connection(&listener, &mut connections, cfg.TCP_NODELAY).await {
+                Ok(x) => x,
+                Err(e) => {
+                    warn!(error = %e, "ip_bypass_plus: accept failed");
+                    continue;
+                }
+            };
         debug!(%peer, "ip_bypass_plus: accepted");
 
         let connect_ip = match *active_ip.read().unwrap() {
@@ -1253,6 +1264,7 @@ async fn handle_tcp_seg_connection_with_ip(
     let mut outgoing = match connect_with_timeout(
         UPSTREAM_CONNECT_TIMEOUT,
         connect_bound(socket_binder.as_ref(), &binding, connect_addr),
+        configured_upstream_nodelay(&cfg),
     )
     .await
     {
@@ -1268,18 +1280,6 @@ async fn handle_tcp_seg_connection_with_ip(
             return Err(error).context("tls_frag: connect upstream");
         }
     };
-
-    // Enable TCP_NODELAY on the upstream socket if configured. The boundary
-    // split depends on two cleanly separated segments, so sni_boundary_frag
-    // always forces it.
-    if method.nodelay
-        || cfg.BYPASS_METHOD.contains("sni_boundary_frag")
-        || cfg.BYPASS_METHOD.contains("ccs_prefix")
-    {
-        outgoing
-            .set_nodelay(true)
-            .context("set_nodelay on upstream socket")?;
-    }
 
     // `ccs_prefix`: write the dummy ChangeCipherSpec as the very first
     // upstream bytes; every ClientHello write below follows it.  When
@@ -1346,9 +1346,6 @@ async fn handle_tcp_seg_connection_with_ip(
         // shadow the boundary branch.
         (_, Some(record)) if record_split.is_some() => {
             let split = record_split.expect("guarded by record_split.is_some()");
-            outgoing
-                .set_nodelay(true)
-                .context("tls_record_split: set_nodelay on upstream socket")?;
             match split.split(&record) {
                 Some((first, second)) => {
                     write_record_split(&mut outgoing, &first, &second, split.delay_ms)
@@ -1499,7 +1496,7 @@ async fn handle_tcp_seg_connection_with_ip(
 // ---------------------------------------------------------------------------
 
 /// Run a bidirectional relay between `incoming` and `outgoing`, emitting
-/// [`ProxyEvent::RelayProgress`] every 500 ms when a sender is present.
+/// [`ProxyEvent::RelayProgressBatch`] at most every 500 ms when progress is enabled.
 ///
 /// Returns the total bytes transferred in each direction plus the reason the
 /// relay ended.  Shutdown of each write half is handled internally when the
@@ -1523,24 +1520,27 @@ async fn counting_relay(
 }
 
 async fn counting_relay_with_client_fragmentation(
-    incoming: TcpStream,
-    outgoing: TcpStream,
+    mut incoming: TcpStream,
+    mut outgoing: TcpStream,
     event_tx: &Option<ProxyEventSender>,
     src_port: u16,
     max_lifetime: Option<Duration>,
     client_fragmentation: Option<(TcpSegmentation, u32)>,
 ) -> RelayResult {
-    let (inc_rd, inc_wr) = incoming.into_split();
-    let (out_rd, out_wr) = outgoing.into_split();
+    let (inc_rd, inc_wr) = incoming.split();
+    let (out_rd, out_wr) = outgoing.split();
 
-    let c2s_atomic = Arc::new(AtomicU64::new(0));
-    let s2c_atomic = Arc::new(AtomicU64::new(0));
+    let local_counters = events::RelayCounters::default();
+    let registration = event_tx.as_ref().and_then(|tx| tx.register_relay(src_port));
+    let counters = registration
+        .as_ref()
+        .map(|relay| relay.counters.as_ref())
+        .unwrap_or(&local_counters);
 
     // Keep both copy futures in this task. Dropping/cancelling the relay now
     // drops the socket halves immediately instead of detaching child tasks.
-    let c2s =
-        copy_counting_client_to_server(inc_rd, out_wr, c2s_atomic.clone(), client_fragmentation);
-    let s2c = copy_counting(out_rd, inc_wr, s2c_atomic.clone());
+    let c2s = copy_counting_client_to_server(inc_rd, out_wr, &counters.c2s, client_fragmentation);
+    let s2c = copy_counting(out_rd, inc_wr, &counters.s2c);
     tokio::pin!(c2s, s2c);
 
     let deadline = async {
@@ -1550,10 +1550,6 @@ async fn counting_relay_with_client_fragmentation(
         }
     };
     tokio::pin!(deadline);
-    let mut interval = tokio::time::interval(Duration::from_millis(500));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await; // skip immediate first tick
-
     let mut c2s_done = false;
     let mut s2c_done = false;
     let reason = loop {
@@ -1577,18 +1573,11 @@ async fn counting_relay_with_client_fragmentation(
                     break RelayEndReason::Completed;
                 }
             }
-            _ = interval.tick(), if event_tx.is_some() => {
-                emit(event_tx, ProxyEvent::RelayProgress {
-                    src_port,
-                    c2s_bytes: c2s_atomic.load(Ordering::Relaxed),
-                    s2c_bytes: s2c_atomic.load(Ordering::Relaxed),
-                });
-            }
         }
     };
     RelayResult {
-        c2s_bytes: c2s_atomic.load(Ordering::Relaxed),
-        s2c_bytes: s2c_atomic.load(Ordering::Relaxed),
+        c2s_bytes: counters.c2s.load(Ordering::Relaxed),
+        s2c_bytes: counters.s2c.load(Ordering::Relaxed),
         reason,
     }
 }
@@ -1596,12 +1585,16 @@ async fn counting_relay_with_client_fragmentation(
 /// Copy all bytes from `reader` to `writer`, updating `counter` after each
 /// chunk.  Shuts down `writer` gracefully on EOF or error, then returns the
 /// total bytes copied.
-async fn copy_counting_client_to_server(
-    mut reader: tokio::net::tcp::OwnedReadHalf,
-    mut writer: tokio::net::tcp::OwnedWriteHalf,
-    counter: Arc<AtomicU64>,
+async fn copy_counting_client_to_server<R, W>(
+    mut reader: R,
+    mut writer: W,
+    counter: &AtomicU64,
     client_fragmentation: Option<(TcpSegmentation, u32)>,
-) -> (u64, bool) {
+) -> (u64, bool)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut buf = vec![0u8; 64 * 1024];
     let mut total = 0u64;
     let mut write_index = client_fragmentation.map(|(_, index)| index).unwrap_or(0);
@@ -1639,11 +1632,11 @@ async fn copy_counting_client_to_server(
     (total, false)
 }
 
-async fn copy_counting(
-    mut reader: tokio::net::tcp::OwnedReadHalf,
-    mut writer: tokio::net::tcp::OwnedWriteHalf,
-    counter: Arc<AtomicU64>,
-) -> (u64, bool) {
+async fn copy_counting<R, W>(mut reader: R, mut writer: W, counter: &AtomicU64) -> (u64, bool)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut buf = vec![0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
@@ -1705,13 +1698,14 @@ pub async fn run_ip_bypass_proxy(
 
     let mut connections = JoinSet::new();
     loop {
-        let (incoming, peer) = match accept_connection(&listener, &mut connections).await {
-            Ok(x) => x,
-            Err(e) => {
-                warn!(error = %e, "ip_bypass: accept failed");
-                continue;
-            }
-        };
+        let (incoming, peer) =
+            match accept_connection(&listener, &mut connections, cfg.TCP_NODELAY).await {
+                Ok(x) => x,
+                Err(e) => {
+                    warn!(error = %e, "ip_bypass: accept failed");
+                    continue;
+                }
+            };
         debug!(%peer, "ip_bypass: accepted");
 
         let ip = *active_ip.read().unwrap();
@@ -1720,6 +1714,7 @@ pub async fn run_ip_bypass_proxy(
         let event_tx = event_tx.clone();
         let src_port = peer.port();
         let relay_max_lifetime = configured_relay_max_lifetime(&cfg);
+        let nodelay = cfg.TCP_NODELAY;
 
         connections.spawn(async move {
             if let Err(e) = handle_ip_bypass_connection(
@@ -1731,6 +1726,7 @@ pub async fn run_ip_bypass_proxy(
                 src_port,
                 event_tx,
                 relay_max_lifetime,
+                nodelay,
             )
             .await
             {
@@ -1750,6 +1746,7 @@ async fn handle_ip_bypass_connection(
     src_port: u16,
     event_tx: Option<ProxyEventSender>,
     relay_max_lifetime: Option<Duration>,
+    nodelay: bool,
 ) -> anyhow::Result<()> {
     let connect_addr = SocketAddr::new(connect_ip, CONNECT_PORT);
     emit(
@@ -1764,6 +1761,7 @@ async fn handle_ip_bypass_connection(
     let outgoing = match connect_with_timeout(
         UPSTREAM_CONNECT_TIMEOUT,
         connect_bound(socket_binder.as_ref(), &binding, connect_addr),
+        nodelay,
     )
     .await
     {
@@ -1810,6 +1808,9 @@ async fn handle_ip_bypass_connection(
 }
 
 #[cfg(test)]
+mod perf_tests;
+
+#[cfg(test)]
 mod tests {
     use std::pin::Pin;
     use std::task::{Context as TaskContext, Poll};
@@ -1852,7 +1853,7 @@ mod tests {
         let controller = Arc::new(PendingFlowController(parking_lot::Mutex::new(Some(
             registered_tx,
         ))));
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = proxy_event_channel(false);
         let task = tokio::spawn(run_proxy(
             Arc::new(config),
             Arc::new(RwLock::new(ActiveSniTarget::new(
@@ -1891,6 +1892,127 @@ mod tests {
         let accept = listener.accept();
         let (client, accepted) = tokio::join!(connect, accept);
         (client.unwrap(), accepted.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn accepted_socket_applies_tcp_nodelay() {
+        for enabled in [false, true] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let mut connections = JoinSet::new();
+            let (client, accepted) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                accept_connection(&listener, &mut connections, enabled)
+            );
+            let _client = client.unwrap();
+            assert_eq!(accepted.unwrap().0.nodelay().unwrap(), enabled);
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_socket_applies_tcp_nodelay() {
+        for enabled in [false, true] {
+            let (_peer, outgoing) = tcp_pair().await;
+            outgoing.set_nodelay(!enabled).unwrap();
+            let stream = connect_with_timeout(
+                Duration::from_secs(1),
+                std::future::ready(Ok::<_, std::io::Error>(outgoing)),
+                enabled,
+            )
+            .await
+            .unwrap();
+            assert_eq!(stream.nodelay().unwrap(), enabled);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_reports_one_batch_then_removes_completed_registration() {
+        let (mut client, incoming) = tcp_pair().await;
+        let (outgoing, mut server) = tcp_pair().await;
+        let (tx, mut rx) = proxy_event_channel(true);
+        let relay_tx = tx.clone();
+        let relay = tokio::spawn(async move {
+            counting_relay(incoming, outgoing, &Some(relay_tx), 1234, None).await
+        });
+        client.write_all(b"hello").await.unwrap();
+        let mut buf = [0; 5];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        server.write_all(b"world").await.unwrap();
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"world");
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let event = rx.try_recv().unwrap();
+        let ProxyEvent::RelayProgressBatch { entries, .. } = event else {
+            panic!("expected batched live counters, got {event:?}");
+        };
+        assert_eq!(
+            entries,
+            vec![RelayProgress {
+                src_port: 1234,
+                c2s_bytes: 5,
+                s2c_bytes: 5
+            }]
+        );
+        client.shutdown().await.unwrap();
+        assert_eq!(server.read(&mut buf).await.unwrap(), 0);
+        server.shutdown().await.unwrap();
+        assert_eq!(client.read(&mut buf).await.unwrap(), 0);
+        let result = relay.await.unwrap();
+        assert_eq!((result.c2s_bytes, result.s2c_bytes), (5, 5));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_relay_removes_live_progress_registration() {
+        let (mut client, incoming) = tcp_pair().await;
+        let (outgoing, mut server) = tcp_pair().await;
+        let (tx, mut rx) = proxy_event_channel(true);
+        let relay_tx = tx.clone();
+        let relay = tokio::spawn(async move {
+            counting_relay(incoming, outgoing, &Some(relay_tx), 1234, None).await
+        });
+        client.write_all(b"hello").await.unwrap();
+        let mut buf = [0; 5];
+        server.read_exact(&mut buf).await.unwrap();
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ProxyEvent::RelayProgressBatch { .. }
+        ));
+        relay.abort();
+        assert!(relay.await.unwrap_err().is_cancelled());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(client.read(&mut buf).await.unwrap(), 0);
+        assert_eq!(server.read(&mut buf).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn upstream_tcp_nodelay_preserves_bypass_requirements() {
+        for (method, segmentation, expected) in [
+            ("wrong_seq", false, false),
+            ("tls_frag", false, false),
+            ("tls_frag", true, true),
+            ("tls_record_frag", false, false),
+            ("tls_record_split", false, true),
+            ("sni_boundary_frag", false, true),
+            ("ccs_prefix", false, true),
+        ] {
+            let mut cfg = cfg_with(
+                &format!("BYPASS_METHOD = \"{method}\""),
+                &format!("TCP_NODELAY = false\nTCP_SEG_NODELAY = {segmentation}"),
+            );
+            assert_eq!(configured_upstream_nodelay(&cfg), expected, "{method}");
+            cfg.TCP_NODELAY = true;
+            assert!(configured_upstream_nodelay(&cfg), "{method}");
+        }
     }
 
     #[derive(Default)]
@@ -2391,7 +2513,7 @@ mod tests {
     async fn connect_timeout_fires_on_a_stalled_connect() {
         let pending = std::future::pending::<std::io::Result<TcpStream>>();
         let started = std::time::Instant::now();
-        let error = connect_with_timeout(std::time::Duration::from_millis(50), pending)
+        let error = connect_with_timeout(std::time::Duration::from_millis(50), pending, false)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error}");

@@ -50,6 +50,7 @@ use crate::methods::mixed_case_sni::MixedCaseSni;
 use crate::methods::sni_boundary_frag::{write_boundary_split, SniBoundaryFrag};
 use crate::methods::tcp_segmentation::{read_one_tls_record, write_fragmented, TcpSegmentation};
 use crate::methods::tls_padding::TlsPadding;
+use crate::methods::tls_record_split::{write_record_split, TlsRecordSplit};
 use crate::net::{
     bound_tcp_socket, connect_bound, InterfaceBinding, InterfaceBindingWatch, OutboundSocketBinder,
 };
@@ -209,6 +210,7 @@ struct ConnectionSettings {
     ccs_prefix: Option<CcsPrefix>,
     mixed_case_sni: Option<MixedCaseSni>,
     sni_boundary_frag: Option<SniBoundaryFrag>,
+    tls_record_split: Option<TlsRecordSplit>,
     tcp_segmentation: TcpSegmentation,
     /// `ip_frag` with `IP_FRAG_ONLY_FIRST_PACKET = false`, or `disorder`
     /// with `DISORDER_ONLY_FIRST_PACKET = false`: the interceptor keeps
@@ -240,6 +242,10 @@ impl ConnectionSettings {
                 .BYPASS_METHOD
                 .contains("sni_boundary_frag")
                 .then(|| SniBoundaryFrag::new(cfg)),
+            tls_record_split: cfg
+                .BYPASS_METHOD
+                .contains("tls_record_split")
+                .then(|| TlsRecordSplit::new(cfg)),
             fragment_all_data: (cfg.BYPASS_METHOD.contains("ip_frag")
                 && !cfg.IP_FRAG_ONLY_FIRST_PACKET)
                 || (cfg.BYPASS_METHOD.contains("disorder") && !cfg.DISORDER_ONLY_FIRST_PACKET),
@@ -354,6 +360,19 @@ where
     dst.flush()
         .await
         .context("ccs_prefix: flushing dummy ChangeCipherSpec record")
+}
+
+/// Write `data` to `dst` and flush it, so the bytes leave as their own write.
+async fn write_and_flush<W>(dst: &mut W, data: &[u8], what: &str) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    dst.write_all(data)
+        .await
+        .with_context(|| format!("writing {what}"))?;
+    dst.flush()
+        .await
+        .with_context(|| format!("flushing {what}"))
 }
 
 async fn read_client_tls_record_with_timeout(
@@ -866,6 +885,56 @@ async fn handle_intercept_connection(
                 if settings.segment_first_client_hello {
                     client_fragmentation_after_prefix = Some((settings.tcp_segmentation, 1));
                 }
+            } else if let Some(split) = settings.tls_record_split {
+                // `tls_record_split`: re-frame the real ClientHello as two TLS
+                // records cut at the SNI boundary, so a DPI that parses only the
+                // first record finds no SNI while the server reassembles the
+                // handshake message across both records. A non-zero
+                // TLS_RECORD_SPLIT_DELAY_MS also separates them at the TCP layer.
+                outgoing
+                    .set_nodelay(true)
+                    .context("tls_record_split: set_nodelay on upstream socket")?;
+
+                let client_hello = read_client_tls_record_with_timeout(
+                    &mut incoming,
+                    settings.bypass_timeout,
+                    &entry,
+                    &event_tx,
+                    src_port,
+                )
+                .await?;
+                // tls_padding / mixed_case_sni run first so the split offset is
+                // resolved against the transformed record.
+                let client_hello = settings.apply_socket_transforms(&client_hello);
+
+                let written = match split.split(&client_hello) {
+                    Some((first, second)) => {
+                        write_record_split(&mut outgoing, &first, &second, split.delay_ms).await
+                    }
+                    // Fail-open: no SNI boundary found; forward the record whole.
+                    None => {
+                        write_and_flush(&mut outgoing, &client_hello, "ClientHello to upstream")
+                            .await
+                    }
+                };
+
+                if let Err(e) = written {
+                    entry.finish(BypassOutcome::UnexpectedClose);
+                    emit(
+                        &event_tx,
+                        ProxyEvent::BypassComplete {
+                            src_port,
+                            outcome: BypassOutcome::UnexpectedClose,
+                        },
+                    );
+                    return Err(e).context("tls_record_split: writing the split ClientHello");
+                }
+
+                // With tls_frag also listed, later client writes are segmented
+                // per its settings. Write index 1 was the ClientHello above.
+                if settings.segment_first_client_hello {
+                    client_fragmentation_after_prefix = Some((settings.tcp_segmentation, 1));
+                }
             } else if settings.segment_first_client_hello {
                 let segmentation = settings.tcp_segmentation;
                 if segmentation.nodelay {
@@ -1250,9 +1319,13 @@ async fn handle_tcp_seg_connection_with_ip(
         .BYPASS_METHOD
         .contains("sni_boundary_frag")
         .then(|| SniBoundaryFrag::new(&cfg));
+    let record_split = cfg
+        .BYPASS_METHOD
+        .contains("tls_record_split")
+        .then(|| TlsRecordSplit::new(&cfg));
     let segment_tlshello =
         cfg.BYPASS_METHOD.contains("tls_frag") && method.packets == TlsFragPackets::TlsHello;
-    let needs_first_record = boundary.is_some() || segment_tlshello;
+    let needs_first_record = boundary.is_some() || record_split.is_some() || segment_tlshello;
 
     // One TLS record is read at most once, transformed first when
     // tls_padding / mixed_case_sni are listed.
@@ -1268,6 +1341,41 @@ async fn handle_tcp_seg_connection_with_ip(
     };
 
     let client_fragmentation = match (boundary, first_record) {
+        // `tls_record_split` owns the first record whenever it is listed; it is
+        // mutually exclusive with `sni_boundary_frag`, so this arm cannot
+        // shadow the boundary branch.
+        (_, Some(record)) if record_split.is_some() => {
+            let split = record_split.expect("guarded by record_split.is_some()");
+            outgoing
+                .set_nodelay(true)
+                .context("tls_record_split: set_nodelay on upstream socket")?;
+            match split.split(&record) {
+                Some((first, second)) => {
+                    write_record_split(&mut outgoing, &first, &second, split.delay_ms)
+                        .await
+                        .context("tls_record_split: writing the split ClientHello")?;
+                    debug!(
+                        split_point = ?split.split_point,
+                        delay_ms = %split.delay_ms,
+                        total_bytes = record.len(),
+                        "tls_record_split: ClientHello rewritten as two TLS records; handing off to relay"
+                    );
+                }
+                None => {
+                    // Fail-open: no SNI boundary found; forward whole.
+                    write_and_flush(&mut outgoing, &record, "ClientHello whole (fail-open)")
+                        .await
+                        .context("tls_record_split")?;
+                }
+            }
+            // The first client write was consumed above; with tls_frag also
+            // listed, later writes are segmented per its settings.
+            if cfg.BYPASS_METHOD.contains("tls_frag") {
+                Some((method, 1))
+            } else {
+                None
+            }
+        }
         (Some(boundary), Some(record)) => {
             match boundary.split_offset(&record) {
                 Some(split) => {

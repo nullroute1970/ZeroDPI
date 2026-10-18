@@ -49,6 +49,11 @@
 //!   a dummy ChangeCipherSpec record (`14 03 03 00 01 01`) as the very first
 //!   upstream bytes before the ClientHello, so DPIs that classify on the
 //!   first TLS record see a benign CCS (RFC 8446 §4.1.3, §5.5).
+//! - `tls_record_split` — TLS Record Split at the SNI boundary. Re-frames the
+//!   client's real ClientHello as two TLS records cut at the `server_name`
+//!   extension, so a DPI that inspects only the first record finds no SNI
+//!   while the server reassembles the handshake message across records
+//!   (RFC 8446 §5.1).
 //!
 //! New interceptor-based methods only need to implement this trait and be
 //! registered in [`build_method`].  New socket-based methods must be wired
@@ -67,6 +72,7 @@ pub mod sni_boundary_frag;
 pub mod tcp_segmentation;
 pub mod tls_padding;
 pub mod tls_record_frag;
+pub mod tls_record_split;
 pub mod urg_sni_split;
 pub mod wrong_ack;
 pub mod wrong_checksum;
@@ -195,7 +201,8 @@ pub trait BypassMethod: Send + Sync + 'static {
 /// `wrong_md5`, `wrong_timestamp`, `low_ttl`, `urg_sni_split`,
 /// `tls_record_frag`, `fake_tls`, `ip_frag`, `disorder`, `seqovl`) and `None`
 /// for socket-only lists (`["tls_frag"]`,
-/// `["tls_padding"]`, `["mixed_case_sni"]`, `["sni_boundary_frag"]`, `["ccs_prefix"]`, or
+/// `["tls_padding"]`, `["mixed_case_sni"]`, `["sni_boundary_frag"]`,
+/// `["tls_record_split"]`, `["ccs_prefix"]`, or
 /// combinations) or empty lists.
 /// Callers should validate the method list via
 /// [`crate::config::Config::validate`] before calling this function.
@@ -213,6 +220,7 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
             "tls_padding" => {}       // socket side; handled directly in proxy.rs
             "mixed_case_sni" => {}    // socket side; handled directly in proxy.rs
             "sni_boundary_frag" => {} // socket side; handled directly in proxy.rs
+            "tls_record_split" => {}  // socket side; handled directly in proxy.rs
             "tls_record_frag" => data = Some(Box::new(tls_record_frag::TlsRecordFrag::new(cfg))),
             "fake_tls" => data = Some(Box::new(fake_tls::FakeTls::new(cfg))),
             "ip_frag" => data = Some(Box::new(ip_frag::IpFrag::new(cfg))),
@@ -239,6 +247,7 @@ pub fn build_method(cfg: &Config) -> Option<Box<dyn BypassMethod>> {
         )
         .with_mixed_case_sni(list.contains("mixed_case_sni"))
         .with_sni_boundary_split(list.contains("sni_boundary_frag"))
+        .with_tls_record_split(list.contains("tls_record_split"))
         .with_ccs_prefix(list.contains("ccs_prefix")),
     ))
 }
@@ -381,6 +390,27 @@ mod tests {
     #[test]
     fn socket_sni_boundary_frag_method_returns_none() {
         let cfg = cfg_with_method(r#"BYPASS_METHOD = "sni_boundary_frag""#);
+        assert!(build_method(&cfg).is_none());
+    }
+
+    #[test]
+    fn socket_tls_record_split_method_returns_none() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = "tls_record_split""#);
+        assert!(build_method(&cfg).is_none());
+    }
+
+    #[test]
+    fn builds_composite_with_tls_record_split() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["wrong_seq", "tls_record_split"]"#);
+        let method = build_method(&cfg).unwrap();
+        assert_eq!(method.name(), "wrong_seq + tls_record_split");
+    }
+
+    #[test]
+    fn socket_list_with_tls_record_split_returns_none() {
+        let cfg = cfg_with_method(r#"BYPASS_METHOD = ["tls_record_split", "tls_frag"]"#);
+        // Both are socket-side, so there is no interceptor-backed chain; the
+        // proxy wires them directly.
         assert!(build_method(&cfg).is_none());
     }
 

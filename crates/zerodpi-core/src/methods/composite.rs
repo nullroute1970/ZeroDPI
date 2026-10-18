@@ -11,7 +11,8 @@
 //! `mixed_case_sni` follows the same pattern via
 //! [`CompositeMethod::mixed_case_sni_first_hello`], and `sni_boundary_frag`
 //! via [`CompositeMethod::splits_first_client_hello`], with `ccs_prefix`
-//! via [`CompositeMethod::ccs_prefix_first_hello`].
+//! via [`CompositeMethod::ccs_prefix_first_hello`], and `tls_record_split`
+//! via [`CompositeMethod::record_splits_first_client_hello`].
 //!
 //! Composition rules (provably reproduce the former hard-coded combos):
 //! - PSH / IP-ident settings come from the **first** handshake-stage member.
@@ -35,6 +36,7 @@ pub struct CompositeMethod {
     pub mixed_case_sni_first_hello: bool,
     pub splits_first_client_hello: bool,
     pub ccs_prefix_first_hello: bool,
+    pub record_splits_first_client_hello: bool,
 }
 
 impl CompositeMethod {
@@ -52,6 +54,7 @@ impl CompositeMethod {
             mixed_case_sni_first_hello: false,
             splits_first_client_hello: false,
             ccs_prefix_first_hello: false,
+            record_splits_first_client_hello: false,
         }
     }
 
@@ -77,6 +80,14 @@ impl CompositeMethod {
         self.ccs_prefix_first_hello = enabled;
         self
     }
+
+    /// Mark the composite as including the socket-side `tls_record_split`
+    /// transform so its name reflects the full method list and the handshake
+    /// stage waits for the data stage.
+    pub fn with_tls_record_split(mut self, enabled: bool) -> Self {
+        self.record_splits_first_client_hello = enabled;
+        self
+    }
 }
 
 impl BypassMethod for CompositeMethod {
@@ -99,6 +110,9 @@ impl BypassMethod for CompositeMethod {
         }
         if self.ccs_prefix_first_hello {
             parts.push("ccs_prefix".into());
+        }
+        if self.record_splits_first_client_hello {
+            parts.push("tls_record_split".into());
         }
         parts.join(" + ")
     }
@@ -144,6 +158,7 @@ impl BypassMethod for CompositeMethod {
             || self.pads_first_client_hello
             || self.splits_first_client_hello
             || self.ccs_prefix_first_hello
+            || self.record_splits_first_client_hello
         {
             tracing::trace!(
                 target = "zerodpi::composite",

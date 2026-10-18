@@ -11,7 +11,7 @@
 
 ## 1. Purpose and scope
 
-ZeroDPI currently ships 17 combinable bypass methods (see §3). This document
+ZeroDPI currently ships 18 combinable bypass methods (see §3). This document
 surveys the remaining techniques used by comparable open-source tools
 (ByeDPI, GoodbyeDPI, zapret) plus a few standards-backed ideas that those
 tools do not use, and assesses each one against ZeroDPI's two plugin
@@ -89,6 +89,7 @@ Windows, no NFQUEUE on Linux). Current members: `tls_frag`, `tls_padding`,
 | `low_ttl` | interceptor, ACK stage | fake packet whose TTL expires between DPI and server; includes `LOW_TTL_DISCOVER` probing |
 | `urg_sni_split` | interceptor, ACK stage | URG pointer tricks to mislead payload-offset parsing |
 | `tls_record_frag` | interceptor, data stage | fragment the TLS record stream (server reassembles, DPI misses SNI) |
+| `tls_record_split` | socket | re-frame the real ClientHello as exactly two TLS records cut at the SNI extension, so a first-record-only DPI finds no SNI while the server reassembles the handshake message (RFC 8446 §5.1); optional delay also splits them across TCP segments |
 | `tls_frag` | socket | write ClientHello in small chunks with `TCP_NODELAY` |
 | `tls_padding` | socket | RFC 7685 ClientHello padding extension pushes SNI past DPI inspection windows |
 | `mixed_case_sni` | socket | randomize SNI letter case (servers lowercase per RFC 6066, case-sensitive DPI misses) |
@@ -103,11 +104,11 @@ Composites: `wrong_seq_wrong_md5`, `wrong_seq_tls_frag`,
 `BYPASS_METHOD = [...]`.
 
 **Gap summary:** the fake-packet injection family (ByeDPI `--wrong-seq`
-etc.) is fully covered; TCP segmentation (`tls_frag`), padding, and
-boundary splitting are covered; and `seqovl` (§4.7) now covers the
-sequence-overlap axis. What is missing versus the comparable tools
-is `fake_tls` variant B (socket-side forged record length) and record-level
-tricks such as `tls_record_split` and `tcp_opt_pad`.
+etc.) is fully covered; TCP segmentation (`tls_frag`), padding, boundary
+splitting, and record-level splitting (`tls_record_split`) are covered; and
+`seqovl` (§4.7) covers the sequence-overlap axis. What is missing versus the
+comparable tools is `fake_tls` variant B (socket-side forged record length)
+and `tcp_opt_pad`.
 
 ---
 
@@ -326,6 +327,11 @@ re-chunked across packet boundaries, not just re-fragmented.
 
 ### 4.5 `tls_record_split` — ClientHello across two TLS records *(moderate value, low effort)*
 
+**Status (2026-09-30):** Implemented (`tls_record_split`, socket-side, splits
+the real ClientHello record into exactly two records at the SNI boundary, with
+`TLS_RECORD_SPLIT_POINT` and an optional `TLS_RECORD_SPLIT_DELAY_MS` that also
+separates the records across TCP segments).
+
 **Overview.** Re-frame the ClientHello so it spans two TLS records:
 record 1 carries the handshake header and every extension up to (but not
 including) the SNI extension; record 2 carries the SNI extension and the
@@ -340,27 +346,34 @@ record-level sibling of `sni_boundary_frag` (which splits one record
 across TCP segments) and is distinct from `tls_record_frag` (which
 fragments records after the handshake).
 
-**ZeroDPI integration.** Socket-side, like `sni_boundary_frag`: reuse its
-ClientHello parser to locate the SNI extension, then re-encode the first
-record as two records split at an extension boundary. Compose as a
-socket-side composite flag. Note the split must fall on an *extension*
-boundary — never mid-extension — or the server rejects the message.
+**ZeroDPI integration.** Socket-side, like `sni_boundary_frag`: it reuses
+`find_sni_boundary` to locate the SNI extension, then re-encodes the first
+record as two records cut at an extension boundary and writes them through a
+new `write_record_split` helper that flushes (and optionally delays) between
+them. Note that a mid-extension cut would still be legal TLS — handshake
+messages span records at any byte offset — but the shipped split points all
+land on or after a domain byte so the result looks like a normal large
+ClientHello split.
 
-**Proposed config.** `TLS_RECORD_SPLIT_POINT` (split before the SNI
-extension by default; allow "before extension N" or byte offsets that the
-parser snaps to the nearest extension boundary).
+**Implemented config.** `TLS_RECORD_SPLIT_POINT` (`"extension_length"`
+default, `"middle"`, or a 0-based domain index) and
+`TLS_RECORD_SPLIT_DELAY_MS` (`Int32Range`, default `0`; a non-zero value also
+separates the records across TCP segments). The method is mutually exclusive
+with `sni_boundary_frag` because both cut the first ClientHello at the SNI
+boundary and the record rewrite destroys the offset `sni_boundary_frag`
+parses.
 
-**Platform.** Everywhere — pure socket transform.
+**Platform.** Everywhere — pure socket transform, no Administrator/root.
 
 **Risks.** Some server implementations (historically a few TLS 1.2
 stacks) reject fragmented ClientHellos; TLS 1.3 implementations are
 required to handle message fragmentation across records. Middleboxes
 that expect the ClientHello in record 1 are precisely the target — but
-some *drop* such connections, so keep the existing
-`PassThrough`/abort-on-failure pattern so the raw stream can be forwarded
-if the split fails validation.
+some *drop* such connections, so the implementation fails open: when the
+record is not a parseable ClientHello with a valid `host_name`, or the cut
+would leave either record empty, the record is forwarded unchanged.
 
-**Effort.** Small-to-medium. ~100–150 LOC reusing the `sni_boundary_frag`
+**Effort.** Small. Implemented in ~150 LOC reusing the `sni_boundary_frag`
 parser, plus tests.
 
 **References.** RFC 8446 §5.1, RFC 5246 §6.2.1.
@@ -491,7 +504,7 @@ segment seqovl bytes to the beginning and decreases sequence number").
 | `ccs_prefix` | TLS middlebox compat | socket | everywhere | small — ✅ implemented | moderate |
 | `disorder` | out-of-order segmentation | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | medium–large* — ✅ implemented | moderate |
 | `seqovl` | TCP sequence overlap | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | medium* — ✅ implemented | high |
-| `tls_record_split` | record-level handshake split | socket | everywhere | small–medium | moderate |
+| `tls_record_split` | record-level handshake split | socket | everywhere | small — ✅ implemented | moderate |
 | `tcp_opt_pad` | TCP option junk | interceptor, data stage | WinDivert/NFQUEUE, IPv4 | small | low |
 
 \* Requires the multi-packet emission infrastructure in the interceptor
@@ -512,8 +525,9 @@ Build in this order:
 4. **`disorder`** — ✅ implemented (reuses the emission plumbing).
 5. **`seqovl`** — ✅ implemented (§4.7), both as a standalone method and as a
    `disorder` modifier.
-6. **`tls_record_split`** / **`tcp_opt_pad`** — cheap additions once the
-   pattern for socket-side and option-staging methods is established.
+6. **`tls_record_split`** — ✅ implemented (§4.5), socket-side and effective
+   against DPIs that reassemble TCP but parse only the first TLS record.
+7. **`tcp_opt_pad`** — the only remaining cheap candidate.
 
 Skip §5 entirely. Do not attempt §6.
 

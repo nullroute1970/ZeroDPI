@@ -30,6 +30,7 @@ enum class ConfigSection(val title: String) {
     MixedCaseSni("mixed_case_sni"),
     CcsPrefix("ccs_prefix"),
     TlsRecordFrag("tls_record_frag"),
+    TlsRecordSplit("tls_record_split"),
     TlsFrag("tls_frag"),
     ProxyScan("Proxy scan"),
 }
@@ -231,6 +232,7 @@ object ZeroDpiConfigSchema {
         "wrong_timestamp",
         "low_ttl",
         "tls_record_frag",
+        "tls_record_split",
         "fake_tls",
         "ip_frag",
         "disorder",
@@ -701,6 +703,24 @@ object ZeroDpiConfigSchema {
             helpText = "Increment IPv4 Identification on TLS-record-fragmented packets.",
         ),
         field(
+            name = "TLS_RECORD_SPLIT_POINT",
+            type = ConfigFieldType.Text,
+            defaultValue = "extension_length",
+            section = ConfigSection.TlsRecordSplit,
+            validationRule = "extension_length, middle, or a 0-based index.",
+            rootImpact = ConfigRootImpact.RootlessFragmentation,
+            helpText = "Where tls_record_split cuts the ClientHello record.",
+        ),
+        field(
+            name = "TLS_RECORD_SPLIT_DELAY_MS",
+            type = ConfigFieldType.IntegerRange,
+            defaultValue = "0",
+            section = ConfigSection.TlsRecordSplit,
+            validationRule = "Must be >= 0; an integer or an inclusive range.",
+            rootImpact = ConfigRootImpact.RootlessFragmentation,
+            helpText = "Delay between the two records (non-zero also splits TCP segments).",
+        ),
+        field(
             name = "TLS_FRAG_PACKETS",
             type = ConfigFieldType.PacketSelector,
             defaultValue = "1-3",
@@ -1091,6 +1111,8 @@ object ZeroDpiConfigToml {
     fun validateMethodCombination(methods: List<String>): String? {
         fun has(vararg names: String) = names.any { it in methods }
         return when {
+            has("tls_record_split") && has("sni_boundary_frag") ->
+                "BYPASS_METHOD \"tls_record_split\" cannot be combined with \"sni_boundary_frag\"."
             has("urg_sni_split") && methods.size > 1 &&
                 methods.any { it != "urg_sni_split" && it !in setOf("tls_frag", "tls_record_frag") } ->
                 "BYPASS_METHOD \"urg_sni_split\" can only be combined with \"tls_frag\" or \"tls_record_frag\"."
@@ -1110,7 +1132,14 @@ object ZeroDpiConfigToml {
         }
     }
 
-    val socketOnlyMethods = setOf("tls_frag", "ccs_prefix", "tls_padding", "mixed_case_sni", "sni_boundary_frag")
+    val socketOnlyMethods = setOf(
+        "tls_frag",
+        "ccs_prefix",
+        "tls_padding",
+        "mixed_case_sni",
+        "sni_boundary_frag",
+        "tls_record_split",
+    )
 
     fun displayMethodList(value: String): String =
         parseTomlStringArray(value)?.joinToString(" + ") ?: value
@@ -1427,7 +1456,8 @@ object ZeroDpiConfigToml {
             val methods = config.methodList("BYPASS_METHOD")
             if (mode == "ip_bypass_plus") {
                 val allowed = setOf(
-                    "tls_record_frag", "tls_frag", "tls_padding", "mixed_case_sni",
+                    "tls_record_frag", "tls_record_split", "tls_frag", "tls_padding",
+                    "mixed_case_sni",
                     "sni_boundary_frag", "ccs_prefix", "ip_frag", "disorder", "seqovl",
                 )
                 val rejected = methods.filter { it !in allowed }
@@ -1509,6 +1539,11 @@ object ZeroDpiConfigToml {
         }
         whenValid("SEQOVL_DELAY_MS") {
             requireField("SEQOVL_DELAY_MS", config.integer("SEQOVL_DELAY_MS") <= 1000, "SEQOVL_DELAY_MS must be <= 1000.")
+        }
+        whenValid("TLS_RECORD_SPLIT_DELAY_MS") {
+            validateIntegerRange(config.text("TLS_RECORD_SPLIT_DELAY_MS"), min = 0)?.let {
+                issues += ConfigValidationIssue("TLS_RECORD_SPLIT_DELAY_MS", "TLS_RECORD_SPLIT_DELAY_MS $it")
+            }
         }
         whenValid("TLS_PADDING_SIZE") {
             validateIntegerRange(config.text("TLS_PADDING_SIZE"), min = 1)?.let {

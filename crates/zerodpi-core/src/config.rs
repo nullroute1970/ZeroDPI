@@ -217,7 +217,7 @@ impl<'de> Deserialize<'de> for SniBoundarySplitPoint {
                 "extension_length" => Ok(Self::ExtensionLength),
                 "middle" => Ok(Self::Middle),
                 _ => Err(de::Error::custom(format!(
-                    "'{value}' is not a valid SNI_BOUNDARY_FRAG_SPLIT_POINT; valid values: \"extension_length\", \"middle\", or an integer"
+                    "'{value}' is not a valid SNI split point; valid values: \"extension_length\", \"middle\", or an integer"
                 ))),
             },
         }
@@ -246,6 +246,7 @@ pub const BASE_BYPASS_METHODS: &[&str] = &[
     "wrong_timestamp",
     "low_ttl",
     "tls_record_frag",
+    "tls_record_split",
     "fake_tls",
     "ip_frag",
     "disorder",
@@ -335,8 +336,8 @@ impl BypassMethodList {
 
     /// `true` when the list contains only socket-side methods
     /// (`["tls_frag"]`, `["tls_padding"]`, `["mixed_case_sni"]`,
-    /// `["sni_boundary_frag"]`, or combinations), which need no packet
-    /// interceptor.
+    /// `["sni_boundary_frag"]`, `["tls_record_split"]`, or combinations),
+    /// which need no packet interceptor.
     pub fn is_socket_only(&self) -> bool {
         !self.0.is_empty()
             && self.0.iter().all(|m| {
@@ -347,6 +348,7 @@ impl BypassMethodList {
                         | "tls_padding"
                         | "mixed_case_sni"
                         | "sni_boundary_frag"
+                        | "tls_record_split"
                 )
             })
     }
@@ -356,7 +358,12 @@ impl BypassMethodList {
         self.0.iter().any(|m| {
             !matches!(
                 m.as_str(),
-                "tls_frag" | "ccs_prefix" | "tls_padding" | "mixed_case_sni" | "sni_boundary_frag"
+                "tls_frag"
+                    | "ccs_prefix"
+                    | "tls_padding"
+                    | "mixed_case_sni"
+                    | "sni_boundary_frag"
+                    | "tls_record_split"
             )
         })
     }
@@ -806,6 +813,32 @@ pub struct Config {
     /// carrying the fragmented ClientHello.  Default: `true`.
     #[serde(default = "default_true")]
     pub TLS_RECORD_FRAG_BUMP_IP_IDENT: bool,
+
+    // -----------------------------------------------------------------------
+    // tls_record_split method parameters
+    // -----------------------------------------------------------------------
+    /// Where `tls_record_split` cuts the client's real ClientHello record when
+    /// re-framing it as two TLS records.
+    ///
+    /// Supported values:
+    /// - `"extension_length"` (default) — right after the `server_name`
+    ///   extension's 2-byte length field, so record 1 holds a ClientHello
+    ///   prefix with no SNI bytes and record 2 starts with the extension body.
+    /// - `"middle"` — the exact middle of the SNI domain string
+    ///   (e.g. `https://you | tube.com`).
+    /// - `N` — after the Nth byte of the domain string (0-based), clamped to
+    ///   the domain length. `0` puts the SNI at the start of record 2.
+    #[serde(default = "default_sni_boundary_split_point")]
+    pub TLS_RECORD_SPLIT_POINT: SniBoundarySplitPoint,
+
+    /// Delay range, in milliseconds, between the two TLS records written by
+    /// `tls_record_split`. Each record is flushed, so a non-zero value makes
+    /// them leave as two TCP segments with a gap — which also defeats DPI
+    /// reassembly buffers. Accepts either an integer (`0`) or an inclusive
+    /// range string (`"5-10"`); a fresh value is sampled per connection.
+    /// Must be `>= 0`. Default: `0`.
+    #[serde(default = "default_zero_range")]
+    pub TLS_RECORD_SPLIT_DELAY_MS: Int32Range,
 
     // -----------------------------------------------------------------------
     // fake_tls method parameters
@@ -1407,6 +1440,9 @@ fn default_sni_boundary_split_point() -> SniBoundarySplitPoint {
 fn default_sni_boundary_delay_ms() -> Int32Range {
     Int32Range { min: 5, max: 10 }
 }
+fn default_zero_range() -> Int32Range {
+    Int32Range::exact(0)
+}
 fn default_tls_frag_packets() -> String {
     "1-3".into()
 }
@@ -1626,6 +1662,13 @@ impl Config {
                     anyhow::bail!("Duplicate BYPASS_METHOD entry '{method}'");
                 }
             }
+            if self.BYPASS_METHOD.contains("tls_record_split")
+                && self.BYPASS_METHOD.contains("sni_boundary_frag")
+            {
+                anyhow::bail!(
+                    "BYPASS_METHOD \"tls_record_split\" cannot be combined with \"sni_boundary_frag\" (both cut the first ClientHello at the SNI boundary; use TLS_RECORD_SPLIT_DELAY_MS to also split the records across TCP segments)"
+                );
+            }
             if self.BYPASS_METHOD.contains("urg_sni_split")
                 && self.BYPASS_METHOD.len() > 1
                 && !self
@@ -1791,6 +1834,8 @@ impl Config {
             .validate_at_least("TLS_FRAG_INTERVAL_MS", 0)?;
         self.SNI_BOUNDARY_FRAG_DELAY_MS
             .validate_at_least("SNI_BOUNDARY_FRAG_DELAY_MS", 0)?;
+        self.TLS_RECORD_SPLIT_DELAY_MS
+            .validate_at_least("TLS_RECORD_SPLIT_DELAY_MS", 0)?;
         if LinuxFirewallBackend::parse(&self.LINUX_FIREWALL_BACKEND).is_none() {
             anyhow::bail!(
                 "Unknown LINUX_FIREWALL_BACKEND '{}'. Valid values: \"iptables\", \"nftables\"",
@@ -1826,11 +1871,12 @@ impl Config {
                         | "ip_frag"
                         | "disorder"
                         | "seqovl"
+                        | "tls_record_split"
                 )
             })
         {
             anyhow::bail!(
-                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_frag\", \"tls_padding\", \"mixed_case_sni\", \"sni_boundary_frag\", \"ccs_prefix\", \"ip_frag\", \"disorder\", or \"seqovl\""
+                "MODE = \"ip_bypass_plus\" supports only real-SNI-preserving BYPASS_METHOD values: \"tls_record_frag\", \"tls_record_split\", \"tls_frag\", \"tls_padding\", \"mixed_case_sni\", \"sni_boundary_frag\", \"ccs_prefix\", \"ip_frag\", \"disorder\", or \"seqovl\""
             );
         }
         if !(0.0..=1.0).contains(&self.PROXY_TEST_SNI_WEIGHT) {
@@ -2536,6 +2582,141 @@ mod tests {
         assert_eq!(cfg.TLS_RECORD_FRAG_SIZE, 1);
         assert!(cfg.TLS_RECORD_FRAG_SET_PSH);
         assert!(cfg.TLS_RECORD_FRAG_BUMP_IP_IDENT);
+    }
+
+    #[test]
+    fn parses_tls_record_split_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.TLS_RECORD_SPLIT_POINT,
+            SniBoundarySplitPoint::ExtensionLength
+        );
+        assert_eq!(cfg.TLS_RECORD_SPLIT_DELAY_MS, Int32Range::exact(0));
+    }
+
+    #[test]
+    fn parses_tls_record_split_overrides() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "tls_record_split"
+               TLS_RECORD_SPLIT_POINT = "middle"
+               TLS_RECORD_SPLIT_DELAY_MS = "5-10""#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.TLS_RECORD_SPLIT_POINT, SniBoundarySplitPoint::Middle);
+        assert_eq!(
+            cfg.TLS_RECORD_SPLIT_DELAY_MS,
+            Int32Range { min: 5, max: 10 }
+        );
+    }
+
+    #[test]
+    fn parses_tls_record_split_integer_point() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               TLS_RECORD_SPLIT_POINT = 3"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.TLS_RECORD_SPLIT_POINT, SniBoundarySplitPoint::Index(3));
+    }
+
+    #[test]
+    fn rejects_invalid_tls_record_split_point() {
+        let cfg = toml::from_str::<Config>(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               TLS_RECORD_SPLIT_POINT = "sideways""#,
+        );
+        assert!(cfg.is_err());
+    }
+
+    #[test]
+    fn rejects_negative_tls_record_split_delay() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               BYPASS_METHOD = "tls_record_split"
+               TLS_RECORD_SPLIT_DELAY_MS = -1"#,
+        )
+        .unwrap();
+        let error = cfg.validate().expect_err("negative delay must be rejected");
+        assert!(error.to_string().contains("TLS_RECORD_SPLIT_DELAY_MS"));
+    }
+
+    #[test]
+    fn rejects_tls_record_split_with_sni_boundary_frag() {
+        for combo in [
+            r#"["tls_record_split", "sni_boundary_frag"]"#,
+            r#"["sni_boundary_frag", "tls_record_split"]"#,
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   BYPASS_METHOD = {combo}"#
+            ))
+            .unwrap();
+            let error = cfg.validate().expect_err("combo must be rejected");
+            assert!(error.to_string().contains("tls_record_split"));
+        }
+    }
+
+    #[test]
+    fn accepts_tls_record_split_combos() {
+        for method in [
+            r#""tls_record_split""#,
+            r#"["tls_record_split", "tls_frag"]"#,
+            r#"["tls_record_split", "tls_padding"]"#,
+            r#"["tls_record_split", "mixed_case_sni"]"#,
+            r#"["tls_record_split", "ccs_prefix"]"#,
+            r#"["tls_record_split", "wrong_seq"]"#,
+            r#"["tls_record_split", "low_ttl"]"#,
+            r#"["wrong_seq", "tls_record_split", "tls_frag"]"#,
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                r#"LISTEN_HOST = "127.0.0.1"
+                   LISTEN_PORT = 44444
+                   BYPASS_METHOD = {method}"#
+            ))
+            .unwrap();
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("combo {method} should validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn tls_record_split_is_socket_only() {
+        let socket_only = BypassMethodList::from("tls_record_split");
+        assert!(socket_only.is_socket_only());
+        assert!(!socket_only.requires_interceptor());
+
+        let combo = BypassMethodList::from_delimited("tls_record_split, tls_frag");
+        assert!(combo.is_socket_only());
+        assert!(!combo.requires_interceptor());
+
+        let with_interceptor = BypassMethodList::from_delimited("tls_record_split, wrong_seq");
+        assert!(!with_interceptor.is_socket_only());
+        assert!(with_interceptor.requires_interceptor());
+    }
+
+    #[test]
+    fn ip_bypass_plus_accepts_tls_record_split() {
+        let cfg: Config = toml::from_str(
+            r#"LISTEN_HOST = "127.0.0.1"
+               LISTEN_PORT = 44444
+               MODE = "ip_bypass_plus"
+               BYPASS_METHOD = "tls_record_split""#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]

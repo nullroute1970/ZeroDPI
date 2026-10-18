@@ -255,6 +255,21 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #     TLS records across fragment boundaries will fail to extract the SNI.  The
 #     upstream TLS server reassembles the fragments normally.
 #
+#   "tls_record_split"
+#     TLS Record Split at the SNI boundary.  Does NOT inject fake packets, does
+#     NOT alter the handshake bytes, and does NOT use WinDivert/NFQUEUE packet
+#     interception.  Parses the client's real ClientHello record down to the
+#     server_name extension and re-frames it as exactly TWO TLS records cut at
+#     that boundary (TLS_RECORD_SPLIT_POINT).  Handshake messages may legally
+#     span several records (RFC 8446 §5.1), so the server reassembles the
+#     ClientHello normally, while a DPI that inspects only the first record —
+#     or that assumes the ClientHello is always record 1 — finds no SNI and
+#     classifies the flow benign.  Unlike "tls_record_frag" this needs no packet
+#     interception, and unlike "tls_frag"/"sni_boundary_frag" it defeats DPIs
+#     that reassemble TCP segments but parse only the first TLS record.
+#     TLS_RECORD_SPLIT_DELAY_MS additionally flushes the two records apart so
+#     they leave as two TCP segments with a gap.
+#
 #   "fake_tls"
 #     Decoy TLS Record Injection.  Injects a decoy TLS record containing a
 #     ClientHello with the whitelisted SNI as the first record a
@@ -421,12 +436,16 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   ClientHello as exactly two TCP segments cut at the SNI extension
 #   boundary.  It combines with handshake-stage methods and with "tls_frag",
 #   "tls_padding", and "mixed_case_sni".
+# - "tls_record_split" adds a socket-side data stage that re-frames the real
+#   ClientHello as two TLS records cut at the SNI boundary.  It combines with
+#   handshake-stage methods and with "tls_frag", "tls_padding",
+#   "mixed_case_sni", and "ccs_prefix", but not with "sni_boundary_frag".
 # - "ccs_prefix" adds a socket-side prefix stage that writes a dummy
 #   ChangeCipherSpec record as the very first upstream bytes.  It combines
 #   with handshake-stage methods and with every socket-side method.
 # - A list containing only "tls_frag", "tls_padding", "mixed_case_sni",
-#   "sni_boundary_frag", and/or "ccs_prefix" skips the packet interceptor
-#   entirely.
+#   "sni_boundary_frag", "tls_record_split", and/or "ccs_prefix" skips the
+#   packet interceptor entirely.
 #
 # Limitations:
 #
@@ -438,6 +457,9 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 # - "sni_boundary_frag" cannot be combined with "tls_record_frag" or
 #   "urg_sni_split"; it combines with the handshake fake-packet methods and
 #   with "tls_frag", "tls_padding", and "mixed_case_sni".
+# - "tls_record_split" cannot be combined with "sni_boundary_frag" (both cut
+#   the first ClientHello at the SNI boundary); use TLS_RECORD_SPLIT_DELAY_MS
+#   to also separate the two records across TCP segments.
 # - "fake_tls" cannot be combined with "tls_record_frag" or
 #   "urg_sni_split".
 # - "ip_frag" cannot be combined with "tls_record_frag", "fake_tls", or
@@ -450,6 +472,8 @@ UPLOAD_SPEED_CAP_BPS = 2048000.0
 #   "tls_padding", "mixed_case_sni", "sni_boundary_frag", "ccs_prefix",
 #   "ip_frag", "disorder", or "seqovl" so the upstream VPN client's real SNI
 #   is preserved.
+# - "tls_record_split" is also accepted by MODE = "ip_bypass_plus" (it
+#   preserves the SNI).
 # - LOW_TTL_DISCOVER only takes effect when "low_ttl" is in the list;
 #   otherwise discovery is silently skipped.
 #
@@ -759,6 +783,48 @@ TLS_RECORD_FRAG_SET_PSH = true
 # rather than a retransmission.  This only affects IPv4 packets; IPv6 has
 # no IPv4 Identification field.
 TLS_RECORD_FRAG_BUMP_IP_IDENT = true
+
+# ---------------------------------------------------------------------------
+# tls_record_split method parameters
+# ---------------------------------------------------------------------------
+# These settings apply when BYPASS_METHOD = "tls_record_split" (alone or
+# combined with handshake fake-packet methods or other socket-side methods).
+#
+# tls_record_split re-frames the client's real ClientHello record as exactly
+# two TLS records cut at the SNI boundary.  Handshake messages may legally span
+# records (RFC 8446 §5.1), so the server reassembles the ClientHello normally;
+# a DPI that parses only the first record finds no SNI.  The handshake bytes
+# are unchanged — the SNI is preserved.
+
+# Where to cut the ClientHello record.
+#   "extension_length" — right after the server_name extension's 2-byte length
+#                        field; record 2 starts with the extension body
+#                        (default)
+#   "middle"           — exact middle of the SNI domain string
+#                        (e.g. https://you | tube.com)
+#   N                  — after the Nth byte of the domain string (0-based),
+#                        clamped to the domain length.  0 puts the SNI at the
+#                        start of record 2.
+#
+# Requires a parseable ClientHello with a valid host_name; otherwise the record
+# is forwarded unchanged (fail-open).  A cut that would leave either record
+# empty is also treated as fail-open.
+TLS_RECORD_SPLIT_POINT = "extension_length"
+
+# Delay between the two TLS records, in milliseconds.
+#
+# Each record is flushed separately, so a non-zero value makes the two records
+# leave as two TCP segments with a gap between them — which also defeats DPI
+# reassembly buffers (this is the job of "sni_boundary_frag", with which
+# "tls_record_split" cannot be combined).
+#
+# Accepts either a fixed integer or an inclusive range string:
+#   0        — write both records back-to-back (default)
+#   "5-10"   — randomly wait 5 through 10 ms between the records
+#
+# A fresh value is chosen per connection.  Must be >= 0.
+TLS_RECORD_SPLIT_DELAY_MS = 0
+
 # ---------------------------------------------------------------------------
 # fake_tls method parameters
 # ---------------------------------------------------------------------------

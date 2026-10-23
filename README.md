@@ -1285,6 +1285,15 @@ ZeroDPI uses [ratatui](https://github.com/ratatui-org/ratatui) for a live termin
 
 **Navigation:** `↑`/`↓` or `j`/`k` to move, `Enter` to confirm, `q`/`Esc` to skip to rank-1.
 
+**Rescan while running:** Press `R` in the `sni_spoof`, `ip_bypass`, or
+`ip_bypass_plus` dashboard to scan the configured list again, even when
+`RESCAN_INTERVAL_SECS = 0` or `SELECTED_SNI` / `SELECTED_IP` skipped the startup
+scan. With `AUTO_SELECT = false`, the fresh results reopen the selection table;
+with `AUTO_SELECT = true`, rank-1 is selected automatically. The proxy stays
+running, and new connections use the selected target. An empty or failed scan
+keeps the current target. Wait for an ongoing scan to finish before requesting
+another one.
+
 ---
 
 ## 💻 CLI Reference

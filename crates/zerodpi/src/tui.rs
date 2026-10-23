@@ -43,6 +43,8 @@ use zerodpi_core::proxy::RescanKind;
 use zerodpi_core::proxy::{ProxyEvent, ProxyEventReceiver, RelayEndReason, RelayProgress};
 use zerodpi_core::sni_scanner::SniProbeEntry;
 
+use crate::manual_rescan::{Controller as RescanController, Selection};
+
 type Term = Terminal<CrosstermBackend<Stdout>>;
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -971,6 +973,7 @@ pub fn run_dashboard(
     rx: &mut ProxyEventReceiver,
     info: &DashboardInfo,
     cfg: &Config,
+    rescan: &mut RescanController,
 ) -> anyhow::Result<()> {
     let active_sni = match info {
         DashboardInfo::SniSpoof { sni, ip, score } => Some((sni.clone(), *ip, *score)),
@@ -1029,6 +1032,29 @@ pub fn run_dashboard(
             }
         }
 
+        if let Ok(selection) = rescan.selections.try_recv() {
+            let result = match selection {
+                Selection::Sni(entries, reply) => {
+                    let result = run_selection(terminal, &entries);
+                    let _ = reply.send(result.as_ref().ok().cloned());
+                    result.map(|_| ())
+                }
+                Selection::Ip(entries, reply) => {
+                    let result = run_ip_selection(terminal, &entries);
+                    let _ = reply.send(result.as_ref().ok().cloned());
+                    result.map(|_| ())
+                }
+            };
+            if let Err(error) = result {
+                state.last_error = Some(LastError {
+                    src_port: 0,
+                    message: format!("rescan selection: {error}"),
+                    at: SystemTime::now(),
+                });
+            }
+            terminal.clear()?;
+        }
+
         if state.auto_scroll && got_event {
             state.scroll_offset = 0;
         }
@@ -1055,6 +1081,14 @@ pub fn run_dashboard(
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press {
                     match k.code {
+                        KeyCode::Char('r') | KeyCode::Char('R')
+                            if !state.rescan_running && !state.channel_closed =>
+                        {
+                            if rescan.requests.try_send(()).is_ok() {
+                                state.rescan_running = true;
+                                state.rescan_started_at = Some(Instant::now());
+                            }
+                        }
                         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                             return Ok(());
                         }
@@ -1322,8 +1356,8 @@ fn find_record(
 // Dashboard rendering
 // ---------------------------------------------------------------------------
 
-fn draw_dashboard(
-    terminal: &mut Term,
+fn draw_dashboard<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
     state: &DashboardState,
     info: &DashboardInfo,
     cfg: &Config,
@@ -1687,6 +1721,8 @@ fn draw_dashboard(
         };
         let help_line = Line::from(vec![
             auto_span,
+            Span::styled(" R ", Style::default().fg(Color::Cyan)),
+            Span::raw("rescan  "),
             Span::styled(" ↑/↓ j/k ", Style::default().fg(Color::Yellow)),
             Span::raw("scroll  "),
             Span::styled(" PgUp/Dn ", Style::default().fg(Color::Yellow)),
@@ -2335,6 +2371,35 @@ mod tests {
             )),
             Style::default()
         );
+    }
+
+    #[test]
+    fn dashboard_shows_rescan_shortcut_at_standard_terminal_width() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let ip = "192.0.2.1".parse().unwrap();
+        let mut state = dashboard_state(vec![]);
+        state.active_ip = Some(ip);
+        draw_dashboard(
+            &mut terminal,
+            &state,
+            &DashboardInfo::IpBypass { ip },
+            &crate::config_for_tests(),
+        )
+        .unwrap();
+        let lines: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        assert!(lines.last().unwrap().contains('─'));
+        assert!(
+            lines[22].contains("R rescan"),
+            "shortcut must remain visible: {}",
+            lines[22]
+        );
+        println!("{}", lines.join("\n"));
     }
 
     fn dashboard_state(records: Vec<ConnectionRecord>) -> DashboardState {

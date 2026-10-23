@@ -8,6 +8,19 @@ import org.junit.Test
 
 class SupportBundleSanitizerTest {
     @Test
+    fun sanitizedConfigRedactsDnsArraysIncludingMultilineValues() {
+        for (array in listOf(
+            """["10.0.0.53", "10.0.0.54"]""",
+            "[\n  \"10.0.0.53\", # ] not the end\n  \"10.0.0.54\"\n]",
+        )) {
+            val sanitized = SupportBundleSanitizer.sanitizedConfig("CUSTOM_DNS_SERVERS = $array\nLISTEN_PORT = 44444")
+            assertTrue(sanitized.contains("CUSTOM_DNS_SERVERS = \"<redacted>\""))
+            assertTrue(sanitized.contains("LISTEN_PORT = 44444"))
+            assertFalse(sanitized.contains("10.0.0."))
+        }
+    }
+
+    @Test
     fun sanitizedConfigRedactsSensitiveTargetsAndKeepsSafeFields() {
         val sanitized = SupportBundleSanitizer.sanitizedConfig(
             """

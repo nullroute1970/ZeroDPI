@@ -846,25 +846,39 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `CUSTOM_DNS_ENABLED` | `bool` | `false` | Resolve SNI hostnames only through `CUSTOM_DNS_SERVER` |
-| `CUSTOM_DNS_SERVER` | `string` | — | Plain DNS server as a literal IPv4/IPv6 address with an optional port (default port `53`) |
+| `CUSTOM_DNS_ENABLED` | `bool` | `false` | Resolve SNI hostnames only through the configured custom DNS servers |
+| `CUSTOM_DNS_SERVERS` | `string[]` | `[]` | Ordered plain-DNS servers; each accepts a literal IPv4/IPv6 address and optional port (default `53`) |
+| `CUSTOM_DNS_SERVER` | `string` | — | Legacy single server, used when `CUSTOM_DNS_SERVERS` is empty or omitted |
 
 System DNS remains the default. To use a custom resolver for `SNI_LIST` scans,
 background rescans, proxy scans, and `SELECTED_SNI`, configure:
 
 ```toml
 CUSTOM_DNS_ENABLED = true
-CUSTOM_DNS_SERVER = "1.1.1.1"
+CUSTOM_DNS_SERVERS = ["1.1.1.1", "8.8.8.8"]
 ```
 
-Custom mode does not fall back to system DNS if the configured server fails.
+Servers are tried sequentially in the listed order for each lookup. Any DNS error
+(including NXDOMAIN, SERVFAIL, or REFUSED), timeout, or response without IPv4
+addresses advances to the next server. The first nonempty IPv4 result is used;
+results from multiple servers are not combined. Each server gets an independent
+`SCAN_TIMEOUT_SECS` deadline covering its UDP/TCP attempts, so three servers with
+a five-second timeout can take about fifteen seconds to resolve a hostname.
+
+A nonempty `CUSTOM_DNS_SERVERS` list overrides `CUSTOM_DNS_SERVER`. Existing
+single-server configurations remain supported. Custom mode does not fall back
+to system DNS or the hosts file if all configured servers fail.
 Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
+
+TUN clients such as sing-box can still intercept or route DNS traffic. To reach
+these servers directly, configure matching routing exceptions before DNS hijack
+rules in that client; process-based direct routing alone may not cover DNS.
 
 ### 🔍 Scan Behavior
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `SCAN_TIMEOUT_SECS` | `u64` | `5` | Per-probe timeout (seconds) |
+| `SCAN_TIMEOUT_SECS` | `u64` | `5` | Independent timeout for each DNS server and probe stage (seconds) |
 | `DEDUPLICATE_SCAN_LISTS` | `bool` | `true` | Remove duplicate entries from `SNI_LIST` / `IP_LIST` on disk before scanning each file, including rescans. Keeps the first entry, order, comments, blank lines, and line endings. SNI comparison ignores ASCII case; IPs and identical CIDR ranges use their parsed values. Overlapping ranges are not merged. Set to `false` to leave files untouched and scan all entries. |
 | `RESCAN_INTERVAL_SECS` | `u64` | `0` | Background rescan interval (`0` = disabled) |
 | `SNI_SWITCH_MIN_SCORE` | `u8` | `1` | Minimum score to auto-switch target on rescan (0–100) |

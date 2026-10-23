@@ -287,16 +287,11 @@ async fn probe_sni(
     progress_tx: Option<mpsc::UnboundedSender<SniProbeEntry>>,
     semaphore: Arc<Semaphore>,
 ) -> Vec<SniProbeEntry> {
-    // DNS resolution is covered by the same per-probe timeout.
-    let addrs: Vec<Ipv4Addr> = match tokio::time::timeout(timeout, resolver.lookup_ipv4(&sni)).await
-    {
-        Ok(Ok(addrs)) => addrs,
-        Ok(Err(e)) => {
-            debug!(sni = %sni, error = %e, "DNS resolution failed");
-            return Vec::new();
-        }
-        Err(_) => {
-            debug!(sni = %sni, timeout = ?timeout, "DNS resolution timed out");
+    // The resolver owns the independent timeout for each DNS server.
+    let addrs = match resolver.lookup_ipv4(&sni).await {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            debug!(sni = %sni, error = %format!("{e:#}"), "DNS resolution failed");
             return Vec::new();
         }
     };
@@ -626,6 +621,42 @@ mod candidate_tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[tokio::test]
+    async fn sni_scan_allows_dns_fallback_beyond_one_timeout() {
+        use crate::dns::test_support::TestDnsServer;
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let first = TestDnsServer::start(0, None, None).await;
+        let second = TestDnsServer::start(
+            0,
+            Some(Ipv4Addr::LOCALHOST),
+            Some(Duration::from_millis(100)),
+        )
+        .await;
+        let config: crate::config::Config = toml::from_str(&format!(
+            "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\nCUSTOM_DNS_ENABLED = true\nCUSTOM_DNS_SERVER = {:?}\nCUSTOM_DNS_SERVERS = [{:?}, {:?}]",
+            first.addr.to_string(), first.addr.to_string(), second.addr.to_string(),
+        )).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snis.txt");
+        std::fs::write(&path, "fallback.test\n").unwrap();
+        let network = OutboundNetwork::new(
+            crate::net::InterfaceBinding::fixed(Ipv4Addr::LOCALHOST),
+            Arc::new(crate::net::NoopSocketBinder),
+        );
+        let entries = scan_sni_list(
+            &path,
+            Duration::from_millis(250),
+            Arc::new(config),
+            network,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ip, Ipv4Addr::LOCALHOST);
+        assert!(second.requests() > 0);
+    }
 
     async fn dns_scan_fixture() -> (
         tempfile::TempDir,

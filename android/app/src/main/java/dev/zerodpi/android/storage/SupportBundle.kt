@@ -8,6 +8,7 @@ object SupportBundleSanitizer {
         "SELECTED_SNI",
         "SELECTED_IP",
         "CUSTOM_DNS_SERVER",
+        "CUSTOM_DNS_SERVERS",
         "SNI_LIST",
         "IP_LIST",
         "SCAN_OUTPUT",
@@ -19,17 +20,56 @@ object SupportBundleSanitizer {
         "PROXY_TEST_URL",
     )
 
-    fun sanitizedConfig(configText: String): String =
-        configText.lineSequence()
-            .joinToString("\n") { line ->
-                val match = assignmentPattern.find(line) ?: return@joinToString line
-                val key = match.groupValues[2]
-                if (key !in redactedConfigFields) {
-                    line
-                } else {
-                    "${match.groupValues[1]}$key${match.groupValues[3]}\"<redacted>\""
+    fun sanitizedConfig(configText: String): String {
+        val lines = mutableListOf<String>()
+        var arrayState: RedactedArray? = null
+        configText.lineSequence().forEach { line ->
+            val activeArray = arrayState
+            if (activeArray != null) {
+                activeArray.consume(line)
+                if (activeArray.depth <= 0) arrayState = null
+                return@forEach
+            }
+            val match = assignmentPattern.find(line)
+            val key = match?.groupValues?.get(2)
+            if (match == null || key !in redactedConfigFields) {
+                lines += line
+            } else {
+                lines += "${match.groupValues[1]}$key${match.groupValues[3]}\"<redacted>\""
+                if (key == "CUSTOM_DNS_SERVERS" && match.groupValues[4].trimStart().startsWith('[')) {
+                    val state = RedactedArray()
+                    state.consume(match.groupValues[4])
+                    if (state.depth > 0) arrayState = state
                 }
             }
+        }
+        return lines.joinToString("\n")
+    }
+
+    private class RedactedArray {
+        var depth = 0
+            private set
+        private var quote: Char? = null
+        private var escaped = false
+
+        fun consume(line: String) {
+            for (char in line) {
+                if (escaped) {
+                    escaped = false
+                } else if (quote != null) {
+                    if (char == '\\' && quote == '"') escaped = true
+                    else if (char == quote) quote = null
+                } else {
+                    when (char) {
+                        '#' -> break
+                        '"', '\'' -> quote = char
+                        '[' -> depth++
+                        ']' -> depth--
+                    }
+                }
+            }
+        }
+    }
 
     fun noticeText(includePrivateLists: Boolean): String =
         buildString {

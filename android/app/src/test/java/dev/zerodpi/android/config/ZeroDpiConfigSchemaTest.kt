@@ -10,6 +10,40 @@ import java.io.File
 
 class ZeroDpiConfigSchemaTest {
     @Test
+    fun customDnsListSupportsOrderedRoundTripAndLegacyPrecedence() {
+        val original = """
+            LISTEN_HOST = "127.0.0.1"
+            LISTEN_PORT = 44444
+            CUSTOM_DNS_ENABLED = true
+            CUSTOM_DNS_SERVER = "invalid-legacy"
+            CUSTOM_DNS_SERVERS = ["1.1.1.1", "[::1]:5353"]
+        """.trimIndent()
+        val editor = ZeroDpiConfigToml.analyze(original)
+        assertTrue("${editor.issues}", editor.canStart)
+        val reversed = """["[::1]:5353", "1.1.1.1"]"""
+        val updated = ZeroDpiConfigToml.replaceOrAppendField(original, "CUSTOM_DNS_SERVERS", reversed)
+        assertTrue(updated.contains("CUSTOM_DNS_SERVERS = $reversed"))
+        val roundTrip = ZeroDpiConfigToml.analyze(updated)
+        assertTrue("${roundTrip.issues}", roundTrip.canStart)
+        assertEquals(reversed, roundTrip.valueFor("CUSTOM_DNS_SERVERS"))
+    }
+
+    @Test
+    fun customDnsListValidatesEntriesAndFallsBackToLegacyWhenEmpty() {
+        val base = "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\nCUSTOM_DNS_ENABLED = true\nCUSTOM_DNS_SERVER = \"1.1.1.1\"\n"
+        for (array in listOf("[]", "[\"1.1.1.1\"]", "[\"::1\", \"1.1.1.1:5353\"]")) {
+            val state = ZeroDpiConfigToml.analyze(base + "CUSTOM_DNS_SERVERS = $array")
+            assertTrue("${state.issues}", state.canStart)
+        }
+        for (array in listOf("[\"\"]", "[\"dns.example.com\"]", "[\"1.1.1.1:0\"]", "[1]")) {
+            val state = ZeroDpiConfigToml.analyze(base + "CUSTOM_DNS_SERVERS = $array")
+            assertFalse("Accepted $array", state.canStart)
+            assertTrue(state.issues.any { it.fieldName == "CUSTOM_DNS_SERVERS" })
+        }
+        assertTrue(ZeroDpiConfigToml.analyze(base.replace("CUSTOM_DNS_ENABLED = true", "CUSTOM_DNS_ENABLED = false") + "CUSTOM_DNS_SERVERS = [\"unused-invalid\"]").canStart)
+    }
+
+    @Test
     fun schemaFieldsMatchRustConfigFields() {
         val rustConfig = findRepoFile("crates/zerodpi-core/src/config.rs")
         assertTrue("Missing Rust config source at ${rustConfig.absolutePath}", rustConfig.isFile)

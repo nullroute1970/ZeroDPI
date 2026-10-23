@@ -287,7 +287,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     cfg.validate()?;
     if cfg.CUSTOM_DNS_ENABLED {
         info!(
-            server = cfg.CUSTOM_DNS_SERVER.as_deref().unwrap_or_default(),
+            servers = ?cfg.custom_dns_servers()?,
             "custom DNS resolver enabled"
         );
     } else {
@@ -417,7 +417,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         info!(sni = %forced_sni, "SELECTED_SNI set — skipping scan");
         let sni = forced_sni.clone();
         let resolver = DnsResolver::from_config(&cfg, scan_timeout)?;
-        rt.block_on(async move { resolve_single_sni(&sni, &resolver, scan_timeout).await })
+        rt.block_on(async move { resolve_single_sni(&sni, &resolver).await })
             .with_context(|| format!("resolving SELECTED_SNI '{}'", forced_sni))?
     } else {
         info!(path = %sni_list_path.display(), "scanning SNI list");
@@ -860,11 +860,10 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
 async fn resolve_single_sni(
     sni: &str,
     resolver: &DnsResolver,
-    timeout: Duration,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
-    let addrs = tokio::time::timeout(timeout, resolver.lookup_ipv4(sni))
+    let addrs = resolver
+        .lookup_ipv4(sni)
         .await
-        .with_context(|| format!("DNS lookup for {sni} timed out"))?
         .with_context(|| format!("DNS lookup for {sni}"))?;
 
     if addrs.is_empty() {
@@ -3947,9 +3946,38 @@ pub(crate) fn config_for_tests() -> Config {
 }
 
 #[cfg(test)]
+#[path = "../../zerodpi-core/src/dns/test_support.rs"]
+mod dns_test_support;
+
+#[cfg(test)]
 mod tests {
 
     use super::*;
+
+    #[tokio::test]
+    async fn selected_sni_allows_dns_fallback_beyond_one_timeout() {
+        use dns_test_support::TestDnsServer;
+        let first = TestDnsServer::start(0, None, None).await;
+        let second = TestDnsServer::start(
+            0,
+            Some(Ipv4Addr::LOCALHOST),
+            Some(Duration::from_millis(100)),
+        )
+        .await;
+        let config: Config = toml::from_str(&format!(
+            "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\nCUSTOM_DNS_ENABLED = true\nCUSTOM_DNS_SERVER = {:?}\nCUSTOM_DNS_SERVERS = [{:?}, {:?}]",
+            first.addr.to_string(), first.addr.to_string(), second.addr.to_string(),
+        )).unwrap();
+        let budget = Duration::from_millis(250);
+        let resolver = DnsResolver::from_config(&config, budget).unwrap();
+        let entries = resolve_single_sni("selected.test", &resolver)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ip, Ipv4Addr::LOCALHOST);
+        assert!(first.requests() > 0);
+        assert!(second.requests() > 0);
+    }
 
     #[tokio::test]
     async fn balanced_pins_skip_even_manual_rescans() {

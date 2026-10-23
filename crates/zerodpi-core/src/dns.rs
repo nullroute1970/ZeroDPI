@@ -9,18 +9,27 @@ use hickory_resolver::config::{
     LookupIpStrategy, NameServerConfigGroup, ResolverConfig, ResolverOpts,
 };
 use hickory_resolver::TokioAsyncResolver;
+use tracing::debug;
 
 use crate::config::Config;
 
 const DEFAULT_DNS_PORT: u16 = 53;
 
+#[cfg(test)]
+mod fallback_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
+
 /// Resolver selected from the application configuration.
 #[derive(Clone)]
-pub enum DnsResolver {
-    /// Delegate hostname resolution to the operating system.
-    System,
-    /// Send plain DNS queries only to the configured name server.
-    Custom(Arc<TokioAsyncResolver>),
+pub struct DnsResolver {
+    custom_servers: Arc<[CustomNameServer]>,
+    timeout: Duration,
+}
+
+struct CustomNameServer {
+    address: SocketAddr,
+    resolver: TokioAsyncResolver,
 }
 
 impl DnsResolver {
@@ -29,57 +38,74 @@ impl DnsResolver {
     /// Custom mode deliberately excludes system resolver configuration and
     /// the hosts file, so a custom lookup cannot silently fall back.
     pub fn from_config(config: &Config, timeout: Duration) -> Result<Self> {
-        if !config.CUSTOM_DNS_ENABLED {
-            return Ok(Self::System);
-        }
-
-        let value = config
-            .CUSTOM_DNS_SERVER
-            .as_deref()
-            .context("CUSTOM_DNS_SERVER is required when CUSTOM_DNS_ENABLED is true")?;
-        let server = parse_custom_dns_server(value)?;
-        let name_servers =
-            NameServerConfigGroup::from_ips_clear(&[server.ip()], server.port(), true);
-        let resolver_config = ResolverConfig::from_parts(None, Vec::new(), name_servers);
-        let mut options = ResolverOpts::default();
-        options.timeout = timeout;
-        options.ip_strategy = LookupIpStrategy::Ipv4Only;
-        options.use_hosts_file = false;
-
-        Ok(Self::Custom(Arc::new(TokioAsyncResolver::tokio(
-            resolver_config,
-            options,
-        ))))
+        let custom_servers = config
+            .custom_dns_servers()?
+            .into_iter()
+            .map(|address| {
+                let name_servers =
+                    NameServerConfigGroup::from_ips_clear(&[address.ip()], address.port(), true);
+                let resolver_config = ResolverConfig::from_parts(None, Vec::new(), name_servers);
+                let mut options = ResolverOpts::default();
+                options.timeout = timeout;
+                options.ip_strategy = LookupIpStrategy::Ipv4Only;
+                options.use_hosts_file = false;
+                CustomNameServer {
+                    address,
+                    resolver: TokioAsyncResolver::tokio(resolver_config, options),
+                }
+            })
+            .collect::<Vec<_>>()
+            .into();
+        Ok(Self {
+            custom_servers,
+            timeout,
+        })
     }
 
     /// Resolve a hostname to IPv4 addresses.
     pub async fn lookup_ipv4(&self, hostname: &str) -> Result<Vec<Ipv4Addr>> {
-        match self {
-            Self::System => {
-                let addrs = tokio::net::lookup_host((hostname, 0))
-                    .await
-                    .with_context(|| format!("system DNS lookup for {hostname}"))?;
-                Ok(addrs
-                    .filter_map(|addr| match addr.ip() {
-                        IpAddr::V4(ip) => Some(ip),
-                        IpAddr::V6(_) => None,
-                    })
-                    .collect())
-            }
-            Self::Custom(resolver) => {
-                let response = resolver
-                    .lookup_ip(hostname)
-                    .await
-                    .with_context(|| format!("custom DNS lookup for {hostname}"))?;
-                Ok(response
-                    .iter()
-                    .filter_map(|ip| match ip {
-                        IpAddr::V4(ip) => Some(ip),
-                        IpAddr::V6(_) => None,
-                    })
-                    .collect())
-            }
+        if self.custom_servers.is_empty() {
+            let addrs = tokio::time::timeout(self.timeout, tokio::net::lookup_host((hostname, 0)))
+                .await
+                .with_context(|| format!("system DNS lookup for {hostname} timed out"))?
+                .with_context(|| format!("system DNS lookup for {hostname}"))?;
+            return Ok(addrs
+                .filter_map(|addr| match addr.ip() {
+                    IpAddr::V4(ip) => Some(ip),
+                    IpAddr::V6(_) => None,
+                })
+                .collect());
         }
+        let mut failures = Vec::new();
+        for (index, server) in self.custom_servers.iter().enumerate() {
+            let reason =
+                match tokio::time::timeout(self.timeout, server.resolver.lookup_ip(hostname)).await
+                {
+                    Ok(Ok(response)) => {
+                        let addresses: Vec<_> = response
+                            .iter()
+                            .filter_map(|ip| match ip {
+                                IpAddr::V4(ip) => Some(ip),
+                                IpAddr::V6(_) => None,
+                            })
+                            .collect();
+                        if !addresses.is_empty() {
+                            return Ok(addresses);
+                        }
+                        "no IPv4 addresses returned".to_owned()
+                    }
+                    Ok(Err(error)) => format!("{error:#}"),
+                    Err(_) => format!("timed out after {:?}", self.timeout),
+                };
+            debug!(%hostname, server = %server.address, error = %reason,
+                next_server = ?self.custom_servers.get(index + 1).map(|next| next.address),
+                "custom DNS lookup failed");
+            failures.push(format!("{}: {reason}", server.address));
+        }
+        anyhow::bail!(
+            "all custom DNS servers failed for {hostname}: {}",
+            failures.join("; ")
+        )
     }
 }
 

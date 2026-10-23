@@ -49,6 +49,7 @@ enum class ConfigFieldType(val label: String) {
     IntegerRange("integer or range"),
     PacketSelector("packet selector"),
     MultiSelect("method list"),
+    StringList("string list"),
 }
 
 enum class ConfigRootImpact(val label: String) {
@@ -314,15 +315,23 @@ object ZeroDpiConfigSchema {
             defaultValue = "false",
             section = ConfigSection.DnsResolution,
             validationRule = "true or false.",
-            helpText = "Resolve SNI hostnames through a custom plain-DNS server.",
+            helpText = "Resolve SNI hostnames through custom plain-DNS servers in order.",
         ),
         field(
             name = "CUSTOM_DNS_SERVER",
             type = ConfigFieldType.OptionalText,
             defaultValue = "",
             section = ConfigSection.DnsResolution,
-            validationRule = "When enabled, a literal IPv4/IPv6 address with an optional non-zero port.",
-            helpText = "Custom DNS endpoint; omitted ports default to 53.",
+            validationRule = "When enabled and CUSTOM_DNS_SERVERS is empty, a literal IPv4/IPv6 address with an optional non-zero port.",
+            helpText = "Legacy DNS endpoint used when the DNS server list is empty; omitted ports default to 53.",
+        ),
+        field(
+            name = "CUSTOM_DNS_SERVERS",
+            type = ConfigFieldType.StringList,
+            defaultValue = "[]",
+            section = ConfigSection.DnsResolution,
+            validationRule = "An ordered TOML array of literal IPv4/IPv6 addresses with optional non-zero ports. Overrides CUSTOM_DNS_SERVER when nonempty.",
+            helpText = "DNS servers to try in order, with an independent scan timeout for each server.",
         ),
         field(
             name = "IP_LIST",
@@ -338,7 +347,7 @@ object ZeroDpiConfigSchema {
             defaultValue = "5",
             section = ConfigSection.ScanBehavior,
             validationRule = "Must be greater than 0.",
-            helpText = "Per-probe timeout in seconds.",
+            helpText = "Independent timeout in seconds for each DNS server and probe stage.",
         ),
         field(
             name = "RESCAN_INTERVAL_SECS",
@@ -1218,6 +1227,8 @@ object ZeroDpiConfigToml {
 
     private fun rawTomlToDisplay(schema: ConfigFieldSchema, rawValue: String): String? =
         when (schema.type) {
+            ConfigFieldType.StringList -> parseTomlStringArray(rawValue)?.let(::canonicalStringArray)
+
             ConfigFieldType.MultiSelect -> {
                 if (rawValue.trim().startsWith('[')) {
                     parseTomlStringArray(rawValue)
@@ -1261,6 +1272,15 @@ object ZeroDpiConfigToml {
 
     private fun parseValue(schema: ConfigFieldSchema, text: String): ParsedConfigValue =
         when (schema.type) {
+            ConfigFieldType.StringList -> {
+                val items = parseTomlStringArray(text)
+                if (items == null) {
+                    ParsedConfigValue(null, "${schema.name} must be a TOML array of strings.")
+                } else {
+                    ParsedConfigValue(TextConfigValue(canonicalStringArray(items)), null)
+                }
+            }
+
             ConfigFieldType.Text,
             ConfigFieldType.OptionalText,
             -> ParsedConfigValue(TextConfigValue(text), null)
@@ -1364,13 +1384,24 @@ object ZeroDpiConfigToml {
         if (
             "CUSTOM_DNS_ENABLED" !in invalidFields &&
             config.boolean("CUSTOM_DNS_ENABLED") &&
-            "CUSTOM_DNS_SERVER" !in invalidFields
+            "CUSTOM_DNS_SERVERS" !in invalidFields
         ) {
-            requireField(
-                "CUSTOM_DNS_SERVER",
-                isValidCustomDnsServer(config.text("CUSTOM_DNS_SERVER")),
-                "CUSTOM_DNS_SERVER must be a literal IP address with an optional non-zero port.",
-            )
+            val servers = parseTomlStringArray(config.text("CUSTOM_DNS_SERVERS")).orEmpty()
+            if (servers.isNotEmpty()) {
+                servers.forEachIndexed { index, server ->
+                    requireField(
+                        "CUSTOM_DNS_SERVERS",
+                        isValidCustomDnsServer(server),
+                        "CUSTOM_DNS_SERVERS[$index] must be a literal IP address with an optional non-zero port.",
+                    )
+                }
+            } else if ("CUSTOM_DNS_SERVER" !in invalidFields) {
+                requireField(
+                    "CUSTOM_DNS_SERVER",
+                    isValidCustomDnsServer(config.text("CUSTOM_DNS_SERVER")),
+                    "CUSTOM_DNS_SERVERS or CUSTOM_DNS_SERVER must provide a literal IP address with an optional non-zero port.",
+                )
+            }
         }
         whenValid("SCAN_TIMEOUT_SECS") {
             requireField("SCAN_TIMEOUT_SECS", config.integer("SCAN_TIMEOUT_SECS") > 0, "SCAN_TIMEOUT_SECS must be > 0.")
@@ -1726,7 +1757,9 @@ object ZeroDpiConfigToml {
 
     private fun toTomlLiteral(schema: ConfigFieldSchema, value: String): String =
         when (schema.type) {
-            ConfigFieldType.MultiSelect -> value.trim()
+            ConfigFieldType.MultiSelect,
+            ConfigFieldType.StringList,
+            -> value.trim()
 
             ConfigFieldType.Text,
             ConfigFieldType.OptionalText,
@@ -1751,6 +1784,9 @@ object ZeroDpiConfigToml {
             ConfigFieldType.Float,
             -> value.trim().ifEmpty { "\"\"" }
         }
+
+    private fun canonicalStringArray(values: List<String>): String =
+        values.joinToString(prefix = "[", separator = ", ", postfix = "]") { "\"${escapeTomlString(it)}\"" }
 
     private fun stripInlineComment(raw: String): String {
         var inString = false

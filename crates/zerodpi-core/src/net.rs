@@ -196,6 +196,18 @@ pub struct InterfaceBindingWatch {
 }
 
 impl InterfaceBindingWatch {
+    /// Mark the current watch revision as seen before starting a probe round.
+    pub fn mark_current(&mut self) -> InterfaceBinding {
+        self.rx.borrow_and_update().clone()
+    }
+
+    /// Hold the current revision stable while applying a probe result. Unlike
+    /// Receiver::has_changed, this also checks revisions after the sender closes.
+    pub fn unchanged(&self) -> Option<watch::Ref<'_, InterfaceBinding>> {
+        let binding = self.rx.borrow();
+        (!binding.has_changed()).then_some(binding)
+    }
+
     pub fn current(&self) -> InterfaceBinding {
         self.rx.borrow().clone()
     }

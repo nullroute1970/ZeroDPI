@@ -521,7 +521,14 @@ where
 
     // Proxy task on LISTEN_HOST:LISTEN_PORT relaying to the target.
     let proxy_cfg = cfg.clone();
-    let proxy_target = active_target.clone();
+    let proxy_target = {
+        let target = active_target.read().unwrap();
+        crate::target_pool::TargetPool::single(crate::target_pool::Target::sni(
+            target.sni.clone(),
+            target.ip,
+            target.score,
+        ))
+    };
     let proxy_fc = flow_controller.clone();
     let proxy_binding = crate::net::InterfaceBindingWatch::fixed(network.binding.clone());
     let proxy_binder = network.binder.clone();

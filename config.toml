@@ -55,6 +55,28 @@ MODE = "sni_spoof"
 # For systemd/headless runs, use the CLI flag: --no-tui.
 AUTO_SELECT = false
 
+# Distribute new connections across the highest-ranked scan results.
+# Applies to sni_spoof, ip_bypass, and ip_bypass_plus. Default: disabled.
+# When enabled, selects targets automatically regardless of AUTO_SELECT.
+# SELECTED_SNI / SELECTED_IP still take priority and create a singleton pool.
+LOAD_BALANCE_ENABLED = false
+
+# Maximum number of unique targets with successful TCP probes and positive
+# scores. Uses fewer when fewer qualify. SNI targets are (hostname, IP) pairs.
+# Must be > 0. Default: 10.
+LOAD_BALANCE_TARGET_COUNT = 10
+
+# "random"      — uniform random choice for each new connection.
+# "round_robin" — cycle through targets in scan rank order (default).
+# "least_ping"  — lowest live TCP connect latency to port 443.
+# "least_load"  — fewest active/connecting relays, rotating between ties.
+LOAD_BALANCE_STRATEGY = "round_robin"
+
+# Seconds between live TCP latency probe rounds, only for least_ping.
+# First round starts immediately; each later round waits this long after the
+# previous one finishes. Probe timeout: SCAN_TIMEOUT_SECS. Must be > 0.
+LOAD_BALANCE_PING_INTERVAL_SECS = 60
+
 # If set to a hostname, skip the scan entirely and use this hostname as the spoofed SNI.
 # The IP address is resolved from DNS automatically.
 # Leave as an empty string ("") to use the scanner.

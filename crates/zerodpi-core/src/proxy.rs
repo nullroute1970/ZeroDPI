@@ -33,7 +33,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -53,9 +53,14 @@ use crate::methods::tls_record_split::{write_record_split, TlsRecordSplit};
 use crate::net::{
     bound_tcp_socket, connect_bound, InterfaceBinding, InterfaceBindingWatch, OutboundSocketBinder,
 };
+#[cfg(test)]
+use crate::target_pool::Target;
+use crate::target_pool::{SelectionStrategy, TargetPool};
 use crate::tls_template::build_client_hello;
 
 mod events;
+#[cfg(test)]
+mod target_pool_tests;
 pub use events::{proxy_event_channel, ProxyEventReceiver, ProxyEventSender, RelayProgress};
 
 // ---------------------------------------------------------------------------
@@ -81,8 +86,6 @@ impl ActiveSniTarget {
     }
 }
 
-pub type SharedSniTarget = Arc<RwLock<ActiveSniTarget>>;
-
 // ---------------------------------------------------------------------------
 // Proxy events
 // ---------------------------------------------------------------------------
@@ -104,6 +107,11 @@ pub enum ProxyEvent {
     ListenerStarted {
         mode: String,
         listen_addr: SocketAddr,
+    },
+    /// Current multi-target routing configuration (representative remains rank one).
+    TargetPoolUpdated {
+        target_count: usize,
+        strategy: SelectionStrategy,
     },
     /// A new inbound connection was accepted and the outbound source port is known.
     ConnectionAccepted {
@@ -282,8 +290,9 @@ enum BypassProgress {
 #[derive(Debug)]
 struct InterceptConnectionTarget {
     binding: InterfaceBinding,
-    connect_ip: Ipv4Addr,
+    connect_addr: SocketAddr,
     fake_client_hello: Vec<u8>,
+    low_ttl_override: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -617,11 +626,32 @@ mod rand_lite {
 /// dashboard; pass `None` when no dashboard is attached.
 pub async fn run_proxy(
     cfg: Arc<Config>,
-    active_target: SharedSniTarget,
+    targets: TargetPool,
     interface_binding: InterfaceBindingWatch,
     socket_binder: Arc<dyn OutboundSocketBinder>,
     flow_controller: Arc<dyn FlowController>,
     event_tx: Option<ProxyEventSender>,
+) -> anyhow::Result<()> {
+    run_proxy_on_port(
+        cfg,
+        targets,
+        interface_binding,
+        socket_binder,
+        flow_controller,
+        event_tx,
+        CONNECT_PORT,
+    )
+    .await
+}
+
+async fn run_proxy_on_port(
+    cfg: Arc<Config>,
+    targets: TargetPool,
+    interface_binding: InterfaceBindingWatch,
+    socket_binder: Arc<dyn OutboundSocketBinder>,
+    flow_controller: Arc<dyn FlowController>,
+    event_tx: Option<ProxyEventSender>,
+    connect_port: u16,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT)
         .parse()
@@ -629,6 +659,7 @@ pub async fn run_proxy(
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
+    let listen_addr = listener.local_addr().context("bound listener address")?;
     info!(%listen_addr, "listening");
     emit(
         &event_tx,
@@ -638,6 +669,22 @@ pub async fn run_proxy(
         },
     );
 
+    let _ping_monitor = crate::target_pool::ping::start(
+        &cfg,
+        targets.clone(),
+        interface_binding.clone(),
+        socket_binder.clone(),
+    );
+    if cfg.LOAD_BALANCE_ENABLED {
+        emit(
+            &event_tx,
+            ProxyEvent::TargetPoolUpdated {
+                target_count: targets.len(),
+                strategy: cfg.LOAD_BALANCE_STRATEGY,
+            },
+        );
+        info!(target_count = targets.len(), strategy = %cfg.LOAD_BALANCE_STRATEGY, "load balancing enabled");
+    }
     let mut connections = JoinSet::new();
     loop {
         let (incoming, peer) =
@@ -650,18 +697,24 @@ pub async fn run_proxy(
             };
         debug!(%peer, "accepted");
 
+        let lease = targets.acquire();
+        let target = lease.target.clone();
+        let IpAddr::V4(connect_ip) = target.ip else {
+            continue;
+        };
+
         // Route to the socket-based path for tls_frag.
         // No FlowTable registration; no interceptor involvement.
         if cfg.BYPASS_METHOD.is_socket_only() {
             let cfg = cfg.clone();
-            let connect_ip = active_target.read().unwrap().ip;
             let binding = interface_binding.current();
             let socket_binder = socket_binder.clone();
             let event_tx = event_tx.clone();
             connections.spawn(async move {
+                let _lease = lease;
                 if let Err(e) = handle_tcp_seg_connection_with_ip(
                     cfg,
-                    connect_ip,
+                    SocketAddr::from((connect_ip, connect_port)),
                     binding,
                     socket_binder,
                     incoming,
@@ -676,19 +729,21 @@ pub async fn run_proxy(
             continue;
         }
 
-        let target = active_target.read().unwrap().clone();
         let flow_controller = flow_controller.clone();
         let socket_binder = socket_binder.clone();
         let event_tx = event_tx.clone();
         let current_binding = interface_binding.current();
         let connection_settings = ConnectionSettings::from_config(&cfg);
-        let fake_client_hello = fresh_fake_client_hello(target.sni.as_bytes());
+        let fake_client_hello =
+            fresh_fake_client_hello(target.sni.as_deref().unwrap_or_default().as_bytes());
         connections.spawn(async move {
+            let _lease = lease;
             if let Err(e) = handle_intercept_connection(
                 InterceptConnectionTarget {
                     binding: current_binding,
-                    connect_ip: target.ip,
+                    connect_addr: SocketAddr::from((connect_ip, connect_port)),
                     fake_client_hello,
+                    low_ttl_override: target.low_ttl,
                 },
                 flow_controller,
                 socket_binder,
@@ -742,10 +797,12 @@ async fn handle_intercept_connection(
     event_tx: Option<ProxyEventSender>,
     settings: ConnectionSettings,
 ) -> anyhow::Result<()> {
-    let connect_port = CONNECT_PORT;
+    let connect_port = target.connect_addr.port();
     let binding = target.binding;
     let interface_ip = binding.ip;
-    let connect_ip = target.connect_ip;
+    let IpAddr::V4(connect_ip) = target.connect_addr.ip() else {
+        anyhow::bail!("intercept targets must be IPv4");
+    };
 
     // Build outbound socket bound to the selected physical interface and IP.
     let socket = bound_tcp_socket(socket_binder.as_ref(), &binding)?;
@@ -772,7 +829,7 @@ async fn handle_intercept_connection(
     // A remote controller resolves this future only after the root helper has
     // inserted the flow. The upstream connect below must never move above it.
     let entry = flow_controller
-        .register_flow(key, target.fake_client_hello, None)
+        .register_flow(key, target.fake_client_hello, target.low_ttl_override)
         .await
         .context("register intercepted flow")?;
 
@@ -1121,11 +1178,32 @@ async fn handle_intercept_connection(
 /// existing IPv4 flow tracking and platform filters.
 pub async fn run_ip_bypass_plus_proxy(
     cfg: Arc<Config>,
-    active_ip: Arc<RwLock<IpAddr>>,
+    targets: TargetPool,
     interface_binding: InterfaceBindingWatch,
     socket_binder: Arc<dyn OutboundSocketBinder>,
     flow_controller: Arc<dyn FlowController>,
     event_tx: Option<ProxyEventSender>,
+) -> anyhow::Result<()> {
+    run_ip_bypass_plus_proxy_on_port(
+        cfg,
+        targets,
+        interface_binding,
+        socket_binder,
+        flow_controller,
+        event_tx,
+        CONNECT_PORT,
+    )
+    .await
+}
+
+async fn run_ip_bypass_plus_proxy_on_port(
+    cfg: Arc<Config>,
+    targets: TargetPool,
+    interface_binding: InterfaceBindingWatch,
+    socket_binder: Arc<dyn OutboundSocketBinder>,
+    flow_controller: Arc<dyn FlowController>,
+    event_tx: Option<ProxyEventSender>,
+    connect_port: u16,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT)
         .parse()
@@ -1133,6 +1211,7 @@ pub async fn run_ip_bypass_plus_proxy(
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
+    let listen_addr = listener.local_addr().context("bound listener address")?;
     info!(%listen_addr, method = %cfg.BYPASS_METHOD, "ip_bypass_plus: listening");
     emit(
         &event_tx,
@@ -1142,6 +1221,22 @@ pub async fn run_ip_bypass_plus_proxy(
         },
     );
 
+    let _ping_monitor = crate::target_pool::ping::start(
+        &cfg,
+        targets.clone(),
+        interface_binding.clone(),
+        socket_binder.clone(),
+    );
+    if cfg.LOAD_BALANCE_ENABLED {
+        emit(
+            &event_tx,
+            ProxyEvent::TargetPoolUpdated {
+                target_count: targets.len(),
+                strategy: cfg.LOAD_BALANCE_STRATEGY,
+            },
+        );
+        info!(target_count = targets.len(), strategy = %cfg.LOAD_BALANCE_STRATEGY, "load balancing enabled");
+    }
     let mut connections = JoinSet::new();
     loop {
         let (incoming, peer) =
@@ -1154,7 +1249,8 @@ pub async fn run_ip_bypass_plus_proxy(
             };
         debug!(%peer, "ip_bypass_plus: accepted");
 
-        let connect_ip = match *active_ip.read().unwrap() {
+        let lease = targets.acquire();
+        let connect_ip = match lease.target.ip {
             IpAddr::V4(ip) => ip,
             IpAddr::V6(ip) => {
                 warn!(%ip, "ip_bypass_plus: active IPv6 target rejected");
@@ -1168,9 +1264,10 @@ pub async fn run_ip_bypass_plus_proxy(
             let socket_binder = socket_binder.clone();
             let event_tx = event_tx.clone();
             connections.spawn(async move {
+                let _lease = lease;
                 if let Err(e) = handle_tcp_seg_connection_with_ip(
                     cfg,
-                    connect_ip,
+                    SocketAddr::from((connect_ip, connect_port)),
                     binding,
                     socket_binder,
                     incoming,
@@ -1191,11 +1288,14 @@ pub async fn run_ip_bypass_plus_proxy(
         let current_binding = interface_binding.current();
         let connection_settings = ConnectionSettings::from_config(&cfg);
         connections.spawn(async move {
+            let low_ttl_override = lease.target.low_ttl;
+            let _lease = lease;
             if let Err(e) = handle_intercept_connection(
                 InterceptConnectionTarget {
                     binding: current_binding,
-                    connect_ip,
+                    connect_addr: SocketAddr::from((connect_ip, connect_port)),
                     fake_client_hello: Vec::new(),
+                    low_ttl_override,
                 },
                 flow_controller,
                 socket_binder,
@@ -1240,7 +1340,7 @@ impl<F: FnOnce()> Drop for ScopeGuard<F> {
 /// 4. Hands off to the normal bidirectional relay for all unselected data.
 async fn handle_tcp_seg_connection_with_ip(
     cfg: Arc<Config>,
-    connect_ip: Ipv4Addr,
+    connect_addr: SocketAddr,
     binding: InterfaceBinding,
     socket_binder: Arc<dyn OutboundSocketBinder>,
     mut incoming: TcpStream,
@@ -1253,12 +1353,11 @@ async fn handle_tcp_seg_connection_with_ip(
         ProxyEvent::ConnectionAccepted {
             peer,
             src_port,
-            target_ip: IpAddr::V4(connect_ip),
+            target_ip: connect_addr.ip(),
         },
     );
 
     let method = TcpSegmentation::new(&cfg);
-    let connect_addr = SocketAddr::from((connect_ip, CONNECT_PORT));
 
     // Connect to upstream.
     let mut outgoing = match connect_with_timeout(
@@ -1668,18 +1767,36 @@ where
 ///
 /// Unlike [`run_proxy`], this function performs **no packet interception**.
 /// It simply accepts incoming TCP connections and relays them to whichever
-/// IP is currently stored in `active_ip:443`, forwarding all data verbatim
+/// IP is reserved from the target pool on port 443, forwarding all data verbatim
 /// so that the upstream app's own TLS SNI passes through unchanged.
 ///
-/// `active_ip` is an `Arc<RwLock<IpAddr>>` that can be hot-swapped by the
-/// background rescan task — each new accepted connection reads the current
-/// value, so the swap applies to new connections only.
+/// Each accepted connection reserves one target from the shared pool. A rescan
+/// changes future reservations; existing workers retain their target and load.
 pub async fn run_ip_bypass_proxy(
     cfg: Arc<Config>,
-    active_ip: Arc<RwLock<IpAddr>>,
+    targets: TargetPool,
     interface_binding: InterfaceBindingWatch,
     socket_binder: Arc<dyn OutboundSocketBinder>,
     event_tx: Option<ProxyEventSender>,
+) -> anyhow::Result<()> {
+    run_ip_bypass_proxy_on_port(
+        cfg,
+        targets,
+        interface_binding,
+        socket_binder,
+        event_tx,
+        CONNECT_PORT,
+    )
+    .await
+}
+
+async fn run_ip_bypass_proxy_on_port(
+    cfg: Arc<Config>,
+    targets: TargetPool,
+    interface_binding: InterfaceBindingWatch,
+    socket_binder: Arc<dyn OutboundSocketBinder>,
+    event_tx: Option<ProxyEventSender>,
+    connect_port: u16,
 ) -> anyhow::Result<()> {
     let listen_addr: SocketAddr = format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT)
         .parse()
@@ -1687,6 +1804,7 @@ pub async fn run_ip_bypass_proxy(
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
+    let listen_addr = listener.local_addr().context("bound listener address")?;
     info!(%listen_addr, "ip_bypass: listening");
     emit(
         &event_tx,
@@ -1696,6 +1814,22 @@ pub async fn run_ip_bypass_proxy(
         },
     );
 
+    let _ping_monitor = crate::target_pool::ping::start(
+        &cfg,
+        targets.clone(),
+        interface_binding.clone(),
+        socket_binder.clone(),
+    );
+    if cfg.LOAD_BALANCE_ENABLED {
+        emit(
+            &event_tx,
+            ProxyEvent::TargetPoolUpdated {
+                target_count: targets.len(),
+                strategy: cfg.LOAD_BALANCE_STRATEGY,
+            },
+        );
+        info!(target_count = targets.len(), strategy = %cfg.LOAD_BALANCE_STRATEGY, "load balancing enabled");
+    }
     let mut connections = JoinSet::new();
     loop {
         let (incoming, peer) =
@@ -1708,7 +1842,8 @@ pub async fn run_ip_bypass_proxy(
             };
         debug!(%peer, "ip_bypass: accepted");
 
-        let ip = *active_ip.read().unwrap();
+        let lease = targets.acquire();
+        let ip = lease.target.ip;
         let binding = interface_binding.current();
         let socket_binder = socket_binder.clone();
         let event_tx = event_tx.clone();
@@ -1717,8 +1852,9 @@ pub async fn run_ip_bypass_proxy(
         let nodelay = cfg.TCP_NODELAY;
 
         connections.spawn(async move {
+            let _lease = lease;
             if let Err(e) = handle_ip_bypass_connection(
-                ip,
+                SocketAddr::new(ip, connect_port),
                 binding,
                 socket_binder,
                 incoming,
@@ -1738,7 +1874,7 @@ pub async fn run_ip_bypass_proxy(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_ip_bypass_connection(
-    connect_ip: IpAddr,
+    connect_addr: SocketAddr,
     binding: InterfaceBinding,
     socket_binder: Arc<dyn OutboundSocketBinder>,
     incoming: TcpStream,
@@ -1748,13 +1884,12 @@ async fn handle_ip_bypass_connection(
     relay_max_lifetime: Option<Duration>,
     nodelay: bool,
 ) -> anyhow::Result<()> {
-    let connect_addr = SocketAddr::new(connect_ip, CONNECT_PORT);
     emit(
         &event_tx,
         ProxyEvent::ConnectionAccepted {
             peer,
             src_port,
-            target_ip: connect_ip,
+            target_ip: connect_addr.ip(),
         },
     );
 
@@ -1854,13 +1989,10 @@ mod tests {
             registered_tx,
         ))));
         let (event_tx, mut event_rx) = proxy_event_channel(false);
+        let targets = TargetPool::single(Target::sni("example.com", Ipv4Addr::LOCALHOST, 100));
         let task = tokio::spawn(run_proxy(
             Arc::new(config),
-            Arc::new(RwLock::new(ActiveSniTarget::new(
-                "example.com",
-                Ipv4Addr::LOCALHOST,
-                100,
-            ))),
+            targets.clone(),
             InterfaceBindingWatch::fixed(InterfaceBinding::fixed(Ipv4Addr::LOCALHOST)),
             Arc::new(crate::net::NoopSocketBinder),
             controller,
@@ -1875,6 +2007,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(targets.active_connections(), 1);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         let mut buf = [0; 1];
@@ -1883,6 +2016,7 @@ mod tests {
             matches!(closed, Ok(Ok(0))),
             "proxy cancellation left its connection task running"
         );
+        assert_eq!(targets.active_connections(), 0);
     }
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {

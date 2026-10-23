@@ -513,6 +513,20 @@ pub struct Config {
     #[serde(default)]
     pub AUTO_SELECT: bool,
 
+    /// Distribute new relay connections across the highest-ranked scan results.
+    #[serde(default)]
+    pub LOAD_BALANCE_ENABLED: bool,
+
+    #[serde(default = "default_load_balance_target_count")]
+    pub LOAD_BALANCE_TARGET_COUNT: usize,
+
+    #[serde(default)]
+    pub LOAD_BALANCE_STRATEGY: crate::target_pool::SelectionStrategy,
+
+    /// Interval between TCP latency probe rounds for least_ping.
+    #[serde(default = "default_load_balance_ping_interval")]
+    pub LOAD_BALANCE_PING_INTERVAL_SECS: u64,
+
     /// Rescan interval in seconds.  After the proxy starts the scanner runs
     /// again in the background every this many seconds and logs the new
     /// rankings.  Set to `0` to disable periodic rescanning.  Default: `0`.
@@ -1424,6 +1438,12 @@ fn default_sni_list() -> String {
 fn default_scan_timeout() -> u64 {
     5
 }
+fn default_load_balance_target_count() -> usize {
+    10
+}
+fn default_load_balance_ping_interval() -> u64 {
+    60
+}
 fn default_method_scan_methods() -> BypassMethodList {
     BypassMethodList::from_delimited(&BASE_BYPASS_METHODS.join(","))
 }
@@ -1611,6 +1631,12 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.LOAD_BALANCE_TARGET_COUNT == 0 {
+            anyhow::bail!("LOAD_BALANCE_TARGET_COUNT must be > 0");
+        }
+        if self.LOAD_BALANCE_PING_INTERVAL_SECS == 0 {
+            anyhow::bail!("LOAD_BALANCE_PING_INTERVAL_SECS must be > 0");
+        }
         for (field, value) in [
             ("SNI_MAX_CONCURRENT", self.SNI_MAX_CONCURRENT),
             ("IP_MAX_P1_CONCURRENT", self.IP_MAX_P1_CONCURRENT),
@@ -1980,6 +2006,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn load_balance_rejects_invalid_settings() {
+        for setting in [
+            "LOAD_BALANCE_TARGET_COUNT = 0",
+            "LOAD_BALANCE_PING_INTERVAL_SECS = 0",
+            "LOAD_BALANCE_STRATEGY = \"unknown\"",
+        ] {
+            let parsed = toml::from_str::<Config>(&format!(
+                "LISTEN_HOST=\"127.0.0.1\"\nLISTEN_PORT=44444\n{setting}"
+            ));
+            assert!(
+                parsed
+                    .and_then(|cfg| cfg.validate().map_err(serde::de::Error::custom))
+                    .is_err(),
+                "accepted {setting}"
+            );
+        }
+    }
+
+    #[test]
     fn scan_list_deduplication_defaults_to_enabled_and_can_be_disabled() {
         for (option, expected) in [
             ("", true),
@@ -2243,6 +2288,13 @@ mod tests {
         assert_eq!(cfg.NFQUEUE_NUM, 1);
         assert_eq!(cfg.LINUX_FIREWALL_BACKEND, "iptables");
         assert!(!cfg.AUTO_SELECT);
+        assert!(!cfg.LOAD_BALANCE_ENABLED);
+        assert_eq!(cfg.LOAD_BALANCE_TARGET_COUNT, 10);
+        assert_eq!(
+            cfg.LOAD_BALANCE_STRATEGY,
+            crate::target_pool::SelectionStrategy::RoundRobin
+        );
+        assert_eq!(cfg.LOAD_BALANCE_PING_INTERVAL_SECS, 60);
         assert_eq!(cfg.RESCAN_INTERVAL_SECS, 0);
         assert_eq!(cfg.SNI_SWITCH_MIN_SCORE, 1);
         assert_eq!(cfg.SNI_LIST, "sni_list.txt");

@@ -750,6 +750,7 @@ fn prune_connection_records(records: &mut VecDeque<ConnectionRecord>) {
 
 /// All mutable state owned by the live proxy dashboard event loop.
 struct DashboardState {
+    target_pool: Option<(usize, zerodpi_core::target_pool::SelectionStrategy)>,
     records: VecDeque<ConnectionRecord>,
     total: u64,
     bypasses_ok: u64,
@@ -892,6 +893,7 @@ fn rescan_status_line(state: &DashboardState, now: Instant) -> Option<Line<'stat
 /// Number of text lines the dashboard header renders, excluding borders.
 fn header_content_rows(state: &DashboardState, now: Instant) -> usize {
     2 + usize::from(rescan_status_line(state, now).is_some())
+        + usize::from(state.target_pool.is_some())
         + usize::from(state.network_status.is_some())
         + usize::from(state.last_error.is_some())
 }
@@ -984,6 +986,7 @@ pub fn run_dashboard(
         DashboardInfo::IpBypass { ip } | DashboardInfo::IpBypassPlus { ip } => Some(*ip),
     };
     let mut state = DashboardState {
+        target_pool: None,
         records: VecDeque::with_capacity(MAX_RECORDS),
         total: 0,
         bypasses_ok: 0,
@@ -1145,6 +1148,12 @@ pub fn run_dashboard(
 
 fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
     match event {
+        ProxyEvent::TargetPoolUpdated {
+            target_count,
+            strategy,
+        } => {
+            state.target_pool = Some((target_count, strategy));
+        }
         ProxyEvent::ListenerStarted { mode, listen_addr } => {
             state.listener = Some((mode, listen_addr));
         }
@@ -1282,15 +1291,25 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
             });
         }
         ProxyEvent::SniTargetChanged { sni, ip, score } => {
+            let changed = state
+                .active_sni
+                .as_ref()
+                .map(|(old_sni, old_ip, _)| (old_sni.as_str(), *old_ip))
+                != Some((sni.as_str(), ip));
             state.active_sni = Some((sni, ip, score));
-            state.target_switches += 1;
-            state.last_switch_at = Some(Instant::now());
+            if changed {
+                state.target_switches += 1;
+                state.last_switch_at = Some(Instant::now());
+            }
         }
         ProxyEvent::IpTargetChanged { ip, score } => {
+            let changed = state.active_ip != Some(ip);
             state.active_ip = Some(ip);
             state.active_ip_score = Some(score);
-            state.target_switches += 1;
-            state.last_switch_at = Some(Instant::now());
+            if changed {
+                state.target_switches += 1;
+                state.last_switch_at = Some(Instant::now());
+            }
         }
         ProxyEvent::LowTtlDiscovered { value } => {
             state.low_ttl = Some(value);
@@ -1528,6 +1547,11 @@ fn draw_dashboard<B: ratatui::backend::Backend>(
                 ]
             }
         };
+        if let Some((count, strategy)) = state.target_pool {
+            header_lines.push(Line::from(format!(
+                "Load balancing: ON   Targets: {count}   Strategy: {strategy}   Header: rank 1"
+            )));
+        }
         if let Some(line) = rescan_line {
             header_lines.push(line);
         }
@@ -2402,8 +2426,40 @@ mod tests {
         println!("{}", lines.join("\n"));
     }
 
+    #[test]
+    fn dashboard_shows_actual_pool_size_and_strategy_at_standard_width() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let ip = "192.0.2.1".parse().unwrap();
+        let mut state = dashboard_state(vec![]);
+        state.active_ip = Some(ip);
+        apply_event(
+            ProxyEvent::TargetPoolUpdated {
+                target_count: 2,
+                strategy: zerodpi_core::target_pool::SelectionStrategy::LeastLoad,
+            },
+            &mut state,
+        );
+        let mut cfg = crate::config_for_tests();
+        cfg.LOAD_BALANCE_ENABLED = true;
+        cfg.LOAD_BALANCE_TARGET_COUNT = 10;
+        draw_dashboard(&mut terminal, &state, &DashboardInfo::IpBypass { ip }, &cfg).unwrap();
+        let lines: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        assert!(lines.iter().any(|line| line.contains("Load balancing: ON")
+            && line.contains("Targets: 2")
+            && line.contains("least_load")
+            && line.contains("rank 1")));
+        println!("{}", lines.join("\n"));
+    }
+
     fn dashboard_state(records: Vec<ConnectionRecord>) -> DashboardState {
         DashboardState {
+            target_pool: None,
             records: VecDeque::from(records),
             total: 0,
             bypasses_ok: 0,
@@ -2432,6 +2488,34 @@ mod tests {
             start: Instant::now(),
             channel_closed: false,
         }
+    }
+
+    #[test]
+    fn refreshing_the_same_representative_updates_score_without_counting_a_switch() {
+        let mut state = dashboard_state(vec![]);
+        for score in [90, 95] {
+            apply_event(
+                ProxyEvent::SniTargetChanged {
+                    sni: "same.example".into(),
+                    ip: Ipv4Addr::new(192, 0, 2, 1),
+                    score,
+                },
+                &mut state,
+            );
+        }
+        assert_eq!(state.target_switches, 1);
+        assert_eq!(state.active_sni.as_ref().unwrap().2, 95);
+        for score in [80, 85] {
+            apply_event(
+                ProxyEvent::IpTargetChanged {
+                    ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+                    score,
+                },
+                &mut state,
+            );
+        }
+        assert_eq!(state.target_switches, 2);
+        assert_eq!(state.active_ip_score, Some(85));
     }
 
     #[test]

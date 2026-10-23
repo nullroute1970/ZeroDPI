@@ -17,6 +17,7 @@ mod helper_client;
 mod manual_rescan;
 mod network_recovery;
 mod runtime_events;
+mod target_selection;
 mod tui;
 
 use std::io::{self, Write};
@@ -55,6 +56,9 @@ use zerodpi_core::proxy_tester::{
     ProxyTestEntry,
 };
 use zerodpi_core::sni_scanner::{scan_sni_list, SniProbeEntry};
+use zerodpi_core::target_pool::{
+    ip_candidates, sni_candidates, SelectionStrategy, Target, TargetPool,
+};
 use zerodpi_platform::uplink::{platform_socket_binder, resolve_physical_binding};
 use zerodpi_platform::{ensure_packet_interception_access, DefaultInterceptor};
 
@@ -445,11 +449,39 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         entries
     };
 
+    let balanced_targets = if cfg.LOAD_BALANCE_ENABLED {
+        if cfg.SELECTED_SNI.is_some() {
+            sorted_entries
+                .first()
+                .map(Target::from_sni)
+                .into_iter()
+                .collect()
+        } else {
+            sni_candidates(&sorted_entries, cfg.LOAD_BALANCE_TARGET_COUNT, 1)
+        }
+    } else {
+        Vec::new()
+    };
+    if cfg.LOAD_BALANCE_ENABLED && balanced_targets.is_empty() {
+        anyhow::bail!(
+            "no valid SNI targets for load balancing (TCP success and positive score required)"
+        );
+    }
+
     // ---- step 2: select a candidate ----
-    if no_tui && !cfg.AUTO_SELECT && cfg.SELECTED_SNI.is_none() {
+    if no_tui && !cfg.AUTO_SELECT && !cfg.LOAD_BALANCE_ENABLED && cfg.SELECTED_SNI.is_none() {
         warn!("--no-tui cannot show the selection table; auto-selecting rank-1");
     }
-    let selected: SniProbeEntry = if cfg.AUTO_SELECT || cfg.SELECTED_SNI.is_some() || no_tui {
+    let selected: SniProbeEntry = if cfg.LOAD_BALANCE_ENABLED {
+        let first = &balanced_targets[0];
+        sorted_entries
+            .iter()
+            .find(|entry| {
+                IpAddr::V4(entry.ip) == first.ip && Some(entry.sni.as_str()) == first.sni.as_deref()
+            })
+            .context("missing ranked SNI target")?
+            .clone()
+    } else if cfg.AUTO_SELECT || cfg.SELECTED_SNI.is_some() || no_tui {
         let best = sorted_entries
             .into_iter()
             .next()
@@ -478,11 +510,18 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         score: Some(selected.score),
     });
 
-    let active_target = Arc::new(std::sync::RwLock::new(ActiveSniTarget::new(
-        selected.sni.clone(),
-        selected.ip,
-        selected.score,
-    )));
+    let active_target = TargetPool::new(
+        if cfg.LOAD_BALANCE_ENABLED {
+            cfg.LOAD_BALANCE_STRATEGY
+        } else {
+            SelectionStrategy::RoundRobin
+        },
+        if cfg.LOAD_BALANCE_ENABLED {
+            balanced_targets
+        } else {
+            vec![Target::from_sni(&selected)]
+        },
+    )?;
     let connect_ip = selected.ip;
 
     // ---- step 3: start the proxy ----
@@ -583,26 +622,44 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         }
     };
 
-    if let Some(discovery_state) = low_ttl_discovery_state.as_ref() {
-        info!(
-            sni = %selected.sni,
-            max_ttl = discovery_state.settings.max_ttl,
-            "LOW_TTL_DISCOVER: probing TTL candidates before listening"
-        );
-        let started = std::time::Instant::now();
-        match rt.block_on(discovery_state.run(&selected.sni, connect_ip)) {
-            Some(value) => {
-                info!(
-                    value,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "LOW_TTL_DISCOVER: applied discovered TTL"
-                );
-                let _ = event_tx.send(ProxyEvent::LowTtlDiscovered { value });
+    if cfg.LOAD_BALANCE_ENABLED {
+        if let Some(discovery) = low_ttl_discovery_state.as_ref() {
+            let (_, targets) = active_target.probe_snapshot();
+            let targets = rt.block_on(target_selection::discover_pool_ttls(
+                targets,
+                &[],
+                Some(cfg.LOW_TTL_VALUE),
+                |target| async move {
+                    let IpAddr::V4(ip) = target.ip else {
+                        return None;
+                    };
+                    discovery.probe(target.sni.as_deref().unwrap(), ip).await
+                },
+            ));
+            active_target.replace(targets);
+        }
+    } else {
+        if let Some(discovery_state) = low_ttl_discovery_state.as_ref() {
+            info!(
+                sni = %selected.sni,
+                max_ttl = discovery_state.settings.max_ttl,
+                "LOW_TTL_DISCOVER: probing TTL candidates before listening"
+            );
+            let started = std::time::Instant::now();
+            match rt.block_on(discovery_state.run(&selected.sni, connect_ip)) {
+                Some(value) => {
+                    info!(
+                        value,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "LOW_TTL_DISCOVER: applied discovered TTL"
+                    );
+                    let _ = event_tx.send(ProxyEvent::LowTtlDiscovered { value });
+                }
+                None => warn!(
+                    "LOW_TTL_DISCOVER: no working TTL found; keeping LOW_TTL_VALUE = {}",
+                    cfg.LOW_TTL_VALUE
+                ),
             }
-            None => warn!(
-                "LOW_TTL_DISCOVER: no working TTL found; keeping LOW_TTL_VALUE = {}",
-                cfg.LOW_TTL_VALUE
-            ),
         }
     }
 
@@ -660,8 +717,14 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         Arc::new(move || {
             let cfg = cfg_verify.clone();
             let (sni, ip) = {
-                let target = verify_target.read().unwrap();
-                (target.sni.to_string(), target.ip)
+                let target = verify_target.representative();
+                (
+                    target.sni.as_deref().unwrap_or_default().to_owned(),
+                    match target.ip {
+                        IpAddr::V4(ip) => ip,
+                        IpAddr::V6(_) => unreachable!("SNI targets are IPv4"),
+                    },
+                )
             };
             let binding = verify_binding.clone();
             let socket_binder = verify_binder.clone();
@@ -727,7 +790,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     let coordinator = network_recovery::RecoveryCoordinator::new(
         recovery_env,
         probe_target,
-        cfg.AUTO_SELECT && cfg.SELECTED_SNI.is_none(),
+        (cfg.AUTO_SELECT || cfg.LOAD_BALANCE_ENABLED) && cfg.SELECTED_SNI.is_none(),
         Some(interface_binding.current()),
     );
     let recovery_handle = rt.spawn(coordinator.run(monitor.events()));
@@ -1120,8 +1183,8 @@ struct LowTtlDiscoveryState {
 }
 
 impl LowTtlDiscoveryState {
-    async fn run(&self, sni: &str, connect_ip: Ipv4Addr) -> Option<u8> {
-        let found = discover_low_ttl(
+    async fn probe(&self, sni: &str, connect_ip: Ipv4Addr) -> Option<u8> {
+        discover_low_ttl(
             self.settings,
             sni,
             connect_ip,
@@ -1130,7 +1193,11 @@ impl LowTtlDiscoveryState {
             self.flow_controller.clone(),
             self.connector.clone(),
         )
-        .await?;
+        .await
+    }
+
+    async fn run(&self, sni: &str, connect_ip: Ipv4Addr) -> Option<u8> {
+        let found = self.probe(sni, connect_ip).await?;
         // Apply the discovered value exactly once, after the scan completes:
         // probing never touched the live handle, so there is no earlier
         // mutation to reconcile (fixes the old "handle left at the first
@@ -1173,7 +1240,7 @@ async fn background_rescan(
     rescan_discovery: Option<LowTtlDiscoveryState>,
     interface_binding: InterfaceBindingWatch,
     socket_binder: Arc<dyn zerodpi_core::net::OutboundSocketBinder>,
-    active_target: Arc<std::sync::RwLock<ActiveSniTarget>>,
+    active_target: TargetPool,
     event_tx: Option<ProxyEventSender>,
     events: RuntimeEventEmitter,
     headless: bool,
@@ -1220,7 +1287,7 @@ async fn rescan_sni_once(
     cfg: Arc<Config>,
     path: PathBuf,
     rescan_discovery: Option<LowTtlDiscoveryState>,
-    active_target: Arc<std::sync::RwLock<ActiveSniTarget>>,
+    active_target: TargetPool,
     event_tx: Option<ProxyEventSender>,
     events: RuntimeEventEmitter,
     headless: bool,
@@ -1228,6 +1295,29 @@ async fn rescan_sni_once(
     probe_target: &std::sync::atomic::AtomicU32,
     manual: Option<&manual_rescan::Worker>,
 ) -> network_recovery::RescanOutcome {
+    if cfg.LOAD_BALANCE_ENABLED && cfg.SELECTED_SNI.is_some() {
+        events.emit(RuntimeEvent::RescanFinished {
+            scan: ScanKind::Sni,
+            found: active_target.len(),
+            best_score: Some(active_target.representative().score),
+            duration_ms: 0,
+            switched: false,
+        });
+        send_rescan_event(
+            &event_tx,
+            ProxyEvent::RescanFinished {
+                kind: RescanKind::Sni,
+                found: active_target.len(),
+                best_score: Some(active_target.representative().score),
+                duration_ms: 0,
+                switched: false,
+            },
+        );
+        return network_recovery::RescanOutcome {
+            found: active_target.len(),
+            switched: false,
+        };
+    }
     let _scan_guard = manual_rescan::SCAN_LOCK.lock().await;
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     events.emit(RuntimeEvent::RescanStarted {
@@ -1263,108 +1353,153 @@ async fn rescan_sni_once(
                     entries.len()
                 );
             }
-            let selected = match manual {
-                Some(worker) => worker.select_sni(cfg.AUTO_SELECT, &entries).await,
-                None => entries.first().cloned(),
-            };
-            if let Some(best) = selected.as_ref() {
-                let current = active_target.read().unwrap().clone();
-                if headless {
-                    info!(
-                        sni = %best.sni,
-                        ip = %best.ip,
-                        score = best.score,
-                        current_sni = %current.sni,
-                        current_ip = %current.ip,
-                        current_score = current.score,
-                        "background SNI rescan evaluated top result"
-                    );
-                } else {
-                    debug!(
-                        sni = %best.sni,
-                        ip = %best.ip,
-                        score = best.score,
-                        current_sni = %current.sni,
-                        current_ip = %current.ip,
-                        current_score = current.score,
-                        "rescan top result"
-                    );
+            if cfg.LOAD_BALANCE_ENABLED {
+                let mut candidates = sni_candidates(
+                    &entries,
+                    cfg.LOAD_BALANCE_TARGET_COUNT,
+                    cfg.SNI_SWITCH_MIN_SCORE,
+                );
+                if let Some(discovery) = rescan_discovery.as_ref() {
+                    let (_, previous) = active_target.probe_snapshot();
+                    candidates = target_selection::discover_pool_ttls(
+                        candidates,
+                        &previous,
+                        None,
+                        |target| async move {
+                            let IpAddr::V4(ip) = target.ip else {
+                                return None;
+                            };
+                            discovery.probe(target.sni.as_deref().unwrap(), ip).await
+                        },
+                    )
+                    .await;
                 }
-
-                let next = if manual.is_some() {
-                    Some(ActiveSniTarget::new(best.sni.clone(), best.ip, best.score))
-                } else {
-                    select_rescan_target(&current, best, cfg.SNI_SWITCH_MIN_SCORE)
+                scan_summary = Some((
+                    candidates.len(),
+                    candidates.first().map(|target| target.score),
+                ));
+                if !candidates.is_empty() {
+                    switched = active_target.replace(candidates);
+                    let representative = active_target.representative();
+                    store_probe_target(probe_target, representative.ip);
+                    announce_target_pool(&cfg, &active_target, &event_tx);
+                }
+            } else {
+                let selected = match manual {
+                    Some(worker) => worker.select_sni(cfg.AUTO_SELECT, &entries).await,
+                    None => entries.first().cloned(),
                 };
-                if let Some(next) = next {
-                    // A switch is warranted. With discovery configured,
-                    // probe the candidate first and gate the hot-swap on
-                    // success; the discovered TTL then goes live together
-                    // with the new target.
-                    let (switch, discovered) = match rescan_discovery.as_ref() {
-                        Some(state) => {
-                            if headless {
-                                info!(
-                                    sni = %next.sni,
-                                    ip = %next.ip,
-                                    "rescan switch warranted; probing TTL candidates"
-                                );
-                            } else {
-                                debug!(
-                                    sni = %next.sni,
-                                    ip = %next.ip,
-                                    "rescan switch warranted; probing TTL candidates"
-                                );
-                            }
-                            let discovered = state.run(&next.sni, next.ip).await;
-                            (
-                                if manual.is_some() {
-                                    discovered.map(|_| next)
-                                } else {
-                                    discovery_gated_switch(
-                                        discovered,
-                                        &current,
-                                        best,
-                                        cfg.SNI_SWITCH_MIN_SCORE,
-                                    )
-                                },
-                                discovered,
-                            )
-                        }
-                        None => (Some(next), None),
+                if let Some(best) = selected.as_ref() {
+                    let representative = active_target.representative();
+                    let current = ActiveSniTarget::new(
+                        representative.sni.clone().unwrap(),
+                        match representative.ip {
+                            IpAddr::V4(ip) => ip,
+                            IpAddr::V6(_) => unreachable!(),
+                        },
+                        representative.score,
+                    );
+                    if headless {
+                        info!(
+                            sni = %best.sni,
+                            ip = %best.ip,
+                            score = best.score,
+                            current_sni = %current.sni,
+                            current_ip = %current.ip,
+                            current_score = current.score,
+                            "background SNI rescan evaluated top result"
+                        );
+                    } else {
+                        debug!(
+                            sni = %best.sni,
+                            ip = %best.ip,
+                            score = best.score,
+                            current_sni = %current.sni,
+                            current_ip = %current.ip,
+                            current_score = current.score,
+                            "rescan top result"
+                        );
+                    }
+
+                    let next = if manual.is_some() {
+                        Some(ActiveSniTarget::new(best.sni.clone(), best.ip, best.score))
+                    } else {
+                        select_rescan_target(&current, best, cfg.SNI_SWITCH_MIN_SCORE)
                     };
-                    match switch {
-                        Some(next) => {
-                            *active_target.write().unwrap() = next.clone();
-                            store_probe_target(probe_target, IpAddr::V4(next.ip));
-                            info!(
-                                old_sni = %current.sni,
-                                old_ip = %current.ip,
-                                old_score = current.score,
-                                new_sni = %next.sni,
-                                new_ip = %next.ip,
-                                new_score = next.score,
-                                "hot-swapped active SNI target"
-                            );
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx.send(ProxyEvent::SniTargetChanged {
-                                    sni: next.sni.to_string(),
-                                    ip: next.ip,
-                                    score: next.score,
-                                });
-                                if let Some(value) = discovered {
-                                    let _ = tx.send(ProxyEvent::LowTtlDiscovered { value });
+                    if let Some(next) = next {
+                        // A switch is warranted. With discovery configured,
+                        // probe the candidate first and gate the hot-swap on
+                        // success; the discovered TTL then goes live together
+                        // with the new target.
+                        let (switch, discovered) = match rescan_discovery.as_ref() {
+                            Some(state) => {
+                                if headless {
+                                    info!(
+                                        sni = %next.sni,
+                                        ip = %next.ip,
+                                        "rescan switch warranted; probing TTL candidates"
+                                    );
+                                } else {
+                                    debug!(
+                                        sni = %next.sni,
+                                        ip = %next.ip,
+                                        "rescan switch warranted; probing TTL candidates"
+                                    );
                                 }
+                                let discovered = state.run(&next.sni, next.ip).await;
+                                (
+                                    if manual.is_some() {
+                                        discovered.map(|_| next)
+                                    } else {
+                                        discovery_gated_switch(
+                                            discovered,
+                                            &current,
+                                            best,
+                                            cfg.SNI_SWITCH_MIN_SCORE,
+                                        )
+                                    },
+                                    discovered,
+                                )
                             }
-                            switched = true;
-                        }
-                        None => {
-                            warn!(
-                                sni = %best.sni,
-                                ip = %best.ip,
-                                "rescan discovery found no working TTL; \
-                                 keeping current target and TTL"
-                            );
+                            None => (Some(next), None),
+                        };
+                        match switch {
+                            Some(next) => {
+                                active_target.replace(vec![Target::sni(
+                                    next.sni.clone(),
+                                    next.ip,
+                                    next.score,
+                                )]);
+                                store_probe_target(probe_target, IpAddr::V4(next.ip));
+                                info!(
+                                    old_sni = %current.sni,
+                                    old_ip = %current.ip,
+                                    old_score = current.score,
+                                    new_sni = %next.sni,
+                                    new_ip = %next.ip,
+                                    new_score = next.score,
+                                    "hot-swapped active SNI target"
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx.send(ProxyEvent::SniTargetChanged {
+                                        sni: next.sni.to_string(),
+                                        ip: next.ip,
+                                        score: next.score,
+                                    });
+                                    if let Some(value) = discovered {
+                                        let _ = tx.send(ProxyEvent::LowTtlDiscovered { value });
+                                    }
+                                }
+                                switched = true;
+                            }
+                            None => {
+                                warn!(
+                                    sni = %best.sni,
+                                    ip = %best.ip,
+                                    "rescan discovery found no working TTL; \
+                                     keeping current target and TTL"
+                                );
+                            }
                         }
                     }
                 }
@@ -1393,6 +1528,38 @@ async fn rescan_sni_once(
         },
     );
     network_recovery::RescanOutcome { found, switched }
+}
+
+fn announce_target_pool(cfg: &Config, pool: &TargetPool, tx: &Option<ProxyEventSender>) {
+    let target = pool.representative();
+    if let Some(sni) = target.sni {
+        if let IpAddr::V4(ip) = target.ip {
+            send_rescan_event(
+                tx,
+                ProxyEvent::SniTargetChanged {
+                    sni: sni.to_string(),
+                    ip,
+                    score: target.score,
+                },
+            );
+        }
+    } else {
+        send_rescan_event(
+            tx,
+            ProxyEvent::IpTargetChanged {
+                ip: target.ip,
+                score: target.score,
+            },
+        );
+    }
+    send_rescan_event(
+        tx,
+        ProxyEvent::TargetPoolUpdated {
+            target_count: pool.len(),
+            strategy: cfg.LOAD_BALANCE_STRATEGY,
+        },
+    );
+    info!(target_count = pool.len(), strategy = %cfg.LOAD_BALANCE_STRATEGY, "load balancing pool refreshed");
 }
 
 fn select_rescan_target(
@@ -1553,6 +1720,12 @@ async fn run_headless_proxy(
 async fn log_headless_proxy_events(mut event_rx: ProxyEventReceiver, events: RuntimeEventEmitter) {
     while let Some(event) = event_rx.recv().await {
         match event {
+            ProxyEvent::TargetPoolUpdated {
+                target_count,
+                strategy,
+            } => {
+                info!(target_count, %strategy, "load balancing pool updated");
+            }
             ProxyEvent::ListenerStarted { mode, listen_addr } => {
                 events.emit(RuntimeEvent::ListenerStarted {
                     mode,
@@ -1778,6 +1951,7 @@ fn ip_bypass_main(
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
 
+    let mut balanced_targets = Vec::new();
     // ---- step 1: obtain active IP ----
     let (active_ip, active_score): (std::net::IpAddr, Option<u8>) =
         if let Some(ref forced_ip) = cfg.SELECTED_IP {
@@ -1804,7 +1978,7 @@ fn ip_bypass_main(
 
             let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
             let cfg_clone = cfg.clone();
-            let entries = if no_tui {
+            let mut entries = if no_tui {
                 let entries = rt.block_on(scan_ip_list_headless(
                     ips,
                     scan_sni,
@@ -1828,25 +2002,30 @@ fn ip_bypass_main(
                 )
             }?;
 
+            if cfg.LOAD_BALANCE_ENABLED {
+                balanced_targets = ip_candidates(&entries, cfg.LOAD_BALANCE_TARGET_COUNT);
+                entries.retain(|entry| balanced_targets.iter().any(|target| target.ip == entry.ip));
+            }
             if entries.is_empty() {
                 anyhow::bail!("no IPs passed the scan — check connectivity or ip_list");
             }
 
-            if no_tui && !cfg.AUTO_SELECT {
+            if no_tui && !cfg.AUTO_SELECT && !cfg.LOAD_BALANCE_ENABLED {
                 warn!("--no-tui cannot show the IP selection table; auto-selecting rank-1");
             }
-            let selected_entry: IpProbeEntry = if cfg.AUTO_SELECT || no_tui {
-                let best = entries.into_iter().next().context("no probe results")?;
-                info!(ip = %best.ip, score = best.score, "auto-selected IP");
-                best
-            } else {
-                let mut terminal = tui::enter_tui()?;
-                let result = tui::run_ip_selection(&mut terminal, &entries);
-                tui::leave_tui(terminal)?;
-                let entry = result.context("IP selection")?;
-                info!(ip = %entry.ip, score = entry.score, "selected IP");
-                entry
-            };
+            let selected_entry: IpProbeEntry =
+                if cfg.LOAD_BALANCE_ENABLED || cfg.AUTO_SELECT || no_tui {
+                    let best = entries.into_iter().next().context("no probe results")?;
+                    info!(ip = %best.ip, score = best.score, "auto-selected IP");
+                    best
+                } else {
+                    let mut terminal = tui::enter_tui()?;
+                    let result = tui::run_ip_selection(&mut terminal, &entries);
+                    tui::leave_tui(terminal)?;
+                    let entry = result.context("IP selection")?;
+                    info!(ip = %entry.ip, score = entry.score, "selected IP");
+                    entry
+                };
             (selected_entry.ip, Some(selected_entry.score))
         };
     events.emit(RuntimeEvent::SelectedTarget {
@@ -1862,7 +2041,18 @@ fn ip_bypass_main(
     let (interface_binding_handle, interface_binding) =
         interface_binding_channel(initial_binding.clone());
 
-    let active_ip_arc = Arc::new(std::sync::RwLock::new(active_ip));
+    let active_ip_arc = TargetPool::new(
+        if cfg.LOAD_BALANCE_ENABLED {
+            cfg.LOAD_BALANCE_STRATEGY
+        } else {
+            SelectionStrategy::RoundRobin
+        },
+        if cfg.LOAD_BALANCE_ENABLED && cfg.SELECTED_IP.is_none() {
+            balanced_targets
+        } else {
+            vec![Target::ip(active_ip, active_score.unwrap_or(0))]
+        },
+    )?;
     let (event_tx, mut event_rx) = proxy_event_channel(!no_tui || events.enabled());
 
     // ---- step 2: optional background IP rescan ----
@@ -1923,7 +2113,7 @@ fn ip_bypass_main(
     let verify: Arc<dyn Fn() -> network_recovery::BoxFuture<'static, bool> + Send + Sync> =
         Arc::new(move || {
             let cfg = cfg_verify.clone();
-            let ip = *verify_active.read().unwrap();
+            let ip = verify_active.representative().ip;
             let binding = verify_binding.clone();
             let socket_binder = verify_binder.clone();
             Box::pin(async move {
@@ -1989,7 +2179,7 @@ fn ip_bypass_main(
     let coordinator = network_recovery::RecoveryCoordinator::new(
         recovery_env,
         probe_target,
-        cfg.AUTO_SELECT && cfg.SELECTED_IP.is_none(),
+        (cfg.AUTO_SELECT || cfg.LOAD_BALANCE_ENABLED) && cfg.SELECTED_IP.is_none(),
         Some(initial_binding),
     );
     let recovery_handle = rt.spawn(coordinator.run(monitor.events()));
@@ -2072,6 +2262,7 @@ fn ip_bypass_plus_main(
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
 
+    let mut balanced_targets = Vec::new();
     // ---- step 1: obtain active IPv4 ----
     let (active_ip, active_score): (IpAddr, Option<u8>) = if let Some(ref forced_ip) =
         cfg.SELECTED_IP
@@ -2101,7 +2292,7 @@ fn ip_bypass_plus_main(
 
         let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
         let cfg_clone = cfg.clone();
-        let entries = if no_tui {
+        let mut entries = if no_tui {
             let entries = rt.block_on(scan_ip_list_headless(
                 ips,
                 scan_sni,
@@ -2125,14 +2316,19 @@ fn ip_bypass_plus_main(
             )
         }?;
 
+        if cfg.LOAD_BALANCE_ENABLED {
+            balanced_targets = ip_candidates(&entries, cfg.LOAD_BALANCE_TARGET_COUNT);
+            entries.retain(|entry| balanced_targets.iter().any(|target| target.ip == entry.ip));
+        }
         if entries.is_empty() {
             anyhow::bail!("ip_bypass_plus: no IPs passed the scan — check connectivity or ip_list");
         }
 
-        if no_tui && !cfg.AUTO_SELECT {
+        if no_tui && !cfg.AUTO_SELECT && !cfg.LOAD_BALANCE_ENABLED {
             warn!("--no-tui cannot show the IP selection table; auto-selecting rank-1");
         }
-        let selected_entry: IpProbeEntry = if cfg.AUTO_SELECT || no_tui {
+        let selected_entry: IpProbeEntry = if cfg.LOAD_BALANCE_ENABLED || cfg.AUTO_SELECT || no_tui
+        {
             let best = entries.into_iter().next().context("no probe results")?;
             info!(ip = %best.ip, score = best.score, "ip_bypass_plus: auto-selected IP");
             best
@@ -2160,7 +2356,18 @@ fn ip_bypass_plus_main(
     let (interface_binding_handle, interface_binding) =
         interface_binding_channel(initial_binding.clone());
 
-    let active_ip_arc = Arc::new(std::sync::RwLock::new(active_ip));
+    let active_ip_arc = TargetPool::new(
+        if cfg.LOAD_BALANCE_ENABLED {
+            cfg.LOAD_BALANCE_STRATEGY
+        } else {
+            SelectionStrategy::RoundRobin
+        },
+        if cfg.LOAD_BALANCE_ENABLED && cfg.SELECTED_IP.is_none() {
+            balanced_targets
+        } else {
+            vec![Target::ip(active_ip, active_score.unwrap_or(0))]
+        },
+    )?;
     let (event_tx, mut event_rx) = proxy_event_channel(!no_tui || events.enabled());
 
     // ---- step 2: optional background IPv4 rescan ----
@@ -2264,7 +2471,7 @@ fn ip_bypass_plus_main(
     let verify: Arc<dyn Fn() -> network_recovery::BoxFuture<'static, bool> + Send + Sync> =
         Arc::new(move || {
             let cfg = cfg_verify.clone();
-            let ip = *verify_active.read().unwrap();
+            let ip = verify_active.representative().ip;
             let network = OutboundNetwork::new(verify_binding.current(), verify_binder.clone());
             Box::pin(async move {
                 zerodpi_core::ip_scanner::probe_ip_candidate(
@@ -2329,7 +2536,7 @@ fn ip_bypass_plus_main(
     let coordinator = network_recovery::RecoveryCoordinator::new(
         recovery_env,
         probe_target,
-        cfg.AUTO_SELECT && cfg.SELECTED_IP.is_none(),
+        (cfg.AUTO_SELECT || cfg.LOAD_BALANCE_ENABLED) && cfg.SELECTED_IP.is_none(),
         Some(interface_binding.current()),
     );
     let recovery_handle = rt.spawn(coordinator.run(monitor.events()));
@@ -2491,7 +2698,7 @@ async fn background_ip_rescan(
     ip_list_path: PathBuf,
     interval_secs: u64,
     probe_target: Arc<std::sync::atomic::AtomicU32>,
-    active_ip: Arc<std::sync::RwLock<std::net::IpAddr>>,
+    active_ip: TargetPool,
     event_tx: Option<ProxyEventSender>,
     events: RuntimeEventEmitter,
     headless: bool,
@@ -2540,7 +2747,7 @@ async fn background_ip_rescan(
 async fn rescan_ip_once(
     cfg: Arc<Config>,
     ip_list_path: PathBuf,
-    active_ip: Arc<std::sync::RwLock<std::net::IpAddr>>,
+    active_ip: TargetPool,
     event_tx: Option<ProxyEventSender>,
     events: RuntimeEventEmitter,
     headless: bool,
@@ -2549,6 +2756,29 @@ async fn rescan_ip_once(
     probe_target: &std::sync::atomic::AtomicU32,
     manual: Option<&manual_rescan::Worker>,
 ) -> network_recovery::RescanOutcome {
+    if cfg.LOAD_BALANCE_ENABLED && cfg.SELECTED_IP.is_some() {
+        events.emit(RuntimeEvent::RescanFinished {
+            scan: ScanKind::Ip,
+            found: active_ip.len(),
+            best_score: Some(active_ip.representative().score),
+            duration_ms: 0,
+            switched: false,
+        });
+        send_rescan_event(
+            &event_tx,
+            ProxyEvent::RescanFinished {
+                kind: RescanKind::Ip,
+                found: active_ip.len(),
+                best_score: Some(active_ip.representative().score),
+                duration_ms: 0,
+                switched: false,
+            },
+        );
+        return network_recovery::RescanOutcome {
+            found: active_ip.len(),
+            switched: false,
+        };
+    }
     let _scan_guard = manual_rescan::SCAN_LOCK.lock().await;
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
@@ -2660,9 +2890,31 @@ async fn rescan_ip_once(
             switched: false,
         };
     }
-    let selected = match manual {
-        Some(worker) => worker.select_ip(cfg.AUTO_SELECT, &entries).await,
-        None => entries.first().cloned(),
+    let candidates = if cfg.LOAD_BALANCE_ENABLED {
+        ip_candidates(&entries, cfg.LOAD_BALANCE_TARGET_COUNT)
+    } else {
+        Vec::new()
+    };
+    let found = if cfg.LOAD_BALANCE_ENABLED {
+        candidates.len()
+    } else {
+        entries.len()
+    };
+    let best_score = if cfg.LOAD_BALANCE_ENABLED {
+        candidates.first().map(|target| target.score)
+    } else {
+        entries.first().map(|entry| entry.score)
+    };
+    let selected = if cfg.LOAD_BALANCE_ENABLED {
+        candidates
+            .first()
+            .and_then(|target| entries.iter().find(|entry| entry.ip == target.ip))
+            .cloned()
+    } else {
+        match manual {
+            Some(worker) => worker.select_ip(cfg.AUTO_SELECT, &entries).await,
+            None => entries.first().cloned(),
+        }
     };
     let mut switched = false;
     if let Some(best) = selected.as_ref() {
@@ -2678,10 +2930,17 @@ async fn rescan_ip_once(
             debug!(mode = policy.mode_label, ip = %best.ip, score = best.score, "background IP rescan top result");
         }
 
-        let current = *active_ip.read().unwrap();
-        switched = best.ip != current;
-        if switched {
-            *active_ip.write().unwrap() = best.ip;
+        let current = active_ip.representative().ip;
+        switched = if cfg.LOAD_BALANCE_ENABLED {
+            let changed = active_ip.replace(candidates);
+            store_probe_target(probe_target, active_ip.representative().ip);
+            announce_target_pool(&cfg, &active_ip, &event_tx);
+            changed
+        } else {
+            best.ip != current
+        };
+        if switched && !cfg.LOAD_BALANCE_ENABLED {
+            active_ip.replace(vec![Target::from_ip(best)]);
             store_probe_target(probe_target, best.ip);
             if let Some(ref tx) = event_tx {
                 let _ = tx.send(ProxyEvent::IpTargetChanged {
@@ -2694,8 +2953,8 @@ async fn rescan_ip_once(
     }
     events.emit(RuntimeEvent::RescanFinished {
         scan: ScanKind::Ip,
-        found: entries.len(),
-        best_score: entries.first().map(|entry| entry.score),
+        found,
+        best_score,
         duration_ms: scan_started.elapsed().as_millis() as u64,
         switched,
     });
@@ -2703,16 +2962,13 @@ async fn rescan_ip_once(
         &event_tx,
         ProxyEvent::RescanFinished {
             kind: RescanKind::Ip,
-            found: entries.len(),
-            best_score: entries.first().map(|entry| entry.score),
+            found,
+            best_score,
             duration_ms: scan_started.elapsed().as_millis() as u64,
             switched,
         },
     );
-    network_recovery::RescanOutcome {
-        found: entries.len(),
-        switched,
-    }
+    network_recovery::RescanOutcome { found, switched }
 }
 
 // ---------------------------------------------------------------------------
@@ -3695,6 +3951,104 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn balanced_pins_skip_even_manual_rescans() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.txt");
+        let mut cfg = config_for_tests();
+        cfg.LOAD_BALANCE_ENABLED = true;
+        cfg.AUTO_SELECT = false;
+        cfg.SELECTED_SNI = Some("pinned.example".into());
+        cfg.SELECTED_IP = Some("192.0.2.1".into());
+        let pool = TargetPool::single(Target::sni(
+            "pinned.example",
+            "192.0.2.1".parse().unwrap(),
+            90,
+        ));
+        let network = OutboundNetwork::new(
+            zerodpi_core::net::InterfaceBinding::fixed(Ipv4Addr::LOCALHOST),
+            Arc::new(OfflineBinder),
+        );
+        let probe_target = std::sync::atomic::AtomicU32::new(0);
+        let (_control, worker) = manual_rescan::channel();
+        let sni = rescan_sni_once(
+            Arc::new(cfg.clone()),
+            missing.clone(),
+            None,
+            pool.clone(),
+            None,
+            RuntimeEventEmitter::default(),
+            true,
+            network.clone(),
+            &probe_target,
+            Some(&worker),
+        )
+        .await;
+        assert_eq!(sni.found, 1);
+        assert!(!sni.switched);
+        let ip = rescan_ip_once(
+            Arc::new(cfg),
+            missing,
+            pool.clone(),
+            None,
+            RuntimeEventEmitter::default(),
+            true,
+            network,
+            IpRescanPolicy {
+                mode_label: "ip_bypass",
+                ipv4_only: false,
+            },
+            &probe_target,
+            Some(&worker),
+        )
+        .await;
+        assert_eq!(ip.found, 1);
+        assert!(!ip.switched);
+        assert_eq!(pool.representative().sni.as_deref(), Some("pinned.example"));
+    }
+
+    #[tokio::test]
+    async fn balanced_rescan_keeps_the_old_pool_when_all_tcp_probes_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ip_list.txt");
+        std::fs::write(&path, "192.0.2.2\n192.0.2.3\n").unwrap();
+        let mut cfg = config_for_tests();
+        cfg.LOAD_BALANCE_ENABLED = true;
+        cfg.AUTO_SELECT = false;
+        cfg.SELECTED_IP = None;
+        let original = Target::ip("192.0.2.1".parse().unwrap(), 90);
+        let pool = TargetPool::single(original.clone());
+        let network = OutboundNetwork::new(
+            zerodpi_core::net::InterfaceBinding::fixed(Ipv4Addr::LOCALHOST),
+            Arc::new(OfflineBinder),
+        );
+        let probe_target = std::sync::atomic::AtomicU32::new(0);
+        let (_control, worker) = manual_rescan::channel();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            rescan_ip_once(
+                Arc::new(cfg),
+                path,
+                pool.clone(),
+                None,
+                RuntimeEventEmitter::default(),
+                true,
+                network,
+                IpRescanPolicy {
+                    mode_label: "ip_bypass",
+                    ipv4_only: false,
+                },
+                &probe_target,
+                Some(&worker),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.found, 0);
+        assert!(!outcome.switched);
+        assert_eq!(pool.representative(), original);
+    }
+
     fn current(score: u8) -> ActiveSniTarget {
         ActiveSniTarget::new("old.example.com", Ipv4Addr::new(1, 1, 1, 1), score)
     }
@@ -4016,11 +4370,7 @@ mod tests {
         let path = dir.path().join("sni_list.txt");
         std::fs::write(&path, "").unwrap();
         let cfg = Arc::new(config_for_tests());
-        let active = Arc::new(std::sync::RwLock::new(ActiveSniTarget::new(
-            "example.com",
-            "1.1.1.1".parse().unwrap(),
-            50,
-        )));
+        let active = TargetPool::single(Target::sni("example.com", "1.1.1.1".parse().unwrap(), 50));
         let probe_target = std::sync::atomic::AtomicU32::new(0);
         let outcome = rescan_sni_once(
             cfg,
@@ -4111,7 +4461,7 @@ mod tests {
             cfg.AUTO_SELECT = auto;
             cfg.SELECTED_IP = Some("192.0.2.99".into());
             cfg.RESCAN_INTERVAL_SECS = 0;
-            let active = Arc::new(std::sync::RwLock::new("192.0.2.99".parse().unwrap()));
+            let active = TargetPool::single(Target::ip("192.0.2.99".parse().unwrap(), 0));
             let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(0));
             let (_, binding) = interface_binding_channel(
                 zerodpi_core::net::InterfaceBinding::fixed(Ipv4Addr::LOCALHOST),
@@ -4179,7 +4529,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(found, [2, 1, 0][round]);
                 assert_eq!(switched, round < 2);
-                assert_eq!(active.read().unwrap().to_string(), expected);
+                assert_eq!(active.representative().ip.to_string(), expected);
                 assert_eq!(
                     Ipv4Addr::from(probe_target.load(Ordering::SeqCst)).to_string(),
                     expected,

@@ -828,6 +828,10 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 |-------|------|---------|-------------|
 | `MODE` | `string` | `"sni_spoof"` | One of: `sni_spoof`, `ip_bypass`, `ip_bypass_plus`, `sni_scan`, `ip_scan`, `proxy_scan`, `sni_method_scan`, `ip_method_scan` |
 | `AUTO_SELECT` | `bool` | `false` | Auto-pick rank-1 after scan (skip manual selection table) |
+| `LOAD_BALANCE_ENABLED` | `bool` | `false` | Distribute new connections across top-ranked targets in relay modes |
+| `LOAD_BALANCE_TARGET_COUNT` | `usize` | `10` | Maximum unique targets with TCP success and a positive score; must be > 0 |
+| `LOAD_BALANCE_STRATEGY` | `string` | `"round_robin"` | `random`, `round_robin`, `least_ping`, or `least_load` |
+| `LOAD_BALANCE_PING_INTERVAL_SECS` | `u64` | `60` | Delay between live TCP latency rounds for `least_ping`; must be > 0 |
 | `SELECTED_SNI` | `string` | — | Skip SNI scan; use this hostname directly |
 | `SELECTED_IP` | `string` | — | Skip IP scan; use this IP directly |
 
@@ -1146,6 +1150,51 @@ The JSON report written to `METHOD_SCAN_OUTPUT` contains:
 > 🔌 Platform impact: no changes to NFQUEUE/WinDivert behavior. Method scans open the packet interceptor once per method with a 200 ms gap between methods, the same pattern as `proxy_scan`.
 
 ---
+
+### Multiple relay targets
+
+Load balancing is disabled by default. To spread new connections across up to
+10 top-ranked scan results:
+
+```toml
+LOAD_BALANCE_ENABLED = true
+LOAD_BALANCE_TARGET_COUNT = 10
+LOAD_BALANCE_STRATEGY = "round_robin"
+LOAD_BALANCE_PING_INTERVAL_SECS = 60
+```
+
+This applies to `sni_spoof`, `ip_bypass`, and `ip_bypass_plus`; scan-only and
+method-test modes keep their existing behavior. Enabling it automatically builds
+the pool regardless of `AUTO_SELECT`, including manual rescans from the TUI.
+`SELECTED_SNI` or `SELECTED_IP` takes priority, skips scanning, and keeps a single
+pinned target even during rescans. The Android settings editor is unchanged;
+these options are configured in TOML.
+
+Candidates retain the scanner's score order. Only successful TCP probes with
+positive scores qualify; duplicate `(SNI, IP)` pairs or IPs count once. Fewer
+than the requested number is allowed; no valid targets at startup is an error.
+Rescans atomically refresh the pool for future connections and preserve the old
+pool if no valid replacement is found. SNI rescans also honor
+`SNI_SWITCH_MIN_SCORE`. Existing connections keep their original target. The
+dashboard's displayed target and network-recovery probe represent rank one;
+the load-balancing line shows the actual pool size and strategy.
+
+- `random`: equal probability for each pool member on each new connection.
+- `round_robin`: cycle through members in scan rank order.
+- `least_ping`: choose the lowest live TCP connect time to port 443; ties favor
+  scan rank. The first probe round runs immediately, seeded by scan latencies.
+  Later rounds wait `LOAD_BALANCE_PING_INTERVAL_SECS` after completion, use
+  `SCAN_TIMEOUT_SECS` per probe, and respect scanner concurrency limits. This
+  measures TCP latency, not ICMP or end-to-end VPN speed. Failed measurements
+  rank after successful ones until recovery; if all fail, selection is round robin.
+- `least_load`: choose the fewest simultaneous relays, including connections
+  being established; ties rotate. Load is a connection count, not bandwidth.
+
+Ping probes do not count as user traffic or active relay load. Connection errors
+end that connection without retrying another pool member. With `low_ttl` and
+working automatic TTL discovery, each target carries its own TTL into the flow;
+startup discovery failures use `LOW_TTL_VALUE`. New targets that fail discovery
+during a rescan are skipped; retained targets keep their prior TTL on failure.
 
 ## 📊 Unified Probe Scoring (0–100)
 

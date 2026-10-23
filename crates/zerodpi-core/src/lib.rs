@@ -27,5 +27,6 @@ pub mod proxy_tester;
 mod scan_list;
 mod scanner_http;
 pub mod sni_scanner;
+pub mod target_pool;
 pub mod tcp_segment;
 pub mod tls_template;

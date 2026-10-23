@@ -5,13 +5,18 @@
 //! receives a filter expression and diverts matching packets to user space.
 
 use std::borrow::Cow;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
 use tracing::{debug, info, warn};
 use windivert::layer::NetworkLayer;
-use windivert::prelude::{WinDivert, WinDivertFlags, WinDivertPacket};
+use windivert::prelude::{WinDivertFlags, WinDivertPacket};
 use windivert_sys::ChecksumFlags;
 
 use zerodpi_core::interceptor::{
@@ -20,32 +25,95 @@ use zerodpi_core::interceptor::{
 };
 
 pub struct WinDivertInterceptor {
-    divert: WinDivert<NetworkLayer>,
+    divert: Arc<DivertHandle>,
+}
+
+use crate::emission::EmissionWorkers;
+
+mod handle;
+use handle::DivertHandle;
+
+/// A joined wakeup worker interrupts blocking recv, including on an idle link.
+struct CaptureStopper {
+    finished: Arc<AtomicBool>,
+    worker: Option<JoinHandle<Result<()>>>,
+}
+
+impl CaptureStopper {
+    fn start(divert: Arc<DivertHandle>, shutdown: InterceptorShutdown) -> Result<Self> {
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = finished.clone();
+        let worker = std::thread::Builder::new()
+            .name("zerodpi-divert-stop".into())
+            .spawn(move || {
+                while !worker_finished.load(Ordering::SeqCst) {
+                    if shutdown.is_requested() {
+                        return divert.shutdown_recv().context("shutdown WinDivert receive");
+                    }
+                    std::thread::park_timeout(Duration::from_millis(10));
+                }
+                Ok(())
+            })
+            .context("spawn WinDivert shutdown worker")?;
+        Ok(Self {
+            finished,
+            worker: Some(worker),
+        })
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.finished.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("WinDivert shutdown worker panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CaptureStopper {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
 }
 
 impl PacketInterceptor for WinDivertInterceptor {
     fn open(filter: FilterSpec) -> Result<Self> {
         let filter_str = build_filter(&filter);
         info!(%filter_str, "opening WinDivert");
-        let divert = WinDivert::network(filter_str, 0, WinDivertFlags::default())
+        let divert = DivertHandle::network(filter_str, 0, WinDivertFlags::default())
             .context("WinDivert::network failed (Administrator and WinDivert.dll/sys required)")?;
-        Ok(Self { divert })
+        Ok(Self {
+            divert: Arc::new(divert),
+        })
     }
 
     fn run_until<H: PacketHandler>(
         self,
         mut handler: H,
-        _shutdown: InterceptorShutdown,
+        shutdown: InterceptorShutdown,
     ) -> Result<()> {
+        let mut stopper = CaptureStopper::start(self.divert.clone(), shutdown.clone())?;
+        let mut emissions = EmissionWorkers::new(shutdown.clone());
         let mut buf = vec![0u8; 0xFFFF];
-        loop {
-            let packet = match self.divert.recv(Some(&mut buf)) {
+        let result = loop {
+            let packet = match self.divert.recv(&mut buf) {
                 Ok(p) => p,
                 Err(e) => {
-                    warn!(error = %e, "WinDivert recv error; exiting loop");
-                    return Ok(());
+                    if shutdown.is_requested() {
+                        break Ok(());
+                    }
+                    break Err(e.context("WinDivert receive failed"));
                 }
             };
+            if shutdown.is_requested() {
+                // Drain queued packets intact after receive shutdown; no new
+                // packets enter this handle, and no stale bypass is injected.
+                let _ = self.divert.send(&packet);
+                continue;
+            }
             let direction = if packet.address.outbound() {
                 Direction::Outbound
             } else {
@@ -162,13 +230,14 @@ impl PacketInterceptor for WinDivertInterceptor {
                                 let remaining = segments[1..].to_vec();
                                 let address = packet.address.clone();
                                 let delay = Duration::from_millis(spec.delay_ms);
-                                std::thread::spawn(move || {
+                                let emission_shutdown = shutdown.clone();
+                                emissions.push(std::thread::spawn(move || {
                                     // A send-only handle: the filter "false"
                                     // matches nothing, so this handle only
                                     // injects. The segments already carry
                                     // valid checksums from the splitter, so
                                     // no recalculation happens here.
-                                    let handle = match WinDivert::network(
+                                    let handle = match DivertHandle::network(
                                         "false",
                                         0,
                                         WinDivertFlags::default(),
@@ -181,6 +250,7 @@ impl PacketInterceptor for WinDivertInterceptor {
                                     };
                                     for (i, seg) in remaining.iter().enumerate() {
                                         std::thread::sleep(delay * (i as u32 + 1));
+                                        if emission_shutdown.is_requested() { break; }
                                         let seg_pkt = WinDivertPacket::<NetworkLayer> {
                                             address: address.clone(),
                                             data: Cow::Owned(seg.clone()),
@@ -190,7 +260,7 @@ impl PacketInterceptor for WinDivertInterceptor {
                                             break;
                                         }
                                     }
-                                });
+                                }));
                             } else {
                                 for seg in &segments[1..] {
                                     if !send_segment(seg) {
@@ -242,7 +312,15 @@ impl PacketInterceptor for WinDivertInterceptor {
                     }
                 }
             }
-        }
+        };
+        shutdown.request();
+        let stop_result = stopper.finish();
+        emissions.finish();
+        let close_result = Arc::try_unwrap(self.divert)
+            .map_err(|_| anyhow::anyhow!("WinDivert handle still has live workers"))?
+            .close()
+            .context("close WinDivert capture handle");
+        result.and(stop_result).and(close_result)
     }
 }
 
@@ -424,6 +502,32 @@ fn corrupt_tcp_checksum(buf: &mut [u8], layout: &PacketLayout, delta: u16) -> Re
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires Administrator and WinDivert.dll/sys"]
+    fn idle_windivert_confirms_shutdown_without_a_packet_arriving() {
+        use super::*;
+        struct Passthrough;
+        impl PacketHandler for Passthrough {
+            fn on_packet(&mut self, _: &mut PacketView<'_>) -> Verdict {
+                Verdict::Accept
+            }
+        }
+        let interceptor = WinDivertInterceptor {
+            divert: Arc::new(DivertHandle::network("false", 0, WinDivertFlags::default()).unwrap()),
+        };
+        let shutdown = InterceptorShutdown::default();
+        let worker_shutdown = shutdown.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = done_tx.send(interceptor.run_until(Passthrough, worker_shutdown));
+        });
+        shutdown.request();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("idle capture must stop without traffic")
+            .unwrap();
+        worker.join().unwrap();
+    }
     use super::*;
     use std::net::Ipv4Addr;
 

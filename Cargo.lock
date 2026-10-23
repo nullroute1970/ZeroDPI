@@ -1975,6 +1975,7 @@ dependencies = [
  "tracing",
  "windivert",
  "windivert-sys",
+ "windows",
  "windows-sys 0.61.2",
  "zerodpi-core",
 ]

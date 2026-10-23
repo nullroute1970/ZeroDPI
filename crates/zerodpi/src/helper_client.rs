@@ -491,6 +491,121 @@ mod unix {
             uid: credentials.uid,
         })
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::data_plane::{DataPlane, DataPlaneController};
+        use zerodpi_core::net::InterfaceBinding;
+        use zerodpi_helper_protocol::{HelperState, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+
+        #[tokio::test]
+        async fn reload_reconfigures_the_same_helper_and_only_quit_sends_shutdown() {
+            // Exercise real framed IPC and DataPlane lifecycle methods; replace
+            // only the privileged NFQUEUE process with an in-memory peer.
+            let (client, mut server) = UnixStream::pair().unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = client.try_clone().unwrap();
+            let inner = Arc::new(Inner {
+                writer: Mutex::new(client),
+                pending: Mutex::new(HashMap::new()),
+                flows: Mutex::new(HashMap::new()),
+                flow_ids: Mutex::new(HashMap::new()),
+                next_request_id: AtomicU32::new(2),
+                next_flow_id: AtomicU64::new(1),
+                disconnected: AtomicBool::new(false),
+                helper_pid: std::process::id(),
+                helper_uid: 0,
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+                capabilities: Vec::new(),
+                disconnect_notify: tokio::sync::Notify::new(),
+            });
+            let reader_inner = inner.clone();
+            let receive = std::thread::spawn(move || {
+                while let Ok(frame) = read_frame(&mut reader) {
+                    reader_inner.handle_frame(frame);
+                }
+            });
+            let peer = std::thread::spawn(move || {
+                let mut state = HelperState::Authenticated;
+                let mut sequence = Vec::new();
+                let mut queues = Vec::new();
+                loop {
+                    let frame = read_frame(&mut server).unwrap();
+                    assert!(state.accepts(&frame.message));
+                    let reply = match frame.message {
+                        Message::ConfigureInterceptor(config) => {
+                            config.validate().unwrap();
+                            queues.push(config.queue_num);
+                            sequence.push("configure");
+                            state = HelperState::Configured;
+                            Message::Configured
+                        }
+                        Message::OpenInterceptor => {
+                            sequence.push("open");
+                            state = HelperState::InterceptorOpen;
+                            Message::InterceptorReady
+                        }
+                        Message::CloseInterceptor => {
+                            sequence.push("close");
+                            state = HelperState::Configured;
+                            Message::InterceptorClosed
+                        }
+                        Message::Shutdown => {
+                            sequence.push("shutdown");
+                            write_frame(
+                                &mut server,
+                                &Frame::new(frame.request_id, Message::ShutdownComplete),
+                            )
+                            .unwrap();
+                            return (sequence, queues);
+                        }
+                        other => panic!("unexpected request: {other:?}"),
+                    };
+                    write_frame(&mut server, &Frame::new(frame.request_id, reply)).unwrap();
+                }
+            });
+            let helper = RemoteHelperClient { inner };
+            let mut cfg = crate::config_for_tests();
+            cfg.NFQUEUE_NUM = 7;
+            let plane = DataPlaneController::remote_pending(
+                Arc::new(cfg.clone()),
+                helper.clone(),
+                Arc::new(helper.clone()),
+            );
+            let binding = InterfaceBinding::fixed("192.0.2.1".parse().unwrap());
+            plane.prepare_remote(binding.clone()).await.unwrap();
+            plane.close_for_reload().await.unwrap();
+            assert!(!helper.is_disconnected());
+            cfg.NFQUEUE_NUM = 42;
+            let next = DataPlaneController::remote_pending(
+                Arc::new(cfg),
+                helper.clone(),
+                Arc::new(helper.clone()),
+            );
+            next.prepare_remote(binding).await.unwrap();
+            next.close_for_reload().await.unwrap();
+            helper.shutdown().await.unwrap();
+            let (sequence, queues) = peer.join().unwrap();
+            receive.join().unwrap();
+            assert_eq!(
+                sequence,
+                [
+                    "configure",
+                    "open",
+                    "close",
+                    "configure",
+                    "open",
+                    "close",
+                    "shutdown"
+                ]
+            );
+            assert_eq!(queues, [7, 42]);
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

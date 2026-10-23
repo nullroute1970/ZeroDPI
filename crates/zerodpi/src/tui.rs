@@ -49,7 +49,7 @@ use zerodpi_core::target_pool::TargetPool;
 mod targets;
 use targets::{draw_targets, fit, DashboardView, TargetsState};
 
-type Term = Terminal<CrosstermBackend<Stdout>>;
+pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn is_tui_active() -> bool {
@@ -755,6 +755,7 @@ fn prune_connection_records(records: &mut VecDeque<ConnectionRecord>) {
 
 /// All mutable state owned by the live proxy dashboard event loop.
 struct DashboardState {
+    reload_status: Option<String>,
     view: DashboardView,
     targets: TargetsState,
     target_pool: Option<(usize, zerodpi_core::target_pool::SelectionStrategy)>,
@@ -903,6 +904,7 @@ fn header_content_rows(state: &DashboardState, now: Instant) -> usize {
         + usize::from(state.target_pool.is_some())
         + usize::from(state.network_status.is_some())
         + usize::from(state.last_error.is_some())
+        + usize::from(state.reload_status.is_some())
 }
 
 /// Fixed rows consumed by the dashboard outside the connection table
@@ -977,6 +979,41 @@ fn aggregate_throughput(records: &VecDeque<ConnectionRecord>) -> (f64, f64) {
 /// After the channel closes the dashboard stays visible so the user can inspect
 /// the final state; pressing any quit key (or waiting for the next key press)
 /// exits.
+pub enum DashboardExit {
+    Quit,
+    Reload(std::sync::Arc<Config>),
+}
+
+fn handle_reload_key(
+    state: &mut DashboardState,
+    key: KeyCode,
+    cfg: &Config,
+    reload: &crate::reload::Session,
+    scan_busy: bool,
+) -> Option<std::sync::Arc<Config>> {
+    if !matches!(key, KeyCode::Char('l') | KeyCode::Char('L')) {
+        return None;
+    }
+    if state.rescan_running || scan_busy {
+        state.reload_status = Some("Config reload busy: wait for the current scan".into());
+        return None;
+    }
+    match reload.candidate((!state.channel_closed).then_some(cfg)) {
+        Ok(Some(next)) => {
+            state.reload_status = Some("Reloading config; closing current connections...".into());
+            Some(next)
+        }
+        Ok(None) => {
+            state.reload_status = Some("Config unchanged".into());
+            None
+        }
+        Err(error) => {
+            state.reload_status = Some(format!("Config reload failed: {error:#}"));
+            None
+        }
+    }
+}
+
 pub fn run_dashboard(
     terminal: &mut Term,
     rx: &mut ProxyEventReceiver,
@@ -984,7 +1021,8 @@ pub fn run_dashboard(
     cfg: &Config,
     rescan: &mut RescanController,
     pool: &TargetPool,
-) -> anyhow::Result<()> {
+    reload: &mut crate::reload::Session,
+) -> anyhow::Result<DashboardExit> {
     let active_sni = match info {
         DashboardInfo::SniSpoof { sni, ip, score } => Some((sni.clone(), *ip, *score)),
         DashboardInfo::IpBypass { .. } | DashboardInfo::IpBypassPlus { .. } => None,
@@ -994,6 +1032,7 @@ pub fn run_dashboard(
         DashboardInfo::IpBypass { ip } | DashboardInfo::IpBypassPlus { ip } => Some(*ip),
     };
     let mut state = DashboardState {
+        reload_status: reload.notice.clone(),
         view: DashboardView::Connections,
         targets: TargetsState::default(),
         target_pool: None,
@@ -1025,6 +1064,21 @@ pub fn run_dashboard(
         start: Instant::now(),
         channel_closed: false,
     };
+
+    for event in reload.take_initial_events() {
+        apply_event(event, &mut state);
+    }
+
+    // Keys typed during startup/reload must not queue a second reload. Preserve
+    // navigation and quit keys so users can still leave immediately afterwards.
+    let mut pending_input = VecDeque::new();
+    while event::poll(Duration::ZERO)? {
+        let input = event::read()?;
+        if !matches!(input, Event::Key(k) if matches!(k.code, KeyCode::Char('l') | KeyCode::Char('L')))
+        {
+            pending_input.push_back(input);
+        }
+    }
 
     loop {
         // Drain all currently available events.
@@ -1111,12 +1165,27 @@ pub fn run_dashboard(
             .unwrap_or(10)
             .max(1);
 
-        if event::poll(
-            Duration::from_millis(200).min(state.targets.next_sample_in(Instant::now())),
-        )? {
-            if let Event::Key(k) = event::read()? {
+        if !pending_input.is_empty()
+            || event::poll(
+                Duration::from_millis(200).min(state.targets.next_sample_in(Instant::now())),
+            )?
+        {
+            if let Event::Key(k) = match pending_input.pop_front() {
+                Some(input) => input,
+                None => event::read()?,
+            } {
                 if k.kind == KeyEventKind::Press {
                     match k.code {
+                        KeyCode::Char('l') | KeyCode::Char('L') => {
+                            let scan_busy = crate::manual_rescan::SCAN_LOCK.try_lock().is_err();
+                            if let Some(next) =
+                                handle_reload_key(&mut state, k.code, cfg, reload, scan_busy)
+                            {
+                                reload.remember_ttl(state.low_ttl);
+                                draw_dashboard(terminal, &state, info, cfg)?;
+                                return Ok(DashboardExit::Reload(next));
+                            }
+                        }
                         KeyCode::Char('r') | KeyCode::Char('R')
                             if !state.rescan_running && !state.channel_closed =>
                         {
@@ -1126,10 +1195,10 @@ pub fn run_dashboard(
                             }
                         }
                         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                            return Ok(());
+                            return Ok(DashboardExit::Quit);
                         }
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(());
+                            return Ok(DashboardExit::Quit);
                         }
                         _ => handle_dashboard_navigation(
                             &mut state,
@@ -1138,6 +1207,42 @@ pub fn run_dashboard(
                             visible_rows,
                         ),
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Keep a recoverable failure on the same alternate screen, even when there is
+/// no running listener or when interceptor cleanup has not been confirmed.
+pub fn run_reload_error(terminal: &mut Term, message: &str) -> anyhow::Result<bool> {
+    terminal.clear()?;
+    loop {
+        terminal.draw(|frame| {
+            let text = format!("{message}\n\nL reload config / retry    q/Esc quit");
+            frame.render_widget(
+                Paragraph::new(text)
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .block(
+                        Block::default()
+                            .title(" ZeroDPI — Stopped ")
+                            .borders(Borders::ALL),
+                    ),
+                frame.area(),
+            );
+        })?;
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('l') | KeyCode::Char('L') => return Ok(true),
+                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return Ok(false),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(false)
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1793,6 +1898,9 @@ fn draw_dashboard<B: ratatui::backend::Backend>(
                 Span::styled(format!("  {}", fmt_time(err.at)), label_style()),
             ]));
         }
+        if let Some(status) = &state.reload_status {
+            header_lines.push(Line::from(Span::styled(status.clone(), Style::default().fg(Color::Yellow))));
+        }
         let header =
             Paragraph::new(header_lines).block(Block::default().borders(Borders::ALL).title(title));
         frame.render_widget(header, chunks[0]);
@@ -1903,10 +2011,11 @@ fn draw_dashboard<B: ratatui::backend::Backend>(
                 auto_span,
                 Span::styled(" v ", Style::default().fg(Color::Cyan)), Span::raw("views "),
                 Span::styled(" R ", Style::default().fg(Color::Cyan)), Span::raw("rescan "),
+                Span::styled(" L ", Style::default().fg(Color::Cyan)), Span::raw("reload config "),
                 Span::raw(if state.view == DashboardView::Connections {
                     "↑/↓ scroll  Tab filter  q/Esc quit"
                 } else {
-                    "↑/↓ scroll  PgUp/Dn page  q/Esc quit"
+                    "↑/↓ scroll  q/Esc quit"
                 }),
             ])
         } else {
@@ -1914,6 +2023,7 @@ fn draw_dashboard<B: ratatui::backend::Backend>(
                 auto_span,
                 Span::styled(" v ", Style::default().fg(Color::Cyan)), Span::raw("views  "),
                 Span::styled(" R ", Style::default().fg(Color::Cyan)), Span::raw("rescan  "),
+                Span::styled(" L ", Style::default().fg(Color::Cyan)), Span::raw("reload config  "),
                 Span::raw(if state.view == DashboardView::Connections {
                     "↑/↓ j/k scroll  PgUp/Dn page  Home/End jump  Space/a auto  Tab filter  q/Esc quit"
                 } else {
@@ -2818,7 +2928,91 @@ mod tests {
             "shortcut must remain visible: {}",
             lines[22]
         );
+        assert!(lines[22].contains("L reload config"), "{}", lines[22]);
         println!("{}", lines.join("\n"));
+    }
+
+    #[test]
+    fn reload_keys_preserve_the_dashboard_on_invalid_or_unchanged_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let text = "LISTEN_HOST='127.0.0.1'\nLISTEN_PORT=1234\nMODE='ip_bypass'\nSELECTED_IP='192.0.2.1'\n";
+        std::fs::write(&path, text).unwrap();
+        let source = crate::reload::ConfigSource::new(<crate::Args as clap::Parser>::parse_from([
+            "zerodpi",
+            "--config",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let cfg = source.load().unwrap();
+        let session = crate::reload::Session::new(source, None);
+        let mut state = dashboard_state(vec![record(ConnStatus::Relaying, 100.0, 200.0)]);
+        state.total = 42;
+        state.scroll_offset = 3;
+        for key in ['l', 'L'] {
+            assert!(
+                handle_reload_key(&mut state, KeyCode::Char(key), &cfg, &session, false).is_none()
+            );
+            assert_eq!(state.reload_status.as_deref(), Some("Config unchanged"));
+        }
+        std::fs::write(&path, "LISTEN_HOST=[").unwrap();
+        assert!(handle_reload_key(&mut state, KeyCode::Char('L'), &cfg, &session, false).is_none());
+        assert!(state
+            .reload_status
+            .as_ref()
+            .unwrap()
+            .starts_with("Config reload failed"));
+        assert_eq!(state.total, 42);
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(state.scroll_offset, 3);
+        assert_eq!(cfg.LISTEN_PORT, 1234);
+        std::fs::write(&path, text.replace("1234", "5678")).unwrap();
+        for key in ['l', 'L'] {
+            let next =
+                handle_reload_key(&mut state, KeyCode::Char(key), &cfg, &session, false).unwrap();
+            assert_eq!(next.LISTEN_PORT, 5678);
+        }
+        state.rescan_running = true;
+        assert!(handle_reload_key(&mut state, KeyCode::Char('L'), &cfg, &session, false).is_none());
+        assert!(state.reload_status.as_ref().unwrap().contains("busy"));
+        state.rescan_running = false;
+        assert!(handle_reload_key(&mut state, KeyCode::Char('l'), &cfg, &session, true).is_none());
+        assert!(state.reload_status.as_ref().unwrap().contains("busy"));
+        state.reload_status = None;
+        assert!(handle_reload_key(&mut state, KeyCode::Char('r'), &cfg, &session, false).is_none());
+        assert!(state.reload_status.is_none());
+    }
+
+    #[test]
+    fn both_views_show_reload_and_its_result_at_eighty_columns() {
+        let mut state = dashboard_state(vec![]);
+        state.active_ip = Some("192.0.2.1".parse().unwrap());
+        state.reload_status = Some("Config reloaded successfully".into());
+        for view in [DashboardView::Connections, DashboardView::Targets] {
+            state.view = view;
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            draw_dashboard(
+                &mut terminal,
+                &state,
+                &DashboardInfo::IpBypass {
+                    ip: state.active_ip.unwrap(),
+                },
+                &crate::config_for_tests(),
+            )
+            .unwrap();
+            let lines: Vec<String> = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(80)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+                .collect();
+            assert!(lines[22].contains("R rescan"));
+            assert!(lines[22].contains("L reload config"));
+            assert!(lines
+                .iter()
+                .any(|line| line.contains("Config reloaded successfully")));
+        }
     }
 
     #[test]
@@ -2854,6 +3048,7 @@ mod tests {
 
     fn dashboard_state(records: Vec<ConnectionRecord>) -> DashboardState {
         DashboardState {
+            reload_status: None,
             view: DashboardView::Connections,
             targets: TargetsState::default(),
             target_pool: None,

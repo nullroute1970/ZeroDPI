@@ -9,7 +9,7 @@
 //! replacing payload" path used by the `wrong_seq` bypass.
 
 use std::io::ErrorKind;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,6 +20,7 @@ use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
 use nfq::{Queue, Verdict as NfqVerdict};
 use tracing::{debug, info, warn};
 
+use crate::emission::EmissionWorkers;
 use zerodpi_core::interceptor::{
     Direction, FilterSpec, InterceptorShutdown, LinuxFirewallBackend, PacketHandler,
     PacketInterceptor, PacketView, TcpFlags, Verdict,
@@ -82,240 +83,261 @@ impl PacketInterceptor for NfqInterceptor {
         shutdown: InterceptorShutdown,
     ) -> Result<()> {
         self.queue.set_nonblocking(true);
-        loop {
-            if shutdown.is_requested() {
-                info!("NFQUEUE shutdown requested");
-                return Ok(());
-            }
-            let mut msg = match self.queue.recv() {
-                Ok(m) => m,
-                Err(e) if e.kind() == ErrorKind::Interrupted => {
-                    debug!(error = %e, "NFQUEUE recv interrupted; retrying");
-                    continue;
+        let mut emissions = EmissionWorkers::new(shutdown.clone());
+        let result = (|| {
+            loop {
+                if shutdown.is_requested() {
+                    info!("NFQUEUE shutdown requested");
+                    return Ok(());
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
-                Err(e) if is_stale_nfq_recv_error(&e) => {
-                    if shutdown.is_requested() {
-                        info!(error = %e, "NFQUEUE recv reported stale state after shutdown");
-                        return Ok(());
+                let mut msg = match self.queue.recv() {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {
+                        debug!(error = %e, "NFQUEUE recv interrupted; retrying");
+                        continue;
                     }
-                    debug!(error = %e, "NFQUEUE recv reported stale state; continuing");
-                    continue;
-                }
-                Err(e) => {
-                    return Err(e).context("NFQUEUE recv");
-                }
-            };
-            let direction = match msg.get_hook() {
-                HOOK_LOCAL_OUT => Direction::Outbound,
-                HOOK_LOCAL_IN => Direction::Inbound,
-                other => {
-                    debug!(hook = other, "unexpected NFQUEUE hook; accepting");
-                    msg.set_verdict(NfqVerdict::Accept);
-                    let _ = self.queue.verdict(msg);
-                    continue;
-                }
-            };
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                    Err(e) if is_stale_nfq_recv_error(&e) => {
+                        if shutdown.is_requested() {
+                            info!(error = %e, "NFQUEUE recv reported stale state after shutdown");
+                            return Ok(());
+                        }
+                        debug!(error = %e, "NFQUEUE recv reported stale state; continuing");
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e).context("NFQUEUE recv");
+                    }
+                };
+                let direction = match msg.get_hook() {
+                    HOOK_LOCAL_OUT => Direction::Outbound,
+                    HOOK_LOCAL_IN => Direction::Inbound,
+                    other => {
+                        debug!(hook = other, "unexpected NFQUEUE hook; accepting");
+                        msg.set_verdict(NfqVerdict::Accept);
+                        let _ = self.queue.verdict(msg);
+                        continue;
+                    }
+                };
 
-            let payload = msg.get_payload();
-            let (mut view, layout) = match parse_view(direction, payload) {
-                Ok(v) => v,
-                Err(_) => {
-                    // Not a TCP/IPv4 packet we understand — accept untouched.
-                    msg.set_verdict(NfqVerdict::Accept);
-                    let _ = self.queue.verdict(msg);
-                    continue;
-                }
-            };
+                let payload = msg.get_payload();
+                let (mut view, layout) = match parse_view(direction, payload) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Not a TCP/IPv4 packet we understand — accept untouched.
+                        msg.set_verdict(NfqVerdict::Accept);
+                        let _ = self.queue.verdict(msg);
+                        continue;
+                    }
+                };
 
-            let verdict = handler.on_packet(&mut view);
-            match verdict {
-                Verdict::Accept => {
-                    msg.set_verdict(NfqVerdict::Accept);
-                }
-                Verdict::Drop => {
-                    msg.set_verdict(NfqVerdict::Drop);
-                }
-                Verdict::AcceptModified => {
-                    // Data-stage chaining: inject the decoy copies through the
-                    // raw socket before the shaped real packet, so a DPI
-                    // classifies the flow benign before the real ClientHello.
-                    if let Some(decoy) = view.decoy.as_ref() {
-                        let decoy_view = view.decoy_view(decoy);
-                        match build_modified(payload, &layout, &decoy_view) {
-                            Ok(decoy_bytes) => match &self.raw_socket {
-                                Some(fd) => {
-                                    for _ in 0..decoy.repeats.max(1) {
-                                        if let Err(e) = send_raw_packet(*fd, &decoy_bytes) {
-                                            warn!(error = %e, "decoy injection failed");
+                let verdict = handler.on_packet(&mut view);
+                match verdict {
+                    Verdict::Accept => {
+                        msg.set_verdict(NfqVerdict::Accept);
+                    }
+                    Verdict::Drop => {
+                        msg.set_verdict(NfqVerdict::Drop);
+                    }
+                    Verdict::AcceptModified => {
+                        // Data-stage chaining: inject the decoy copies through the
+                        // raw socket before the shaped real packet, so a DPI
+                        // classifies the flow benign before the real ClientHello.
+                        if let Some(decoy) = view.decoy.as_ref() {
+                            let decoy_view = view.decoy_view(decoy);
+                            match build_modified(payload, &layout, &decoy_view) {
+                                Ok(decoy_bytes) => match &self.raw_socket {
+                                    Some(fd) => {
+                                        for _ in 0..decoy.repeats.max(1) {
+                                            if let Err(e) = send_raw_packet(*fd, &decoy_bytes) {
+                                                warn!(error = %e, "decoy injection failed");
+                                                break;
+                                            }
+                                        }
+                                        if decoy.delay_ms > 0 {
+                                            // Bounded by
+                                            // MAX_FAKE_TLS_CHAIN_DELAY_MS; default
+                                            // 0 never reaches this branch.
+                                            std::thread::sleep(Duration::from_millis(
+                                                decoy.delay_ms,
+                                            ));
+                                        }
+                                    }
+                                    None => {
+                                        if !RAW_INJECTION_UNAVAILABLE_WARNED
+                                            .swap(true, Ordering::SeqCst)
+                                        {
+                                            warn!("raw socket unavailable; chained decoy skipped (the shaped real packet is still emitted)");
+                                        }
+                                    }
+                                },
+                                Err(e) => warn!(error = %e, "decoy build failed; skipping decoy"),
+                            }
+                        }
+
+                        let new_bytes = match build_modified(payload, &layout, &view) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(error = %e, "failed to build modified packet; accepting original");
+                                msg.set_verdict(NfqVerdict::Accept);
+                                let _ = self.queue.verdict(msg);
+                                continue;
+                            }
+                        };
+                        if let Some(frag_size) = view.ip_frag_payload_size {
+                            let fragments = zerodpi_core::ip_fragment::fragment_ipv4_packet(
+                                &new_bytes, frag_size,
+                            );
+                            match &self.raw_socket {
+                                Some(fd) if fragments.len() > 1 => {
+                                    // Inject every fragment through the raw
+                                    // socket; the queued original is dropped so
+                                    // the fragments replace it on the wire.
+                                    let mut injected = true;
+                                    for frag in &fragments {
+                                        if let Err(e) = send_raw_packet(*fd, frag) {
+                                            warn!(error = %e, "raw fragment injection failed; emitting unfragmented packet");
+                                            injected = false;
                                             break;
                                         }
                                     }
-                                    if decoy.delay_ms > 0 {
-                                        // Bounded by
-                                        // MAX_FAKE_TLS_CHAIN_DELAY_MS; default
-                                        // 0 never reaches this branch.
-                                        std::thread::sleep(Duration::from_millis(decoy.delay_ms));
+                                    if injected {
+                                        msg.set_verdict(NfqVerdict::Drop);
+                                    } else {
+                                        msg.set_payload(new_bytes);
+                                        msg.set_verdict(NfqVerdict::Accept);
                                     }
                                 }
-                                None => {
-                                    if !RAW_INJECTION_UNAVAILABLE_WARNED
-                                        .swap(true, Ordering::SeqCst)
+                                _ => {
+                                    if fragments.len() > 1
+                                        && !RAW_INJECTION_UNAVAILABLE_WARNED
+                                            .swap(true, Ordering::SeqCst)
                                     {
-                                        warn!("raw socket unavailable; chained decoy skipped (the shaped real packet is still emitted)");
+                                        warn!("raw socket unavailable; ip_frag falling back to unfragmented packets");
                                     }
-                                }
-                            },
-                            Err(e) => warn!(error = %e, "decoy build failed; skipping decoy"),
-                        }
-                    }
-
-                    let new_bytes = match build_modified(payload, &layout, &view) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(error = %e, "failed to build modified packet; accepting original");
-                            msg.set_verdict(NfqVerdict::Accept);
-                            let _ = self.queue.verdict(msg);
-                            continue;
-                        }
-                    };
-                    if let Some(frag_size) = view.ip_frag_payload_size {
-                        let fragments =
-                            zerodpi_core::ip_fragment::fragment_ipv4_packet(&new_bytes, frag_size);
-                        match &self.raw_socket {
-                            Some(fd) if fragments.len() > 1 => {
-                                // Inject every fragment through the raw
-                                // socket; the queued original is dropped so
-                                // the fragments replace it on the wire.
-                                let mut injected = true;
-                                for frag in &fragments {
-                                    if let Err(e) = send_raw_packet(*fd, frag) {
-                                        warn!(error = %e, "raw fragment injection failed; emitting unfragmented packet");
-                                        injected = false;
-                                        break;
-                                    }
-                                }
-                                if injected {
-                                    msg.set_verdict(NfqVerdict::Drop);
-                                } else {
                                     msg.set_payload(new_bytes);
                                     msg.set_verdict(NfqVerdict::Accept);
                                 }
                             }
-                            _ => {
-                                if fragments.len() > 1
-                                    && !RAW_INJECTION_UNAVAILABLE_WARNED
-                                        .swap(true, Ordering::SeqCst)
-                                {
-                                    warn!("raw socket unavailable; ip_frag falling back to unfragmented packets");
-                                }
-                                msg.set_payload(new_bytes);
-                                msg.set_verdict(NfqVerdict::Accept);
-                            }
-                        }
-                    } else if let Some(spec) = view.disorder_spec.as_ref() {
-                        let segments =
-                            zerodpi_core::tcp_segment::split_tcp_payload(&new_bytes, spec);
-                        match &self.raw_socket {
-                            Some(fd) if segments.len() > 1 => {
-                                // Emit the first segment synchronously; the
-                                // queued original is dropped so the segments
-                                // replace it on the wire. The remaining
-                                // segments follow on a short-lived thread so
-                                // the capture loop never blocks on the delay.
-                                match send_raw_packet(*fd, &segments[0]) {
-                                    Ok(_) => {
-                                        msg.set_verdict(NfqVerdict::Drop);
-                                        if spec.delay_ms > 0 {
-                                            let remaining = segments[1..].to_vec();
-                                            let delay = Duration::from_millis(spec.delay_ms);
-                                            // Duplicate the raw socket fd for
-                                            // the thread; the interceptor owns
-                                            // the original and closes it on
-                                            // drop.
-                                            let dup_fd = unsafe { libc::dup(*fd) };
-                                            if dup_fd < 0 {
-                                                warn!("dup failed for delayed disorder emission; emitting remaining segments immediately");
-                                                for seg in &remaining {
-                                                    if let Err(e) = send_raw_packet(*fd, seg) {
-                                                        warn!(error = %e, "disorder segment injection failed");
-                                                        break;
+                        } else if let Some(spec) = view.disorder_spec.as_ref() {
+                            let segments =
+                                zerodpi_core::tcp_segment::split_tcp_payload(&new_bytes, spec);
+                            match &self.raw_socket {
+                                Some(fd) if segments.len() > 1 => {
+                                    // Emit the first segment synchronously; the
+                                    // queued original is dropped so the segments
+                                    // replace it on the wire. The remaining
+                                    // segments follow on a short-lived thread so
+                                    // the capture loop never blocks on the delay.
+                                    match send_raw_packet(*fd, &segments[0]) {
+                                        Ok(_) => {
+                                            msg.set_verdict(NfqVerdict::Drop);
+                                            if spec.delay_ms > 0 {
+                                                let remaining = segments[1..].to_vec();
+                                                let delay = Duration::from_millis(spec.delay_ms);
+                                                // Duplicate the raw socket fd for
+                                                // the thread; the interceptor owns
+                                                // the original and closes it on
+                                                // drop.
+                                                let dup_fd = unsafe { libc::dup(*fd) };
+                                                if dup_fd < 0 {
+                                                    warn!("dup failed for delayed disorder emission; emitting remaining segments immediately");
+                                                    for seg in &remaining {
+                                                        if let Err(e) = send_raw_packet(*fd, seg) {
+                                                            warn!(error = %e, "disorder segment injection failed");
+                                                            break;
+                                                        }
                                                     }
-                                                }
-                                            } else {
-                                                std::thread::spawn(move || {
+                                                } else {
+                                                    // SAFETY: dup_fd is a fresh successful dup,
+                                                    // exclusively transferred to this worker.
+                                                    let dup_socket =
+                                                        unsafe { OwnedFd::from_raw_fd(dup_fd) };
+                                                    let emission_shutdown = shutdown.clone();
+                                                    emissions.push(std::thread::spawn(move || {
                                                     for (i, seg) in remaining.iter().enumerate() {
                                                         std::thread::sleep(delay * (i as u32 + 1));
-                                                        if let Err(e) = send_raw_packet(dup_fd, seg)
+                                                        if emission_shutdown.is_requested() { break; }
+                                                        if let Err(e) = send_raw_packet(dup_socket.as_raw_fd(), seg)
                                                         {
                                                             warn!(error = %e, "delayed disorder segment injection failed; abandoning remaining segments (TCP retransmission will heal the connection)");
                                                             break;
                                                         }
                                                     }
-                                                    unsafe { libc::close(dup_fd) };
-                                                });
-                                            }
-                                        } else {
-                                            for seg in &segments[1..] {
-                                                if let Err(e) = send_raw_packet(*fd, seg) {
-                                                    warn!(error = %e, "disorder segment injection failed");
-                                                    break;
+                                                }));
+                                                }
+                                            } else {
+                                                for seg in &segments[1..] {
+                                                    if let Err(e) = send_raw_packet(*fd, seg) {
+                                                        warn!(error = %e, "disorder segment injection failed");
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         }
+                                        Err(e) => {
+                                            warn!(error = %e, "raw segment injection failed; emitting unsegmented packet");
+                                            msg.set_payload(new_bytes);
+                                            msg.set_verdict(NfqVerdict::Accept);
+                                        }
                                     }
-                                    Err(e) => {
-                                        warn!(error = %e, "raw segment injection failed; emitting unsegmented packet");
+                                }
+                                _ => {
+                                    if segments.len() > 1
+                                        && !RAW_INJECTION_UNAVAILABLE_WARNED
+                                            .swap(true, Ordering::SeqCst)
+                                    {
+                                        warn!("raw socket unavailable; disorder falling back to unsegmented packets");
+                                    }
+                                    msg.set_payload(new_bytes);
+                                    msg.set_verdict(NfqVerdict::Accept);
+                                }
+                            }
+                        } else if view.emit_original_after {
+                            match &self.raw_socket {
+                                Some(fd) => {
+                                    // Inject the decoy through the raw socket
+                                    // first; the queued original is accepted
+                                    // below, so the decoy is guaranteed to hit
+                                    // the wire first.
+                                    if let Err(e) = send_raw_packet(*fd, &new_bytes) {
+                                        warn!(error = %e, "raw decoy injection failed; emitting modified packet instead");
                                         msg.set_payload(new_bytes);
-                                        msg.set_verdict(NfqVerdict::Accept);
                                     }
+                                    // else: the original packet passes through as-is.
                                 }
-                            }
-                            _ => {
-                                if segments.len() > 1
-                                    && !RAW_INJECTION_UNAVAILABLE_WARNED
+                                None => {
+                                    if !RAW_INJECTION_UNAVAILABLE_WARNED
                                         .swap(true, Ordering::SeqCst)
-                                {
-                                    warn!("raw socket unavailable; disorder falling back to unsegmented packets");
-                                }
-                                msg.set_payload(new_bytes);
-                                msg.set_verdict(NfqVerdict::Accept);
-                            }
-                        }
-                    } else if view.emit_original_after {
-                        match &self.raw_socket {
-                            Some(fd) => {
-                                // Inject the decoy through the raw socket
-                                // first; the queued original is accepted
-                                // below, so the decoy is guaranteed to hit
-                                // the wire first.
-                                if let Err(e) = send_raw_packet(*fd, &new_bytes) {
-                                    warn!(error = %e, "raw decoy injection failed; emitting modified packet instead");
+                                    {
+                                        warn!("raw socket unavailable; fake_tls falling back to single-packet mode");
+                                    }
                                     msg.set_payload(new_bytes);
                                 }
-                                // else: the original packet passes through as-is.
                             }
-                            None => {
-                                if !RAW_INJECTION_UNAVAILABLE_WARNED.swap(true, Ordering::SeqCst) {
-                                    warn!("raw socket unavailable; fake_tls falling back to single-packet mode");
-                                }
-                                msg.set_payload(new_bytes);
-                            }
+                            msg.set_verdict(NfqVerdict::Accept);
+                        } else {
+                            msg.set_payload(new_bytes);
+                            msg.set_verdict(NfqVerdict::Accept);
                         }
-                        msg.set_verdict(NfqVerdict::Accept);
-                    } else {
-                        msg.set_payload(new_bytes);
-                        msg.set_verdict(NfqVerdict::Accept);
                     }
                 }
+                if let Err(e) = self.queue.verdict(msg) {
+                    warn!(error = %e, "NFQUEUE verdict failed");
+                }
             }
-            if let Err(e) = self.queue.verdict(msg) {
-                warn!(error = %e, "NFQUEUE verdict failed");
-            }
-        }
+        })();
+        emissions.finish();
+        // Report firewall removal errors to the owner; logging them from Drop
+        // alone would falsely confirm cleanup and allow another generation.
+        let cleanup = self
+            ._rules
+            .cleanup()
+            .context("remove NFQUEUE firewall rules");
+        result.and(cleanup)
     }
 }
 
@@ -563,6 +585,12 @@ pub fn recover_stale_firewall_state(backend: LinuxFirewallBackend) -> Result<usi
 }
 
 impl FirewallGuard {
+    fn cleanup(&mut self) -> Result<()> {
+        match self {
+            Self::Iptables { _guard: guard } => guard.cleanup(),
+            Self::Nftables { _guard: guard } => guard.cleanup(),
+        }
+    }
     fn install(filter: &FilterSpec) -> Result<Self> {
         match filter.linux_firewall_backend {
             LinuxFirewallBackend::Iptables => {
@@ -582,6 +610,9 @@ struct IptablesGuard {
 }
 
 impl IptablesGuard {
+    fn cleanup(&mut self) -> Result<()> {
+        remove_owned_rules(&mut self.rules, |rule| run_iptables("-D", rule))
+    }
     fn install(filter: &FilterSpec) -> Result<Self> {
         let rules = iptables_rules(filter);
         let mut installed: Vec<Vec<String>> = Vec::with_capacity(rules.len());
@@ -605,12 +636,28 @@ impl IptablesGuard {
 
 impl Drop for IptablesGuard {
     fn drop(&mut self) {
-        for rule in &self.rules {
-            if let Err(e) = run_iptables("-D", rule) {
-                warn!(error = %e, "failed to remove iptables rule");
-            }
+        if let Err(e) = self.cleanup() {
+            warn!(error = %e, "failed to remove iptables rules");
         }
-        debug!("iptables rules removed");
+    }
+}
+
+fn remove_owned_rules(
+    rules: &mut Vec<Vec<String>>,
+    mut delete: impl FnMut(&[String]) -> Result<()>,
+) -> Result<()> {
+    let mut failed = Vec::new();
+    let mut error = None;
+    for rule in rules.drain(..) {
+        if let Err(failure) = delete(&rule) {
+            failed.push(rule);
+            error = Some(failure);
+        }
+    }
+    *rules = failed;
+    match error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -790,10 +837,13 @@ const NFT_INPUT_CHAIN: &str = "input";
 static NFT_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct NftablesGuard {
-    table_name: String,
+    table_name: Option<String>,
 }
 
 impl NftablesGuard {
+    fn cleanup(&mut self) -> Result<()> {
+        remove_owned_table(&mut self.table_name, delete_nft_table)
+    }
     fn install(filter: &FilterSpec) -> Result<Self> {
         let table_name = next_nft_table_name();
         let commands = nft_install_commands(&table_name, filter);
@@ -804,18 +854,29 @@ impl NftablesGuard {
             }
         }
         info!(table = %table_name, "nftables rules installed");
-        Ok(Self { table_name })
+        Ok(Self {
+            table_name: Some(table_name),
+        })
     }
 }
 
 impl Drop for NftablesGuard {
     fn drop(&mut self) {
-        if let Err(e) = delete_nft_table(&self.table_name) {
-            warn!(error = %e, table = %self.table_name, "failed to remove nftables table");
-        } else {
-            debug!(table = %self.table_name, "nftables table removed");
+        if let Err(e) = self.cleanup() {
+            warn!(error = %e, table = ?self.table_name, "failed to remove nftables table");
         }
     }
+}
+
+fn remove_owned_table(
+    table: &mut Option<String>,
+    delete: impl FnOnce(&str) -> Result<()>,
+) -> Result<()> {
+    if let Some(name) = table.as_deref() {
+        delete(name)?;
+    }
+    *table = None;
+    Ok(())
 }
 
 fn next_nft_table_name() -> String {
@@ -970,6 +1031,35 @@ fn strings(items: &[&str]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_firewall_cleanup_is_reported_and_kept_for_retry() {
+        let mut rules = vec![vec!["first".into()], vec!["second".into()]];
+        let mut deleted = Vec::new();
+        let result = super::remove_owned_rules(&mut rules, |rule| {
+            if rule[0] == "first" {
+                anyhow::bail!("delete failed");
+            }
+            deleted.push(rule[0].clone());
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(rules, vec![vec!["first".to_string()]]);
+        assert_eq!(deleted, ["second"]);
+        super::remove_owned_rules(&mut rules, |rule| {
+            deleted.push(rule[0].clone());
+            Ok(())
+        })
+        .unwrap();
+        assert!(rules.is_empty());
+        assert_eq!(deleted, ["second", "first"]);
+
+        let mut table = Some("owned_test_table".into());
+        assert!(super::remove_owned_table(&mut table, |_| anyhow::bail!("delete failed")).is_err());
+        assert_eq!(table.as_deref(), Some("owned_test_table"));
+        super::remove_owned_table(&mut table, |_| Ok(())).unwrap();
+        assert!(table.is_none());
+        super::remove_owned_table(&mut table, |_| panic!("already removed")).unwrap();
+    }
     use super::*;
     use std::net::Ipv4Addr;
 
@@ -1657,6 +1747,8 @@ mod tests {
             total_len: buf.len(),
         };
         let mut view = make_view();
+        // This test splits the original sequence; the generic fixture rewrites it.
+        view.new_seq = None;
         let spec = DisorderSpec {
             segments: 2,
             reverse: true,

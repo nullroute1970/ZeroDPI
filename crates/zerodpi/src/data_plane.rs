@@ -26,6 +26,10 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait DataPlane: Send + Sync {
     fn rebuild<'a>(&'a self, binding: InterfaceBinding) -> BoxFuture<'a, Result<()>>;
     fn stop<'a>(&'a self) -> BoxFuture<'a, Result<()>>;
+    /// Close interception while keeping the authenticated helper available.
+    fn close_for_reload<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
+        self.stop()
+    }
     /// True when the remote root helper is gone and no rebuild can succeed.
     fn remote_disconnected(&self) -> bool {
         false
@@ -37,7 +41,6 @@ pub trait DataPlane: Send + Sync {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 const INTERCEPTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Build the local filter used by every intercept mode.
@@ -65,6 +68,7 @@ struct LocalPlane {
     method: Arc<dyn BypassMethod>,
     shutdown: Option<InterceptorShutdown>,
     done_rx: Option<oneshot::Receiver<Result<()>>>,
+    stop_report: Option<tokio::sync::mpsc::UnboundedReceiver<Result<()>>>,
     /// True while an interceptor may still be live. Cleared only after a
     /// confirmed shutdown, so a failed stop can never reopen over live rules.
     armed: bool,
@@ -74,6 +78,7 @@ struct RemotePlane {
     cfg: Arc<Config>,
     helper: RemoteHelperClient,
     flow_controller: Arc<dyn FlowController>,
+    configured: bool,
 }
 
 /// Owns the live interceptor and rebuilds it for a new address.
@@ -99,6 +104,7 @@ impl DataPlaneController {
             method,
             shutdown: None,
             done_rx: None,
+            stop_report: None,
             armed: false,
         };
         plane.open(binding)?;
@@ -108,29 +114,44 @@ impl DataPlaneController {
         })
     }
 
-    /// Configure and open the root-helper interceptor immediately.
-    pub async fn remote(
+    /// Construct before opening so failed startup still has an owned cleanup path.
+    pub fn remote_pending(
         cfg: Arc<Config>,
         helper: RemoteHelperClient,
         flow_controller: Arc<dyn FlowController>,
-        binding: InterfaceBinding,
-    ) -> Result<Self> {
-        helper
-            .configure(interceptor_config(&cfg, binding.ip, None, CONNECT_PORT))
-            .await
-            .context("configure root helper interceptor")?;
-        helper
-            .open()
-            .await
-            .context("open root helper interceptor")?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             inner: Mutex::new(Inner::Remote(RemotePlane {
                 cfg,
                 helper: helper.clone(),
                 flow_controller,
+                configured: false,
             })),
             remote_helper: Some(helper),
-        })
+        }
+    }
+
+    pub async fn prepare_remote(&self, binding: InterfaceBinding) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let Inner::Remote(plane) = &mut *inner else {
+            anyhow::bail!("not a remote interceptor");
+        };
+        plane
+            .helper
+            .configure(interceptor_config(
+                &plane.cfg,
+                binding.ip,
+                None,
+                CONNECT_PORT,
+            ))
+            .await
+            .context("configure root helper interceptor")?;
+        plane.configured = true;
+        plane
+            .helper
+            .open()
+            .await
+            .context("open root helper interceptor")
     }
 
     /// A plane for modes without interception (`ip_bypass`, socket-only).
@@ -143,6 +164,22 @@ impl DataPlaneController {
 }
 
 impl DataPlane for DataPlaneController {
+    fn close_for_reload<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let mut inner = self.inner.lock().await;
+            match &mut *inner {
+                Inner::Local(plane) => stop_local(plane).await,
+                Inner::Remote(plane) => {
+                    if plane.configured {
+                        plane.helper.close().await?;
+                    }
+                    plane.flow_controller.reset();
+                    Ok(())
+                }
+                Inner::None => Ok(()),
+            }
+        })
+    }
     fn rebuild<'a>(&'a self, binding: InterfaceBinding) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
@@ -243,19 +280,18 @@ async fn stop_local(plane: &mut LocalPlane) -> Result<()> {
     if !plane.armed {
         return Ok(());
     }
-    let Some(shutdown) = plane.shutdown.take() else {
-        anyhow::bail!(
-            "packet interceptor stop did not complete; refusing to reopen over live firewall rules"
-        );
-    };
-    shutdown.request();
-    let Some(done_rx) = plane.done_rx.take() else {
-        anyhow::bail!(
-            "packet interceptor stop did not complete; refusing to reopen over live firewall rules"
-        );
-    };
-    let mut report_rx = spawn_interceptor_report(done_rx);
-    wait_for_interceptor_shutdown(&mut report_rx).await?;
+    if plane.stop_report.is_none() {
+        let shutdown = plane.shutdown.take().context(
+            "packet interceptor stop did not complete; refusing to reopen over live firewall rules",
+        )?;
+        shutdown.request();
+        let done_rx = plane.done_rx.take().context(
+            "packet interceptor stop did not complete; refusing to reopen over live firewall rules",
+        )?;
+        plane.stop_report = Some(spawn_interceptor_report(done_rx));
+    }
+    wait_for_interceptor_shutdown(plane.stop_report.as_mut().unwrap()).await?;
+    plane.stop_report = None;
     plane.armed = false;
     Ok(())
 }
@@ -276,7 +312,6 @@ fn spawn_interceptor_report(
     rx
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 async fn wait_for_interceptor_shutdown(
     report_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Result<()>>,
 ) -> Result<()> {
@@ -291,14 +326,6 @@ async fn wait_for_interceptor_shutdown(
             INTERCEPTOR_SHUTDOWN_TIMEOUT.as_secs()
         )),
     }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-async fn wait_for_interceptor_shutdown(
-    report_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Result<()>>,
-) -> Result<()> {
-    let _ = tokio::time::timeout(Duration::from_millis(100), report_rx.recv()).await;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -327,6 +354,7 @@ mod tests {
             .await
             .unwrap();
         plane.stop().await.unwrap();
+        plane.close_for_reload().await.unwrap();
         assert!(!plane.remote_disconnected());
     }
     fn local_plane_with_missing_handles() -> LocalPlane {
@@ -343,6 +371,7 @@ mod tests {
             method,
             shutdown: None,
             done_rx: None,
+            stop_report: None,
             armed: true,
         }
     }
@@ -356,5 +385,21 @@ mod tests {
             plane.armed,
             "a plane whose interceptor may still be live stays armed"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_stop_can_be_confirmed_on_retry_without_reopening() {
+        let mut plane = local_plane_with_missing_handles();
+        let (done_tx, done_rx) = oneshot::channel();
+        let shutdown = InterceptorShutdown::default();
+        plane.shutdown = Some(shutdown.clone());
+        plane.done_rx = Some(done_rx);
+        assert!(stop_local(&mut plane).await.is_err());
+        assert!(shutdown.is_requested());
+        assert!(plane.armed);
+        done_tx.send(Ok(())).unwrap();
+        stop_local(&mut plane).await.unwrap();
+        assert!(!plane.armed);
+        stop_local(&mut plane).await.unwrap();
     }
 }

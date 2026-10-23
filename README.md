@@ -106,6 +106,23 @@ After an SNI scan, ZeroDPI shows a ranked table of candidates. Use it to compare
 
 The running dashboard confirms the active SNI/IP pair (with score and hot-swap count), current bypass method, local listener, uptime, connection state, byte counters, peak concurrency, the latest connection error, background-rescan results, a 60-second throughput graph, and recent relay activity including each connection's outbound target IP. This is the main view for interactive desktop runs.
 
+Press **R** to rescan targets, or **L** (lowercase **l** also works) to reload the
+config file used at startup. Reload keeps the same process and terminal open,
+closes existing connections, and rebuilds the proxy with the new settings,
+including the listener, bypass method, DNS, load balancing, and rescan interval.
+Original command-line overrides keep priority over file values. Relative list
+paths are resolved beside the config file.
+
+Reload can switch between `sni_spoof`, `ip_bypass`, and `ip_bypass_plus`; scan-only
+modes are rejected. Wait for an active scan or selection to finish before
+reloading. An unchanged config leaves the service running. Invalid files or
+unavailable permissions leave the current service intact. If applying valid
+settings fails (for example, the new port is occupied), ZeroDPI attempts to
+restore the previous settings and cached targets. The dashboard reports the
+result; if recovery or cleanup fails, it stays open with **L** to retry and
+**q/Esc** to quit. Connection statistics reset when the service is rebuilt.
+This shortcut is available in the TUI; headless runs keep their existing behavior.
+
 ### 🖥️ Headless Service Logs
 
 ![ZeroDPI service log output showing accepted proxy connections, bypass failures before relay, interceptor-closed flows, and successful bypass completion.](images/linux-service-logs.png)

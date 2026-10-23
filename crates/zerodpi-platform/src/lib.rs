@@ -14,6 +14,9 @@
 pub mod netmon;
 pub mod uplink;
 
+#[cfg(any(windows, feature = "packet-interception"))]
+mod emission;
+
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     feature = "packet-interception"

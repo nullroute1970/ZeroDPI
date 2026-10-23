@@ -16,6 +16,7 @@ mod data_plane;
 mod helper_client;
 mod manual_rescan;
 mod network_recovery;
+mod reload;
 mod runtime_events;
 mod target_selection;
 mod tui;
@@ -103,7 +104,7 @@ impl<'a> MakeWriter<'a> for TuiAwareStderr {
     }
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(version, about = "Cross-platform DPI bypass via SNI spoofing")]
 struct Args {
     /// Path to config.toml (defaults to one next to the binary).
@@ -184,6 +185,54 @@ struct Args {
     expected_data_plane_uid: Option<u32>,
 }
 
+impl Args {
+    fn apply(&self, cfg: &mut Config) {
+        let args = self.clone();
+        if let Some(v) = args.listen_host {
+            cfg.LISTEN_HOST = v;
+        }
+        if let Some(v) = args.listen_port {
+            cfg.LISTEN_PORT = v;
+        }
+        if args.auto_select {
+            cfg.AUTO_SELECT = true;
+        }
+        if let Some(v) = args.sni {
+            cfg.SELECTED_SNI = Some(v);
+        }
+        if let Some(v) = args.method {
+            cfg.BYPASS_METHOD = BypassMethodList::from_delimited(&v);
+        }
+        if let Some(v) = args.queue_num {
+            cfg.NFQUEUE_NUM = v;
+        }
+        if let Some(v) = args.scan_timeout {
+            cfg.SCAN_TIMEOUT_SECS = v;
+        }
+        if let Some(v) = args.rescan_interval {
+            cfg.RESCAN_INTERVAL_SECS = v;
+        }
+        if let Some(v) = args.sni_switch_min_score {
+            cfg.SNI_SWITCH_MIN_SCORE = v;
+        }
+        if let Some(v) = args.wrong_seq_extra_offset {
+            cfg.WRONG_SEQ_EXTRA_OFFSET = v;
+        }
+        if args.wrong_seq_no_psh {
+            cfg.WRONG_SEQ_SET_PSH = false;
+        }
+        if args.wrong_seq_no_bump_ident {
+            cfg.WRONG_SEQ_BUMP_IP_IDENT = false;
+        }
+        if let Some(v) = args.bypass_timeout {
+            cfg.BYPASS_TIMEOUT_SECS = v;
+        }
+        if let Some(v) = args.relay_max_lifetime {
+            cfg.RELAY_MAX_LIFETIME_SECS = v;
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // Install the ring CryptoProvider as the process-level default.  This must
     // happen before any rustls ClientConfig (or ServerConfig) is constructed.
@@ -233,58 +282,9 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     }
 
     // ---- config ----
-    let cfg_path = args.config.clone().unwrap_or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("config.toml")))
-            .unwrap_or_else(|| PathBuf::from("config.toml"))
-    });
-    let mut cfg = Config::from_file(&cfg_path)
-        .with_context(|| format!("loading config from {}", cfg_path.display()))?;
-
-    if let Some(v) = args.listen_host {
-        cfg.LISTEN_HOST = v;
-    }
-    if let Some(v) = args.listen_port {
-        cfg.LISTEN_PORT = v;
-    }
-    if args.auto_select {
-        cfg.AUTO_SELECT = true;
-    }
-    if let Some(v) = args.sni {
-        cfg.SELECTED_SNI = Some(v);
-    }
-    if let Some(v) = args.method {
-        cfg.BYPASS_METHOD = BypassMethodList::from_delimited(&v);
-    }
-    if let Some(v) = args.queue_num {
-        cfg.NFQUEUE_NUM = v;
-    }
-    if let Some(v) = args.scan_timeout {
-        cfg.SCAN_TIMEOUT_SECS = v;
-    }
-    if let Some(v) = args.rescan_interval {
-        cfg.RESCAN_INTERVAL_SECS = v;
-    }
-    if let Some(v) = args.sni_switch_min_score {
-        cfg.SNI_SWITCH_MIN_SCORE = v;
-    }
-    if let Some(v) = args.wrong_seq_extra_offset {
-        cfg.WRONG_SEQ_EXTRA_OFFSET = v;
-    }
-    if args.wrong_seq_no_psh {
-        cfg.WRONG_SEQ_SET_PSH = false;
-    }
-    if args.wrong_seq_no_bump_ident {
-        cfg.WRONG_SEQ_BUMP_IP_IDENT = false;
-    }
-    if let Some(v) = args.bypass_timeout {
-        cfg.BYPASS_TIMEOUT_SECS = v;
-    }
-    if let Some(v) = args.relay_max_lifetime {
-        cfg.RELAY_MAX_LIFETIME_SECS = v;
-    }
-    cfg.validate()?;
+    let source = reload::ConfigSource::new(args)?;
+    let cfg_path = source.path.clone();
+    let cfg = source.load()?;
     if cfg.CUSTOM_DNS_ENABLED {
         info!(
             servers = ?cfg.custom_dns_servers()?,
@@ -328,6 +328,20 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     }
     let cfg = Arc::new(cfg);
 
+    if !no_tui && reload::is_proxy_mode(&cfg.MODE) {
+        return reload::run(source, cfg, events, remote_helper);
+    }
+    run_config(cfg, cfg_path, no_tui, events, remote_helper, None)
+}
+
+fn run_config(
+    cfg: Arc<Config>,
+    cfg_path: PathBuf,
+    no_tui: bool,
+    events: RuntimeEventEmitter,
+    remote_helper: Option<RemoteHelperClient>,
+    mut session: Option<&mut reload::Session>,
+) -> Result<()> {
     // ---- branch: ip_bypass modes ----
     if cfg.MODE == "ip_bypass" {
         let cfg_clone = cfg.clone();
@@ -335,7 +349,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return ip_bypass_main(cfg_clone, cfg_path_clone, rt, no_tui, events);
+        return ip_bypass_main(cfg_clone, cfg_path_clone, rt, no_tui, events, session);
     }
     if cfg.MODE == "ip_bypass_plus" {
         let cfg_clone = cfg.clone();
@@ -343,7 +357,15 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return ip_bypass_plus_main(cfg_clone, cfg_path_clone, rt, no_tui, events, remote_helper);
+        return ip_bypass_plus_main(
+            cfg_clone,
+            cfg_path_clone,
+            rt,
+            no_tui,
+            events,
+            remote_helper,
+            session,
+        );
     }
 
     // ---- branch: scan-only modes ----
@@ -390,17 +412,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     }
 
     // ---- resolve SNI list path relative to the config file ----
-    let sni_list_path = {
-        let raw = PathBuf::from(&cfg.SNI_LIST);
-        if raw.is_absolute() {
-            raw
-        } else {
-            cfg_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(raw)
-        }
-    };
+    let sni_list_path = reload::relative_path(&cfg_path, &cfg.SNI_LIST);
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
 
@@ -411,117 +423,155 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
 
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
 
-    // ---- step 1: obtain a sorted list of probe results ----
-    let sorted_entries: Vec<SniProbeEntry> = if let Some(ref forced_sni) = cfg.SELECTED_SNI {
-        // Skip scanning; just resolve the forced SNI.
-        info!(sni = %forced_sni, "SELECTED_SNI set — skipping scan");
-        let sni = forced_sni.clone();
-        let resolver = DnsResolver::from_config(&cfg, scan_timeout)?;
-        rt.block_on(async move { resolve_single_sni(&sni, &resolver).await })
-            .with_context(|| format!("resolving SELECTED_SNI '{}'", forced_sni))?
+    let restored_pool = session
+        .as_deref_mut()
+        .and_then(|s| s.restore_targets.take())
+        .map(|targets| reload::restore_pool(&cfg, targets))
+        .transpose()?;
+    let restoring = restored_pool.is_some();
+    let (active_target, selected) = if let Some(pool) = restored_pool {
+        let target = pool.representative();
+        let ip = require_ipv4_target(target.ip, "sni_spoof")?;
+        let selected = ActiveSniTarget::new(
+            target
+                .sni
+                .as_deref()
+                .context("restored target missing SNI")?,
+            ip,
+            target.score,
+        );
+        (pool, selected)
     } else {
-        info!(path = %sni_list_path.display(), "scanning SNI list");
-        let path = sni_list_path.clone();
-        let cfg_clone = cfg.clone();
-        let entries = if no_tui {
-            let entries = rt.block_on(scan_sni_list_headless(
-                cfg_clone,
-                &path,
-                scan_timeout,
-                scan_network.clone(),
-                &events,
-                ScanKind::Sni,
-            ))?;
-            log_sni_scan_results("headless scan", &entries);
-            entries
+        // ---- step 1: obtain a sorted list of probe results ----
+        let sorted_entries: Vec<SniProbeEntry> = if let Some(ref forced_sni) = cfg.SELECTED_SNI {
+            // Skip scanning; just resolve the forced SNI.
+            info!(sni = %forced_sni, "SELECTED_SNI set — skipping scan");
+            let sni = forced_sni.clone();
+            let resolver = DnsResolver::from_config(&cfg, scan_timeout)?;
+            rt.block_on(async move { resolve_single_sni(&sni, &resolver).await })
+                .with_context(|| format!("resolving SELECTED_SNI '{}'", forced_sni))?
         } else {
-            let progress_network = scan_network.clone();
-            rt.block_on(async move {
-                scan_sni_list_with_progress(cfg_clone, &path, scan_timeout, progress_network).await
-            })?
+            info!(path = %sni_list_path.display(), "scanning SNI list");
+            let path = sni_list_path.clone();
+            let cfg_clone = cfg.clone();
+            let entries = if no_tui {
+                let entries = rt.block_on(scan_sni_list_headless(
+                    cfg_clone,
+                    &path,
+                    scan_timeout,
+                    scan_network.clone(),
+                    &events,
+                    ScanKind::Sni,
+                ))?;
+                log_sni_scan_results("headless scan", &entries);
+                entries
+            } else {
+                let progress_network = scan_network.clone();
+                rt.block_on(async {
+                    scan_sni_list_with_progress(
+                        cfg_clone,
+                        &path,
+                        scan_timeout,
+                        progress_network,
+                        session
+                            .as_deref_mut()
+                            .context("missing interactive session")?
+                            .terminal()?,
+                    )
+                    .await
+                })?
+            };
+            if entries.is_empty() {
+                anyhow::bail!(
+                    "no reachable SNI candidates found in {}",
+                    sni_list_path.display()
+                );
+            }
+            entries
         };
-        if entries.is_empty() {
+
+        let balanced_targets = if cfg.LOAD_BALANCE_ENABLED {
+            if cfg.SELECTED_SNI.is_some() {
+                sorted_entries
+                    .first()
+                    .map(Target::from_sni)
+                    .into_iter()
+                    .collect()
+            } else {
+                sni_candidates(&sorted_entries, cfg.LOAD_BALANCE_TARGET_COUNT, 1)
+            }
+        } else {
+            Vec::new()
+        };
+        if cfg.LOAD_BALANCE_ENABLED && balanced_targets.is_empty() {
             anyhow::bail!(
-                "no reachable SNI candidates found in {}",
-                sni_list_path.display()
+                "no valid SNI targets for load balancing (TCP success and positive score required)"
             );
         }
-        entries
-    };
 
-    let balanced_targets = if cfg.LOAD_BALANCE_ENABLED {
-        if cfg.SELECTED_SNI.is_some() {
+        // ---- step 2: select a candidate ----
+        if no_tui && !cfg.AUTO_SELECT && !cfg.LOAD_BALANCE_ENABLED && cfg.SELECTED_SNI.is_none() {
+            warn!("--no-tui cannot show the selection table; auto-selecting rank-1");
+        }
+        let selected: SniProbeEntry = if cfg.LOAD_BALANCE_ENABLED {
+            let first = &balanced_targets[0];
             sorted_entries
-                .first()
-                .map(Target::from_sni)
+                .iter()
+                .find(|entry| {
+                    IpAddr::V4(entry.ip) == first.ip
+                        && Some(entry.sni.as_str()) == first.sni.as_deref()
+                })
+                .context("missing ranked SNI target")?
+                .clone()
+        } else if cfg.AUTO_SELECT || cfg.SELECTED_SNI.is_some() || no_tui {
+            let best = sorted_entries
                 .into_iter()
-                .collect()
+                .next()
+                .context("no probe results")?;
+            info!(sni = %best.sni, ip = %best.ip, score = best.score, "auto-selected SNI");
+            best
         } else {
-            sni_candidates(&sorted_entries, cfg.LOAD_BALANCE_TARGET_COUNT, 1)
-        }
-    } else {
-        Vec::new()
-    };
-    if cfg.LOAD_BALANCE_ENABLED && balanced_targets.is_empty() {
-        anyhow::bail!(
-            "no valid SNI targets for load balancing (TCP success and positive score required)"
-        );
-    }
-
-    // ---- step 2: select a candidate ----
-    if no_tui && !cfg.AUTO_SELECT && !cfg.LOAD_BALANCE_ENABLED && cfg.SELECTED_SNI.is_none() {
-        warn!("--no-tui cannot show the selection table; auto-selecting rank-1");
-    }
-    let selected: SniProbeEntry = if cfg.LOAD_BALANCE_ENABLED {
-        let first = &balanced_targets[0];
-        sorted_entries
-            .iter()
-            .find(|entry| {
-                IpAddr::V4(entry.ip) == first.ip && Some(entry.sni.as_str()) == first.sni.as_deref()
-            })
-            .context("missing ranked SNI target")?
-            .clone()
-    } else if cfg.AUTO_SELECT || cfg.SELECTED_SNI.is_some() || no_tui {
-        let best = sorted_entries
-            .into_iter()
-            .next()
-            .context("no probe results")?;
-        info!(sni = %best.sni, ip = %best.ip, score = best.score, "auto-selected SNI");
-        best
-    } else {
-        // Interactive ratatui selection.
-        let mut terminal = tui::enter_tui()?;
-        let result = tui::run_selection(&mut terminal, &sorted_entries);
-        tui::leave_tui(terminal)?;
-        match result {
-            Ok(entry) => {
-                info!(sni = %entry.sni, ip = %entry.ip, score = entry.score, "selected SNI");
-                entry
+            // Interactive ratatui selection.
+            let terminal = session
+                .as_deref_mut()
+                .context("missing interactive session")?
+                .terminal()?;
+            let result = tui::run_selection(terminal, &sorted_entries);
+            match result {
+                Ok(entry) => {
+                    info!(sni = %entry.sni, ip = %entry.ip, score = entry.score, "selected SNI");
+                    entry
+                }
+                Err(e) => {
+                    return Err(e).context("SNI selection");
+                }
             }
-            Err(e) => {
-                return Err(e).context("SNI selection");
-            }
-        }
-    };
-    events.emit(RuntimeEvent::SelectedTarget {
-        target: TargetKind::Sni,
-        sni: Some(selected.sni.clone()),
-        ip: selected.ip.to_string(),
-        score: Some(selected.score),
-    });
+        };
+        events.emit(RuntimeEvent::SelectedTarget {
+            target: TargetKind::Sni,
+            sni: Some(selected.sni.clone()),
+            ip: selected.ip.to_string(),
+            score: Some(selected.score),
+        });
 
-    let active_target = TargetPool::new(
-        if cfg.LOAD_BALANCE_ENABLED {
-            cfg.LOAD_BALANCE_STRATEGY
-        } else {
-            SelectionStrategy::RoundRobin
-        },
-        if cfg.LOAD_BALANCE_ENABLED {
-            balanced_targets
-        } else {
-            vec![Target::from_sni(&selected)]
-        },
-    )?;
+        let active_target = TargetPool::new(
+            if cfg.LOAD_BALANCE_ENABLED {
+                cfg.LOAD_BALANCE_STRATEGY
+            } else {
+                SelectionStrategy::RoundRobin
+            },
+            if cfg.LOAD_BALANCE_ENABLED {
+                balanced_targets
+            } else {
+                vec![Target::from_sni(&selected)]
+            },
+        )?;
+        let selected = ActiveSniTarget::new(selected.sni, selected.ip, selected.score);
+        (active_target, selected)
+    };
+    if let Some(session) = session.as_deref_mut() {
+        session.own_pool(active_target.clone());
+    }
     let connect_ip = selected.ip;
 
     // ---- step 3: start the proxy ----
@@ -549,20 +599,22 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
             Arc::new(data_plane::DataPlaneController::none()),
         )
     } else if let Some(helper) = remote_helper.as_ref() {
-        let controller = rt
-            .block_on(data_plane::DataPlaneController::remote(
-                cfg.clone(),
-                helper.clone(),
-                Arc::new(helper.clone()),
-                interface_binding.current(),
-            ))
+        let controller = Arc::new(data_plane::DataPlaneController::remote_pending(
+            cfg.clone(),
+            helper.clone(),
+            Arc::new(helper.clone()),
+        ));
+        if let Some(session) = session.as_deref_mut() {
+            session.own_plane(controller.clone());
+        }
+        rt.block_on(controller.prepare_remote(interface_binding.current()))
             .context("prepare root helper interceptor")?;
         info!(
             helper_pid = helper.helper_pid(),
             helper_uid = helper.helper_uid(),
             "root helper interceptor ready"
         );
-        (Arc::new(helper.clone()), Arc::new(controller))
+        (Arc::new(helper.clone()), controller)
     } else {
         let flows = new_flow_table();
         let method_box = build_method(&cfg)
@@ -581,10 +633,22 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
             Arc::new(controller),
         )
     };
+    if let Some(session) = session.as_deref_mut() {
+        session.own_plane(data_plane_controller.clone());
+    }
 
     let (event_tx, mut event_rx) = proxy_event_channel(!no_tui || events.enabled());
 
     // ---- step 3b: automatic LOW_TTL_VALUE discovery ----
+    if restoring {
+        if let Some(value) = active_target.representative().low_ttl {
+            if let Some(handle) = low_ttl_handle.as_ref() {
+                handle.store(value, Ordering::Relaxed);
+            } else if let Some(helper) = remote_helper.as_ref() {
+                rt.block_on(helper.set_low_ttl_value(value))?;
+            }
+        }
+    }
     let low_ttl_discovery_state = match decide_low_ttl_discovery(&cfg) {
         LowTtlDiscoveryDecision::Disabled => None,
         LowTtlDiscoveryDecision::SkippedNoLowTtlMethod => None,
@@ -622,47 +686,48 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         }
     };
 
-    if cfg.LOAD_BALANCE_ENABLED {
-        if let Some(discovery) = low_ttl_discovery_state.as_ref() {
-            let (_, targets) = active_target.probe_snapshot();
-            let targets = rt.block_on(target_selection::discover_pool_ttls(
-                targets,
-                &[],
-                Some(cfg.LOW_TTL_VALUE),
-                |target| async move {
-                    let IpAddr::V4(ip) = target.ip else {
-                        return None;
-                    };
-                    discovery.probe(target.sni.as_deref().unwrap(), ip).await
-                },
-            ));
-            active_target.replace(targets);
-        }
-    } else {
-        if let Some(discovery_state) = low_ttl_discovery_state.as_ref() {
-            info!(
-                sni = %selected.sni,
-                max_ttl = discovery_state.settings.max_ttl,
-                "LOW_TTL_DISCOVER: probing TTL candidates before listening"
-            );
-            let started = std::time::Instant::now();
-            match rt.block_on(discovery_state.run(&selected.sni, connect_ip)) {
-                Some(value) => {
-                    info!(
-                        value,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "LOW_TTL_DISCOVER: applied discovered TTL"
-                    );
-                    let _ = event_tx.send(ProxyEvent::LowTtlDiscovered { value });
+    if !restoring {
+        if cfg.LOAD_BALANCE_ENABLED {
+            if let Some(discovery) = low_ttl_discovery_state.as_ref() {
+                let (_, targets) = active_target.probe_snapshot();
+                let targets = rt.block_on(target_selection::discover_pool_ttls(
+                    targets,
+                    &[],
+                    Some(cfg.LOW_TTL_VALUE),
+                    |target| async move {
+                        let IpAddr::V4(ip) = target.ip else {
+                            return None;
+                        };
+                        discovery.probe(target.sni.as_deref().unwrap(), ip).await
+                    },
+                ));
+                active_target.replace(targets);
+            }
+        } else {
+            if let Some(discovery_state) = low_ttl_discovery_state.as_ref() {
+                info!(
+                    sni = %selected.sni,
+                    max_ttl = discovery_state.settings.max_ttl,
+                    "LOW_TTL_DISCOVER: probing TTL candidates before listening"
+                );
+                let started = std::time::Instant::now();
+                match rt.block_on(discovery_state.run(&selected.sni, connect_ip)) {
+                    Some(value) => {
+                        info!(
+                            value,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "LOW_TTL_DISCOVER: applied discovered TTL"
+                        );
+                        let _ = event_tx.send(ProxyEvent::LowTtlDiscovered { value });
+                    }
+                    None => warn!(
+                        "LOW_TTL_DISCOVER: no working TTL found; keeping LOW_TTL_VALUE = {}",
+                        cfg.LOW_TTL_VALUE
+                    ),
                 }
-                None => warn!(
-                    "LOW_TTL_DISCOVER: no working TTL found; keeping LOW_TTL_VALUE = {}",
-                    cfg.LOW_TTL_VALUE
-                ),
             }
         }
     }
-
     // ---- step 4: optional background rescan ----
     let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(connect_ip)));
     let rescan_cfg = cfg.clone();
@@ -701,13 +766,18 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     }
 
     // ---- step 5: network recovery ----
-    let monitor = zerodpi_platform::netmon::NetworkMonitor::start(
-        probe_target.clone(),
-        Some(interface_binding.current()),
-        network_recovery::SETTLE,
-        network_recovery::POLL_INTERVAL,
-    )
-    .context("start network monitor")?;
+    let monitor = Arc::new(
+        zerodpi_platform::netmon::NetworkMonitor::start(
+            probe_target.clone(),
+            Some(interface_binding.current()),
+            network_recovery::SETTLE,
+            network_recovery::POLL_INTERVAL,
+        )
+        .context("start network monitor")?,
+    );
+    if let Some(session) = session.as_deref_mut() {
+        session.own_monitor(monitor.clone());
+    }
 
     let cfg_verify = cfg.clone();
     let verify_target = active_target.clone();
@@ -793,7 +863,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         (cfg.AUTO_SELECT || cfg.LOAD_BALANCE_ENABLED) && cfg.SELECTED_SNI.is_none(),
         Some(interface_binding.current()),
     );
-    let recovery_handle = rt.spawn(coordinator.run(monitor.events()));
+    rt.spawn(coordinator.run(monitor.events()));
 
     let cfg_dash = cfg.clone();
     let selected_dash = selected.clone();
@@ -804,7 +874,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     let dashboard_event_tx = Some(event_tx.clone());
     let proxy_binding = interface_binding.clone();
     let proxy_binder = socket_binder.clone();
-    let proxy_handle = rt.spawn(async move {
+    let mut proxy_handle = rt.spawn(async move {
         run_proxy(
             cfg,
             active_target,
@@ -827,30 +897,20 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         return result;
     }
 
-    let mut terminal = tui::enter_tui()?;
     let dash_info = tui::DashboardInfo::SniSpoof {
-        sni: selected_dash.sni.clone(),
+        sni: selected_dash.sni.to_string(),
         ip: selected_dash.ip,
         score: selected_dash.score,
     };
-    let dash_result = tui::run_dashboard(
-        &mut terminal,
+    let session = session.context("missing interactive session")?;
+    session.wait_listener(&rt, &mut proxy_handle, &mut event_rx)?;
+    session.dashboard(
         &mut event_rx,
         &dash_info,
         &cfg_dash,
         &mut manual_control,
         &dashboard_pool,
-    );
-    tui::leave_tui(terminal)?;
-
-    proxy_handle.abort();
-    monitor.shutdown();
-    recovery_handle.abort();
-    rt.block_on(data_plane_controller.stop())?;
-    info!("shutting down");
-    dash_result?;
-
-    Ok(())
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -901,6 +961,7 @@ async fn scan_sni_list_with_progress(
     path: &std::path::Path,
     timeout: Duration,
     network: OutboundNetwork,
+    terminal: &mut tui::Term,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
     let total_hostnames = count_hostnames(path, cfg.DEDUPLICATE_SCAN_LISTS);
     let path_owned = path.to_owned();
@@ -914,9 +975,7 @@ async fn scan_sni_list_with_progress(
         scan_sni_list(&path_owned, timeout, cfg_clone, network, Some(tx)).await
     });
 
-    let mut terminal = tui::enter_tui()?;
-    let (arrived, aborted) = tui::run_scan_progress(&mut terminal, &mut rx, total_hostnames)?;
-    tui::leave_tui(terminal)?;
+    let (arrived, aborted) = tui::run_scan_progress(terminal, &mut rx, total_hostnames)?;
 
     // Obtain the authoritative sorted list.
     let sorted = if scan_handle.is_finished() {
@@ -1937,26 +1996,25 @@ fn ip_bypass_main(
     rt: tokio::runtime::Runtime,
     no_tui: bool,
     events: RuntimeEventEmitter,
+    mut session: Option<&mut reload::Session>,
 ) -> Result<()> {
-    let ip_list_path = {
-        let raw = PathBuf::from(&cfg.IP_LIST);
-        if raw.is_absolute() {
-            raw
-        } else {
-            cfg_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(raw)
-        }
-    };
+    let ip_list_path = reload::relative_path(&cfg_path, &cfg.IP_LIST);
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
 
+    let restored_pool = session
+        .as_deref_mut()
+        .and_then(|s| s.restore_targets.take())
+        .map(|targets| reload::restore_pool(&cfg, targets))
+        .transpose()?;
     let mut balanced_targets = Vec::new();
     // ---- step 1: obtain active IP ----
     let (active_ip, active_score): (std::net::IpAddr, Option<u8>) =
-        if let Some(ref forced_ip) = cfg.SELECTED_IP {
+        if let Some(pool) = restored_pool.as_ref() {
+            let target = pool.representative();
+            (target.ip, Some(target.score))
+        } else if let Some(ref forced_ip) = cfg.SELECTED_IP {
             let ip: std::net::IpAddr = forced_ip
                 .parse()
                 .with_context(|| format!("parsing SELECTED_IP '{forced_ip}'"))?;
@@ -1999,8 +2057,11 @@ fn ip_bypass_main(
                     ips,
                     scan_sni,
                     scan_timeout,
-                    total_ips,
                     scan_network.clone(),
+                    session
+                        .as_deref_mut()
+                        .context("missing interactive session")?
+                        .terminal()?,
                 )
             }?;
 
@@ -2021,9 +2082,11 @@ fn ip_bypass_main(
                     info!(ip = %best.ip, score = best.score, "auto-selected IP");
                     best
                 } else {
-                    let mut terminal = tui::enter_tui()?;
-                    let result = tui::run_ip_selection(&mut terminal, &entries);
-                    tui::leave_tui(terminal)?;
+                    let terminal = session
+                        .as_deref_mut()
+                        .context("missing interactive session")?
+                        .terminal()?;
+                    let result = tui::run_ip_selection(terminal, &entries);
                     let entry = result.context("IP selection")?;
                     info!(ip = %entry.ip, score = entry.score, "selected IP");
                     entry
@@ -2043,18 +2106,25 @@ fn ip_bypass_main(
     let (interface_binding_handle, interface_binding) =
         interface_binding_channel(initial_binding.clone());
 
-    let active_ip_arc = TargetPool::new(
-        if cfg.LOAD_BALANCE_ENABLED {
-            cfg.LOAD_BALANCE_STRATEGY
-        } else {
-            SelectionStrategy::RoundRobin
-        },
-        if cfg.LOAD_BALANCE_ENABLED && cfg.SELECTED_IP.is_none() {
-            balanced_targets
-        } else {
-            vec![Target::ip(active_ip, active_score.unwrap_or(0))]
-        },
-    )?;
+    let active_ip_arc = if let Some(pool) = restored_pool {
+        pool
+    } else {
+        TargetPool::new(
+            if cfg.LOAD_BALANCE_ENABLED {
+                cfg.LOAD_BALANCE_STRATEGY
+            } else {
+                SelectionStrategy::RoundRobin
+            },
+            if cfg.LOAD_BALANCE_ENABLED && cfg.SELECTED_IP.is_none() {
+                balanced_targets
+            } else {
+                vec![Target::ip(active_ip, active_score.unwrap_or(0))]
+            },
+        )?
+    };
+    if let Some(session) = session.as_deref_mut() {
+        session.own_pool(active_ip_arc.clone());
+    }
     let (event_tx, mut event_rx) = proxy_event_channel(!no_tui || events.enabled());
 
     // ---- step 2: optional background IP rescan ----
@@ -2100,13 +2170,18 @@ fn ip_bypass_main(
 
     let data_plane_controller: Arc<dyn data_plane::DataPlane> =
         Arc::new(data_plane::DataPlaneController::none());
-    let monitor = zerodpi_platform::netmon::NetworkMonitor::start(
-        probe_target.clone(),
-        Some(initial_binding.clone()),
-        network_recovery::SETTLE,
-        network_recovery::POLL_INTERVAL,
-    )
-    .context("start network monitor")?;
+    let monitor = Arc::new(
+        zerodpi_platform::netmon::NetworkMonitor::start(
+            probe_target.clone(),
+            Some(initial_binding.clone()),
+            network_recovery::SETTLE,
+            network_recovery::POLL_INTERVAL,
+        )
+        .context("start network monitor")?,
+    );
+    if let Some(session) = session.as_deref_mut() {
+        session.own_monitor(monitor.clone());
+    }
 
     let cfg_verify = cfg.clone();
     let verify_active = active_ip_arc.clone();
@@ -2184,7 +2259,7 @@ fn ip_bypass_main(
         (cfg.AUTO_SELECT || cfg.LOAD_BALANCE_ENABLED) && cfg.SELECTED_IP.is_none(),
         Some(initial_binding),
     );
-    let recovery_handle = rt.spawn(coordinator.run(monitor.events()));
+    rt.spawn(coordinator.run(monitor.events()));
 
     info!(%active_ip, "ip_bypass: starting proxy (no packet interception)");
 
@@ -2196,7 +2271,7 @@ fn ip_bypass_main(
     let dashboard_event_tx = Some(event_tx.clone());
     let proxy_binding = interface_binding.clone();
     let proxy_binder = socket_binder.clone();
-    let proxy_handle = rt.spawn(async move {
+    let mut proxy_handle = rt.spawn(async move {
         run_ip_bypass_proxy(
             cfg,
             proxy_active,
@@ -2219,29 +2294,16 @@ fn ip_bypass_main(
     }
 
     let dash_info = tui::DashboardInfo::IpBypass { ip: active_ip };
-    let mut terminal = tui::enter_tui()?;
-    let dash_result = tui::run_dashboard(
-        &mut terminal,
+    let session = session.context("missing interactive session")?;
+    session.wait_listener(&rt, &mut proxy_handle, &mut event_rx)?;
+    session.dashboard(
         &mut event_rx,
         &dash_info,
         &cfg_dash,
         &mut manual_control,
         &dashboard_pool,
-    );
-    tui::leave_tui(terminal)?;
-
-    proxy_handle.abort();
-    monitor.shutdown();
-    recovery_handle.abort();
-    info!("shutting down");
-    dash_result?;
-
-    Ok(())
+    )
 }
-
-// ---------------------------------------------------------------------------
-// IP bypass plus mode
-// ---------------------------------------------------------------------------
 
 fn ip_bypass_plus_main(
     cfg: Arc<Config>,
@@ -2250,27 +2312,25 @@ fn ip_bypass_plus_main(
     no_tui: bool,
     events: RuntimeEventEmitter,
     remote_helper: Option<RemoteHelperClient>,
+    mut session: Option<&mut reload::Session>,
 ) -> Result<()> {
-    let ip_list_path = {
-        let raw = PathBuf::from(&cfg.IP_LIST);
-        if raw.is_absolute() {
-            raw
-        } else {
-            cfg_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(raw)
-        }
-    };
+    let ip_list_path = reload::relative_path(&cfg_path, &cfg.IP_LIST);
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
 
+    let restored_pool = session
+        .as_deref_mut()
+        .and_then(|s| s.restore_targets.take())
+        .map(|targets| reload::restore_pool(&cfg, targets))
+        .transpose()?;
     let mut balanced_targets = Vec::new();
     // ---- step 1: obtain active IPv4 ----
-    let (active_ip, active_score): (IpAddr, Option<u8>) = if let Some(ref forced_ip) =
-        cfg.SELECTED_IP
+    let (active_ip, active_score): (IpAddr, Option<u8>) = if let Some(pool) = restored_pool.as_ref()
     {
+        let target = pool.representative();
+        (target.ip, Some(target.score))
+    } else if let Some(ref forced_ip) = cfg.SELECTED_IP {
         let ip: IpAddr = forced_ip
             .parse()
             .with_context(|| format!("parsing SELECTED_IP '{forced_ip}'"))?;
@@ -2315,8 +2375,11 @@ fn ip_bypass_plus_main(
                 ips,
                 scan_sni,
                 scan_timeout,
-                total_ips,
                 scan_network.clone(),
+                session
+                    .as_deref_mut()
+                    .context("missing interactive session")?
+                    .terminal()?,
             )
         }?;
 
@@ -2337,9 +2400,11 @@ fn ip_bypass_plus_main(
             info!(ip = %best.ip, score = best.score, "ip_bypass_plus: auto-selected IP");
             best
         } else {
-            let mut terminal = tui::enter_tui()?;
-            let result = tui::run_ip_selection(&mut terminal, &entries);
-            tui::leave_tui(terminal)?;
+            let terminal = session
+                .as_deref_mut()
+                .context("missing interactive session")?
+                .terminal()?;
+            let result = tui::run_ip_selection(terminal, &entries);
             let entry = result.context("IP selection")?;
             info!(ip = %entry.ip, score = entry.score, "ip_bypass_plus: selected IP");
             entry
@@ -2360,18 +2425,25 @@ fn ip_bypass_plus_main(
     let (interface_binding_handle, interface_binding) =
         interface_binding_channel(initial_binding.clone());
 
-    let active_ip_arc = TargetPool::new(
-        if cfg.LOAD_BALANCE_ENABLED {
-            cfg.LOAD_BALANCE_STRATEGY
-        } else {
-            SelectionStrategy::RoundRobin
-        },
-        if cfg.LOAD_BALANCE_ENABLED && cfg.SELECTED_IP.is_none() {
-            balanced_targets
-        } else {
-            vec![Target::ip(active_ip, active_score.unwrap_or(0))]
-        },
-    )?;
+    let active_ip_arc = if let Some(pool) = restored_pool {
+        pool
+    } else {
+        TargetPool::new(
+            if cfg.LOAD_BALANCE_ENABLED {
+                cfg.LOAD_BALANCE_STRATEGY
+            } else {
+                SelectionStrategy::RoundRobin
+            },
+            if cfg.LOAD_BALANCE_ENABLED && cfg.SELECTED_IP.is_none() {
+                balanced_targets
+            } else {
+                vec![Target::ip(active_ip, active_score.unwrap_or(0))]
+            },
+        )?
+    };
+    if let Some(session) = session.as_deref_mut() {
+        session.own_pool(active_ip_arc.clone());
+    }
     let (event_tx, mut event_rx) = proxy_event_channel(!no_tui || events.enabled());
 
     // ---- step 2: optional background IPv4 rescan ----
@@ -2432,15 +2504,17 @@ fn ip_bypass_plus_main(
             Arc::new(data_plane::DataPlaneController::none()),
         )
     } else if let Some(helper) = remote_helper {
-        let controller = rt
-            .block_on(data_plane::DataPlaneController::remote(
-                cfg.clone(),
-                helper.clone(),
-                Arc::new(helper.clone()),
-                interface_binding.current(),
-            ))
+        let controller = Arc::new(data_plane::DataPlaneController::remote_pending(
+            cfg.clone(),
+            helper.clone(),
+            Arc::new(helper.clone()),
+        ));
+        if let Some(session) = session.as_deref_mut() {
+            session.own_plane(controller.clone());
+        }
+        rt.block_on(controller.prepare_remote(interface_binding.current()))
             .context("prepare root helper interceptor")?;
-        (Arc::new(helper.clone()), Arc::new(controller))
+        (Arc::new(helper.clone()), controller)
     } else {
         let flows = new_flow_table();
         let method_box = build_method(&cfg)
@@ -2458,15 +2532,23 @@ fn ip_bypass_plus_main(
             Arc::new(controller),
         )
     };
+    if let Some(session) = session.as_deref_mut() {
+        session.own_plane(data_plane_controller.clone());
+    }
 
     // ---- step 4: network recovery ----
-    let monitor = zerodpi_platform::netmon::NetworkMonitor::start(
-        probe_target.clone(),
-        Some(interface_binding.current()),
-        network_recovery::SETTLE,
-        network_recovery::POLL_INTERVAL,
-    )
-    .context("start network monitor")?;
+    let monitor = Arc::new(
+        zerodpi_platform::netmon::NetworkMonitor::start(
+            probe_target.clone(),
+            Some(interface_binding.current()),
+            network_recovery::SETTLE,
+            network_recovery::POLL_INTERVAL,
+        )
+        .context("start network monitor")?,
+    );
+    if let Some(session) = session.as_deref_mut() {
+        session.own_monitor(monitor.clone());
+    }
 
     let cfg_verify = cfg.clone();
     let verify_active = active_ip_arc.clone();
@@ -2543,14 +2625,14 @@ fn ip_bypass_plus_main(
         (cfg.AUTO_SELECT || cfg.LOAD_BALANCE_ENABLED) && cfg.SELECTED_IP.is_none(),
         Some(interface_binding.current()),
     );
-    let recovery_handle = rt.spawn(coordinator.run(monitor.events()));
+    rt.spawn(coordinator.run(monitor.events()));
 
     // ---- step 4: run the proxy ----
     let cfg_dash = cfg.clone();
     let proxy_active = active_ip_arc.clone();
     let dashboard_pool = active_ip_arc.clone();
     let dashboard_event_tx = Some(event_tx.clone());
-    let proxy_handle = rt.spawn(async move {
+    let mut proxy_handle = rt.spawn(async move {
         run_ip_bypass_plus_proxy(
             cfg,
             proxy_active,
@@ -2574,30 +2656,17 @@ fn ip_bypass_plus_main(
     }
 
     let dash_info = tui::DashboardInfo::IpBypassPlus { ip: active_ip };
-    let mut terminal = tui::enter_tui()?;
-    let dash_result = tui::run_dashboard(
-        &mut terminal,
+    let session = session.context("missing interactive session")?;
+    session.wait_listener(&rt, &mut proxy_handle, &mut event_rx)?;
+    session.dashboard(
         &mut event_rx,
         &dash_info,
         &cfg_dash,
         &mut manual_control,
         &dashboard_pool,
-    );
-    tui::leave_tui(terminal)?;
-
-    proxy_handle.abort();
-    monitor.shutdown();
-    recovery_handle.abort();
-    rt.block_on(data_plane_controller.stop())?;
-    info!("shutting down");
-    dash_result?;
-
-    Ok(())
+    )
 }
 
-/// IPv4 address the network monitor probes with. `ip_bypass` may hold an IPv6
-/// target, which cannot detect the local IPv4 route, so it falls back to a
-/// stable anchor.
 fn monitor_probe_target(active: IpAddr) -> Ipv4Addr {
     match active {
         IpAddr::V4(ip) => ip,
@@ -2645,9 +2714,10 @@ fn scan_ip_list_with_ip_progress(
     ips: Vec<std::net::IpAddr>,
     scan_sni: Arc<str>,
     timeout: Duration,
-    total_ips: usize,
     network: OutboundNetwork,
+    terminal: &mut tui::Term,
 ) -> anyhow::Result<Vec<IpProbeEntry>> {
+    let total_ips = ips.len();
     let (tx, mut rx) = mpsc::unbounded_channel::<IpScanEvent>();
     let cfg_clone = cfg.clone();
     let network = network.clone();
@@ -2655,9 +2725,7 @@ fn scan_ip_list_with_ip_progress(
         scan_ip_list(ips, scan_sni, timeout, cfg_clone, network, Some(tx)).await
     });
 
-    let mut terminal = tui::enter_tui()?;
-    let (arrived, aborted) = tui::run_ip_scan_progress(&mut terminal, &mut rx, total_ips)?;
-    tui::leave_tui(terminal)?;
+    let (arrived, aborted) = tui::run_ip_scan_progress(terminal, &mut rx, total_ips)?;
 
     let sorted = if scan_handle.is_finished() {
         rt.block_on(scan_handle).context("scanner task panicked")?
@@ -2988,17 +3056,7 @@ fn sni_scan_main(
     no_tui: bool,
     events: RuntimeEventEmitter,
 ) -> Result<()> {
-    let sni_list_path = {
-        let raw = PathBuf::from(&cfg.SNI_LIST);
-        if raw.is_absolute() {
-            raw
-        } else {
-            cfg_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(raw)
-        }
-    };
+    let sni_list_path = reload::relative_path(&cfg_path, &cfg.SNI_LIST);
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
@@ -3084,17 +3142,7 @@ fn ip_scan_main(
     no_tui: bool,
     events: RuntimeEventEmitter,
 ) -> Result<()> {
-    let ip_list_path = {
-        let raw = PathBuf::from(&cfg.IP_LIST);
-        if raw.is_absolute() {
-            raw
-        } else {
-            cfg_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(raw)
-        }
-    };
+    let ip_list_path = reload::relative_path(&cfg_path, &cfg.IP_LIST);
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
@@ -3201,17 +3249,7 @@ fn sni_method_scan_main(
     no_tui: bool,
     events: RuntimeEventEmitter,
 ) -> Result<()> {
-    let sni_list_path = {
-        let raw = PathBuf::from(&cfg.SNI_LIST);
-        if raw.is_absolute() {
-            raw
-        } else {
-            cfg_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(raw)
-        }
-    };
+    let sni_list_path = reload::relative_path(&cfg_path, &cfg.SNI_LIST);
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
@@ -3299,17 +3337,7 @@ fn ip_method_scan_main(
     no_tui: bool,
     events: RuntimeEventEmitter,
 ) -> Result<()> {
-    let ip_list_path = {
-        let raw = PathBuf::from(&cfg.IP_LIST);
-        if raw.is_absolute() {
-            raw
-        } else {
-            cfg_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(raw)
-        }
-    };
+    let ip_list_path = reload::relative_path(&cfg_path, &cfg.IP_LIST);
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
@@ -3650,17 +3678,7 @@ fn proxy_scan_main(
     remote_helper: Option<RemoteHelperClient>,
 ) -> Result<()> {
     // ---- resolve SNI list path ----
-    let sni_list_path = {
-        let raw = PathBuf::from(&cfg.SNI_LIST);
-        if raw.is_absolute() {
-            raw
-        } else {
-            cfg_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(raw)
-        }
-    };
+    let sni_list_path = reload::relative_path(&cfg_path, &cfg.SNI_LIST);
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;

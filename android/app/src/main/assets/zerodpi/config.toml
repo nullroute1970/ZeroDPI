@@ -87,6 +87,8 @@ CUSTOM_DNS_ENABLED = false
 # Ordered plain-DNS servers, tried one at a time until IPv4 resolution succeeds.
 # Each server gets SCAN_TIMEOUT_SECS; three servers can take up to three times it.
 # Example: ["1.1.1.1", "8.8.8.8:53"]. No fallback to system DNS.
+# Iran DNS servers (optional example; not enabled by default):
+# CUSTOM_DNS_SERVERS = ["217.218.127.127", "217.218.155.155"]
 CUSTOM_DNS_SERVERS = []
 
 # Legacy single DNS server, used only when CUSTOM_DNS_SERVERS is empty.

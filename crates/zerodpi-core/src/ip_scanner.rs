@@ -195,14 +195,31 @@ fn compute_score(entry: &IpProbeEntry, config: &crate::config::Config) -> u8 {
 /// - Entries that are neither a valid IP nor a valid CIDR are silently
 ///   skipped (e.g. hostnames, malformed lines).
 ///
+/// Removes duplicate IP/CIDR entries from the file by default. Use
+/// [`load_ip_list_with_options`] to disable this preparation step.
 /// Returns `Ok(Vec<IpAddr>)`.  The vector may be empty if the file is empty
 /// or contains only comments.
 pub fn load_ip_list(
     path: impl AsRef<std::path::Path>,
     ipv6_max_hosts: u64,
 ) -> anyhow::Result<Vec<IpAddr>> {
-    let text = std::fs::read_to_string(path.as_ref())
-        .map_err(|e| anyhow::anyhow!("cannot read ip_list '{}': {e}", path.as_ref().display()))?;
+    load_ip_list_with_options(path, ipv6_max_hosts, true)
+}
+
+/// Load IP candidates, optionally removing duplicate IP/CIDR entries from disk.
+/// CIDR ranges are compared as ranges, without expanding or merging overlaps.
+pub fn load_ip_list_with_options(
+    path: impl AsRef<std::path::Path>,
+    ipv6_max_hosts: u64,
+    deduplicate: bool,
+) -> anyhow::Result<Vec<IpAddr>> {
+    let text = crate::scan_list::read_scan_list(path.as_ref(), deduplicate, |entry| {
+        entry
+            .parse::<IpAddr>()
+            .map(|ip| ip.to_string())
+            .or_else(|_| entry.parse::<IpNet>().map(|net| net.trunc().to_string()))
+            .ok()
+    })?;
     let mut ips = Vec::new();
     for line in text.lines() {
         let line = line.trim();
@@ -654,6 +671,44 @@ mod tests {
         std::fs::write(&path, "1.1.1.1\n1.0.0.1\n# comment\n\n8.8.8.8\n").unwrap();
         let ips = load_ip_list(&path, 65536).unwrap();
         assert_eq!(ips.len(), 3);
+    }
+
+    #[test]
+    fn load_ip_list_removes_duplicates_from_file_preserving_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ips.txt");
+        std::fs::write(
+            &path,
+            "# candidates\r\n 1.1.1.1 \r\n\r\n1.1.1.1\r\n# candidates\r\n2606:4700::1111\r\n2606:4700:0:0:0:0:0:1111\r\n192.0.2.0/30\r\n192.0.2.0/30\r\ngarbage\r\ngarbage",
+        )
+        .unwrap();
+        let ips = load_ip_list(&path, 65536).unwrap();
+        assert_eq!(ips.len(), 4);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# candidates\r\n 1.1.1.1 \r\n\r\n# candidates\r\n2606:4700::1111\r\n192.0.2.0/30\r\ngarbage\r\ngarbage"
+        );
+    }
+
+    #[test]
+    fn load_ip_list_keeps_duplicates_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ips.txt");
+        let content = "# candidates\r\n1.1.1.1\r\n 1.1.1.1 \r\n";
+        std::fs::write(&path, content).unwrap();
+        let ips = load_ip_list_with_options(&path, 65536, false).unwrap();
+        assert_eq!(ips, vec!["1.1.1.1".parse::<IpAddr>().unwrap(); 2]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[test]
+    fn load_ip_list_preserves_unique_file_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ips.txt");
+        let content = "# candidates\r\n 1.1.1.1 \r\n\r\n2606:4700::1111";
+        std::fs::write(&path, content).unwrap();
+        assert_eq!(load_ip_list(&path, 65536).unwrap().len(), 2);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
     }
 
     #[test]

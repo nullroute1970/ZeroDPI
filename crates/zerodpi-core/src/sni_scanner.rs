@@ -209,8 +209,9 @@ pub async fn scan_sni_list(
     network: OutboundNetwork,
     progress_tx: Option<mpsc::UnboundedSender<SniProbeEntry>>,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+    let content = crate::scan_list::read_scan_list(path, config.DEDUPLICATE_SCAN_LISTS, |entry| {
+        Some(entry.to_ascii_lowercase())
+    })?;
     let hostnames: Vec<String> = content
         .lines()
         .map(|l| l.trim())
@@ -702,6 +703,47 @@ mod candidate_tests {
         task.abort();
         let _ = task.await;
         assert!(extra.is_err(), "DNS fanout exceeded SNI_MAX_CONCURRENT");
+    }
+
+    #[tokio::test]
+    async fn sni_scan_removes_duplicates_before_dns_queries() {
+        let (_dir, path, server, config, network) = dns_scan_fixture().await;
+        std::fs::write(
+            &path,
+            "# candidates\nExample.test\n\n example.TEST \nother.test\n",
+        )
+        .unwrap();
+        let scan_path = path.clone();
+        let task = tokio::spawn(async move {
+            scan_sni_list(&scan_path, Duration::from_secs(10), config, network, None).await
+        });
+        let mut buf = [0; 512];
+        let query = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buf)).await;
+        task.abort();
+        let _ = task.await;
+        query.unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# candidates\nExample.test\n\nother.test\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn sni_scan_keeps_duplicates_when_disabled() {
+        let (_dir, path, server, mut config, network) = dns_scan_fixture().await;
+        Arc::get_mut(&mut config).unwrap().DEDUPLICATE_SCAN_LISTS = false;
+        let content = "Example.test\nexample.TEST\n";
+        std::fs::write(&path, content).unwrap();
+        let scan_path = path.clone();
+        let task = tokio::spawn(async move {
+            scan_sni_list(&scan_path, Duration::from_secs(10), config, network, None).await
+        });
+        let mut buf = [0; 512];
+        let query = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buf)).await;
+        task.abort();
+        let _ = task.await;
+        query.unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
     }
 
     #[tokio::test]

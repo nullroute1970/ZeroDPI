@@ -501,6 +501,11 @@ pub struct Config {
     #[serde(default = "default_scan_timeout")]
     pub SCAN_TIMEOUT_SECS: u64,
 
+    /// Remove duplicate entries from each input file before scanning it.
+    /// Keeps the first occurrence, comments, and blank lines. Default: `true`.
+    #[serde(default = "default_true")]
+    pub DEDUPLICATE_SCAN_LISTS: bool,
+
     /// When `true` the application automatically picks the top-ranked entry
     /// after scanning instead of showing the manual selection table.
     /// TUI progress, result, and dashboard views are still shown.
@@ -1973,6 +1978,24 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_list_deduplication_defaults_to_enabled_and_can_be_disabled() {
+        for (option, expected) in [
+            ("", true),
+            ("DEDUPLICATE_SCAN_LISTS = true", true),
+            ("DEDUPLICATE_SCAN_LISTS = false", false),
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\n{option}"
+            ))
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(cfg).unwrap()["DEDUPLICATE_SCAN_LISTS"],
+                expected
+            );
+        }
+    }
 
     #[test]
     fn tcp_nodelay_defaults_to_enabled_and_can_be_disabled() {

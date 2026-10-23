@@ -37,7 +37,9 @@ use zerodpi_core::config::{BypassMethodList, Config};
 use zerodpi_core::dns::DnsResolver;
 use zerodpi_core::flow::{new_flow_table, FlowController, LocalFlowController};
 use zerodpi_core::interceptor::PacketInterceptor;
-use zerodpi_core::ip_scanner::{load_ip_list, scan_ip_list, IpProbeEntry, IpScanEvent};
+use zerodpi_core::ip_scanner::{
+    load_ip_list_with_options, scan_ip_list, IpProbeEntry, IpScanEvent,
+};
 use zerodpi_core::low_ttl_discover::{discover_low_ttl, LowTtlDiscovery};
 use zerodpi_core::method_scanner::{
     rank_entries, run_method_tests, MethodScanEvent, MethodScanReport, MethodScanTarget,
@@ -836,7 +838,7 @@ async fn scan_sni_list_with_progress(
     timeout: Duration,
     network: OutboundNetwork,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
-    let total_hostnames = count_hostnames(path);
+    let total_hostnames = count_hostnames(path, cfg.DEDUPLICATE_SCAN_LISTS);
     let path_owned = path.to_owned();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
@@ -884,12 +886,14 @@ async fn scan_sni_list_with_progress(
 }
 
 /// Count valid hostname lines in the SNI list file.
-fn count_hostnames(path: &std::path::Path) -> usize {
+fn count_hostnames(path: &std::path::Path, deduplicate: bool) -> usize {
+    let mut seen = std::collections::HashSet::new();
     std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|l| !deduplicate || seen.insert(l.to_ascii_lowercase()))
         .count()
 }
 
@@ -901,7 +905,7 @@ async fn scan_sni_list_headless(
     events: &RuntimeEventEmitter,
     scan: ScanKind,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
-    let total = count_hostnames(path);
+    let total = count_hostnames(path, cfg.DEDUPLICATE_SCAN_LISTS);
     events.emit(RuntimeEvent::ScanStarted {
         scan,
         path: Some(path.display().to_string()),
@@ -1783,8 +1787,12 @@ fn ip_bypass_main(
             info!(%ip, "SELECTED_IP set — skipping scan");
             (ip, None)
         } else {
-            let ips = load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS)
-                .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
+            let ips = load_ip_list_with_options(
+                &ip_list_path,
+                cfg.IPV6_MAX_HOSTS,
+                cfg.DEDUPLICATE_SCAN_LISTS,
+            )
+            .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
             if ips.is_empty() {
                 anyhow::bail!(
                     "ip_list '{}' is empty — add at least one IP or CIDR",
@@ -2075,8 +2083,12 @@ fn ip_bypass_plus_main(
         info!(%ip, "ip_bypass_plus: SELECTED_IP set — skipping scan");
         (ip, None)
     } else {
-        let ips = load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS)
-            .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
+        let ips = load_ip_list_with_options(
+            &ip_list_path,
+            cfg.IPV6_MAX_HOSTS,
+            cfg.DEDUPLICATE_SCAN_LISTS,
+        )
+        .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
         reject_ipv6_ip_candidates(&ips, "ip_bypass_plus", &ip_list_path)?;
         if ips.is_empty() {
             anyhow::bail!(
@@ -2554,7 +2566,11 @@ async fn rescan_ip_once(
     );
     let scan_started = std::time::Instant::now();
 
-    let ips = match load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS) {
+    let ips = match load_ip_list_with_options(
+        &ip_list_path,
+        cfg.IPV6_MAX_HOSTS,
+        cfg.DEDUPLICATE_SCAN_LISTS,
+    ) {
         Ok(v) => v,
         Err(e) => {
             warn!(mode = policy.mode_label, error = %e, "background IP rescan failed to load ip_list");
@@ -2727,7 +2743,7 @@ fn sni_scan_main(
 
     info!(path = %sni_list_path.display(), "sni_scan: scanning SNI list");
 
-    let total_hostnames = count_hostnames(&sni_list_path);
+    let total_hostnames = count_hostnames(&sni_list_path, cfg.DEDUPLICATE_SCAN_LISTS);
     let path = sni_list_path.clone();
     let cfg_clone = cfg.clone();
     let sorted = if no_tui {
@@ -2820,8 +2836,12 @@ fn ip_scan_main(
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
-    let ips = load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS)
-        .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
+    let ips = load_ip_list_with_options(
+        &ip_list_path,
+        cfg.IPV6_MAX_HOSTS,
+        cfg.DEDUPLICATE_SCAN_LISTS,
+    )
+    .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
     if ips.is_empty() {
         anyhow::bail!(
             "ip_list '{}' is empty — add at least one IP or CIDR",
@@ -2945,7 +2965,7 @@ fn sni_method_scan_main(
             ScanKind::Sni,
         ))?
     } else {
-        let total_hostnames = count_hostnames(&sni_list_path);
+        let total_hostnames = count_hostnames(&sni_list_path, cfg.DEDUPLICATE_SCAN_LISTS);
         let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
         let path = sni_list_path.clone();
         let cfg_clone = cfg.clone();
@@ -3031,8 +3051,12 @@ fn ip_method_scan_main(
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
-    let ips = load_ip_list(&ip_list_path, cfg.IPV6_MAX_HOSTS)
-        .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
+    let ips = load_ip_list_with_options(
+        &ip_list_path,
+        cfg.IPV6_MAX_HOSTS,
+        cfg.DEDUPLICATE_SCAN_LISTS,
+    )
+    .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
     if ips.is_empty() {
         anyhow::bail!(
             "ip_list '{}' is empty — add at least one IP or CIDR",
@@ -3393,7 +3417,7 @@ fn proxy_scan_main(
             ScanKind::Sni,
         ))?
     } else {
-        let total_hostnames = count_hostnames(&sni_list_path);
+        let total_hostnames = count_hostnames(&sni_list_path, cfg.DEDUPLICATE_SCAN_LISTS);
         let (tx1, mut rx1) = mpsc::unbounded_channel::<SniProbeEntry>();
         let scan_handle = rt.spawn(async move {
             scan_sni_list(&path, scan_timeout, cfg_clone, scan_network, Some(tx1)).await
@@ -3673,6 +3697,19 @@ mod tests {
 
     fn current(score: u8) -> ActiveSniTarget {
         ActiveSniTarget::new("old.example.com", Ipv4Addr::new(1, 1, 1, 1), score)
+    }
+
+    #[test]
+    fn hostname_progress_total_excludes_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snis.txt");
+        std::fs::write(
+            &path,
+            "# candidates\nExample.test\n\n example.TEST \nother.test\n",
+        )
+        .unwrap();
+        assert_eq!(count_hostnames(&path, true), 2);
+        assert_eq!(count_hostnames(&path, false), 3);
     }
 
     fn candidate(sni: &str, ip: Ipv4Addr, score: u8) -> SniProbeEntry {

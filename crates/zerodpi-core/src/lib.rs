@@ -24,6 +24,7 @@ pub mod methods;
 pub mod net;
 pub mod proxy;
 pub mod proxy_tester;
+mod scan_list;
 mod scanner_http;
 pub mod sni_scanner;
 pub mod tcp_segment;

@@ -861,6 +861,7 @@ Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `SCAN_TIMEOUT_SECS` | `u64` | `5` | Per-probe timeout (seconds) |
+| `DEDUPLICATE_SCAN_LISTS` | `bool` | `true` | Remove duplicate entries from `SNI_LIST` / `IP_LIST` on disk before scanning each file, including rescans. Keeps the first entry, order, comments, blank lines, and line endings. SNI comparison ignores ASCII case; IPs and identical CIDR ranges use their parsed values. Overlapping ranges are not merged. Set to `false` to leave files untouched and scan all entries. |
 | `RESCAN_INTERVAL_SECS` | `u64` | `0` | Background rescan interval (`0` = disabled) |
 | `SNI_SWITCH_MIN_SCORE` | `u8` | `1` | Minimum score to auto-switch target on rescan (0–100) |
 | `SCAN_OUTPUT` | `string` | — | Path to save scan results as JSON (scan-only modes) |

@@ -96,6 +96,10 @@ CUSTOM_DNS_SERVER = ""
 # Scan Behavior
 # ---------------------------------------------------------------------------
 
+# Remove duplicate SNI/IP entries from each input file before scanning it.
+# Keeps the first entry, comments, blank lines, and entry order. Default: true.
+DEDUPLICATE_SCAN_LISTS = true
+
 # Maximum time (in seconds) each individual probe may take before
 # it is abandoned.
 SCAN_TIMEOUT_SECS = 5

@@ -22,8 +22,8 @@ tokio-rustls.workspace = true
 webpki-roots.workspace = true
 hickory-resolver.workspace = true
 ipnet.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tempfile.workspace = true
 serde_json.workspace = true

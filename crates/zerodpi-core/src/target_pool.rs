@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -113,17 +113,52 @@ fn unique_targets(targets: impl Iterator<Item = Target>, limit: usize) -> Vec<Ta
         .collect()
 }
 
-#[derive(Debug)]
+/// A missing scan measurement is unknown; a missing live measurement failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PingSource {
+    Scan,
+    Live,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetSnapshot {
+    pub target: Target,
+    /// One-based scan rank, or None when no longer in the selection pool.
+    pub rank: Option<usize>,
+    pub ping: Option<Duration>,
+    pub ping_source: PingSource,
+    pub active_connections: usize,
+    pub c2s_bytes: u64,
+    pub s2c_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetPoolSnapshot {
+    pub strategy: SelectionStrategy,
+    /// Current members in rank order, followed by history in first-seen order.
+    pub targets: Vec<TargetSnapshot>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TargetTraffic {
+    pub c2s: AtomicU64,
+    pub s2c: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
 struct Member {
     target: Target,
     ping: Option<Duration>,
     load: Arc<AtomicUsize>,
+    traffic: Arc<TargetTraffic>,
+    ping_source: PingSource,
 }
 
 #[derive(Debug)]
 struct PoolState {
     members: Vec<Member>,
-    loads: HashMap<TargetKey, Weak<AtomicUsize>>,
+    history: Vec<Member>,
+    history_indices: HashMap<TargetKey, usize>,
     cursor: usize,
     generation: u64,
     random: u64,
@@ -140,6 +175,7 @@ pub struct TargetPool {
 pub struct TargetLease {
     pub target: Target,
     load: Arc<AtomicUsize>,
+    pub(crate) traffic: Arc<TargetTraffic>,
 }
 
 impl Drop for TargetLease {
@@ -159,7 +195,8 @@ impl TargetPool {
             strategy,
             state: Arc::new(Mutex::new(PoolState {
                 members: Vec::new(),
-                loads: HashMap::new(),
+                history: Vec::new(),
+                history_indices: HashMap::new(),
                 cursor: 0,
                 generation: 0,
                 random: seed,
@@ -186,11 +223,43 @@ impl TargetPool {
     pub fn active_connections(&self) -> usize {
         self.state
             .lock()
-            .loads
-            .values()
-            .filter_map(Weak::upgrade)
-            .map(|load| load.load(Ordering::Relaxed))
+            .history
+            .iter()
+            .map(|member| member.load.load(Ordering::Relaxed))
             .sum()
+    }
+
+    /// Session counters survive rescans and worker cancellation. Atomics are
+    /// sampled without stopping relays; no network IO or selection takes place.
+    pub fn snapshot(&self) -> TargetPoolSnapshot {
+        let state = self.state.lock();
+        let current: HashSet<_> = state.members.iter().map(|m| m.target.key()).collect();
+        let sample = |member: &Member, rank| TargetSnapshot {
+            target: member.target.clone(),
+            rank,
+            ping: member.ping,
+            ping_source: member.ping_source,
+            active_connections: member.load.load(Ordering::Relaxed),
+            c2s_bytes: member.traffic.c2s.load(Ordering::Relaxed),
+            s2c_bytes: member.traffic.s2c.load(Ordering::Relaxed),
+        };
+        let targets = state
+            .members
+            .iter()
+            .enumerate()
+            .map(|(i, member)| sample(member, Some(i + 1)))
+            .chain(
+                state
+                    .history
+                    .iter()
+                    .filter(|m| !current.contains(&m.target.key()))
+                    .map(|member| sample(member, None)),
+            )
+            .collect();
+        TargetPoolSnapshot {
+            strategy: self.strategy,
+            targets,
+        }
     }
 
     /// Preserve counters even when an address is removed and re-added while a
@@ -211,20 +280,28 @@ impl TargetPool {
             .into_iter()
             .map(|target| {
                 let key = target.key();
-                let load = state
-                    .loads
-                    .get(&key)
-                    .and_then(Weak::upgrade)
-                    .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
-                state.loads.insert(key, Arc::downgrade(&load));
-                Member {
+                let previous = state.history_indices.get(&key).copied();
+                let member = Member {
                     ping: target.tcp_latency,
+                    ping_source: PingSource::Scan,
                     target,
-                    load,
+                    load: previous
+                        .map(|i| state.history[i].load.clone())
+                        .unwrap_or_default(),
+                    traffic: previous
+                        .map(|i| state.history[i].traffic.clone())
+                        .unwrap_or_default(),
+                };
+                if let Some(i) = previous {
+                    state.history[i] = member.clone();
+                } else {
+                    let i = state.history.len();
+                    state.history_indices.insert(key, i);
+                    state.history.push(member.clone());
                 }
+                member
             })
             .collect();
-        state.loads.retain(|_, counter| counter.strong_count() > 0);
         state.cursor = 0;
         state.generation = state.generation.wrapping_add(1);
         changed
@@ -256,6 +333,7 @@ impl TargetPool {
         TargetLease {
             target: member.target.clone(),
             load: member.load.clone(),
+            traffic: member.traffic.clone(),
         }
     }
 
@@ -280,6 +358,10 @@ impl TargetPool {
                 .find(|m| m.target.key() == target.key())
             {
                 member.ping = ping;
+                member.ping_source = PingSource::Live;
+                let i = state.history_indices[&target.key()];
+                state.history[i].ping = ping;
+                state.history[i].ping_source = PingSource::Live;
             }
         }
     }
@@ -304,6 +386,59 @@ fn random_index(state: &mut u64, count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_preserve_identity_traffic_and_history_across_replacement() {
+        let ip = std::net::Ipv4Addr::new(192, 0, 2, 1);
+        let first = Target::sni("first.example", ip, 90);
+        let second = Target::sni("second.example", ip, 80);
+        let pool = TargetPool::new(
+            SelectionStrategy::RoundRobin,
+            vec![first.clone(), second.clone()],
+        )
+        .unwrap();
+        let a = pool.acquire();
+        let b = pool.acquire();
+        a.traffic.c2s.fetch_add(100, Ordering::Relaxed);
+        b.traffic.s2c.fetch_add(200, Ordering::Relaxed);
+        pool.replace(vec![second]);
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.strategy, SelectionStrategy::RoundRobin);
+        assert_eq!(
+            snapshot.targets[0].target.sni.as_deref(),
+            Some("second.example")
+        );
+        assert_eq!(snapshot.targets[0].rank, Some(1));
+        assert_eq!(snapshot.targets[0].s2c_bytes, 200);
+        assert_eq!(snapshot.targets[1].rank, None);
+        assert_eq!(snapshot.targets[1].active_connections, 1);
+        assert_eq!(snapshot.targets[1].c2s_bytes, 100);
+        drop((a, b));
+        assert_eq!(pool.snapshot().targets[1].active_connections, 0);
+        pool.replace(vec![first]);
+        let a = pool.acquire();
+        a.traffic.c2s.fetch_add(50, Ordering::Relaxed);
+        assert_eq!(pool.snapshot().targets[0].c2s_bytes, 150);
+        assert_eq!(pool.active_connections(), 1);
+    }
+
+    #[test]
+    fn snapshots_distinguish_scan_unknown_and_failed_live_ping() {
+        let pool = TargetPool::single(target(1, 12));
+        let initial = pool.snapshot();
+        assert_eq!(initial.targets[0].ping_source, PingSource::Scan);
+        assert_eq!(initial.targets[0].ping, Some(Duration::from_millis(12)));
+        let (generation, targets) = pool.probe_snapshot();
+        pool.update_ping(generation, &targets[0], None);
+        let failed = pool.snapshot();
+        assert_eq!(failed.targets[0].ping_source, PingSource::Live);
+        assert_eq!(failed.targets[0].ping, None);
+        assert_eq!(failed.targets[0].rank, Some(1));
+        pool.replace(vec![Target::ip(targets[0].ip, 80)]);
+        pool.update_ping(generation, &targets[0], Some(Duration::ZERO));
+        assert_eq!(pool.snapshot().targets[0].ping_source, PingSource::Scan);
+        assert_eq!(pool.snapshot().targets[0].ping, None);
+    }
 
     #[test]
     fn random_choice_is_reproducible_and_spreads_across_members() {

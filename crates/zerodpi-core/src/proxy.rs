@@ -119,6 +119,8 @@ pub enum ProxyEvent {
         src_port: u16,
         /// The outbound IP this connection relays to (snapshot at accept time).
         target_ip: IpAddr,
+        /// SNI of the reserved target, independent of later pool refreshes.
+        target_sni: Option<Arc<str>>,
     },
     /// The SNI-bypass phase finished (successfully or not).
     BypassComplete {
@@ -711,7 +713,6 @@ async fn run_proxy_on_port(
             let socket_binder = socket_binder.clone();
             let event_tx = event_tx.clone();
             connections.spawn(async move {
-                let _lease = lease;
                 if let Err(e) = handle_tcp_seg_connection_with_ip(
                     cfg,
                     SocketAddr::from((connect_ip, connect_port)),
@@ -720,6 +721,7 @@ async fn run_proxy_on_port(
                     incoming,
                     peer,
                     event_tx,
+                    &lease,
                 )
                 .await
                 {
@@ -737,7 +739,6 @@ async fn run_proxy_on_port(
         let fake_client_hello =
             fresh_fake_client_hello(target.sni.as_deref().unwrap_or_default().as_bytes());
         connections.spawn(async move {
-            let _lease = lease;
             if let Err(e) = handle_intercept_connection(
                 InterceptConnectionTarget {
                     binding: current_binding,
@@ -751,6 +752,7 @@ async fn run_proxy_on_port(
                 peer,
                 event_tx,
                 connection_settings,
+                &lease,
             )
             .await
             {
@@ -788,6 +790,7 @@ async fn accept_connection(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_intercept_connection(
     target: InterceptConnectionTarget,
     flow_controller: Arc<dyn FlowController>,
@@ -796,6 +799,7 @@ async fn handle_intercept_connection(
     peer: SocketAddr,
     event_tx: Option<ProxyEventSender>,
     settings: ConnectionSettings,
+    lease: &crate::target_pool::TargetLease,
 ) -> anyhow::Result<()> {
     let connect_port = target.connect_addr.port();
     let binding = target.binding;
@@ -816,6 +820,7 @@ async fn handle_intercept_connection(
             peer,
             src_port,
             target_ip: IpAddr::V4(connect_ip),
+            target_sni: lease.target.sni.clone(),
         },
     );
 
@@ -1138,6 +1143,7 @@ async fn handle_intercept_connection(
         src_port,
         settings.max_lifetime,
         client_fragmentation_after_prefix,
+        Some(&lease.traffic),
     )
     .await;
     debug!(
@@ -1264,7 +1270,6 @@ async fn run_ip_bypass_plus_proxy_on_port(
             let socket_binder = socket_binder.clone();
             let event_tx = event_tx.clone();
             connections.spawn(async move {
-                let _lease = lease;
                 if let Err(e) = handle_tcp_seg_connection_with_ip(
                     cfg,
                     SocketAddr::from((connect_ip, connect_port)),
@@ -1273,6 +1278,7 @@ async fn run_ip_bypass_plus_proxy_on_port(
                     incoming,
                     peer,
                     event_tx,
+                    &lease,
                 )
                 .await
                 {
@@ -1289,7 +1295,6 @@ async fn run_ip_bypass_plus_proxy_on_port(
         let connection_settings = ConnectionSettings::from_config(&cfg);
         connections.spawn(async move {
             let low_ttl_override = lease.target.low_ttl;
-            let _lease = lease;
             if let Err(e) = handle_intercept_connection(
                 InterceptConnectionTarget {
                     binding: current_binding,
@@ -1303,6 +1308,7 @@ async fn run_ip_bypass_plus_proxy_on_port(
                 peer,
                 event_tx,
                 connection_settings,
+                &lease,
             )
             .await
             {
@@ -1338,6 +1344,7 @@ impl<F: FnOnce()> Drop for ScopeGuard<F> {
 /// 2. In `tlshello` mode, reads and fragments the first complete TLS record.
 /// 3. In packet-range mode, lets the relay fragment selected client writes.
 /// 4. Hands off to the normal bidirectional relay for all unselected data.
+#[allow(clippy::too_many_arguments)]
 async fn handle_tcp_seg_connection_with_ip(
     cfg: Arc<Config>,
     connect_addr: SocketAddr,
@@ -1346,6 +1353,7 @@ async fn handle_tcp_seg_connection_with_ip(
     mut incoming: TcpStream,
     peer: SocketAddr,
     event_tx: Option<ProxyEventSender>,
+    lease: &crate::target_pool::TargetLease,
 ) -> anyhow::Result<()> {
     let src_port = peer.port();
     emit(
@@ -1354,6 +1362,7 @@ async fn handle_tcp_seg_connection_with_ip(
             peer,
             src_port,
             target_ip: connect_addr.ip(),
+            target_sni: lease.target.sni.clone(),
         },
     );
 
@@ -1570,6 +1579,7 @@ async fn handle_tcp_seg_connection_with_ip(
         src_port,
         configured_relay_max_lifetime(&cfg),
         client_fragmentation,
+        Some(&lease.traffic),
     )
     .await;
     debug!(
@@ -1600,6 +1610,7 @@ async fn handle_tcp_seg_connection_with_ip(
 /// Returns the total bytes transferred in each direction plus the reason the
 /// relay ended.  Shutdown of each write half is handled internally when the
 /// corresponding read half reaches EOF.
+#[cfg(test)]
 async fn counting_relay(
     incoming: TcpStream,
     outgoing: TcpStream,
@@ -1614,6 +1625,7 @@ async fn counting_relay(
         src_port,
         max_lifetime,
         None,
+        None,
     )
     .await
 }
@@ -1625,6 +1637,7 @@ async fn counting_relay_with_client_fragmentation(
     src_port: u16,
     max_lifetime: Option<Duration>,
     client_fragmentation: Option<(TcpSegmentation, u32)>,
+    target_traffic: Option<&crate::target_pool::TargetTraffic>,
 ) -> RelayResult {
     let (inc_rd, inc_wr) = incoming.split();
     let (out_rd, out_wr) = outgoing.split();
@@ -1638,8 +1651,19 @@ async fn counting_relay_with_client_fragmentation(
 
     // Keep both copy futures in this task. Dropping/cancelling the relay now
     // drops the socket halves immediately instead of detaching child tasks.
-    let c2s = copy_counting_client_to_server(inc_rd, out_wr, &counters.c2s, client_fragmentation);
-    let s2c = copy_counting(out_rd, inc_wr, &counters.s2c);
+    let c2s = copy_counting_client_to_server(
+        inc_rd,
+        out_wr,
+        &counters.c2s,
+        client_fragmentation,
+        target_traffic.map(|traffic| &traffic.c2s),
+    );
+    let s2c = copy_counting(
+        out_rd,
+        inc_wr,
+        &counters.s2c,
+        target_traffic.map(|traffic| &traffic.s2c),
+    );
     tokio::pin!(c2s, s2c);
 
     let deadline = async {
@@ -1689,6 +1713,7 @@ async fn copy_counting_client_to_server<R, W>(
     mut writer: W,
     counter: &AtomicU64,
     client_fragmentation: Option<(TcpSegmentation, u32)>,
+    target_counter: Option<&AtomicU64>,
 ) -> (u64, bool)
 where
     R: AsyncRead + Unpin,
@@ -1726,12 +1751,20 @@ where
         }
         total += n as u64;
         counter.store(total, Ordering::Relaxed);
+        if let Some(target_counter) = target_counter {
+            target_counter.fetch_add(n as u64, Ordering::Relaxed);
+        }
     }
     let _ = writer.shutdown().await;
     (total, false)
 }
 
-async fn copy_counting<R, W>(mut reader: R, mut writer: W, counter: &AtomicU64) -> (u64, bool)
+async fn copy_counting<R, W>(
+    mut reader: R,
+    mut writer: W,
+    counter: &AtomicU64,
+    target_counter: Option<&AtomicU64>,
+) -> (u64, bool)
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -1754,6 +1787,9 @@ where
         }
         total += n as u64;
         counter.store(total, Ordering::Relaxed);
+        if let Some(target_counter) = target_counter {
+            target_counter.fetch_add(n as u64, Ordering::Relaxed);
+        }
     }
     let _ = writer.shutdown().await;
     (total, false)
@@ -1852,7 +1888,6 @@ async fn run_ip_bypass_proxy_on_port(
         let nodelay = cfg.TCP_NODELAY;
 
         connections.spawn(async move {
-            let _lease = lease;
             if let Err(e) = handle_ip_bypass_connection(
                 SocketAddr::new(ip, connect_port),
                 binding,
@@ -1863,6 +1898,7 @@ async fn run_ip_bypass_proxy_on_port(
                 event_tx,
                 relay_max_lifetime,
                 nodelay,
+                &lease,
             )
             .await
             {
@@ -1883,6 +1919,7 @@ async fn handle_ip_bypass_connection(
     event_tx: Option<ProxyEventSender>,
     relay_max_lifetime: Option<Duration>,
     nodelay: bool,
+    lease: &crate::target_pool::TargetLease,
 ) -> anyhow::Result<()> {
     emit(
         &event_tx,
@@ -1890,6 +1927,7 @@ async fn handle_ip_bypass_connection(
             peer,
             src_port,
             target_ip: connect_addr.ip(),
+            target_sni: lease.target.sni.clone(),
         },
     );
 
@@ -1923,7 +1961,16 @@ async fn handle_ip_bypass_connection(
         }
     };
 
-    let relay = counting_relay(incoming, outgoing, &event_tx, src_port, relay_max_lifetime).await;
+    let relay = counting_relay_with_client_fragmentation(
+        incoming,
+        outgoing,
+        &event_tx,
+        src_port,
+        relay_max_lifetime,
+        None,
+        Some(&lease.traffic),
+    )
+    .await;
     debug!(
         c2s_bytes = relay.c2s_bytes,
         s2c_bytes = relay.s2c_bytes,
@@ -2019,7 +2066,7 @@ mod tests {
         assert_eq!(targets.active_connections(), 0);
     }
 
-    async fn tcp_pair() -> (TcpStream, TcpStream) {
+    pub(super) async fn tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let connect = TcpStream::connect(addr);
@@ -2505,6 +2552,7 @@ mod tests {
             peer,
             src_port: 4242,
             target_ip: target,
+            target_sni: None,
         };
         match ev {
             ProxyEvent::ConnectionAccepted { target_ip, .. } => {

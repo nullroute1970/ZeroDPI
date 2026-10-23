@@ -1191,7 +1191,41 @@ Rescans atomically refresh the pool for future connections and preserve the old
 pool if no valid replacement is found. SNI rescans also honor
 `SNI_SWITCH_MIN_SCORE`. Existing connections keep their original target. The
 dashboard's displayed target and network-recovery probe represent rank one;
-the load-balancing line shows the actual pool size and strategy.
+the load-balancing line shows the actual pool size and strategy. In the TUI,
+press **v** to switch between **Connections** (the default) and **Targets**.
+
+Connections shows each connection's reserved target IP and, in SNI mode, a
+separate **SNI** column. These values remain attached to that connection after
+a rescan; the header's **Rank 1** target is only the highest-ranked pool member.
+The SNI column describes the selected relay target, not an SNI parsed from the
+client's traffic. IP-only connection views omit the SNI column.
+
+Targets shows rank, membership, IP/SNI, score, TCP latency, active connections,
+active-load share, upload/download rates, and cumulative relay bytes. **In pool**
+means eligible for selection, **Draining** means removed by a rescan but still
+serving connections, and **Retired** means removed with no remaining connections.
+Current members appear in scan rank order, followed by history in first-seen
+order. Re-adding the same `(SNI, IP)` pair continues its session counters; different
+SNIs on the same IP have separate counters. History lasts until the process exits.
+
+TCP measurements are labeled **Scan** or **Live**. An unavailable scan latency
+is **unknown**; an unsuccessful live probe is **failed**, which does not remove
+the target from the pool. Live probes still run only for `least_ping`. Active-load
+share includes connections being established and those on draining targets; it
+is zero when there are no active connections. Rates use actual elapsed sample
+time, starting at zero for a newly observed target. Samples refresh every 500 ms
+without extra network probes. Byte totals cover the same relay data as connection
+counters, excluding probes, fake packets, and TLS prefixes sent before the relay.
+Totals survive connection-log pruning, rescans, connection errors, and cancellation.
+
+Each view remembers its own scroll position. Use **↑/↓** or **j/k**, **PgUp/PgDn**,
+and **Home/End** to navigate. **Tab** changes the Connections filter; **Space/a**
+toggles its automatic scrolling. **R** keeps the existing rescan behavior and
+**q/Esc** exits. Targets is read-only and is not affected by the Connections
+filter or automatic scrolling. Below 140 terminal columns, both tables use
+two-line rows with target/status information above traffic information; the
+compact Connections view omits time and peer columns. Long names are shortened
+with an ellipsis for display while the full values remain stored.
 
 - `random`: equal probability for each pool member on each new connection.
 - `round_robin`: cycle through members in scan rank order.
@@ -1348,6 +1382,11 @@ ZeroDPI uses [ratatui](https://github.com/ratatui-org/ratatui) for a live termin
 | `sni_method_scan` / `ip_method_scan` | 📊 Phase 1 method-testing progress (per-sample counters) | 📋 Ranked method results table | — |
 
 **Navigation:** `↑`/`↓` or `j`/`k` to move, `Enter` to confirm, `q`/`Esc` to skip to rank-1.
+
+**Running dashboard:** `v` switches between Connections and Targets. Each view
+remembers its own scroll position; `Tab` filters Connections and `Space/a`
+toggles its automatic scrolling. See [Multiple relay targets](#multiple-relay-targets) for
+per-target statistics and history.
 
 **Rescan while running:** Press `R` in the `sni_spoof`, `ip_bypass`, or
 `ip_bypass_plus` dashboard to scan the configured list again, even when

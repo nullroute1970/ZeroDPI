@@ -797,6 +797,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
 
     let cfg_dash = cfg.clone();
     let selected_dash = selected.clone();
+    let dashboard_pool = active_target.clone();
 
     // Spawn the proxy on the tokio runtime's worker threads so the main
     // thread is free to drive the ratatui dashboard.
@@ -838,6 +839,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         &dash_info,
         &cfg_dash,
         &mut manual_control,
+        &dashboard_pool,
     );
     tui::leave_tui(terminal)?;
 
@@ -1735,6 +1737,7 @@ async fn log_headless_proxy_events(mut event_rx: ProxyEventReceiver, events: Run
                 peer,
                 src_port,
                 target_ip,
+                ..
             } => {
                 events.emit(RuntimeEvent::ConnectionAccepted {
                     peer: peer.to_string(),
@@ -2188,6 +2191,7 @@ fn ip_bypass_main(
     // ---- step 3: run the proxy ----
     let cfg_dash = cfg.clone();
     let proxy_active = active_ip_arc.clone();
+    let dashboard_pool = active_ip_arc.clone();
 
     let dashboard_event_tx = Some(event_tx.clone());
     let proxy_binding = interface_binding.clone();
@@ -2222,6 +2226,7 @@ fn ip_bypass_main(
         &dash_info,
         &cfg_dash,
         &mut manual_control,
+        &dashboard_pool,
     );
     tui::leave_tui(terminal)?;
 
@@ -2543,6 +2548,7 @@ fn ip_bypass_plus_main(
     // ---- step 4: run the proxy ----
     let cfg_dash = cfg.clone();
     let proxy_active = active_ip_arc.clone();
+    let dashboard_pool = active_ip_arc.clone();
     let dashboard_event_tx = Some(event_tx.clone());
     let proxy_handle = rt.spawn(async move {
         run_ip_bypass_plus_proxy(
@@ -2575,6 +2581,7 @@ fn ip_bypass_plus_main(
         &dash_info,
         &cfg_dash,
         &mut manual_control,
+        &dashboard_pool,
     );
     tui::leave_tui(terminal)?;
 

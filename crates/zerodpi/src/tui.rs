@@ -44,6 +44,10 @@ use zerodpi_core::proxy::{ProxyEvent, ProxyEventReceiver, RelayEndReason, RelayP
 use zerodpi_core::sni_scanner::SniProbeEntry;
 
 use crate::manual_rescan::{Controller as RescanController, Selection};
+use zerodpi_core::target_pool::TargetPool;
+
+mod targets;
+use targets::{draw_targets, fit, DashboardView, TargetsState};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -676,6 +680,7 @@ struct ConnectionRecord {
     peer: SocketAddr,
     /// Outbound target IP this connection relays to (from ConnectionAccepted).
     target_ip: IpAddr,
+    target_sni: Option<std::sync::Arc<str>>,
     status: ConnStatus,
     status_changed_at: Instant,
     c2s_bytes: u64,
@@ -750,6 +755,8 @@ fn prune_connection_records(records: &mut VecDeque<ConnectionRecord>) {
 
 /// All mutable state owned by the live proxy dashboard event loop.
 struct DashboardState {
+    view: DashboardView,
+    targets: TargetsState,
     target_pool: Option<(usize, zerodpi_core::target_pool::SelectionStrategy)>,
     records: VecDeque<ConnectionRecord>,
     total: u64,
@@ -976,6 +983,7 @@ pub fn run_dashboard(
     info: &DashboardInfo,
     cfg: &Config,
     rescan: &mut RescanController,
+    pool: &TargetPool,
 ) -> anyhow::Result<()> {
     let active_sni = match info {
         DashboardInfo::SniSpoof { sni, ip, score } => Some((sni.clone(), *ip, *score)),
@@ -986,6 +994,8 @@ pub fn run_dashboard(
         DashboardInfo::IpBypass { ip } | DashboardInfo::IpBypassPlus { ip } => Some(*ip),
     };
     let mut state = DashboardState {
+        view: DashboardView::Connections,
+        targets: TargetsState::default(),
         target_pool: None,
         records: VecDeque::with_capacity(MAX_RECORDS),
         total: 0,
@@ -1058,29 +1068,52 @@ pub fn run_dashboard(
             terminal.clear()?;
         }
 
-        if state.auto_scroll && got_event {
+        if state.view == DashboardView::Connections && state.auto_scroll && got_event {
             state.scroll_offset = 0;
         }
 
+        if state.targets.refresh(pool, Instant::now()) && cfg.LOAD_BALANCE_ENABLED {
+            state.target_pool = Some((
+                state
+                    .targets
+                    .rows
+                    .iter()
+                    .filter(|row| row.snapshot.rank.is_some())
+                    .count(),
+                state.targets.strategy,
+            ));
+        }
+        if state.channel_closed {
+            state.targets.stop();
+        }
         draw_dashboard(terminal, &state, info, cfg)?;
 
         // Filtered count — needed for scroll bounds in key handler.
-        let filtered_len = state
+        let filtered_connections = state
             .records
             .iter()
             .filter(|r| state.filter.matches(&r.status))
             .count();
 
+        let filtered_len = match state.view {
+            DashboardView::Connections => filtered_connections,
+            DashboardView::Targets => state.targets.rows.len(),
+        };
         // Page size: terminal height minus the fixed widget rows (computed by
         // fixed_dashboard_rows: header, stats, help, table header, and table
         // borders).
         let visible_rows = terminal
             .size()
-            .map(|s| (s.height as usize).saturating_sub(fixed_dashboard_rows(&state)))
+            .map(|s| {
+                (s.height as usize).saturating_sub(fixed_dashboard_rows(&state))
+                    / if s.width >= 140 { 1 } else { 2 }
+            })
             .unwrap_or(10)
             .max(1);
 
-        if event::poll(Duration::from_millis(200))? {
+        if event::poll(
+            Duration::from_millis(200).min(state.targets.next_sample_in(Instant::now())),
+        )? {
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press {
                     match k.code {
@@ -1098,43 +1131,12 @@ pub fn run_dashboard(
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                             return Ok(());
                         }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            state.auto_scroll = false;
-                            state.scroll_offset = state.scroll_offset.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            state.auto_scroll = false;
-                            if filtered_len > 0 && state.scroll_offset + 1 < filtered_len {
-                                state.scroll_offset += 1;
-                            }
-                        }
-                        KeyCode::PageUp => {
-                            state.auto_scroll = false;
-                            state.scroll_offset = state.scroll_offset.saturating_sub(visible_rows);
-                        }
-                        KeyCode::PageDown => {
-                            state.auto_scroll = false;
-                            state.scroll_offset = (state.scroll_offset + visible_rows)
-                                .min(filtered_len.saturating_sub(1));
-                        }
-                        KeyCode::Home => {
-                            state.scroll_offset = 0;
-                        }
-                        KeyCode::End => {
-                            state.auto_scroll = false;
-                            state.scroll_offset = filtered_len.saturating_sub(1);
-                        }
-                        KeyCode::Char(' ') | KeyCode::Char('a') => {
-                            state.auto_scroll = !state.auto_scroll;
-                            if state.auto_scroll {
-                                state.scroll_offset = 0;
-                            }
-                        }
-                        KeyCode::Tab => {
-                            state.filter = state.filter.next();
-                            state.scroll_offset = 0;
-                        }
-                        _ => {}
+                        _ => handle_dashboard_navigation(
+                            &mut state,
+                            k.code,
+                            filtered_len,
+                            visible_rows,
+                        ),
                     }
                 }
             }
@@ -1161,6 +1163,7 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
             peer,
             src_port,
             target_ip,
+            target_sni,
         } => {
             state.total += 1;
             state.active += 1;
@@ -1173,6 +1176,7 @@ fn apply_event(event: ProxyEvent, state: &mut DashboardState) {
                 src_port,
                 peer,
                 target_ip,
+                target_sni,
                 status: ConnStatus::Connecting,
                 status_changed_at: now,
                 c2s_bytes: 0,
@@ -1375,6 +1379,216 @@ fn find_record(
 // Dashboard rendering
 // ---------------------------------------------------------------------------
 
+fn handle_dashboard_navigation(state: &mut DashboardState, key: KeyCode, len: usize, page: usize) {
+    if matches!(key, KeyCode::Char('v') | KeyCode::Char('V')) {
+        state.view = match state.view {
+            DashboardView::Connections => DashboardView::Targets,
+            DashboardView::Targets => DashboardView::Connections,
+        };
+        return;
+    }
+    if key == KeyCode::Tab {
+        if state.view == DashboardView::Connections {
+            state.filter = state.filter.next();
+            state.scroll_offset = 0;
+        }
+        return;
+    }
+    if matches!(key, KeyCode::Char(' ') | KeyCode::Char('a')) {
+        if state.view == DashboardView::Connections {
+            state.auto_scroll = !state.auto_scroll;
+            if state.auto_scroll {
+                state.scroll_offset = 0;
+            }
+        }
+        return;
+    }
+    if !matches!(
+        key,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Char('j')
+            | KeyCode::Char('k')
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End
+    ) {
+        return;
+    }
+    if state.view == DashboardView::Connections && key != KeyCode::Home {
+        state.auto_scroll = false;
+    }
+    let offset = match state.view {
+        DashboardView::Connections => &mut state.scroll_offset,
+        DashboardView::Targets => &mut state.targets.scroll_offset,
+    };
+    *offset = match key {
+        KeyCode::Up | KeyCode::Char('k') => offset.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => offset.saturating_add(1).min(len.saturating_sub(1)),
+        KeyCode::PageUp => offset.saturating_sub(page),
+        KeyCode::PageDown => offset.saturating_add(page).min(len.saturating_sub(1)),
+        KeyCode::Home => 0,
+        KeyCode::End => len.saturating_sub(1),
+        _ => *offset,
+    };
+}
+
+fn draw_connections(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    state: &DashboardState,
+    show_sni: bool,
+    now: Instant,
+) {
+    let filtered = ordered_connection_records(state, now);
+    let title = format!(
+        " Connections [{}] ({} shown / {} total) ",
+        state.filter.label(),
+        filtered.len(),
+        state.records.len()
+    );
+    let wide = area.width >= 140;
+    let widths: Vec<u16> = if wide {
+        let mut widths = vec![8, 18, 24];
+        if show_sni {
+            widths.push(
+                area.width
+                    .saturating_sub(2 + 9 + 8 + 18 + 24 + 10 + 7 + 7 + 9 + 9 + 8),
+            );
+        }
+        widths.extend([10, 7, 7, 9, 9, 8]);
+        widths
+    } else if show_sni {
+        vec![
+            24.min(area.width / 3),
+            area.width.saturating_sub(4 + 24.min(area.width / 3) + 18),
+            18,
+        ]
+    } else {
+        vec![
+            area.width.saturating_sub(3) / 2,
+            area.width.saturating_sub(3).div_ceil(2),
+        ]
+    };
+    let rows = filtered.iter().skip(state.scroll_offset).map(|record| {
+        let texts = if wide {
+            let mut cells = vec![
+                fmt_time(record.started_at),
+                record.peer.to_string(),
+                record.target_ip.to_string(),
+            ];
+            if show_sni {
+                cells.push(record.target_sni.as_deref().unwrap_or("—").into());
+            }
+            cells.extend([
+                record.status.label().into(),
+                fmt_bytes(record.c2s_bytes),
+                fmt_bytes(record.s2c_bytes),
+                fmt_rate(record.rate_c2s_bps),
+                fmt_rate(record.rate_s2c_bps),
+                record.duration_str(),
+            ]);
+            cells
+        } else {
+            let up = format!(
+                "↑ {} / {}",
+                fmt_rate(record.rate_c2s_bps),
+                fmt_bytes(record.c2s_bytes)
+            );
+            let down = format!(
+                "↓ {} / {}",
+                fmt_rate(record.rate_s2c_bps),
+                fmt_bytes(record.s2c_bytes)
+            );
+            if show_sni {
+                vec![
+                    format!(
+                        "{}\n{}",
+                        fit(&record.target_ip.to_string(), widths[0]),
+                        fit(&up, widths[0])
+                    ),
+                    format!(
+                        "{}\n{}",
+                        fit(record.target_sni.as_deref().unwrap_or("—"), widths[1]),
+                        fit(&down, widths[1])
+                    ),
+                    format!(
+                        "{}\n{}",
+                        record.status.label(),
+                        fit(&record.duration_str(), widths[2])
+                    ),
+                ]
+            } else {
+                vec![
+                    format!(
+                        "{}\n{}",
+                        fit(&record.target_ip.to_string(), widths[0]),
+                        fit(&up, widths[0])
+                    ),
+                    format!("{}\n{}", record.status.label(), fit(&down, widths[1])),
+                ]
+            }
+        };
+        let status_column = if wide {
+            if show_sni {
+                4
+            } else {
+                3
+            }
+        } else if show_sni {
+            2
+        } else {
+            1
+        };
+        let cells: Vec<_> = texts
+            .into_iter()
+            .zip(&widths)
+            .enumerate()
+            .map(|(index, (text, width))| {
+                let cell = Cell::from(if wide { fit(&text, *width) } else { text });
+                if index == status_column {
+                    cell.style(record.status.style())
+                } else {
+                    cell
+                }
+            })
+            .collect();
+        Row::new(cells)
+            .height(if wide { 1 } else { 2 })
+            .style(connection_row_style(record))
+    });
+    let headers = if wide {
+        let mut headers = vec!["Time", "Peer", "Target"];
+        if show_sni {
+            headers.push("SNI");
+        }
+        headers.extend(["Status", "↑ Bytes", "↓ Bytes", "Rate↑", "Rate↓", "Duration"]);
+        headers
+    } else if show_sni {
+        vec!["Target / upload", "SNI / download", "Status / duration"]
+    } else {
+        vec!["Target / upload", "Status / download"]
+    };
+    let header = Row::new(
+        headers
+            .into_iter()
+            .zip(&widths)
+            .map(|(text, width)| Cell::from(fit(text, *width))),
+    )
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    );
+    frame.render_widget(
+        Table::new(rows, widths.iter().copied().map(Constraint::Length))
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
 fn draw_dashboard<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state: &DashboardState,
@@ -1411,9 +1625,9 @@ fn draw_dashboard<B: ratatui::backend::Backend>(
                 vec![
                     {
                         let mut spans = vec![
-                            Span::styled("SNI: ", label_style()),
+                            Span::styled(if state.target_pool.is_some() { "Rank 1 SNI: " } else { "SNI: " }, label_style()),
                             Span::styled(
-                                sni.clone(),
+                                fit(sni, area.width.saturating_sub(67)),
                                 Style::default()
                                     .fg(Color::Cyan)
                                     .add_modifier(Modifier::BOLD),
@@ -1509,7 +1723,7 @@ fn draw_dashboard<B: ratatui::backend::Backend>(
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::raw("   "),
-                            Span::styled("Active IP: ", label_style()),
+                            Span::styled(if state.target_pool.is_some() { "Rank 1 IP: " } else { "Active IP: " }, label_style()),
                             Span::styled(ip.to_string(), Style::default().fg(Color::White)),
                         ];
                         if let Some(score) = state.active_ip_score {
@@ -1549,7 +1763,7 @@ fn draw_dashboard<B: ratatui::backend::Backend>(
         };
         if let Some((count, strategy)) = state.target_pool {
             header_lines.push(Line::from(format!(
-                "Load balancing: ON   Targets: {count}   Strategy: {strategy}   Header: rank 1"
+                "Load balancing: ON   Targets: {count}   Strategy: {strategy}   Rank 1"
             )));
         }
         if let Some(line) = rescan_line {
@@ -1661,74 +1875,15 @@ fn draw_dashboard<B: ratatui::backend::Backend>(
         frame.render_widget(stats, chunks[1]);
 
         // ── Connection log ───────────────────────────────────────────────────
-        let filtered = ordered_connection_records(state, now);
-        let filter_label = state.filter.label();
-        let table_title = if filtered.is_empty() {
-            format!(" Connections [{}] — no traffic yet ", filter_label)
-        } else {
-            format!(
-                " Connections [{}] ({} shown / {} total) ",
-                filter_label,
-                filtered.len(),
-                state.records.len()
-            )
-        };
+        match state.view {
+            DashboardView::Connections => draw_connections(frame, chunks[2], state,
+                matches!(info, DashboardInfo::SniSpoof { .. }), now),
+            DashboardView::Targets => draw_targets(frame, chunks[2], &state.targets),
+        }
 
-        let rows: Vec<Row> = filtered
-            .iter()
-            .skip(state.scroll_offset)
-            .map(|r| {
-                let row_style = connection_row_style(r);
-                Row::new(vec![
-                    Cell::from(fmt_time(r.started_at)),
-                    Cell::from(r.peer.to_string()),
-                    Cell::from(r.target_ip.to_string()),
-                    Cell::from(r.status.label()).style(r.status.style()),
-                    Cell::from(fmt_bytes(r.c2s_bytes)),
-                    Cell::from(fmt_bytes(r.s2c_bytes)),
-                    Cell::from(fmt_rate(r.rate_c2s_bps)),
-                    Cell::from(fmt_rate(r.rate_s2c_bps)),
-                    Cell::from(r.duration_str()),
-                ])
-                .style(row_style)
-            })
-            .collect();
-
-        let widths = [
-            Constraint::Length(8),  // Time
-            Constraint::Length(18), // Peer
-            Constraint::Length(16), // Target
-            Constraint::Length(11), // Status
-            Constraint::Length(8),  // ↑ Bytes
-            Constraint::Length(8),  // ↓ Bytes
-            Constraint::Length(9),  // Rate↑
-            Constraint::Length(9),  // Rate↓
-            Constraint::Min(5),     // Duration
-        ];
-        let log_table = Table::new(rows, widths)
-            .header(
-                Row::new(vec![
-                    "Time",
-                    "Peer",
-                    "Target",
-                    "Status",
-                    "↑ Bytes",
-                    "↓ Bytes",
-                    "Rate↑",
-                    "Rate↓",
-                    "Duration",
-                ])
-                .style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                ),
-            )
-            .block(Block::default().borders(Borders::ALL).title(table_title));
-        frame.render_widget(log_table, chunks[2]);
-
-        // ── Help bar ─────────────────────────────────────────────────────────
-        let auto_span = if state.auto_scroll {
+        let auto_span = if state.view == DashboardView::Targets {
+            Span::styled("[TARGETS] ", Style::default().fg(Color::Cyan))
+        } else if state.auto_scroll {
             Span::styled(
                 "[AUTO] ",
                 Style::default()
@@ -1743,23 +1898,29 @@ fn draw_dashboard<B: ratatui::backend::Backend>(
                     .add_modifier(Modifier::BOLD),
             )
         };
-        let help_line = Line::from(vec![
-            auto_span,
-            Span::styled(" R ", Style::default().fg(Color::Cyan)),
-            Span::raw("rescan  "),
-            Span::styled(" ↑/↓ j/k ", Style::default().fg(Color::Yellow)),
-            Span::raw("scroll  "),
-            Span::styled(" PgUp/Dn ", Style::default().fg(Color::Yellow)),
-            Span::raw("page  "),
-            Span::styled(" Home/End ", Style::default().fg(Color::Yellow)),
-            Span::raw("jump  "),
-            Span::styled(" Space/a ", Style::default().fg(Color::Yellow)),
-            Span::raw("auto  "),
-            Span::styled(" Tab ", Style::default().fg(Color::Yellow)),
-            Span::raw("filter  "),
-            Span::styled(" q/Esc ", Style::default().fg(Color::Red)),
-            Span::raw("quit "),
-        ]);
+        let help_line = if area.width < 140 {
+            Line::from(vec![
+                auto_span,
+                Span::styled(" v ", Style::default().fg(Color::Cyan)), Span::raw("views "),
+                Span::styled(" R ", Style::default().fg(Color::Cyan)), Span::raw("rescan "),
+                Span::raw(if state.view == DashboardView::Connections {
+                    "↑/↓ scroll  Tab filter  q/Esc quit"
+                } else {
+                    "↑/↓ scroll  PgUp/Dn page  q/Esc quit"
+                }),
+            ])
+        } else {
+            Line::from(vec![
+                auto_span,
+                Span::styled(" v ", Style::default().fg(Color::Cyan)), Span::raw("views  "),
+                Span::styled(" R ", Style::default().fg(Color::Cyan)), Span::raw("rescan  "),
+                Span::raw(if state.view == DashboardView::Connections {
+                    "↑/↓ j/k scroll  PgUp/Dn page  Home/End jump  Space/a auto  Tab filter  q/Esc quit"
+                } else {
+                    "↑/↓ j/k scroll  PgUp/Dn page  Home/End jump  q/Esc quit"
+                }),
+            ])
+        };
         let help = Paragraph::new(help_line).block(Block::default().borders(Borders::ALL));
         frame.render_widget(help, chunks[3]);
     })?;
@@ -2281,6 +2442,239 @@ fn draw_sni_results_view(
 mod tests {
     use super::*;
 
+    #[test]
+    fn connection_sni_survives_representative_changes() {
+        let mut state = dashboard_state(vec![]);
+        apply_event(
+            ProxyEvent::ConnectionAccepted {
+                peer: "127.0.0.1:1234".parse().unwrap(),
+                src_port: 1234,
+                target_ip: "192.0.2.1".parse().unwrap(),
+                target_sni: Some("original.example".into()),
+            },
+            &mut state,
+        );
+        apply_event(
+            ProxyEvent::SniTargetChanged {
+                sni: "other.example".into(),
+                ip: "192.0.2.2".parse().unwrap(),
+                score: 90,
+            },
+            &mut state,
+        );
+        assert_eq!(
+            state.records[0].target_sni.as_deref(),
+            Some("original.example")
+        );
+        assert_eq!(state.records[0].target_ip.to_string(), "192.0.2.1");
+    }
+
+    #[test]
+    fn dashboard_navigation_keeps_scroll_and_filters_independent() {
+        let mut state = dashboard_state(vec![]);
+        state.scroll_offset = 3;
+        handle_dashboard_navigation(&mut state, KeyCode::Char('v'), 10, 2);
+        handle_dashboard_navigation(&mut state, KeyCode::PageDown, 10, 2);
+        assert_eq!(state.targets.scroll_offset, 2);
+        assert_eq!(state.scroll_offset, 3);
+        handle_dashboard_navigation(&mut state, KeyCode::Tab, 10, 2);
+        assert!(matches!(state.filter, FilterStatus::All));
+        handle_dashboard_navigation(&mut state, KeyCode::Char('v'), 10, 2);
+        handle_dashboard_navigation(&mut state, KeyCode::Down, 10, 2);
+        assert_eq!(state.scroll_offset, 4);
+        assert_eq!(state.targets.scroll_offset, 2);
+        handle_dashboard_navigation(&mut state, KeyCode::Tab, 10, 2);
+        assert!(!matches!(state.filter, FilterStatus::All));
+        assert_eq!(state.scroll_offset, 0);
+        assert_eq!(state.targets.scroll_offset, 2);
+    }
+
+    #[test]
+    fn pool_sampling_is_bounded_and_draining_load_counts_toward_share() {
+        use zerodpi_core::target_pool::{SelectionStrategy, Target, TargetPool};
+        let first = Target::ip("192.0.2.1".parse().unwrap(), 90);
+        let second = Target::ip("192.0.2.2".parse().unwrap(), 80);
+        let pool =
+            TargetPool::new(SelectionStrategy::RoundRobin, vec![first, second.clone()]).unwrap();
+        let mut targets = TargetsState::default();
+        let now = Instant::now();
+        assert!(targets.refresh(&pool, now));
+        let _old = pool.acquire();
+        let _current = pool.acquire();
+        pool.replace(vec![second]);
+        assert!(!targets.refresh(&pool, now + Duration::from_millis(499)));
+        assert_eq!(targets.rows[0].snapshot.active_connections, 0);
+        assert!(targets.refresh(&pool, now + Duration::from_millis(500)));
+        assert_eq!(targets.rows[0].share, 50.0);
+        assert_eq!(targets.rows[1].share, 50.0);
+        assert_eq!(targets::membership(&targets.rows[1].snapshot), "Draining");
+        targets.scroll_offset = 1;
+        assert!(targets.refresh(&pool, now + Duration::from_secs(1)));
+        assert_eq!(targets.scroll_offset, 1);
+    }
+
+    #[test]
+    fn pruning_connection_history_does_not_reset_target_totals() {
+        use zerodpi_core::target_pool::{Target, TargetPool};
+        let pool = TargetPool::single(Target::ip("192.0.2.1".parse().unwrap(), 90));
+        let mut snapshot = pool.snapshot();
+        snapshot.targets[0].c2s_bytes = 1_000;
+        snapshot.targets[0].s2c_bytes = 2_000;
+        let mut state = dashboard_state(vec![]);
+        state.targets.update(snapshot, Instant::now());
+        for port in 1..=250 {
+            apply_event(
+                ProxyEvent::ConnectionAccepted {
+                    peer: "127.0.0.1:1234".parse().unwrap(),
+                    src_port: port,
+                    target_ip: "192.0.2.1".parse().unwrap(),
+                    target_sni: None,
+                },
+                &mut state,
+            );
+            apply_event(
+                ProxyEvent::RelayFinished {
+                    src_port: port,
+                    c2s_bytes: 4,
+                    s2c_bytes: 8,
+                    reason: RelayEndReason::Completed,
+                },
+                &mut state,
+            );
+        }
+        assert_eq!(state.records.len(), 200);
+        assert_eq!(state.targets.rows[0].snapshot.c2s_bytes, 1_000);
+        assert_eq!(state.targets.rows[0].snapshot.s2c_bytes, 2_000);
+    }
+
+    #[test]
+    fn ip_connection_table_hides_sni_and_sni_table_marks_missing_values() {
+        for width in [80, 140, 160] {
+            for show_sni in [false, true] {
+                let state = dashboard_state(vec![record(ConnStatus::Connecting, 0.0, 0.0)]);
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(width, 10)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        draw_connections(frame, frame.area(), &state, show_sni, Instant::now())
+                    })
+                    .unwrap();
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert_eq!(text.contains("SNI"), show_sni, "{width}: {text}");
+                assert!(text.contains("203.0.113.1"));
+                assert!(text.contains("Connecting"), "{width}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn target_rates_use_actual_elapsed_time_and_survive_refresh() {
+        use zerodpi_core::target_pool::{Target, TargetPool};
+        let pool = TargetPool::single(Target::ip("192.0.2.1".parse().unwrap(), 90));
+        let mut targets = TargetsState::default();
+        let now = Instant::now();
+        targets.update(pool.snapshot(), now);
+        assert_eq!(targets.rows[0].upload_bps, 0.0);
+        assert_eq!(targets.rows[0].share, 0.0);
+        let mut snapshot = pool.snapshot();
+        snapshot.targets[0].c2s_bytes = 400;
+        snapshot.targets[0].s2c_bytes = 800;
+        snapshot.targets[0].active_connections = 2;
+        targets.update(snapshot.clone(), now + Duration::from_secs(4));
+        assert_eq!(targets.rows[0].upload_bps, 100.0);
+        assert_eq!(targets.rows[0].download_bps, 200.0);
+        assert_eq!(targets.rows[0].share, 100.0);
+        snapshot.targets[0].rank = None;
+        snapshot.targets[0].target.score = 95;
+        snapshot.targets[0].c2s_bytes = 600;
+        targets.update(snapshot, now + Duration::from_secs(6));
+        assert_eq!(targets.rows[0].upload_bps, 100.0);
+        targets.stop();
+        assert_eq!(targets.rows[0].upload_bps, 0.0);
+    }
+
+    #[test]
+    fn both_dashboard_views_render_at_supported_sizes() {
+        use zerodpi_core::target_pool::{SelectionStrategy, Target, TargetPool};
+        let sni = format!("{}.example", "long-hostname-".repeat(8));
+        let first = Target::sni(sni.clone(), "192.0.2.1".parse().unwrap(), 90);
+        let second = Target::ip(
+            "2001:db8:abcd:1234:5678:90ab:cdef:1234".parse().unwrap(),
+            80,
+        );
+        let pool = TargetPool::new(
+            SelectionStrategy::LeastLoad,
+            vec![first.clone(), second.clone()],
+        )
+        .unwrap();
+        pool.replace(vec![first]);
+        let mut state = dashboard_state(vec![record(ConnStatus::Relaying, 100.0, 200.0)]);
+        state.records[0].target_sni = Some(sni.clone().into());
+        state.active_sni = Some((sni.clone(), "192.0.2.1".parse().unwrap(), 90));
+        state.target_pool = Some((1, SelectionStrategy::LeastLoad));
+        let mut snapshot = pool.snapshot();
+        snapshot.targets[1].ping_source = zerodpi_core::target_pool::PingSource::Live;
+        state.targets.update(snapshot, Instant::now());
+        let info = DashboardInfo::SniSpoof {
+            sni,
+            ip: "192.0.2.1".parse().unwrap(),
+            score: 90,
+        };
+        let mut cfg = crate::config_for_tests();
+        cfg.LOAD_BALANCE_ENABLED = true;
+        for (width, height) in [(160, 40), (120, 30), (80, 24)] {
+            for view in [DashboardView::Connections, DashboardView::Targets] {
+                state.view = view;
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+                draw_dashboard(&mut terminal, &state, &info, &cfg).unwrap();
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(text.contains("SNI"), "{width} {view:?}: {text}");
+                assert!(text.contains("Rank 1"), "{width} {view:?}: {text}");
+                assert!(text.contains("rescan"));
+                assert!(text.contains("views"));
+                if view == DashboardView::Targets {
+                    assert!(text.contains("Retired"), "{width}: {text}");
+                    assert!(text.contains("In pool"));
+                    assert!(text.contains("2001:db8"));
+                    assert!(text.contains("failed Live"));
+                    assert!(text.contains("unknown Scan"));
+                }
+                let lines = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .chunks(width as usize)
+                    .map(|line| line.iter().map(|cell| cell.symbol()).collect::<String>())
+                    .collect::<Vec<_>>();
+                println!("\n{width}x{height} {view:?}\n{}", lines.join("\n"));
+            }
+        }
+        assert_eq!(
+            state.records[0].target_sni.as_deref(),
+            Some(info_sni(&info))
+        );
+    }
+
+    fn info_sni(info: &DashboardInfo) -> &str {
+        match info {
+            DashboardInfo::SniSpoof { sni, .. } => sni,
+            _ => unreachable!(),
+        }
+    }
+
     fn record(status: ConnStatus, upload_bps: f64, download_bps: f64) -> ConnectionRecord {
         let now = Instant::now();
         ConnectionRecord {
@@ -2290,6 +2684,7 @@ mod tests {
             src_port: 443,
             peer: "127.0.0.1:12345".parse().unwrap(),
             target_ip: "203.0.113.1".parse().unwrap(),
+            target_sni: None,
             status,
             status_changed_at: now,
             c2s_bytes: 0,
@@ -2453,12 +2848,14 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("Load balancing: ON")
             && line.contains("Targets: 2")
             && line.contains("least_load")
-            && line.contains("rank 1")));
+            && line.contains("Rank 1")));
         println!("{}", lines.join("\n"));
     }
 
     fn dashboard_state(records: Vec<ConnectionRecord>) -> DashboardState {
         DashboardState {
+            view: DashboardView::Connections,
+            targets: TargetsState::default(),
             target_pool: None,
             records: VecDeque::from(records),
             total: 0,
@@ -2621,6 +3018,7 @@ mod tests {
                 peer: "127.0.0.1:22222".parse().unwrap(),
                 src_port: new_active_port,
                 target_ip: "203.0.113.2".parse().unwrap(),
+                target_sni: None,
             },
             &mut state,
         );
@@ -2776,6 +3174,7 @@ mod tests {
                     peer: "127.0.0.1:11111".parse().unwrap(),
                     src_port: port,
                     target_ip: "203.0.113.1".parse().unwrap(),
+                    target_sni: None,
                 },
                 &mut state,
             );
@@ -2890,6 +3289,7 @@ mod tests {
                 peer: "127.0.0.1:12345".parse().unwrap(),
                 src_port: 777,
                 target_ip: "203.0.113.7".parse().unwrap(),
+                target_sni: None,
             },
             &mut state,
         );

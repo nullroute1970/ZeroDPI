@@ -896,6 +896,7 @@ rules in that client; process-based direct routing alone may not cover DNS.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `SCAN_TIMEOUT_SECS` | `u64` | `5` | Independent timeout for each DNS server and probe stage (seconds) |
+| `CLOUDFLARE_ONLY` | `bool` | `true` | Only probe IPs contained in the CIDR ranges in `cf.txt` next to `config.toml`. Applies to each resolved SNI address and IP-list candidates, including rescans, proxy scans, and method scans. Set to `false` to skip this check and file access. |
 | `DEDUPLICATE_SCAN_LISTS` | `bool` | `true` | Remove duplicate entries from `SNI_LIST` / `IP_LIST` on disk before scanning each file, including rescans. Keeps the first entry, order, comments, blank lines, and line endings. SNI comparison ignores ASCII case; IPs and identical CIDR ranges use their parsed values. Overlapping ranges are not merged. Set to `false` to leave files untouched and scan all entries. |
 | `RESCAN_INTERVAL_SECS` | `u64` | `0` | Background rescan interval (`0` = disabled) |
 | `SNI_SWITCH_MIN_SCORE` | `u8` | `1` | Minimum score to auto-switch target on rescan (0–100) |
@@ -913,6 +914,17 @@ rules in that client; process-based direct routing alone may not cover DNS.
 | `SCAN_UPLOAD_PATH` | `string` | `"/"` | Candidate-relative HTTP path used for upload speed tests |
 | `IP_SCAN_SNI` | `string` | `"cloudflare.com"` | SNI used during IP scan TLS phase only |
 | `IPV6_MAX_HOSTS` | `u64` | `65536` | Max hosts expanded from a single IPv6 CIDR |
+
+`cf.txt` is loaded once per scan and accepts IPv4/IPv6 CIDRs, blank lines, and
+full-line `#` comments. When filtering is enabled, a missing, unreadable, empty,
+or malformed file stops the scan with its path and, for malformed CIDRs, line
+number. Addresses outside these ranges are skipped before any TCP/TLS/HTTP
+probe and excluded from results. A hostname with mixed DNS answers retains only
+its allowed addresses. `SELECTED_SNI` and `SELECTED_IP` bypass scanning and are
+not filtered. The SNI scanner remains IPv4-only.
+
+Build packages include `cf.txt` alongside the other runtime lists. Android seeds
+it next to each profile config when missing, preserving an existing file.
 
 ### 📊 Scoring Parameters
 

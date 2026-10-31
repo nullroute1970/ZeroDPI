@@ -11,6 +11,7 @@
 //! - [`sni_scanner`]: DNS/TCP/TLS/HTTP probe + ranking for SNI candidates.
 //! - [`ip_scanner`]: 3-phase IP scanner (TCP→TLS→TTFB) used in `ip_bypass` mode.
 
+pub mod cloudflare;
 pub mod config;
 pub mod dns;
 pub mod flow;

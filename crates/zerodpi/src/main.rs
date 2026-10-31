@@ -35,6 +35,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
+use zerodpi_core::cloudflare::ScanFilter;
 use zerodpi_core::config::{BypassMethodList, Config};
 use zerodpi_core::dns::DnsResolver;
 use zerodpi_core::flow::{new_flow_table, FlowController, LocalFlowController};
@@ -963,6 +964,7 @@ async fn scan_sni_list_with_progress(
     network: OutboundNetwork,
     terminal: &mut tui::Term,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
+    let filter = cfg.scan_filter()?;
     let total_hostnames = count_hostnames(path, cfg.DEDUPLICATE_SCAN_LISTS);
     let path_owned = path.to_owned();
 
@@ -972,7 +974,7 @@ async fn scan_sni_list_with_progress(
     let cfg_clone = cfg.clone();
     let network = network.clone();
     let scan_handle = tokio::spawn(async move {
-        scan_sni_list(&path_owned, timeout, cfg_clone, network, Some(tx)).await
+        scan_sni_list(&path_owned, timeout, cfg_clone, network, filter, Some(tx)).await
     });
 
     let (arrived, aborted) = tui::run_scan_progress(terminal, &mut rx, total_hostnames)?;
@@ -1028,6 +1030,7 @@ async fn scan_sni_list_headless(
     events: &RuntimeEventEmitter,
     scan: ScanKind,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
+    let filter = cfg.scan_filter()?;
     let total = count_hostnames(path, cfg.DEDUPLICATE_SCAN_LISTS);
     events.emit(RuntimeEvent::ScanStarted {
         scan,
@@ -1036,7 +1039,7 @@ async fn scan_sni_list_headless(
     });
 
     if !events.enabled() {
-        let entries = scan_sni_list(path, timeout, cfg, network, None).await?;
+        let entries = scan_sni_list(path, timeout, cfg, network, filter, None).await?;
         events.emit(RuntimeEvent::ScanCompleted {
             scan,
             results: entries.len(),
@@ -1062,7 +1065,7 @@ async fn scan_sni_list_headless(
         }
     });
 
-    let entries = scan_sni_list(path, timeout, cfg, network, Some(tx)).await?;
+    let entries = scan_sni_list(path, timeout, cfg, network, filter, Some(tx)).await?;
     let _ = progress_handle.await;
     events.emit(RuntimeEvent::ScanCompleted {
         scan,
@@ -1071,6 +1074,7 @@ async fn scan_sni_list_headless(
     Ok(entries)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn scan_ip_list_headless(
     ips: Vec<IpAddr>,
     scan_sni: Arc<str>,
@@ -1079,6 +1083,7 @@ async fn scan_ip_list_headless(
     network: OutboundNetwork,
     events: &RuntimeEventEmitter,
     path: Option<&Path>,
+    filter: Arc<ScanFilter>,
 ) -> Vec<IpProbeEntry> {
     let total = ips.len();
     events.emit(RuntimeEvent::ScanStarted {
@@ -1088,7 +1093,7 @@ async fn scan_ip_list_headless(
     });
 
     if !events.enabled() {
-        let entries = scan_ip_list(ips, scan_sni, timeout, cfg, network, None).await;
+        let entries = scan_ip_list(ips, scan_sni, timeout, cfg, network, filter, None).await;
         events.emit(RuntimeEvent::ScanCompleted {
             scan: ScanKind::Ip,
             results: entries.len(),
@@ -1129,7 +1134,7 @@ async fn scan_ip_list_headless(
         }
     });
 
-    let entries = scan_ip_list(ips, scan_sni, timeout, cfg, network, Some(tx)).await;
+    let entries = scan_ip_list(ips, scan_sni, timeout, cfg, network, filter, Some(tx)).await;
     let _ = progress_handle.await;
     events.emit(RuntimeEvent::ScanCompleted {
         scan: ScanKind::Ip,
@@ -1398,7 +1403,12 @@ async fn rescan_sni_once(
     let mut switched = false;
     let mut scan_summary: Option<(usize, Option<u8>)> = None;
     let cfg_clone = cfg.clone();
-    match scan_sni_list(&path, scan_timeout, cfg_clone, network, None).await {
+    match async {
+        let filter = cfg_clone.scan_filter()?;
+        scan_sni_list(&path, scan_timeout, cfg_clone, network, filter, None).await
+    }
+    .await
+    {
         Ok(entries) => {
             scan_summary = Some((entries.len(), entries.first().map(|e| e.score)));
             if headless {
@@ -2021,12 +2031,8 @@ fn ip_bypass_main(
             info!(%ip, "SELECTED_IP set — skipping scan");
             (ip, None)
         } else {
-            let ips = load_ip_list_with_options(
-                &ip_list_path,
-                cfg.IPV6_MAX_HOSTS,
-                cfg.DEDUPLICATE_SCAN_LISTS,
-            )
-            .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
+            let (ips, filter) = load_ip_scan_input(&cfg, &ip_list_path)
+                .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
             if ips.is_empty() {
                 anyhow::bail!(
                     "ip_list '{}' is empty — add at least one IP or CIDR",
@@ -2047,6 +2053,7 @@ fn ip_bypass_main(
                     scan_network.clone(),
                     &events,
                     Some(&ip_list_path),
+                    filter,
                 ));
                 log_ip_scan_results("headless IP scan", &entries);
                 Ok(entries)
@@ -2062,6 +2069,7 @@ fn ip_bypass_main(
                         .as_deref_mut()
                         .context("missing interactive session")?
                         .terminal()?,
+                    filter,
                 )
             }?;
 
@@ -2338,12 +2346,8 @@ fn ip_bypass_plus_main(
         info!(%ip, "ip_bypass_plus: SELECTED_IP set — skipping scan");
         (ip, None)
     } else {
-        let ips = load_ip_list_with_options(
-            &ip_list_path,
-            cfg.IPV6_MAX_HOSTS,
-            cfg.DEDUPLICATE_SCAN_LISTS,
-        )
-        .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
+        let (ips, filter) = load_ip_scan_input(&cfg, &ip_list_path)
+            .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
         reject_ipv6_ip_candidates(&ips, "ip_bypass_plus", &ip_list_path)?;
         if ips.is_empty() {
             anyhow::bail!(
@@ -2365,6 +2369,7 @@ fn ip_bypass_plus_main(
                 scan_network.clone(),
                 &events,
                 Some(&ip_list_path),
+                filter,
             ));
             log_ip_scan_results("ip_bypass_plus: headless IP scan", &entries);
             Ok(entries)
@@ -2380,6 +2385,7 @@ fn ip_bypass_plus_main(
                     .as_deref_mut()
                     .context("missing interactive session")?
                     .terminal()?,
+                filter,
             )
         }?;
 
@@ -2697,6 +2703,19 @@ fn require_ipv4_target(ip: IpAddr, mode: &str) -> Result<Ipv4Addr> {
     }
 }
 
+/// Prepare one IP scan before any progress UI or worker is started.
+fn load_ip_scan_input(cfg: &Config, path: &Path) -> Result<(Vec<IpAddr>, Arc<ScanFilter>)> {
+    let filter = cfg.scan_filter()?;
+    let mut ips = load_ip_list_with_options(path, cfg.IPV6_MAX_HOSTS, cfg.DEDUPLICATE_SCAN_LISTS)?;
+    filter.retain(&mut ips);
+    anyhow::ensure!(
+        !cfg.CLOUDFLARE_ONLY || !ips.is_empty(),
+        "no IP candidates match the Cloudflare ranges in cf.txt (input '{}')",
+        path.display()
+    );
+    Ok((ips, filter))
+}
+
 fn reject_ipv6_ip_candidates(ips: &[IpAddr], mode: &str, path: &Path) -> Result<()> {
     if let Some(IpAddr::V6(ip)) = ips.iter().find(|ip| ip.is_ipv6()) {
         anyhow::bail!(
@@ -2708,6 +2727,7 @@ fn reject_ipv6_ip_candidates(ips: &[IpAddr], mode: &str, path: &Path) -> Result<
 }
 
 /// Run the IP scanner with TUI progress display.
+#[allow(clippy::too_many_arguments)]
 fn scan_ip_list_with_ip_progress(
     cfg: Arc<Config>,
     rt: &tokio::runtime::Runtime,
@@ -2716,13 +2736,14 @@ fn scan_ip_list_with_ip_progress(
     timeout: Duration,
     network: OutboundNetwork,
     terminal: &mut tui::Term,
+    filter: Arc<ScanFilter>,
 ) -> anyhow::Result<Vec<IpProbeEntry>> {
     let total_ips = ips.len();
     let (tx, mut rx) = mpsc::unbounded_channel::<IpScanEvent>();
     let cfg_clone = cfg.clone();
     let network = network.clone();
     let scan_handle = rt.spawn(async move {
-        scan_ip_list(ips, scan_sni, timeout, cfg_clone, network, Some(tx)).await
+        scan_ip_list(ips, scan_sni, timeout, cfg_clone, network, filter, Some(tx)).await
     });
 
     let (arrived, aborted) = tui::run_ip_scan_progress(terminal, &mut rx, total_ips)?;
@@ -2870,11 +2891,7 @@ async fn rescan_ip_once(
     );
     let scan_started = std::time::Instant::now();
 
-    let ips = match load_ip_list_with_options(
-        &ip_list_path,
-        cfg.IPV6_MAX_HOSTS,
-        cfg.DEDUPLICATE_SCAN_LISTS,
-    ) {
+    let (ips, filter) = match load_ip_scan_input(&cfg, &ip_list_path) {
         Ok(v) => v,
         Err(e) => {
             warn!(mode = policy.mode_label, error = %e, "background IP rescan failed to load ip_list");
@@ -2934,6 +2951,7 @@ async fn rescan_ip_once(
         scan_timeout,
         cfg_clone,
         network,
+        filter,
         None,
     )
     .await;
@@ -3077,8 +3095,17 @@ fn sni_scan_main(
         ))?
     } else {
         let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
+        let filter = cfg_clone.scan_filter()?;
         let scan_handle = rt.spawn(async move {
-            scan_sni_list(&path, scan_timeout, cfg_clone, scan_network, Some(tx)).await
+            scan_sni_list(
+                &path,
+                scan_timeout,
+                cfg_clone,
+                scan_network,
+                filter,
+                Some(tx),
+            )
+            .await
         });
 
         let mut terminal = tui::enter_tui()?;
@@ -3146,12 +3173,8 @@ fn ip_scan_main(
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
-    let ips = load_ip_list_with_options(
-        &ip_list_path,
-        cfg.IPV6_MAX_HOSTS,
-        cfg.DEDUPLICATE_SCAN_LISTS,
-    )
-    .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
+    let (ips, filter) = load_ip_scan_input(&cfg, &ip_list_path)
+        .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
     if ips.is_empty() {
         anyhow::bail!(
             "ip_list '{}' is empty — add at least one IP or CIDR",
@@ -3173,6 +3196,7 @@ fn ip_scan_main(
             scan_network.clone(),
             &events,
             Some(&ip_list_path),
+            filter,
         ))
     } else {
         let (tx, mut rx) = mpsc::unbounded_channel::<IpScanEvent>();
@@ -3183,6 +3207,7 @@ fn ip_scan_main(
                 scan_timeout,
                 cfg_clone,
                 scan_network,
+                filter,
                 Some(tx),
             )
             .await
@@ -3269,8 +3294,17 @@ fn sni_method_scan_main(
         let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
         let path = sni_list_path.clone();
         let cfg_clone = cfg.clone();
+        let filter = cfg_clone.scan_filter()?;
         let scan_handle = rt.spawn(async move {
-            scan_sni_list(&path, scan_timeout, cfg_clone, scan_network, Some(tx)).await
+            scan_sni_list(
+                &path,
+                scan_timeout,
+                cfg_clone,
+                scan_network,
+                filter,
+                Some(tx),
+            )
+            .await
         });
 
         let mut terminal = tui::enter_tui()?;
@@ -3341,12 +3375,8 @@ fn ip_method_scan_main(
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
-    let ips = load_ip_list_with_options(
-        &ip_list_path,
-        cfg.IPV6_MAX_HOSTS,
-        cfg.DEDUPLICATE_SCAN_LISTS,
-    )
-    .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
+    let (ips, filter) = load_ip_scan_input(&cfg, &ip_list_path)
+        .with_context(|| format!("loading ip_list from '{}'", ip_list_path.display()))?;
     if ips.is_empty() {
         anyhow::bail!(
             "ip_list '{}' is empty — add at least one IP or CIDR",
@@ -3367,6 +3397,7 @@ fn ip_method_scan_main(
             scan_network.clone(),
             &events,
             Some(&ip_list_path),
+            filter,
         ))
     } else {
         let (tx, mut rx) = mpsc::unbounded_channel::<IpScanEvent>();
@@ -3377,6 +3408,7 @@ fn ip_method_scan_main(
                 scan_timeout,
                 cfg_clone,
                 scan_network,
+                filter,
                 Some(tx),
             )
             .await
@@ -3699,8 +3731,17 @@ fn proxy_scan_main(
     } else {
         let total_hostnames = count_hostnames(&sni_list_path, cfg.DEDUPLICATE_SCAN_LISTS);
         let (tx1, mut rx1) = mpsc::unbounded_channel::<SniProbeEntry>();
+        let filter = cfg_clone.scan_filter()?;
         let scan_handle = rt.spawn(async move {
-            scan_sni_list(&path, scan_timeout, cfg_clone, scan_network, Some(tx1)).await
+            scan_sni_list(
+                &path,
+                scan_timeout,
+                cfg_clone,
+                scan_network,
+                filter,
+                Some(tx1),
+            )
+            .await
         });
 
         let mut terminal = tui::enter_tui()?;
@@ -3978,6 +4019,31 @@ mod dns_test_support;
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn cloudflare_ip_input_uses_config_directory_and_filtered_progress_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let candidates = dir.path().join("ip_list.txt");
+        std::fs::write(&config, "LISTEN_HOST='127.0.0.1'\nLISTEN_PORT=44444\n").unwrap();
+        std::fs::write(&candidates, "192.0.2.0/30\n198.51.100.1\n").unwrap();
+        let cfg = Config::from_file(&config).unwrap();
+        assert!(load_ip_scan_input(&cfg, &candidates).is_err());
+        std::fs::write(dir.path().join("cf.txt"), "192.0.2.0/24\n").unwrap();
+        let (ips, filter) = load_ip_scan_input(&cfg, &candidates).unwrap();
+        assert_eq!(ips.len(), 2);
+        assert!(ips.iter().all(|ip| filter.allows(*ip)));
+        let mut disabled = cfg.clone();
+        disabled.CLOUDFLARE_ONLY = false;
+        std::fs::remove_file(dir.path().join("cf.txt")).unwrap();
+        assert_eq!(
+            load_ip_scan_input(&disabled, &candidates).unwrap().0.len(),
+            3
+        );
+        std::fs::write(dir.path().join("cf.txt"), "203.0.113.0/24\n").unwrap();
+        let error = load_ip_scan_input(&cfg, &candidates).unwrap_err();
+        assert!(error.to_string().contains("no IP candidates match"));
+    }
 
     #[tokio::test]
     async fn selected_sni_allows_dns_fallback_beyond_one_timeout() {
@@ -4509,8 +4575,11 @@ mod tests {
         for auto in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("ip_list.txt");
-            std::fs::write(&path, "192.0.2.1\n192.0.2.2\n").unwrap();
-            let mut cfg = config_for_tests();
+            std::fs::write(&path, "192.0.2.1\n198.51.100.1\n192.0.2.2\n").unwrap();
+            let config_path = dir.path().join("config.toml");
+            std::fs::write(&config_path, "LISTEN_HOST='127.0.0.1'\nLISTEN_PORT=44444\n").unwrap();
+            std::fs::write(dir.path().join("cf.txt"), "192.0.2.0/24\n").unwrap();
+            let mut cfg = Config::from_file(&config_path).unwrap();
             cfg.AUTO_SELECT = auto;
             cfg.SELECTED_IP = Some("192.0.2.99".into());
             cfg.RESCAN_INTERVAL_SECS = 0;
@@ -4548,7 +4617,8 @@ mod tests {
             .enumerate()
             {
                 if round == 1 {
-                    std::fs::write(&path, "192.0.2.3\n").unwrap();
+                    std::fs::write(&path, "192.0.2.1\n192.0.2.3\n").unwrap();
+                    std::fs::write(dir.path().join("cf.txt"), "192.0.2.3/32\n").unwrap();
                 } else if round == 2 {
                     std::fs::write(&path, "").unwrap();
                 }

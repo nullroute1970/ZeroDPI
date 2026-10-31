@@ -470,6 +470,14 @@ impl<'de> serde::Deserialize<'de> for BypassMethodList {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub struct Config {
+    /// Source location retained for config-relative scan inputs; never serialized.
+    #[serde(skip)]
+    scan_config_path: std::path::PathBuf,
+
+    /// Only probe candidate addresses contained in cf.txt. Default: true.
+    #[serde(default = "default_true")]
+    pub CLOUDFLARE_ONLY: bool,
+
     /// Local address the proxy listens on (e.g. `0.0.0.0` or `127.0.0.1`).
     pub LISTEN_HOST: String,
 
@@ -1652,9 +1660,20 @@ impl Config {
 
     pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path.as_ref())?;
-        let cfg: Self = toml::from_str(&text)?;
+        let mut cfg: Self = toml::from_str(&text)?;
+        cfg.scan_config_path = if path.as_ref().is_absolute() {
+            path.as_ref().to_owned()
+        } else {
+            std::env::current_dir()?.join(path.as_ref())
+        };
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Read a fresh allowlist for one scan. Selected targets do not call this.
+    pub fn scan_filter(&self) -> anyhow::Result<std::sync::Arc<crate::cloudflare::ScanFilter>> {
+        crate::cloudflare::ScanFilter::load(self.CLOUDFLARE_ONLY, &self.scan_config_path)
+            .map(std::sync::Arc::new)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -4855,5 +4874,43 @@ pub(crate) mod test_support {
                LISTEN_PORT = 44444"#,
         )
         .expect("parse minimal config")
+    }
+}
+
+#[cfg(test)]
+mod cloudflare_tests {
+    use super::*;
+
+    #[test]
+    fn cloudflare_defaults_enabled_and_supports_explicit_disable() {
+        let base = "LISTEN_HOST='127.0.0.1'\nLISTEN_PORT=44444\n";
+        let old: Config = toml::from_str(base).unwrap();
+        assert!(old.CLOUDFLARE_ONLY);
+        for enabled in [false, true] {
+            let cfg: Config = toml::from_str(&format!("{base}CLOUDFLARE_ONLY={enabled}")).unwrap();
+            assert_eq!(cfg.CLOUDFLARE_ONLY, enabled);
+            assert_eq!(
+                serde_json::to_value(cfg).unwrap()["CLOUDFLARE_ONLY"],
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn cloudflare_file_is_relative_to_config_and_reloaded_for_each_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "LISTEN_HOST='127.0.0.1'\nLISTEN_PORT=44444\n").unwrap();
+        let cfg = Config::from_file(&path).unwrap();
+        assert!(cfg.scan_filter().is_err());
+        let cf = dir.path().join("cf.txt");
+        std::fs::write(&cf, "192.0.2.0/24\n").unwrap();
+        let first = cfg.scan_filter().unwrap();
+        assert!(first.allows("192.0.2.1".parse().unwrap()));
+        std::fs::write(&cf, "198.51.100.0/24\n").unwrap();
+        let next = cfg.scan_filter().unwrap();
+        assert!(!next.allows("192.0.2.1".parse().unwrap()));
+        assert!(next.allows("198.51.100.1".parse().unwrap()));
+        assert!(first.allows("192.0.2.1".parse().unwrap()));
     }
 }

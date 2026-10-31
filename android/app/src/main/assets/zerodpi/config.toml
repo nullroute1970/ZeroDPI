@@ -101,6 +101,13 @@ CUSTOM_DNS_SERVER = ""
 # Scan Behavior
 # ---------------------------------------------------------------------------
 
+# Only scan candidate IPs inside the CIDR ranges in cf.txt next to this config.
+# Applies to IP lists and each resolved SNI address, including rescans.
+# Missing, unreadable, empty, or invalid cf.txt stops the scan.
+# Set false to scan all candidates without reading cf.txt. Default: true.
+# SELECTED_SNI / SELECTED_IP skip scanning and are not filtered.
+CLOUDFLARE_ONLY = true
+
 # Maximum time (in seconds) for each DNS server and each individual probe stage
 # before it is abandoned. A DNS failure advances to the next custom server.
 SCAN_TIMEOUT_SECS = 5

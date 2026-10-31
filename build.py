@@ -12,7 +12,7 @@ What it does
 Linux:
   1. Checks that libnetfilter-queue-dev is installed (offers to install it).
   2. Runs `cargo build --workspace --release`.
-  3. Copies the resulting binary + config.toml + sni_list.txt + ip_list.txt +
+  3. Copies the resulting binary + config.toml + sni_list.txt + ip_list.txt + cf.txt +
      README.md to dist/linux/.
 
 Windows:
@@ -21,13 +21,13 @@ Windows:
      stable-x86_64-pc-windows-msvc). Pass --toolchain="" to use the workspace
      default toolchain instead.
   3. Copies zerodpi.exe + WinDivert.dll + WinDivert64.sys + config.toml +
-     sni_list.txt + ip_list.txt + README.md to dist/windows/.
+     sni_list.txt + ip_list.txt + cf.txt + README.md to dist/windows/.
 
 Termux:
   1. Finds the Android NDK from --android-ndk or ANDROID_NDK_HOME.
   2. Configures Cargo to use the selected NDK clang linker.
   3. Runs `cargo build --workspace --release --target <android-target>`.
-  4. Copies zerodpi + config.toml + sni_list.txt + ip_list.txt + README.md
+  4. Copies zerodpi + config.toml + sni_list.txt + ip_list.txt + cf.txt + README.md
      to dist/termux/<arch>/. The default `all` builds Android ARMv7 and ARMv8.
 
 Android app runtime:
@@ -148,7 +148,7 @@ ANDROID_PROJECT_DIR = REPO_ROOT / "android"
 ANDROID_APP_MODULE_DIR = ANDROID_PROJECT_DIR / "app"
 ANDROID_GRADLE_DIST_DIR = REPO_ROOT / ".gradle-dist"
 CARGO_RELEASE_DIR = REPO_ROOT / "target" / "release"
-COMMON_DIST_FILES = ("config.toml", "sni_list.txt", "ip_list.txt", "README.md")
+COMMON_DIST_FILES = ("config.toml", "sni_list.txt", "ip_list.txt", "cf.txt", "README.md")
 LINUX_DIST_FILES = ("install-systemd.sh",)
 
 
@@ -974,7 +974,7 @@ def android_build_env(
 def copy_android_app_runtime_templates(dist_dir: Path) -> None:
     assets_dir = dist_dir / "assets" / "zerodpi"
     assets_dir.mkdir(parents=True, exist_ok=True)
-    for filename in ("config.toml", "sni_list.txt", "ip_list.txt"):
+    for filename in ("config.toml", "sni_list.txt", "ip_list.txt", "cf.txt"):
         copy_required_file(REPO_ROOT / filename, assets_dir / filename)
 
 

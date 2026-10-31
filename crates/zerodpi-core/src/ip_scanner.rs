@@ -335,13 +335,15 @@ fn tcp_only_entry(
 }
 
 pub async fn scan_ip_list(
-    ips: Vec<IpAddr>,
+    mut ips: Vec<IpAddr>,
     scan_sni: Arc<str>,
     timeout: Duration,
     config: Arc<crate::config::Config>,
     network: OutboundNetwork,
+    filter: Arc<crate::cloudflare::ScanFilter>,
     progress_tx: Option<mpsc::UnboundedSender<IpScanEvent>>,
 ) -> Vec<IpProbeEntry> {
+    filter.retain(&mut ips);
     if ips.is_empty() {
         return Vec::new();
     }
@@ -762,6 +764,71 @@ mod candidate_tests {
     }
 
     #[tokio::test]
+    async fn cloudflare_ip_scan_filters_plain_ips_and_cidrs_before_connecting() {
+        use crate::cloudflare::ScanFilter;
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ip_list.txt");
+        std::fs::write(
+            &path,
+            "192.0.2.0/30\n198.51.100.1\n2001:db8::1\n2001:db9::1\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("cf.txt"), "192.0.2.0/24\n2001:db8::/32\n").unwrap();
+        let filter = Arc::new(ScanFilter::load(true, dir.path().join("config.toml")).unwrap());
+        let ips = load_ip_list_with_options(&path, 10, false).unwrap();
+        let binder = Arc::new(RejectingBinder(std::sync::atomic::AtomicUsize::new(0)));
+        let network = OutboundNetwork::new(
+            crate::net::InterfaceBinding::fixed(std::net::Ipv4Addr::LOCALHOST),
+            binder.clone(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cfg = Arc::new(crate::config::test_support::minimal_config());
+        let entries = scan_ip_list(
+            ips.clone(),
+            Arc::from("example.com"),
+            Duration::from_secs(1),
+            cfg.clone(),
+            network.clone(),
+            filter.clone(),
+            Some(tx),
+        )
+        .await;
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|entry| filter.allows(entry.ip)));
+        assert_eq!(binder.0.load(Ordering::SeqCst), 3);
+        let mut counts = Vec::new();
+        while let Ok(IpScanEvent::TcpDone { tcp_tested }) = rx.try_recv() {
+            counts.push(tcp_tested);
+        }
+        assert_eq!(counts, vec![1, 2, 3]);
+        let entries = scan_ip_list(
+            ips,
+            Arc::from("example.com"),
+            Duration::from_secs(1),
+            cfg,
+            network.clone(),
+            Arc::new(ScanFilter::default()),
+            None,
+        )
+        .await;
+        assert_eq!(entries.len(), 5);
+        assert_eq!(binder.0.load(Ordering::SeqCst), 8);
+        let entries = scan_ip_list(
+            vec!["198.51.100.1".parse().unwrap()],
+            Arc::from("example.com"),
+            Duration::from_secs(1),
+            Arc::new(crate::config::test_support::minimal_config()),
+            network,
+            filter,
+            None,
+        )
+        .await;
+        assert!(entries.is_empty());
+        assert_eq!(binder.0.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
     async fn tls_reconnect_failure_keeps_tcp_score() {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         let config = Arc::new(crate::config::test_support::minimal_config());
@@ -802,6 +869,7 @@ mod candidate_tests {
             Duration::from_secs(1),
             Arc::new(crate::config::test_support::minimal_config()),
             network,
+            Arc::new(crate::cloudflare::ScanFilter::default()),
             None,
         ));
         std::future::poll_fn(|cx| {

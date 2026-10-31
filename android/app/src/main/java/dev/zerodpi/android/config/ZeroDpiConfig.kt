@@ -342,6 +342,14 @@ object ZeroDpiConfigSchema {
             helpText = "Path to candidate IPs and CIDR ranges.",
         ),
         field(
+            name = "CLOUDFLARE_ONLY",
+            type = ConfigFieldType.Boolean,
+            defaultValue = "true",
+            section = ConfigSection.ScanBehavior,
+            validationRule = "true or false.",
+            helpText = "Only scan IPs inside cf.txt ranges, including resolved SNI addresses. Missing or invalid ranges stop the scan.",
+        ),
+        field(
             name = "SCAN_TIMEOUT_SECS",
             type = ConfigFieldType.UInt64,
             defaultValue = "5",

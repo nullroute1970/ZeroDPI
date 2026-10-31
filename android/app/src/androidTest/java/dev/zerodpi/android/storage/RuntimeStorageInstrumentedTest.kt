@@ -38,6 +38,27 @@ class RuntimeStorageInstrumentedTest {
     }
 
     @Test
+    fun cloudflareRangesAreSeededForNewAndExistingProfilesWithoutOverwriting() = runBlocking {
+        val storage = RuntimeStorage(context)
+        val id = ZeroDpiProfile.DEFAULT_PROFILE_ID
+        val files = storage.ensureInitialized(id)
+        val cf = File(files.runtimeDir, "cf.txt")
+        val bundled = context.assets.open("zerodpi/cf.txt").bufferedReader().use { it.readText() }
+        assertEquals(bundled, cf.readText())
+        assertTrue(cf.delete())
+        storage.ensureInitialized(id)
+        assertEquals(bundled, cf.readText())
+        val custom = "# custom ranges\n192.0.2.0/24\n"
+        cf.writeText(custom)
+        storage.ensureInitialized(id)
+        assertEquals(custom, cf.readText())
+        val repository = ProfileRepository(context, idGenerator = { "cf-new" })
+        repository.createProfile("Cloudflare")
+        val newFiles = storage.ensureInitialized("cf-new")
+        assertEquals(bundled, File(newFiles.runtimeDir, "cf.txt").readText())
+    }
+
+    @Test
     fun settingsAndListsSaveAndReopenFromAppPrivateStorage() = runBlocking {
         val storage = RuntimeStorage(context)
         val defaults = storage.readAll(ZeroDpiProfile.DEFAULT_PROFILE_ID)

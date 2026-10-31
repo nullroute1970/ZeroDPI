@@ -15,6 +15,10 @@ pub struct TestDnsServer {
 
 impl TestDnsServer {
     pub async fn start(rcode: u8, answer: Option<Ipv4Addr>, delay: Option<Duration>) -> Self {
+        Self::start_many(rcode, answer.into_iter().collect(), delay).await
+    }
+
+    pub async fn start_many(rcode: u8, answers: Vec<Ipv4Addr>, delay: Option<Duration>) -> Self {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = socket.local_addr().unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
@@ -34,8 +38,8 @@ impl TestDnsServer {
                 let mut response = Vec::from(&buf[..end]);
                 response[2] = 0x81;
                 response[3] = 0x80 | rcode;
-                response[6..12].copy_from_slice(&[0, u8::from(answer.is_some()), 0, 0, 0, 0]);
-                if let Some(ip) = answer {
+                response[6..12].copy_from_slice(&[0, answers.len() as u8, 0, 0, 0, 0]);
+                for ip in &answers {
                     response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4]);
                     response.extend_from_slice(&ip.octets());
                 }

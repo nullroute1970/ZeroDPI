@@ -439,6 +439,12 @@ class ProfileRepository(
     private fun ensureProfileDirectories(paths: ProfileFilePaths) {
         RuntimeFileOps.ensureDirectory(paths.profileDir)
         RuntimeFileOps.ensureDirectory(paths.scanResultsDir)
+        // Also seeds cf.txt for profiles created before Cloudflare filtering existed.
+        RuntimeFileOps.seedAssetIfMissing(
+            context = appContext,
+            assetPath = "${RuntimeStorageLayout.ASSET_DIR}/cf.txt",
+            target = File(paths.profileDir, "cf.txt"),
+        )
     }
 
     private fun legacySourceFor(kind: RuntimeFileKind): File? {

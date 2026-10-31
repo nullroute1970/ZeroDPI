@@ -207,6 +207,7 @@ pub async fn scan_sni_list(
     timeout: Duration,
     config: Arc<crate::config::Config>,
     network: OutboundNetwork,
+    filter: Arc<crate::cloudflare::ScanFilter>,
     progress_tx: Option<mpsc::UnboundedSender<SniProbeEntry>>,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
     let content = crate::scan_list::read_scan_list(path, config.DEDUPLICATE_SCAN_LISTS, |entry| {
@@ -239,8 +240,12 @@ pub async fn scan_sni_list(
             let cfg = config.clone();
             let network = network.clone();
             let resolver = resolver.clone();
+            let filter = filter.clone();
             tasks.spawn(async move {
-                probe_sni(sni, timeout, cfg, resolver, connector, network, tx, sem).await
+                probe_sni(
+                    sni, timeout, cfg, resolver, connector, network, filter, tx, sem,
+                )
+                .await
             });
         }
         match tasks.join_next().await {
@@ -258,6 +263,9 @@ pub async fn scan_sni_list(
         )
     });
 
+    if results.is_empty() && config.CLOUDFLARE_ONLY {
+        warn!("no SNI/IP candidates were probed; check DNS and Cloudflare ranges in cf.txt");
+    }
     Ok(results)
 }
 
@@ -284,6 +292,7 @@ async fn probe_sni(
     resolver: Arc<DnsResolver>,
     connector: Arc<TlsConnector>,
     network: OutboundNetwork,
+    filter: Arc<crate::cloudflare::ScanFilter>,
     progress_tx: Option<mpsc::UnboundedSender<SniProbeEntry>>,
     semaphore: Arc<Semaphore>,
 ) -> Vec<SniProbeEntry> {
@@ -299,6 +308,10 @@ async fn probe_sni(
     let mut tasks = JoinSet::new();
     let mut out = Vec::new();
     for ip in addrs {
+        if !filter.allows(ip.into()) {
+            debug!(%sni, %ip, "skipping SNI address outside Cloudflare ranges");
+            continue;
+        }
         // Acquire before spawning, so queued addresses do not each allocate
         // a task. Owned permits are released on completion or cancellation.
         let permit = semaphore
@@ -623,6 +636,71 @@ mod candidate_tests {
     use super::*;
 
     #[tokio::test]
+    async fn cloudflare_sni_scan_filters_mixed_dns_before_creating_sockets() {
+        use crate::cloudflare::ScanFilter;
+        use crate::dns::test_support::TestDnsServer;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingBinder(AtomicUsize);
+        impl crate::net::OutboundSocketBinder for CountingBinder {
+            fn configure(
+                &self,
+                _: &tokio::net::TcpSocket,
+                _: &crate::net::InterfaceBinding,
+            ) -> anyhow::Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("reject test socket")
+            }
+        }
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let dns = TestDnsServer::start_many(
+            0,
+            vec![
+                "192.0.2.1".parse().unwrap(),
+                "198.51.100.1".parse().unwrap(),
+            ],
+            Some(Duration::ZERO),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snis.txt");
+        std::fs::write(&path, "mixed.test\n").unwrap();
+        std::fs::write(dir.path().join("cf.txt"), "192.0.2.0/24\n").unwrap();
+        let filter = Arc::new(ScanFilter::load(true, dir.path().join("config.toml")).unwrap());
+        let mut cfg = crate::config::test_support::minimal_config();
+        cfg.CUSTOM_DNS_ENABLED = true;
+        cfg.CUSTOM_DNS_SERVER = Some(dns.addr.to_string());
+        let cfg = Arc::new(cfg);
+        let binder = Arc::new(CountingBinder(AtomicUsize::new(0)));
+        let network = OutboundNetwork::new(
+            crate::net::InterfaceBinding::fixed(Ipv4Addr::LOCALHOST),
+            binder.clone(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let entries = scan_sni_list(
+            &path,
+            Duration::from_secs(1),
+            cfg.clone(),
+            network.clone(),
+            filter,
+            Some(tx),
+        )
+        .await
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ip, "192.0.2.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(binder.0.load(Ordering::SeqCst), 1);
+        assert_eq!(rx.try_recv().unwrap().ip, entries[0].ip);
+        assert!(rx.try_recv().is_err());
+        std::fs::write(dir.path().join("cf.txt"), "203.0.113.0/24\n").unwrap();
+        let filter = Arc::new(ScanFilter::load(true, dir.path().join("config.toml")).unwrap());
+        let entries = scan_sni_list(&path, Duration::from_secs(1), cfg, network, filter, None)
+            .await
+            .unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(binder.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn sni_scan_allows_dns_fallback_beyond_one_timeout() {
         use crate::dns::test_support::TestDnsServer;
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
@@ -649,6 +727,7 @@ mod candidate_tests {
             Duration::from_millis(250),
             Arc::new(config),
             network,
+            Arc::new(crate::cloudflare::ScanFilter::default()),
             None,
         )
         .await
@@ -699,6 +778,7 @@ mod candidate_tests {
             Duration::from_secs(10),
             config,
             network,
+            Arc::new(crate::cloudflare::ScanFilter::default()),
             None,
         ));
         std::future::poll_fn(|cx| {
@@ -720,7 +800,15 @@ mod candidate_tests {
     async fn sni_scan_bounds_concurrent_dns_queries() {
         let (_dir, path, server, config, network) = dns_scan_fixture().await;
         let task = tokio::spawn(async move {
-            scan_sni_list(&path, Duration::from_secs(10), config, network, None).await
+            scan_sni_list(
+                &path,
+                Duration::from_secs(10),
+                config,
+                network,
+                Arc::new(crate::cloudflare::ScanFilter::default()),
+                None,
+            )
+            .await
         });
         let mut buf = [0; 512];
         for _ in 0..2 {
@@ -746,7 +834,15 @@ mod candidate_tests {
         .unwrap();
         let scan_path = path.clone();
         let task = tokio::spawn(async move {
-            scan_sni_list(&scan_path, Duration::from_secs(10), config, network, None).await
+            scan_sni_list(
+                &scan_path,
+                Duration::from_secs(10),
+                config,
+                network,
+                Arc::new(crate::cloudflare::ScanFilter::default()),
+                None,
+            )
+            .await
         });
         let mut buf = [0; 512];
         let query = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buf)).await;
@@ -767,7 +863,15 @@ mod candidate_tests {
         std::fs::write(&path, content).unwrap();
         let scan_path = path.clone();
         let task = tokio::spawn(async move {
-            scan_sni_list(&scan_path, Duration::from_secs(10), config, network, None).await
+            scan_sni_list(
+                &scan_path,
+                Duration::from_secs(10),
+                config,
+                network,
+                Arc::new(crate::cloudflare::ScanFilter::default()),
+                None,
+            )
+            .await
         });
         let mut buf = [0; 512];
         let query = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buf)).await;

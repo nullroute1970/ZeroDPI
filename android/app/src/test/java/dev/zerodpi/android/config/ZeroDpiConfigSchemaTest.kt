@@ -10,6 +10,19 @@ import java.io.File
 
 class ZeroDpiConfigSchemaTest {
     @Test
+    fun cloudflareOnlyDefaultsEnabledAndSupportsDisabling() {
+        val base = "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\n"
+        val defaults = ZeroDpiConfigToml.analyze(base)
+        assertTrue(defaults.config.boolean("CLOUDFLARE_ONLY"))
+        assertEquals("true", defaults.valueFor("CLOUDFLARE_ONLY"))
+        val updated = ZeroDpiConfigToml.replaceOrAppendField(base, "CLOUDFLARE_ONLY", "false")
+        val disabled = ZeroDpiConfigToml.analyze(updated)
+        assertTrue("${disabled.issues}", disabled.canStart)
+        assertFalse(disabled.config.boolean("CLOUDFLARE_ONLY"))
+        assertEquals("false", disabled.valueFor("CLOUDFLARE_ONLY"))
+    }
+
+    @Test
     fun customDnsListSupportsOrderedRoundTripAndLegacyPrecedence() {
         val original = """
             LISTEN_HOST = "127.0.0.1"

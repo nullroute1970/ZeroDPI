@@ -27,7 +27,7 @@ class SupportBundleSanitizerTest {
             LISTEN_PORT = 44444
             SELECTED_SNI = "private.example.com"
             SELECTED_IP = "203.0.113.10"
-            CUSTOM_DNS_SERVER = "10.0.0.53"
+            CUSTOM_DNS_SERVERS = ["10.0.0.53"]
             SNI_LIST = "production_sni_list.txt"
             IP_LIST = "production_ip_list.txt"
             PROXY_TEST_URL = "https://private.example.com/probe"
@@ -37,7 +37,7 @@ class SupportBundleSanitizerTest {
         assertTrue(sanitized.contains("LISTEN_PORT = 44444"))
         assertTrue(sanitized.contains("SELECTED_SNI = \"<redacted>\""))
         assertTrue(sanitized.contains("SELECTED_IP = \"<redacted>\""))
-        assertTrue(sanitized.contains("CUSTOM_DNS_SERVER = \"<redacted>\""))
+        assertTrue(sanitized.contains("CUSTOM_DNS_SERVERS = \"<redacted>\""))
         assertTrue(sanitized.contains("SNI_LIST = \"<redacted>\""))
         assertTrue(sanitized.contains("IP_LIST = \"<redacted>\""))
         assertTrue(sanitized.contains("PROXY_TEST_URL = \"<redacted>\""))

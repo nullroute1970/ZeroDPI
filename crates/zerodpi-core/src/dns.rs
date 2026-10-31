@@ -116,12 +116,12 @@ impl DnsResolver {
 pub fn parse_custom_dns_server(value: &str) -> Result<SocketAddr> {
     let value = value.trim();
     if value.is_empty() {
-        anyhow::bail!("CUSTOM_DNS_SERVER must not be empty");
+        anyhow::bail!("DNS server must not be empty");
     }
 
     if let Ok(addr) = value.parse::<SocketAddr>() {
         if addr.port() == 0 {
-            anyhow::bail!("CUSTOM_DNS_SERVER port must be greater than 0");
+            anyhow::bail!("DNS server port must be greater than 0");
         }
         return Ok(addr);
     }
@@ -130,7 +130,7 @@ pub fn parse_custom_dns_server(value: &str) -> Result<SocketAddr> {
         return Ok(SocketAddr::new(ip, DEFAULT_DNS_PORT));
     }
 
-    anyhow::bail!("CUSTOM_DNS_SERVER '{value}' must be a literal IP address with an optional port")
+    anyhow::bail!("DNS server '{value}' must be a literal IP address with an optional port")
 }
 
 #[cfg(test)]
@@ -182,7 +182,7 @@ mod tests {
             LISTEN_HOST = "127.0.0.1"
             LISTEN_PORT = 44444
             CUSTOM_DNS_ENABLED = true
-            CUSTOM_DNS_SERVER = "{server}"
+            CUSTOM_DNS_SERVERS = ["{server}"]
             "#
         ))
         .unwrap();
@@ -202,7 +202,7 @@ mod tests {
             LISTEN_HOST = "127.0.0.1"
             LISTEN_PORT = 44444
             CUSTOM_DNS_ENABLED = true
-            CUSTOM_DNS_SERVER = "{server}"
+            CUSTOM_DNS_SERVERS = ["{server}"]
             "#
         ))
         .unwrap();
@@ -243,7 +243,7 @@ mod tests {
             LISTEN_HOST = "127.0.0.1"
             LISTEN_PORT = 44444
             CUSTOM_DNS_ENABLED = true
-            CUSTOM_DNS_SERVER = "{addr}"
+            CUSTOM_DNS_SERVERS = ["{addr}"]
             "#
         ))
         .unwrap();

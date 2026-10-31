@@ -318,19 +318,11 @@ object ZeroDpiConfigSchema {
             helpText = "Resolve SNI hostnames through custom plain-DNS servers in order.",
         ),
         field(
-            name = "CUSTOM_DNS_SERVER",
-            type = ConfigFieldType.OptionalText,
-            defaultValue = "",
-            section = ConfigSection.DnsResolution,
-            validationRule = "When enabled and CUSTOM_DNS_SERVERS is empty, a literal IPv4/IPv6 address with an optional non-zero port.",
-            helpText = "Legacy DNS endpoint used when the DNS server list is empty; omitted ports default to 53.",
-        ),
-        field(
             name = "CUSTOM_DNS_SERVERS",
             type = ConfigFieldType.StringList,
             defaultValue = "[]",
             section = ConfigSection.DnsResolution,
-            validationRule = "An ordered TOML array of literal IPv4/IPv6 addresses with optional non-zero ports. Overrides CUSTOM_DNS_SERVER when nonempty.",
+            validationRule = "An ordered TOML array of literal IPv4/IPv6 addresses with optional non-zero ports. Must not be empty when custom DNS is enabled.",
             helpText = "DNS servers to try in order, with an independent scan timeout for each server.",
         ),
         field(
@@ -1395,19 +1387,16 @@ object ZeroDpiConfigToml {
             "CUSTOM_DNS_SERVERS" !in invalidFields
         ) {
             val servers = parseTomlStringArray(config.text("CUSTOM_DNS_SERVERS")).orEmpty()
-            if (servers.isNotEmpty()) {
-                servers.forEachIndexed { index, server ->
-                    requireField(
-                        "CUSTOM_DNS_SERVERS",
-                        isValidCustomDnsServer(server),
-                        "CUSTOM_DNS_SERVERS[$index] must be a literal IP address with an optional non-zero port.",
-                    )
-                }
-            } else if ("CUSTOM_DNS_SERVER" !in invalidFields) {
+            requireField(
+                "CUSTOM_DNS_SERVERS",
+                servers.isNotEmpty(),
+                "CUSTOM_DNS_SERVERS must not be empty when CUSTOM_DNS_ENABLED is true.",
+            )
+            servers.forEachIndexed { index, server ->
                 requireField(
-                    "CUSTOM_DNS_SERVER",
-                    isValidCustomDnsServer(config.text("CUSTOM_DNS_SERVER")),
-                    "CUSTOM_DNS_SERVERS or CUSTOM_DNS_SERVER must provide a literal IP address with an optional non-zero port.",
+                    "CUSTOM_DNS_SERVERS",
+                    isValidCustomDnsServer(server),
+                    "CUSTOM_DNS_SERVERS[$index] must be a literal IP address with an optional non-zero port.",
                 )
             }
         }

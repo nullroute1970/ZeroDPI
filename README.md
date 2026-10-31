@@ -865,7 +865,6 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 |-------|------|---------|-------------|
 | `CUSTOM_DNS_ENABLED` | `bool` | `false` | Resolve SNI hostnames only through the configured custom DNS servers |
 | `CUSTOM_DNS_SERVERS` | `string[]` | `[]` | Ordered plain-DNS servers; each accepts a literal IPv4/IPv6 address and optional port (default `53`) |
-| `CUSTOM_DNS_SERVER` | `string` | — | Legacy single server, used when `CUSTOM_DNS_SERVERS` is empty or omitted |
 
 System DNS remains the default. To use a custom resolver for `SNI_LIST` scans,
 background rescans, proxy scans, and `SELECTED_SNI`, configure:
@@ -882,9 +881,9 @@ results from multiple servers are not combined. Each server gets an independent
 `SCAN_TIMEOUT_SECS` deadline covering its UDP/TCP attempts, so three servers with
 a five-second timeout can take about fifteen seconds to resolve a hostname.
 
-A nonempty `CUSTOM_DNS_SERVERS` list overrides `CUSTOM_DNS_SERVER`. Existing
-single-server configurations remain supported. Custom mode does not fall back
-to system DNS or the hosts file if all configured servers fail.
+`CUSTOM_DNS_SERVERS` must contain at least one server when `CUSTOM_DNS_ENABLED`
+is true. For a single server, use a one-element array such as `["1.1.1.1"]`.
+Custom mode does not fall back to system DNS or the hosts file if all configured servers fail.
 Explicit ports use `1.1.1.1:5353` or `[2606:4700:4700::1111]:5353`.
 
 TUN clients such as sing-box can still intercept or route DNS traffic. To reach

@@ -668,7 +668,7 @@ mod candidate_tests {
         let filter = Arc::new(ScanFilter::load(true, dir.path().join("config.toml")).unwrap());
         let mut cfg = crate::config::test_support::minimal_config();
         cfg.CUSTOM_DNS_ENABLED = true;
-        cfg.CUSTOM_DNS_SERVER = Some(dns.addr.to_string());
+        cfg.CUSTOM_DNS_SERVERS = vec![dns.addr.to_string()];
         let cfg = Arc::new(cfg);
         let binder = Arc::new(CountingBinder(AtomicUsize::new(0)));
         let network = OutboundNetwork::new(
@@ -750,7 +750,7 @@ mod candidate_tests {
             .unwrap();
         let mut config = crate::config::test_support::minimal_config();
         config.CUSTOM_DNS_ENABLED = true;
-        config.CUSTOM_DNS_SERVER = Some(server.local_addr().unwrap().to_string());
+        config.CUSTOM_DNS_SERVERS = vec![server.local_addr().unwrap().to_string()];
         config.SNI_MAX_CONCURRENT = 2;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snis.txt");

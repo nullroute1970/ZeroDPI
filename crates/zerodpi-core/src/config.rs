@@ -499,13 +499,9 @@ pub struct Config {
     #[serde(default)]
     pub CUSTOM_DNS_ENABLED: bool,
 
-    /// Plain DNS server used when `CUSTOM_DNS_ENABLED` is true.
+    /// Ordered custom DNS servers; required when `CUSTOM_DNS_ENABLED` is true.
     /// Accepts a literal IPv4 or IPv6 address with an optional port; when the
     /// port is omitted, port 53 is used.
-    #[serde(default, deserialize_with = "empty_string_as_none")]
-    pub CUSTOM_DNS_SERVER: Option<String>,
-
-    /// Ordered custom DNS servers. A nonempty list overrides CUSTOM_DNS_SERVER.
     #[serde(default)]
     pub CUSTOM_DNS_SERVERS: Vec<String>,
 
@@ -1641,21 +1637,17 @@ impl Config {
         if !self.CUSTOM_DNS_ENABLED {
             return Ok(Vec::new());
         }
-        if !self.CUSTOM_DNS_SERVERS.is_empty() {
-            return self
-                .CUSTOM_DNS_SERVERS
-                .iter()
-                .enumerate()
-                .map(|(index, server)| {
-                    crate::dns::parse_custom_dns_server(server)
-                        .with_context(|| format!("CUSTOM_DNS_SERVERS[{index}]"))
-                })
-                .collect();
+        if self.CUSTOM_DNS_SERVERS.is_empty() {
+            anyhow::bail!("CUSTOM_DNS_SERVERS must not be empty when CUSTOM_DNS_ENABLED is true");
         }
-        let server = self.CUSTOM_DNS_SERVER.as_deref().context(
-            "CUSTOM_DNS_SERVERS or CUSTOM_DNS_SERVER is required when CUSTOM_DNS_ENABLED is true",
-        )?;
-        Ok(vec![crate::dns::parse_custom_dns_server(server)?])
+        self.CUSTOM_DNS_SERVERS
+            .iter()
+            .enumerate()
+            .map(|(index, server)| {
+                crate::dns::parse_custom_dns_server(server)
+                    .with_context(|| format!("CUSTOM_DNS_SERVERS[{index}]"))
+            })
+            .collect()
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -4512,12 +4504,12 @@ mod tests {
         .unwrap();
 
         assert!(!cfg.CUSTOM_DNS_ENABLED);
-        assert_eq!(cfg.CUSTOM_DNS_SERVER, None);
+        assert!(cfg.CUSTOM_DNS_SERVERS.is_empty());
         assert!(cfg.validate().is_ok());
     }
 
     #[test]
-    fn custom_dns_list_accepts_multiple_servers_without_legacy_field() {
+    fn custom_dns_list_accepts_multiple_servers() {
         let cfg: Config = toml::from_str(
             "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\nCUSTOM_DNS_ENABLED = true\nCUSTOM_DNS_SERVERS = [\"1.1.1.1\", \"[::1]:5353\"]",
         ).unwrap();
@@ -4532,26 +4524,12 @@ mod tests {
     }
 
     #[test]
-    fn custom_dns_list_takes_precedence_over_invalid_legacy_server() {
-        let cfg: Config = toml::from_str(
-            "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\nCUSTOM_DNS_ENABLED = true\nCUSTOM_DNS_SERVER = \"invalid\"\nCUSTOM_DNS_SERVERS = [\"1.1.1.1\"]",
-        ).unwrap();
-        assert!(cfg.validate().is_ok());
-        assert_eq!(
-            cfg.custom_dns_servers().unwrap(),
-            vec!["1.1.1.1:53".parse::<SocketAddr>().unwrap()]
-        );
-    }
-
-    #[test]
-    fn empty_custom_dns_list_uses_legacy_server_and_disabled_mode_ignores_endpoints() {
+    fn empty_custom_dns_list_is_rejected_and_disabled_mode_ignores_endpoints() {
         let mut cfg: Config = toml::from_str(
-            "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\nCUSTOM_DNS_ENABLED = true\nCUSTOM_DNS_SERVER = \"1.1.1.1:5353\"\nCUSTOM_DNS_SERVERS = []",
+            "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\nCUSTOM_DNS_ENABLED = true\nCUSTOM_DNS_SERVERS = []",
         ).unwrap();
-        assert_eq!(
-            cfg.custom_dns_servers().unwrap(),
-            vec!["1.1.1.1:5353".parse::<SocketAddr>().unwrap()]
-        );
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("CUSTOM_DNS_SERVERS"), "{error}");
         cfg.CUSTOM_DNS_ENABLED = false;
         cfg.CUSTOM_DNS_SERVERS = vec!["ignored-invalid".into()];
         assert!(cfg.validate().is_ok());
@@ -4559,10 +4537,10 @@ mod tests {
     }
 
     #[test]
-    fn custom_dns_list_rejects_invalid_entries_even_with_valid_legacy_server() {
+    fn custom_dns_list_rejects_invalid_entries() {
         for entry in ["", "dns.example.com", "1.1.1.1:0", "[::1]:0"] {
             let cfg: Config = toml::from_str(&format!(
-                "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\nCUSTOM_DNS_ENABLED = true\nCUSTOM_DNS_SERVER = \"1.1.1.1\"\nCUSTOM_DNS_SERVERS = [{entry:?}]",
+                "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\nCUSTOM_DNS_ENABLED = true\nCUSTOM_DNS_SERVERS = [{entry:?}]",
             )).unwrap();
             assert!(cfg.validate().is_err(), "accepted {entry:?}");
         }
@@ -4581,7 +4559,7 @@ mod tests {
                 LISTEN_HOST = "127.0.0.1"
                 LISTEN_PORT = 44444
                 CUSTOM_DNS_ENABLED = true
-                CUSTOM_DNS_SERVER = "{server}"
+                CUSTOM_DNS_SERVERS = ["{server}"]
                 "#
             );
             let cfg: Config = toml::from_str(&toml_str).unwrap();
@@ -4593,9 +4571,10 @@ mod tests {
     fn rejects_missing_or_invalid_enabled_custom_dns_server() {
         for server_line in [
             "",
-            "CUSTOM_DNS_SERVER = \"\"",
-            "CUSTOM_DNS_SERVER = \"dns.example.com\"",
-            "CUSTOM_DNS_SERVER = \"1.1.1.1:0\"",
+            "CUSTOM_DNS_SERVERS = []",
+            "CUSTOM_DNS_SERVERS = [\"\"]",
+            "CUSTOM_DNS_SERVERS = [\"dns.example.com\"]",
+            "CUSTOM_DNS_SERVERS = [\"1.1.1.1:0\"]",
         ] {
             let toml_str = format!(
                 r#"

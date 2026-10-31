@@ -23,12 +23,11 @@ class ZeroDpiConfigSchemaTest {
     }
 
     @Test
-    fun customDnsListSupportsOrderedRoundTripAndLegacyPrecedence() {
+    fun customDnsListSupportsOrderedRoundTrip() {
         val original = """
             LISTEN_HOST = "127.0.0.1"
             LISTEN_PORT = 44444
             CUSTOM_DNS_ENABLED = true
-            CUSTOM_DNS_SERVER = "invalid-legacy"
             CUSTOM_DNS_SERVERS = ["1.1.1.1", "[::1]:5353"]
         """.trimIndent()
         val editor = ZeroDpiConfigToml.analyze(original)
@@ -42,13 +41,13 @@ class ZeroDpiConfigSchemaTest {
     }
 
     @Test
-    fun customDnsListValidatesEntriesAndFallsBackToLegacyWhenEmpty() {
-        val base = "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\nCUSTOM_DNS_ENABLED = true\nCUSTOM_DNS_SERVER = \"1.1.1.1\"\n"
-        for (array in listOf("[]", "[\"1.1.1.1\"]", "[\"::1\", \"1.1.1.1:5353\"]")) {
+    fun customDnsListValidatesEntriesAndRejectsEmptyList() {
+        val base = "LISTEN_HOST = \"127.0.0.1\"\nLISTEN_PORT = 44444\nCUSTOM_DNS_ENABLED = true\n"
+        for (array in listOf("[\"1.1.1.1\"]", "[\"::1\", \"1.1.1.1:5353\"]")) {
             val state = ZeroDpiConfigToml.analyze(base + "CUSTOM_DNS_SERVERS = $array")
             assertTrue("${state.issues}", state.canStart)
         }
-        for (array in listOf("[\"\"]", "[\"dns.example.com\"]", "[\"1.1.1.1:0\"]", "[1]")) {
+        for (array in listOf("[]", "[\"\"]", "[\"dns.example.com\"]", "[\"1.1.1.1:0\"]", "[1]")) {
             val state = ZeroDpiConfigToml.analyze(base + "CUSTOM_DNS_SERVERS = $array")
             assertFalse("Accepted $array", state.canStart)
             assertTrue(state.issues.any { it.fieldName == "CUSTOM_DNS_SERVERS" })
@@ -132,11 +131,10 @@ class ZeroDpiConfigSchemaTest {
             LISTEN_HOST = "127.0.0.1"
             LISTEN_PORT = 44444
             CUSTOM_DNS_ENABLED = true
-            CUSTOM_DNS_SERVER = ""
             """.trimIndent(),
         )
         assertFalse(missingServer.canStart)
-        assertTrue(missingServer.issues.any { it.fieldName == "CUSTOM_DNS_SERVER" })
+        assertTrue(missingServer.issues.any { it.fieldName == "CUSTOM_DNS_SERVERS" })
 
         for (server in listOf("1.1.1.1", "1.1.1.1:5353", "2606:4700:4700::1111", "[2606:4700:4700::1111]:5353")) {
             val validServer = ZeroDpiConfigToml.analyze(
@@ -144,7 +142,7 @@ class ZeroDpiConfigSchemaTest {
                 LISTEN_HOST = "127.0.0.1"
                 LISTEN_PORT = 44444
                 CUSTOM_DNS_ENABLED = true
-                CUSTOM_DNS_SERVER = "$server"
+                CUSTOM_DNS_SERVERS = ["$server"]
                 """.trimIndent(),
             )
             assertTrue("Unexpected issues for $server: ${validServer.issues}", validServer.canStart)
@@ -156,7 +154,7 @@ class ZeroDpiConfigSchemaTest {
                 LISTEN_HOST = "127.0.0.1"
                 LISTEN_PORT = 44444
                 CUSTOM_DNS_ENABLED = true
-                CUSTOM_DNS_SERVER = "$server"
+                CUSTOM_DNS_SERVERS = ["$server"]
                 """.trimIndent(),
             )
             assertFalse("Accepted invalid DNS server $server", invalidServer.canStart)

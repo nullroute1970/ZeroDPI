@@ -197,6 +197,7 @@ pub fn run_scan_progress(
     terminal: &mut Term,
     rx: &mut mpsc::UnboundedReceiver<SniProbeEntry>,
     total_hostnames: usize,
+    cfg: &Config,
 ) -> anyhow::Result<(Vec<SniProbeEntry>, bool)> {
     let mut arrived: Vec<SniProbeEntry> = Vec::new();
 
@@ -210,13 +211,13 @@ pub fn run_scan_progress(
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     // Scanner finished – draw one final frame and return.
-                    draw_scan_progress(terminal, &arrived, total_hostnames)?;
+                    draw_scan_progress(terminal, &arrived, total_hostnames, cfg)?;
                     return Ok((arrived, false));
                 }
             }
         }
 
-        draw_scan_progress(terminal, &arrived, total_hostnames)?;
+        draw_scan_progress(terminal, &arrived, total_hostnames, cfg)?;
 
         // Poll for user input (Ctrl-C / q to abort).
         if event::poll(Duration::from_millis(100))? {
@@ -237,6 +238,7 @@ fn draw_scan_progress(
     terminal: &mut Term,
     arrived: &[SniProbeEntry],
     total_hostnames: usize,
+    cfg: &Config,
 ) -> anyhow::Result<()> {
     let done = arrived.len();
     terminal.draw(|frame| {
@@ -252,7 +254,15 @@ fn draw_scan_progress(
             .split(area);
 
         // Header
-        let header = Paragraph::new("ZeroDPI — Scanning SNIs…")
+        let title = match cfg.SNI_TARGET_SOURCE {
+            zerodpi_core::config::SniTargetSource::SniList => "ZeroDPI — Scanning SNIs…".to_owned(),
+            zerodpi_core::config::SniTargetSource::IpList => format!(
+                "ZeroDPI — Scanning {} with SNI {}",
+                cfg.IP_LIST,
+                cfg.SELECTED_SNI.as_deref().unwrap_or("")
+            ),
+        };
+        let header = Paragraph::new(title)
             .style(
                 Style::default()
                     .fg(Color::Cyan)
@@ -272,7 +282,13 @@ fn draw_scan_progress(
             .block(Block::default().borders(Borders::ALL).title(" Progress "))
             .gauge_style(Style::default().fg(Color::Green))
             .ratio(ratio)
-            .label(format!("{done} probes done (~{total_hostnames} hostnames)"));
+            .label(
+                if cfg.SNI_TARGET_SOURCE == zerodpi_core::config::SniTargetSource::IpList {
+                    format!("{done} / {total_hostnames} IPs probed")
+                } else {
+                    format!("{done} probes done (~{total_hostnames} hostnames)")
+                },
+            );
         frame.render_widget(gauge, chunks[1]);
 
         // Results so far

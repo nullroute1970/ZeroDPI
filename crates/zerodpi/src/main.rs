@@ -3,7 +3,8 @@
 //! Start-up flow:
 //!   1. Load `config.toml`.
 //!   2. Read `sni_list.txt` (or the path set in `SNI_LIST`).
-//!   3. If `SELECTED_SNI` is set, skip scanning; resolve the IP from DNS.
+//!   3. With sni_list, SELECTED_SNI skips scanning and resolves through DNS.
+//!      With ip_list, scan explicit IPv4 candidates using the fixed SELECTED_SNI.
 //!   4. Otherwise scan all SNIs concurrently (DNS → TCP → TLS → HTTP) and
 //!      show the ratatui progress view, then either auto-select the top result
 //!      (`AUTO_SELECT = true`) or show the selection table.
@@ -18,6 +19,7 @@ mod manual_rescan;
 mod network_recovery;
 mod reload;
 mod runtime_events;
+mod sni_target_scan;
 mod target_selection;
 mod tui;
 
@@ -35,6 +37,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
+use sni_target_scan::{retain_selectable, PreparedSniScan};
 use zerodpi_core::cloudflare::ScanFilter;
 use zerodpi_core::config::{BypassMethodList, Config};
 use zerodpi_core::dns::DnsResolver;
@@ -57,7 +60,7 @@ use zerodpi_core::proxy_tester::{
     failed_candidate_entry, test_candidate_full, test_candidate_with_flow_controller,
     ProxyTestEntry,
 };
-use zerodpi_core::sni_scanner::{scan_sni_list, SniProbeEntry};
+use zerodpi_core::sni_scanner::SniProbeEntry;
 use zerodpi_core::target_pool::{
     ip_candidates, sni_candidates, SelectionStrategy, Target, TargetPool,
 };
@@ -127,7 +130,7 @@ struct Args {
     /// Emit newline-delimited JSON runtime events to stdout; implies --no-tui.
     #[arg(long)]
     json_events: bool,
-    /// Override `SELECTED_SNI` — skip scanning and use this hostname.
+    /// Override SELECTED_SNI: DNS shortcut for sni_list, fixed hostname for ip_list.
     #[arg(long)]
     sni: Option<String>,
     /// Override `BYPASS_METHOD` — a single method or a comma-separated list
@@ -413,7 +416,7 @@ fn run_config(
     }
 
     // ---- resolve SNI list path relative to the config file ----
-    let sni_list_path = reload::relative_path(&cfg_path, &cfg.SNI_LIST);
+    let sni_scan_path = reload::relative_path(&cfg_path, cfg.sni_scan_list());
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
 
@@ -444,7 +447,8 @@ fn run_config(
         (pool, selected)
     } else {
         // ---- step 1: obtain a sorted list of probe results ----
-        let sorted_entries: Vec<SniProbeEntry> = if let Some(ref forced_sni) = cfg.SELECTED_SNI {
+        let mut sorted_entries: Vec<SniProbeEntry> = if cfg.selected_sni_uses_dns() {
+            let forced_sni = cfg.SELECTED_SNI.as_ref().expect("fixed DNS SNI");
             // Skip scanning; just resolve the forced SNI.
             info!(sni = %forced_sni, "SELECTED_SNI set — skipping scan");
             let sni = forced_sni.clone();
@@ -452,8 +456,8 @@ fn run_config(
             rt.block_on(async move { resolve_single_sni(&sni, &resolver).await })
                 .with_context(|| format!("resolving SELECTED_SNI '{}'", forced_sni))?
         } else {
-            info!(path = %sni_list_path.display(), "scanning SNI list");
-            let path = sni_list_path.clone();
+            info!(path = %sni_scan_path.display(), source = ?cfg.SNI_TARGET_SOURCE, "scanning SNI targets");
+            let path = sni_scan_path.clone();
             let cfg_clone = cfg.clone();
             let entries = if no_tui {
                 let entries = rt.block_on(scan_sni_list_headless(
@@ -485,25 +489,20 @@ fn run_config(
             if entries.is_empty() {
                 anyhow::bail!(
                     "no reachable SNI candidates found in {}",
-                    sni_list_path.display()
+                    sni_scan_path.display()
                 );
             }
             entries
         };
 
-        let balanced_targets = if cfg.LOAD_BALANCE_ENABLED {
-            if cfg.SELECTED_SNI.is_some() {
-                sorted_entries
-                    .first()
-                    .map(Target::from_sni)
-                    .into_iter()
-                    .collect()
-            } else {
-                sni_candidates(&sorted_entries, cfg.LOAD_BALANCE_TARGET_COUNT, 1)
-            }
-        } else {
-            Vec::new()
-        };
+        retain_selectable(&cfg, &mut sorted_entries);
+        anyhow::ensure!(
+            !sorted_entries.is_empty(),
+            "no selectable SNI/IP targets in {} (TCP success and positive score required)",
+            sni_scan_path.display()
+        );
+
+        let balanced_targets = sni_target_scan::balanced_targets(&cfg, &sorted_entries);
         if cfg.LOAD_BALANCE_ENABLED && balanced_targets.is_empty() {
             anyhow::bail!(
                 "no valid SNI targets for load balancing (TCP success and positive score required)"
@@ -511,7 +510,7 @@ fn run_config(
         }
 
         // ---- step 2: select a candidate ----
-        if no_tui && !cfg.AUTO_SELECT && !cfg.LOAD_BALANCE_ENABLED && cfg.SELECTED_SNI.is_none() {
+        if no_tui && !cfg.AUTO_SELECT && !cfg.LOAD_BALANCE_ENABLED && !cfg.selected_sni_uses_dns() {
             warn!("--no-tui cannot show the selection table; auto-selecting rank-1");
         }
         let selected: SniProbeEntry = if cfg.LOAD_BALANCE_ENABLED {
@@ -524,7 +523,7 @@ fn run_config(
                 })
                 .context("missing ranked SNI target")?
                 .clone()
-        } else if cfg.AUTO_SELECT || cfg.SELECTED_SNI.is_some() || no_tui {
+        } else if sni_target_scan::select_automatically(&cfg, no_tui) {
             let best = sorted_entries
                 .into_iter()
                 .next()
@@ -732,7 +731,7 @@ fn run_config(
     // ---- step 4: optional background rescan ----
     let probe_target = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(connect_ip)));
     let rescan_cfg = cfg.clone();
-    let rescan_path = sni_list_path.clone();
+    let rescan_path = sni_scan_path.clone();
     let (mut manual_control, manual_worker) = manual_rescan::channel();
     if cfg.RESCAN_INTERVAL_SECS > 0 || !no_tui {
         let interval = cfg.RESCAN_INTERVAL_SECS;
@@ -813,7 +812,7 @@ fn run_config(
         });
 
     let cfg_rescan = cfg.clone();
-    let rescan_path = sni_list_path.clone();
+    let rescan_path = sni_scan_path.clone();
     let rescan_target = active_target.clone();
     let rescan_discovery = low_ttl_discovery_state.clone();
     let rescan_event_tx = event_tx.clone();
@@ -861,7 +860,7 @@ fn run_config(
     let coordinator = network_recovery::RecoveryCoordinator::new(
         recovery_env,
         probe_target,
-        (cfg.AUTO_SELECT || cfg.LOAD_BALANCE_ENABLED) && cfg.SELECTED_SNI.is_none(),
+        (cfg.AUTO_SELECT || cfg.LOAD_BALANCE_ENABLED) && !cfg.selected_sni_uses_dns(),
         Some(interface_binding.current()),
     );
     rt.spawn(coordinator.run(monitor.events()));
@@ -964,20 +963,18 @@ async fn scan_sni_list_with_progress(
     network: OutboundNetwork,
     terminal: &mut tui::Term,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
-    let filter = cfg.scan_filter()?;
-    let total_hostnames = count_hostnames(path, cfg.DEDUPLICATE_SCAN_LISTS);
-    let path_owned = path.to_owned();
+    let input = PreparedSniScan::new(&cfg, path)?;
+    let total_hostnames = input.total;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
 
     // Spawn scanner; it sends each result over `tx` as it arrives.
     let cfg_clone = cfg.clone();
     let network = network.clone();
-    let scan_handle = tokio::spawn(async move {
-        scan_sni_list(&path_owned, timeout, cfg_clone, network, filter, Some(tx)).await
-    });
+    let scan_handle =
+        tokio::spawn(async move { input.run(timeout, cfg_clone, network, Some(tx)).await });
 
-    let (arrived, aborted) = tui::run_scan_progress(terminal, &mut rx, total_hostnames)?;
+    let (arrived, aborted) = tui::run_scan_progress(terminal, &mut rx, total_hostnames, &cfg)?;
 
     // Obtain the authoritative sorted list.
     let sorted = if scan_handle.is_finished() {
@@ -986,6 +983,7 @@ async fn scan_sni_list_with_progress(
     } else {
         // User aborted early — stop the scan and sort what arrived.
         scan_handle.abort();
+        let _ = scan_handle.await;
         if aborted {
             info!(
                 "scan aborted by user — using {} results collected so far",
@@ -1030,8 +1028,8 @@ async fn scan_sni_list_headless(
     events: &RuntimeEventEmitter,
     scan: ScanKind,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
-    let filter = cfg.scan_filter()?;
-    let total = count_hostnames(path, cfg.DEDUPLICATE_SCAN_LISTS);
+    let input = PreparedSniScan::new(&cfg, path)?;
+    let total = input.total;
     events.emit(RuntimeEvent::ScanStarted {
         scan,
         path: Some(path.display().to_string()),
@@ -1039,7 +1037,7 @@ async fn scan_sni_list_headless(
     });
 
     if !events.enabled() {
-        let entries = scan_sni_list(path, timeout, cfg, network, filter, None).await?;
+        let entries = input.run(timeout, cfg, network, None).await?;
         events.emit(RuntimeEvent::ScanCompleted {
             scan,
             results: entries.len(),
@@ -1065,8 +1063,9 @@ async fn scan_sni_list_headless(
         }
     });
 
-    let entries = scan_sni_list(path, timeout, cfg, network, filter, Some(tx)).await?;
+    let result = input.run(timeout, cfg, network, Some(tx)).await;
     let _ = progress_handle.await;
+    let entries = result?;
     events.emit(RuntimeEvent::ScanCompleted {
         scan,
         results: entries.len(),
@@ -1360,7 +1359,7 @@ async fn rescan_sni_once(
     probe_target: &std::sync::atomic::AtomicU32,
     manual: Option<&manual_rescan::Worker>,
 ) -> network_recovery::RescanOutcome {
-    if cfg.LOAD_BALANCE_ENABLED && cfg.SELECTED_SNI.is_some() {
+    if cfg.LOAD_BALANCE_ENABLED && cfg.selected_sni_uses_dns() {
         events.emit(RuntimeEvent::RescanFinished {
             scan: ScanKind::Sni,
             found: active_target.len(),
@@ -1404,12 +1403,14 @@ async fn rescan_sni_once(
     let mut scan_summary: Option<(usize, Option<u8>)> = None;
     let cfg_clone = cfg.clone();
     match async {
-        let filter = cfg_clone.scan_filter()?;
-        scan_sni_list(&path, scan_timeout, cfg_clone, network, filter, None).await
+        PreparedSniScan::new(&cfg_clone, &path)?
+            .run(scan_timeout, cfg_clone, network, None)
+            .await
     }
     .await
     {
-        Ok(entries) => {
+        Ok(mut entries) => {
+            retain_selectable(&cfg, &mut entries);
             scan_summary = Some((entries.len(), entries.first().map(|e| e.score)));
             if headless {
                 info!(
@@ -3074,65 +3075,33 @@ fn sni_scan_main(
     no_tui: bool,
     events: RuntimeEventEmitter,
 ) -> Result<()> {
-    let sni_list_path = reload::relative_path(&cfg_path, &cfg.SNI_LIST);
+    let sni_scan_path = reload::relative_path(&cfg_path, cfg.sni_scan_list());
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
 
-    info!(path = %sni_list_path.display(), "sni_scan: scanning SNI list");
+    info!(path = %sni_scan_path.display(), "sni_scan: scanning SNI targets");
 
-    let total_hostnames = count_hostnames(&sni_list_path, cfg.DEDUPLICATE_SCAN_LISTS);
-    let path = sni_list_path.clone();
-    let cfg_clone = cfg.clone();
     let sorted = if no_tui {
         rt.block_on(scan_sni_list_headless(
-            cfg_clone,
-            &path,
+            cfg.clone(),
+            &sni_scan_path,
             scan_timeout,
             scan_network.clone(),
             &events,
             ScanKind::Sni,
         ))?
     } else {
-        let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
-        let filter = cfg_clone.scan_filter()?;
-        let scan_handle = rt.spawn(async move {
-            scan_sni_list(
-                &path,
-                scan_timeout,
-                cfg_clone,
-                scan_network,
-                filter,
-                Some(tx),
-            )
-            .await
-        });
-
         let mut terminal = tui::enter_tui()?;
-        let (arrived, aborted) = tui::run_scan_progress(&mut terminal, &mut rx, total_hostnames)?;
+        let result = rt.block_on(scan_sni_list_with_progress(
+            cfg.clone(),
+            &sni_scan_path,
+            scan_timeout,
+            scan_network.clone(),
+            &mut terminal,
+        ));
         tui::leave_tui(terminal)?;
-
-        if scan_handle.is_finished() {
-            rt.block_on(scan_handle)
-                .context("scanner task panicked")??
-        } else {
-            scan_handle.abort();
-            if aborted {
-                info!(
-                    "sni_scan aborted — using {} results collected so far",
-                    arrived.len()
-                );
-            }
-            let mut e = arrived;
-            e.sort_by(|a, b| {
-                b.score.cmp(&a.score).then(
-                    a.tcp_latency_ms
-                        .unwrap_or(u64::MAX)
-                        .cmp(&b.tcp_latency_ms.unwrap_or(u64::MAX)),
-                )
-            });
-            e
-        }
+        result?
     };
 
     info!("sni_scan complete — {} (SNI, IP) pairs", sorted.len());
@@ -3274,66 +3243,36 @@ fn sni_method_scan_main(
     no_tui: bool,
     events: RuntimeEventEmitter,
 ) -> Result<()> {
-    let sni_list_path = reload::relative_path(&cfg_path, &cfg.SNI_LIST);
+    let sni_scan_path = reload::relative_path(&cfg_path, cfg.sni_scan_list());
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
-    info!(path = %sni_list_path.display(), "sni_method_scan: Phase 0 — scanning SNI list");
+    info!(path = %sni_scan_path.display(), "sni_method_scan: Phase 0 — scanning SNI targets");
 
     let sorted = if no_tui {
         rt.block_on(scan_sni_list_headless(
             cfg.clone(),
-            &sni_list_path,
+            &sni_scan_path,
             scan_timeout,
             scan_network.clone(),
             &events,
             ScanKind::Sni,
         ))?
     } else {
-        let total_hostnames = count_hostnames(&sni_list_path, cfg.DEDUPLICATE_SCAN_LISTS);
-        let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
-        let path = sni_list_path.clone();
-        let cfg_clone = cfg.clone();
-        let filter = cfg_clone.scan_filter()?;
-        let scan_handle = rt.spawn(async move {
-            scan_sni_list(
-                &path,
-                scan_timeout,
-                cfg_clone,
-                scan_network,
-                filter,
-                Some(tx),
-            )
-            .await
-        });
-
         let mut terminal = tui::enter_tui()?;
-        let (arrived, aborted) = tui::run_scan_progress(&mut terminal, &mut rx, total_hostnames)?;
+        let result = rt.block_on(scan_sni_list_with_progress(
+            cfg.clone(),
+            &sni_scan_path,
+            scan_timeout,
+            scan_network.clone(),
+            &mut terminal,
+        ));
         tui::leave_tui(terminal)?;
-
-        if scan_handle.is_finished() {
-            rt.block_on(scan_handle)
-                .context("scanner task panicked")??
-        } else {
-            scan_handle.abort();
-            if aborted {
-                info!(
-                    "sni_method_scan: Phase 0 aborted — using {} results collected so far",
-                    arrived.len()
-                );
-            }
-            let mut e = arrived;
-            e.sort_by(|a, b| {
-                b.score.cmp(&a.score).then(
-                    a.tcp_latency_ms
-                        .unwrap_or(u64::MAX)
-                        .cmp(&b.tcp_latency_ms.unwrap_or(u64::MAX)),
-                )
-            });
-            e
-        }
+        result?
     };
 
+    let mut sorted = sorted;
+    retain_selectable(&cfg, &mut sorted);
     let top = sorted.into_iter().next().ok_or_else(|| {
         anyhow::anyhow!("sni_method_scan: no SNI candidates — cannot test bypass methods")
     })?;
@@ -3710,65 +3649,33 @@ fn proxy_scan_main(
     remote_helper: Option<RemoteHelperClient>,
 ) -> Result<()> {
     // ---- resolve SNI list path ----
-    let sni_list_path = reload::relative_path(&cfg_path, &cfg.SNI_LIST);
+    let sni_scan_path = reload::relative_path(&cfg_path, cfg.sni_scan_list());
 
     let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
     let scan_network = physical_network(Ipv4Addr::new(1, 1, 1, 1))?;
 
     // ---- Phase 1: SNI scan ----
-    info!(path = %sni_list_path.display(), "proxy_scan: Phase 1 — scanning SNI list");
-    let path = sni_list_path.clone();
-    let cfg_clone = cfg.clone();
+    info!(path = %sni_scan_path.display(), "proxy_scan: Phase 1 — scanning SNI targets");
     let phase1_sorted = if no_tui {
         rt.block_on(scan_sni_list_headless(
-            cfg_clone,
-            &path,
+            cfg.clone(),
+            &sni_scan_path,
             scan_timeout,
             scan_network.clone(),
             &events,
             ScanKind::Sni,
         ))?
     } else {
-        let total_hostnames = count_hostnames(&sni_list_path, cfg.DEDUPLICATE_SCAN_LISTS);
-        let (tx1, mut rx1) = mpsc::unbounded_channel::<SniProbeEntry>();
-        let filter = cfg_clone.scan_filter()?;
-        let scan_handle = rt.spawn(async move {
-            scan_sni_list(
-                &path,
-                scan_timeout,
-                cfg_clone,
-                scan_network,
-                filter,
-                Some(tx1),
-            )
-            .await
-        });
-
         let mut terminal = tui::enter_tui()?;
-        let (arrived, aborted) = tui::run_scan_progress(&mut terminal, &mut rx1, total_hostnames)?;
+        let result = rt.block_on(scan_sni_list_with_progress(
+            cfg.clone(),
+            &sni_scan_path,
+            scan_timeout,
+            scan_network.clone(),
+            &mut terminal,
+        ));
         tui::leave_tui(terminal)?;
-
-        if scan_handle.is_finished() {
-            rt.block_on(scan_handle)
-                .context("scanner task panicked")??
-        } else {
-            scan_handle.abort();
-            if aborted {
-                info!(
-                    "proxy_scan: Phase 1 aborted — using {} results collected so far",
-                    arrived.len()
-                );
-            }
-            let mut entries = arrived;
-            entries.sort_by(|a, b| {
-                b.score.cmp(&a.score).then(
-                    a.tcp_latency_ms
-                        .unwrap_or(u64::MAX)
-                        .cmp(&b.tcp_latency_ms.unwrap_or(u64::MAX)),
-                )
-            });
-            entries
-        }
+        result?
     };
 
     info!(
@@ -3780,6 +3687,8 @@ fn proxy_scan_main(
     }
 
     // ---- Filter Phase 1 results ----
+    let mut phase1_sorted = phase1_sorted;
+    retain_selectable(&cfg, &mut phase1_sorted);
     let min_score = cfg.PROXY_TEST_MIN_SNI_SCORE;
     let mut candidates: Vec<SniProbeEntry> = phase1_sorted
         .into_iter()
@@ -4679,5 +4588,40 @@ mod tests {
             probe_target.load(std::sync::atomic::Ordering::SeqCst),
             u32::from(std::net::Ipv4Addr::new(1, 1, 1, 1))
         );
+    }
+    #[tokio::test]
+    async fn fixed_sni_balanced_rescan_uses_ip_source_and_keeps_old_pool_on_failure() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ip_list.txt");
+        std::fs::write(&path, "192.0.2.2\n192.0.2.3\n").unwrap();
+        let mut cfg = config_for_tests();
+        cfg.CLOUDFLARE_ONLY = false;
+        cfg.SELECTED_SNI = Some("fixed.example".into());
+        cfg.SNI_TARGET_SOURCE = zerodpi_core::config::SniTargetSource::IpList;
+        cfg.LOAD_BALANCE_ENABLED = true;
+        let original = Target::sni("fixed.example", "192.0.2.1".parse().unwrap(), 90);
+        let pool = TargetPool::single(original.clone());
+        let network = OutboundNetwork::new(
+            zerodpi_core::net::InterfaceBinding::fixed(Ipv4Addr::LOCALHOST),
+            Arc::new(OfflineBinder),
+        );
+        let probe_target = std::sync::atomic::AtomicU32::new(0);
+        let outcome = rescan_sni_once(
+            Arc::new(cfg),
+            path,
+            None,
+            pool.clone(),
+            None,
+            RuntimeEventEmitter::default(),
+            true,
+            network,
+            &probe_target,
+            None,
+        )
+        .await;
+        assert_eq!(outcome.found, 0);
+        assert!(!outcome.switched);
+        assert_eq!(pool.representative(), original);
     }
 }

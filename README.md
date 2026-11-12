@@ -255,15 +255,15 @@ Mode-specific inputs:
 
 | Mode | Reads `SNI_LIST` | Reads `IP_LIST` | Starts Proxy | Uses `BYPASS_METHOD` |
 |------|:---:|:---:|:---:|:---:|
-| `sni_spoof` | Yes, unless `SELECTED_SNI` is set | No | Yes | Yes |
+| `sni_spoof` | With `sni_list`, unless `SELECTED_SNI` is set | With `ip_list` | Yes | Yes |
 | `ip_bypass` | No | Yes, unless `SELECTED_IP` is set | Yes | No |
 | `ip_bypass_plus` | No | Yes, unless `SELECTED_IP` is set | Yes | Yes, only `tls_record_frag`, `tls_record_split`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, `disorder`, or `seqovl` |
-| `sni_scan` | Yes | No | No | No relay; scan only |
+| `sni_scan` | With `sni_list` | With `ip_list` | No | No relay; scan only |
 | `ip_scan` | No | Yes | No | No |
-| `proxy_scan` | Yes | No | Temporary per-candidate tests | Yes, except standalone proxy scoring still depends on your SOCKS5 proxy |
+| `proxy_scan` | With `sni_list` | With `ip_list` | Temporary per-candidate tests | Yes, except standalone proxy scoring still depends on your SOCKS5 proxy |
 | `sni_method_scan` / `ip_method_scan` | Yes | Yes | Temporary per-method tests | Yes |
 
-`SELECTED_SNI` and `SELECTED_IP` are operational shortcuts. They skip scanning and are useful after you have already identified a stable candidate. They are not a replacement for periodic scan-only testing, because CDN routing and IP reachability can change.
+`SELECTED_SNI` with the default `SNI_TARGET_SOURCE = "sni_list"`, and `SELECTED_IP` in IP-family modes, are operational shortcuts. They skip scanning and are useful after you have already identified a stable candidate. They are not a replacement for periodic scan-only testing, because CDN routing and IP reachability can change.
 
 ---
 
@@ -774,12 +774,58 @@ AUTO_SELECT = true
 
 For TLS-record fragmentation instead, set `BYPASS_METHOD = "tls_record_frag"` and run with packet interception privileges. For IP-layer fragmentation, set `BYPASS_METHOD = "ip_frag"` and run with packet interception privileges. For out-of-order TCP segmentation, set `BYPASS_METHOD = "disorder"` and run with packet interception privileges. For a TCP sequence overlap (fake bytes spliced into the reassembled ClientHello without replacing it), set `BYPASS_METHOD = "seqovl"` and run with packet interception privileges. For a socket-only padding transform, set `BYPASS_METHOD = "tls_padding"`.
 
+### Fixed SNI with IP-list scanning (Rust CLI/TUI)
+
+Keep `MODE = "sni_spoof"` and choose the target source:
+
+```toml
+MODE = "sni_spoof"
+SNI_TARGET_SOURCE = "ip_list"
+SELECTED_SNI = "example.com"
+IP_LIST = "ip_list.txt"
+AUTO_SELECT = true
+```
+
+Each candidate is contacted directly on IPv4 port 443 with `SELECTED_SNI`
+as its TLS server name and HTTP Host. The hostname is not resolved through
+system or custom DNS. The existing SNI probe measures TCP, TLS (including
+certificate validation), `GET /`, and upload timing. `IP_SCAN_SNI` is ignored.
+The selected `(fixed SNI, IP)` pair goes to the existing SNI-spoof proxy and
+configured `BYPASS_METHOD`.
+
+`IP_LIST` accepts IPv4 addresses and CIDRs relative to the config directory.
+Existing deduplication and Cloudflare filtering apply; overlapping expanded
+addresses are deduplicated in memory when deduplication is enabled. IPv6
+candidates remaining after filtering are rejected. Set `CLOUDFLARE_ONLY = false`
+to scan outside `cf.txt`. A valid `SELECTED_SNI` is required in TOML or via
+`--sni`. `SELECTED_IP` retains its IP-mode meaning and does not pin this scan.
+
+Ranking uses the existing score, highest first, then lower TCP latency.
+Successful TCP probes with positive scores qualify for selection; TLS success
+is a score component rather than an extra eligibility requirement. Failed
+probes remain in scan reports. Direct probe scores do not establish that a
+VPN connection through the configured bypass method will succeed.
+
+`AUTO_SELECT = false` opens the TUI selection table; headless operation chooses
+rank one. Load balancing uses multiple IPs with the same SNI. Manual/periodic
+rescans and network recovery may change IPs while keeping the SNI fixed. Failed
+rescans preserve the current target, and existing connections keep their target.
+Existing switch-score and LOW_TTL discovery rules apply.
+
+The source also applies to `sni_scan` and the initial scan stages of
+`sni_method_scan` and `proxy_scan`; their explicit method/proxy tests still run
+as configured. IP-family modes ignore `SNI_TARGET_SOURCE`. Its default value,
+`"sni_list"`, preserves the existing hostname-list and fixed-hostname DNS paths.
+This release implements the feature in Rust; Android UI/configuration support
+is deferred.
+
 ### 📌 Fixed Candidate After a Successful Scan
 
 Use this after you have already run `sni_scan` and want deterministic startup without scanning every time.
 
 ```toml
 MODE = "sni_spoof"
+SNI_TARGET_SOURCE = "sni_list"
 SELECTED_SNI = "auth.vercel.com"
 BYPASS_METHOD = ["wrong_seq", "tls_frag"]
 BYPASS_TIMEOUT_SECS = 20
@@ -849,13 +895,14 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | `LOAD_BALANCE_TARGET_COUNT` | `usize` | `10` | Maximum unique targets with TCP success and a positive score; must be > 0 |
 | `LOAD_BALANCE_STRATEGY` | `string` | `"round_robin"` | `random`, `round_robin`, `least_ping`, or `least_load` |
 | `LOAD_BALANCE_PING_INTERVAL_SECS` | `u64` | `60` | Delay between live TCP latency rounds for `least_ping`; must be > 0 |
-| `SELECTED_SNI` | `string` | — | Skip SNI scan; use this hostname directly |
+| `SELECTED_SNI` | `string` | — | With `sni_list`, skip startup scanning and resolve DNS; with `ip_list`, required fixed SNI for every probe and relay |
 | `SELECTED_IP` | `string` | — | Skip IP scan; use this IP directly |
 
 ### 📂 Input Files
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `SNI_TARGET_SOURCE` | `string` | `"sni_list"` | SNI target input: `sni_list` or `ip_list` with fixed `SELECTED_SNI`; applies to SNI-family modes |
 | `SNI_LIST` | `string` | `"sni_list.txt"` | Path to decoy SNI hostname file (one per line) |
 | `IP_LIST` | `string` | `"ip_list.txt"` | Path to IP list file (plain IPs or CIDR ranges) |
 
@@ -919,7 +966,7 @@ full-line `#` comments. When filtering is enabled, a missing, unreadable, empty,
 or malformed file stops the scan with its path and, for malformed CIDRs, line
 number. Addresses outside these ranges are skipped before any TCP/TLS/HTTP
 probe and excluded from results. A hostname with mixed DNS answers retains only
-its allowed addresses. `SELECTED_SNI` and `SELECTED_IP` bypass scanning and are
+its allowed addresses. DNS-only `SELECTED_SNI` (`sni_list`) and `SELECTED_IP` bypass scanning and are
 not filtered. The SNI scanner remains IPv4-only.
 
 Build packages include `cf.txt` alongside the other runtime lists. Android seeds
@@ -1208,8 +1255,9 @@ LOAD_BALANCE_PING_INTERVAL_SECS = 60
 This applies to `sni_spoof`, `ip_bypass`, and `ip_bypass_plus`; scan-only and
 method-test modes keep their existing behavior. Enabling it automatically builds
 the pool regardless of `AUTO_SELECT`, including manual rescans from the TUI.
-`SELECTED_SNI` or `SELECTED_IP` takes priority, skips scanning, and keeps a single
-pinned target even during rescans. The Android settings editor is unchanged;
+`SELECTED_SNI` with the default `sni_list` source, or `SELECTED_IP` in IP modes,
+takes priority, skips scanning, and keeps a single pinned target even during rescans.
+With `SNI_TARGET_SOURCE = "ip_list"`, the fixed SNI does not pin the IP pool. The Android settings editor is unchanged;
 these options are configured in TOML.
 
 Candidates retain the scanner's score order. Only successful TCP probes with
@@ -1439,7 +1487,7 @@ Options:
       --auto-select                    Auto-select top-ranked candidate
       --no-tui                         Disable ratatui screens for headless/service runs
       --json-events                    Emit newline-delimited JSON runtime events to stdout; implies --no-tui
-      --sni <SNI>                      Override SELECTED_SNI (skip scan)
+      --sni <SNI>                      Override SELECTED_SNI (DNS shortcut or fixed-SNI IP scan)
       --method <METHOD>                Override BYPASS_METHOD (single method or comma-separated list, e.g. wrong_seq,tls_frag)
       --queue-num <N>                  Override NFQUEUE_NUM (Linux)
       --scan-timeout <SECS>            Override SCAN_TIMEOUT_SECS
@@ -1731,7 +1779,7 @@ reset), the core detects it from OS notifications with a 10-second polling
 safety net, rebuilds packet interception against the new address, drops stale
 flow state, and verifies the active target. If the target no longer works and
 `AUTO_SELECT = true`, it runs one rescan (at most once per minute) and
-hot-swaps; a pinned target (`AUTO_SELECT = false` or `SELECTED_SNI`/`SELECTED_IP`)
+hot-swaps; a pinned target (`AUTO_SELECT = false` without load balancing, DNS-only `SELECTED_SNI`, or `SELECTED_IP` in IP modes)
 is never replaced automatically. Rebuild failures retry with a 1 s to 60 s
 backoff, reset by the next network event. Existing connections still break on
 a network change; only new connections recover.
@@ -1904,7 +1952,7 @@ Unit tests cover:
 - 🌐 Interceptor-based methods currently parse and rewrite IPv4 TCP packets. IPv6 scan entries can be tested in IP scanning, but packet-interceptor bypass behavior is IPv4-oriented.
 - 🚫 UDP VPN transports are not supported by the relay. Use TCP + TLS profiles.
 - 🗒️ ZeroDPI does not create candidate lists for you. Good results depend heavily on SNI/IP candidates that make sense for your network and upstream service.
-- ⏩ `SELECTED_SNI` skips probing. It can start faster, but it will not tell you whether the resolved edge is currently healthy.
+- ⏩ `SELECTED_SNI` with the default `sni_list` source skips probing. It can start faster, but it will not tell you whether the resolved edge is currently healthy.
 - 🛡️ `ip_bypass` does not spoof SNI. It relays the upstream VPN client's original TLS bytes to the selected IP.
 - ✂️ `ip_bypass_plus` also preserves the upstream VPN client's original SNI, but can fragment, pad, randomize the SNI case, boundary-split, record-split, reorder, or sequence-overlap the first real ClientHello with `tls_record_frag`, `tls_record_split`, `ip_frag`, `disorder`, `seqovl`, `tls_frag`, `tls_padding`, `mixed_case_sni`, or `sni_boundary_frag`.
 - ⏱️ `wrong_timestamp` requires TCP timestamps to be negotiated by the host OS on the upstream connection. If the intercepted ACK has no Timestamp option, ZeroDPI aborts that bypass attempt.

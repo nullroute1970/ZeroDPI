@@ -38,11 +38,8 @@ impl ConfigSource {
     }
 
     pub fn load(&self) -> Result<Config> {
-        let mut cfg = Config::from_file(&self.path)
-            .with_context(|| format!("loading config from {}", self.path.display()))?;
-        self.overrides.apply(&mut cfg);
-        cfg.validate()?;
-        Ok(cfg)
+        Config::from_file_with_overrides(&self.path, |cfg| self.overrides.apply(cfg))
+            .with_context(|| format!("loading config from {}", self.path.display()))
     }
 
     pub fn relative_path(&self, value: &str) -> PathBuf {
@@ -182,8 +179,10 @@ impl Session {
             return Ok(None);
         }
         let list = match next.MODE.as_str() {
-            "sni_spoof" if next.SELECTED_SNI.is_none() => Some(&next.SNI_LIST),
-            "ip_bypass" | "ip_bypass_plus" if next.SELECTED_IP.is_none() => Some(&next.IP_LIST),
+            "sni_spoof" if !next.selected_sni_uses_dns() => Some(next.sni_scan_list()),
+            "ip_bypass" | "ip_bypass_plus" if next.SELECTED_IP.is_none() => {
+                Some(next.IP_LIST.as_str())
+            }
             _ => None,
         };
         if let Some(list) = list {
@@ -733,5 +732,34 @@ mod tests {
         cfg.MODE = "ip_bypass".into();
         cfg.LISTEN_HOST = "invalid listener".into();
         assert!(validate_reload(&cfg, None).is_err());
+    }
+    #[test]
+    fn fixed_sni_reload_preflights_ip_list_even_with_selected_sni() {
+        let (dir, session, _) = session_fixture();
+        fs::write(dir.path().join("config.toml"), "LISTEN_HOST='127.0.0.1'\nLISTEN_PORT=0\nMODE='sni_spoof'\nBYPASS_METHOD='tls_frag'\nSNI_TARGET_SOURCE='ip_list'\nSELECTED_SNI='fixed.example'\nCLOUDFLARE_ONLY=false\n").unwrap();
+        assert!(session.candidate(None).is_err());
+        fs::write(dir.path().join("ip_list.txt"), "192.0.2.1\n").unwrap();
+        assert!(session.candidate(None).unwrap().is_some());
+    }
+    #[test]
+    fn fixed_sni_cli_override_is_applied_before_source_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "LISTEN_HOST='127.0.0.1'\nLISTEN_PORT=0\nSNI_TARGET_SOURCE='ip_list'\n",
+        )
+        .unwrap();
+        let source = ConfigSource::new(crate::Args::parse_from([
+            "zerodpi",
+            "--config",
+            path.to_str().unwrap(),
+            "--sni",
+            "fixed.example",
+        ]))
+        .unwrap();
+        let cfg = source.load().unwrap();
+        assert_eq!(cfg.SELECTED_SNI.as_deref(), Some("fixed.example"));
+        assert!(!cfg.selected_sni_uses_dns());
     }
 }

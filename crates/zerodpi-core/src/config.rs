@@ -467,6 +467,15 @@ impl<'de> serde::Deserialize<'de> for BypassMethodList {
     }
 }
 
+/// Input source for scans that produce SNI/IP target pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SniTargetSource {
+    #[default]
+    SniList,
+    IpList,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub struct Config {
@@ -493,6 +502,10 @@ pub struct Config {
     /// Relative paths are resolved from the directory that contains `config.toml`.
     #[serde(default = "default_sni_list")]
     pub SNI_LIST: String,
+
+    /// Scan hostnames from SNI_LIST, or IP_LIST using the fixed SELECTED_SNI.
+    #[serde(default)]
+    pub SNI_TARGET_SOURCE: SniTargetSource,
 
     /// Whether SNI hostnames should be resolved through the custom DNS servers
     /// instead of the operating system resolver. Default: `false`.
@@ -547,8 +560,8 @@ pub struct Config {
     #[serde(default = "default_sni_switch_min_score")]
     pub SNI_SWITCH_MIN_SCORE: u8,
 
-    /// If set, skip scanning entirely and use this hostname as the SNI.
-    /// The IP is resolved from DNS at startup.
+    /// Fixed SNI. With sni_list, bypass startup scanning and resolve through DNS.
+    /// With ip_list, probe every candidate IP with this hostname instead.
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub SELECTED_SNI: Option<String>,
 
@@ -1632,6 +1645,18 @@ fn default_proxy_speed_cap_bps() -> f64 {
 }
 
 impl Config {
+    /// The legacy fixed-hostname DNS shortcut applies only to sni_list.
+    pub fn selected_sni_uses_dns(&self) -> bool {
+        self.SNI_TARGET_SOURCE == SniTargetSource::SniList && self.SELECTED_SNI.is_some()
+    }
+
+    pub fn sni_scan_list(&self) -> &str {
+        match self.SNI_TARGET_SOURCE {
+            SniTargetSource::SniList => &self.SNI_LIST,
+            SniTargetSource::IpList => &self.IP_LIST,
+        }
+    }
+
     /// Select and validate the effective DNS endpoints in configured order.
     pub fn custom_dns_servers(&self) -> anyhow::Result<Vec<SocketAddr>> {
         if !self.CUSTOM_DNS_ENABLED {
@@ -1651,6 +1676,14 @@ impl Config {
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::from_file_with_overrides(path, |_| {})
+    }
+
+    /// Apply CLI overrides before validating the effective configuration.
+    pub fn from_file_with_overrides(
+        path: impl AsRef<Path>,
+        overrides: impl FnOnce(&mut Self),
+    ) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path.as_ref())?;
         let mut cfg: Self = toml::from_str(&text)?;
         cfg.scan_config_path = if path.as_ref().is_absolute() {
@@ -1658,6 +1691,7 @@ impl Config {
         } else {
             std::env::current_dir()?.join(path.as_ref())
         };
+        overrides(&mut cfg);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -1669,6 +1703,23 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.SNI_TARGET_SOURCE == SniTargetSource::IpList
+            && matches!(
+                self.MODE.as_str(),
+                "sni_spoof" | "sni_scan" | "sni_method_scan" | "proxy_scan"
+            )
+        {
+            let sni = self.SELECTED_SNI.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("SELECTED_SNI is required when SNI_TARGET_SOURCE = 'ip_list'")
+            })?;
+            anyhow::ensure!(
+                matches!(
+                    rustls::pki_types::ServerName::try_from(sni),
+                    Ok(rustls::pki_types::ServerName::DnsName(_))
+                ),
+                "SELECTED_SNI must be a valid DNS hostname when SNI_TARGET_SOURCE = 'ip_list'"
+            );
+        }
         if self.LOAD_BALANCE_TARGET_COUNT == 0 {
             anyhow::bail!("LOAD_BALANCE_TARGET_COUNT must be > 0");
         }
@@ -4891,5 +4942,50 @@ mod cloudflare_tests {
         assert!(!next.allows("192.0.2.1".parse().unwrap()));
         assert!(next.allows("198.51.100.1".parse().unwrap()));
         assert!(first.allows("192.0.2.1".parse().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod sni_target_source_tests {
+    use super::*;
+
+    fn parse(extra: &str) -> anyhow::Result<Config> {
+        let cfg: Config = toml::from_str(&format!(
+            "LISTEN_HOST='127.0.0.1'\nLISTEN_PORT=44444\n{extra}"
+        ))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn sni_target_source_defaults_and_round_trips() {
+        let old = parse("").unwrap();
+        assert_eq!(
+            serde_json::to_value(&old).unwrap()["SNI_TARGET_SOURCE"],
+            "sni_list"
+        );
+        let cfg = parse("SNI_TARGET_SOURCE='ip_list'\nSELECTED_SNI='fixed.example'").unwrap();
+        let encoded = toml::to_string(&cfg).unwrap();
+        let table: toml::Value = toml::from_str(&encoded).unwrap();
+        let source: SniTargetSource = table["SNI_TARGET_SOURCE"].clone().try_into().unwrap();
+        assert_eq!(source, SniTargetSource::IpList);
+        assert!(!cfg.selected_sni_uses_dns());
+        assert!(parse("SELECTED_SNI='legacy.example'")
+            .unwrap()
+            .selected_sni_uses_dns());
+    }
+
+    #[test]
+    fn ip_list_source_requires_a_dns_hostname_in_sni_modes() {
+        for mode in ["sni_spoof", "sni_scan", "sni_method_scan", "proxy_scan"] {
+            for name in ["", "127.0.0.1", "::1", "bad host", "bad\\r\\nHost: evil"] {
+                let text =
+                    format!("MODE={mode:?}\nSNI_TARGET_SOURCE='ip_list'\nSELECTED_SNI={name:?}");
+                assert!(parse(&text).is_err(), "accepted {text}");
+            }
+        }
+        assert!(parse("SNI_TARGET_SOURCE='unknown'").is_err());
+        assert!(parse("MODE='ip_scan'\nSNI_TARGET_SOURCE='ip_list'").is_ok());
+        assert!(parse("SELECTED_SNI='legacy.example'").is_ok());
     }
 }

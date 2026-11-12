@@ -58,7 +58,8 @@ AUTO_SELECT = false
 # Distribute new connections across the highest-ranked scan results.
 # Applies to sni_spoof, ip_bypass, and ip_bypass_plus. Default: disabled.
 # When enabled, selects targets automatically regardless of AUTO_SELECT.
-# SELECTED_SNI / SELECTED_IP still take priority and create a singleton pool.
+# With sni_list, SELECTED_SNI creates a singleton pool. SELECTED_IP pins IP modes.
+# With ip_list, SELECTED_SNI stays fixed while the pool contains multiple IPs.
 LOAD_BALANCE_ENABLED = false
 
 # Maximum number of unique targets with successful TCP probes and positive
@@ -77,9 +78,9 @@ LOAD_BALANCE_STRATEGY = "round_robin"
 # previous one finishes. Probe timeout: SCAN_TIMEOUT_SECS. Must be > 0.
 LOAD_BALANCE_PING_INTERVAL_SECS = 60
 
-# If set to a hostname, skip the scan entirely and use this hostname as the spoofed SNI.
-# The IP address is resolved from DNS automatically.
-# Leave as an empty string ("") to use the scanner.
+# With SNI_TARGET_SOURCE = "sni_list", a hostname skips startup scanning and uses DNS.
+# With "ip_list", a valid hostname is required and used for every IP probe and relay.
+# Leave empty only when using the default sni_list source.
 SELECTED_SNI = ""
 
 # If set to a valid IP, skip the IP scan entirely and use this IP directly.
@@ -94,7 +95,13 @@ SELECTED_IP = ""
 # Default: "sni_list.txt" (next to config.toml).
 SNI_LIST = "sni_list.txt"
 
-# Path to the IP list file (ip_bypass, ip_bypass_plus, and ip_scan modes).
+# Source for sni_spoof and SNI-family scans (sni_scan, sni_method_scan, proxy_scan).
+# "sni_list" (default): resolve/probe hostnames from SNI_LIST.
+# "ip_list": probe IP_LIST with fixed SELECTED_SNI, without DNS. IPv4 only.
+# AUTO_SELECT and load balancing work normally; IP_SCAN_SNI is not used here.
+SNI_TARGET_SOURCE = "sni_list"
+
+# Path to the IP list file (IP-family modes and SNI_TARGET_SOURCE = "ip_list").
 # One entry per line: plain IPs (IPv4 or IPv6) or CIDR ranges.
 # ip_bypass_plus is IPv4-only and rejects IPv6 entries.
 # Default: "ip_list.txt".
@@ -125,7 +132,8 @@ CUSTOM_DNS_SERVERS = []
 # Applies to IP lists and each resolved SNI address, including rescans.
 # Missing, unreadable, empty, or invalid cf.txt stops the scan.
 # Set false to scan all candidates without reading cf.txt. Default: true.
-# SELECTED_SNI / SELECTED_IP skip scanning and are not filtered.
+# DNS-only SELECTED_SNI (sni_list) and SELECTED_IP skip scanning and filtering.
+# Fixed-SNI ip_list scans still apply CLOUDFLARE_ONLY.
 CLOUDFLARE_ONLY = true
 
 # Remove duplicate SNI/IP entries from each input file before scanning it.

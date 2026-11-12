@@ -269,6 +269,79 @@ pub async fn scan_sni_list(
     Ok(results)
 }
 
+/// Probe explicit IPv4 addresses with one fixed hostname, without DNS lookup.
+#[allow(clippy::too_many_arguments)]
+pub async fn scan_sni_ips(
+    ips: Vec<Ipv4Addr>,
+    sni: String,
+    timeout: Duration,
+    config: Arc<crate::config::Config>,
+    network: OutboundNetwork,
+    filter: Arc<crate::cloudflare::ScanFilter>,
+    progress_tx: Option<mpsc::UnboundedSender<SniProbeEntry>>,
+) -> Vec<SniProbeEntry> {
+    let ips = ips
+        .into_iter()
+        .filter(|ip| filter.allows((*ip).into()))
+        .collect();
+    let connector = Arc::new(make_tls_connector());
+    scan_sni_ips_with(
+        ips,
+        config.SNI_MAX_CONCURRENT.max(1),
+        progress_tx,
+        move |ip| {
+            probe_sni_ip(
+                sni.clone(),
+                ip,
+                timeout,
+                config.clone(),
+                connector.clone(),
+                network.clone(),
+            )
+        },
+    )
+    .await
+}
+
+async fn scan_sni_ips_with<F, Fut>(
+    ips: Vec<Ipv4Addr>,
+    limit: usize,
+    progress_tx: Option<mpsc::UnboundedSender<SniProbeEntry>>,
+    mut probe: F,
+) -> Vec<SniProbeEntry>
+where
+    F: FnMut(Ipv4Addr) -> Fut,
+    Fut: std::future::Future<Output = SniProbeEntry> + Send + 'static,
+{
+    let mut ips = ips.into_iter();
+    let mut tasks = JoinSet::new();
+    let mut entries = Vec::new();
+    loop {
+        while tasks.len() < limit.max(1) {
+            let Some(ip) = ips.next() else { break };
+            tasks.spawn(probe(ip));
+        }
+        match tasks.join_next().await {
+            Some(Ok(entry)) => {
+                if let Some(tx) = &progress_tx {
+                    let _ = tx.send(entry.clone());
+                }
+                entries.push(entry);
+            }
+            Some(Err(error)) => warn!(%error, "fixed-SNI IP probe task failed"),
+            None => break,
+        }
+    }
+    entries.sort_by(|a, b| {
+        b.score.cmp(&a.score).then_with(|| {
+            a.tcp_latency_ms
+                .unwrap_or(u64::MAX)
+                .cmp(&b.tcp_latency_ms.unwrap_or(u64::MAX))
+        })
+    });
+    entries
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -901,5 +974,133 @@ mod candidate_tests {
         assert_eq!(entry.sni, "example.com");
         let expected_ip: std::net::Ipv4Addr = "127.0.0.1".parse().unwrap();
         assert_eq!(entry.ip, expected_ip);
+    }
+}
+
+#[cfg(test)]
+mod fixed_ip_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn fixed_ip_scan_ranks_pairs_and_emits_each_result() {
+        let ips = vec![
+            Ipv4Addr::new(192, 0, 2, 1),
+            Ipv4Addr::new(192, 0, 2, 2),
+            Ipv4Addr::new(192, 0, 2, 3),
+        ];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let entries = scan_sni_ips_with(ips, 2, Some(tx), |ip| async move {
+            let mut entry = blank("fixed.example", ip);
+            entry.score = if ip.octets()[3] == 1 { 10 } else { 90 };
+            entry.tcp_latency_ms = Some(if ip.octets()[3] == 3 { 5 } else { 20 });
+            entry
+        })
+        .await;
+        assert_eq!(
+            entries.iter().map(|e| e.ip.octets()[3]).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        let mut seen = 0;
+        while let Some(entry) = rx.recv().await {
+            assert_eq!(entry.sni, "fixed.example");
+            seen += 1;
+        }
+        assert_eq!(seen, 3);
+    }
+
+    #[tokio::test]
+    async fn cancelling_fixed_ip_scan_drops_all_bounded_workers() {
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let count = active.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(scan_sni_ips_with(
+            (1..=10).map(|n| Ipv4Addr::new(192, 0, 2, n)).collect(),
+            2,
+            None,
+            move |ip| {
+                let count = count.clone();
+                let tx = tx.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let _guard = Active(count);
+                    tx.send(ip).unwrap();
+                    std::future::pending::<()>().await;
+                    blank("fixed.example", ip)
+                }
+            },
+        ));
+        rx.recv().await.unwrap();
+        rx.recv().await.unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+        assert!(rx.try_recv().is_err());
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn fixed_ip_scan_uses_supplied_hostname_without_dns_and_filters_before_sockets() {
+        use crate::dns::test_support::TestDnsServer;
+        struct Offline(AtomicUsize);
+        impl crate::net::OutboundSocketBinder for Offline {
+            fn configure(
+                &self,
+                _: &tokio::net::TcpSocket,
+                _: &crate::net::InterfaceBinding,
+            ) -> anyhow::Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("offline fixture")
+            }
+        }
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let dns = TestDnsServer::start(0, Some(Ipv4Addr::LOCALHOST), None).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cf.txt"), "192.0.2.0/24\n").unwrap();
+        let filter = Arc::new(
+            crate::cloudflare::ScanFilter::load(true, dir.path().join("config.toml")).unwrap(),
+        );
+        let mut cfg = crate::config::test_support::minimal_config();
+        cfg.CUSTOM_DNS_ENABLED = true;
+        cfg.CUSTOM_DNS_SERVERS = vec![dns.addr.to_string()];
+        cfg.IP_SCAN_SNI = "different.example".into();
+        let binder = Arc::new(Offline(AtomicUsize::new(0)));
+        let network = OutboundNetwork::new(
+            crate::net::InterfaceBinding::fixed(Ipv4Addr::LOCALHOST),
+            binder.clone(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let entries = scan_sni_ips(
+            vec![
+                "192.0.2.1".parse().unwrap(),
+                "198.51.100.1".parse().unwrap(),
+            ],
+            "fixed.example".into(),
+            Duration::from_millis(100),
+            Arc::new(cfg),
+            network,
+            filter,
+            Some(tx),
+        )
+        .await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sni, "fixed.example");
+        assert_eq!(entries[0].ip.to_string(), "192.0.2.1");
+        assert!(entries[0].tcp_latency_ms.is_none());
+        assert_eq!(rx.recv().await.unwrap().sni, "fixed.example");
+        assert!(rx.recv().await.is_none());
+        assert_eq!(binder.0.load(Ordering::SeqCst), 1);
+        assert_eq!(dns.requests(), 0);
     }
 }

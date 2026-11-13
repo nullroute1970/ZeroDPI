@@ -965,23 +965,27 @@ async fn scan_sni_list_with_progress(
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
     let input = if cfg.SNI_TARGET_SOURCE == zerodpi_core::config::SniTargetSource::SniListIpList {
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let sni_total = count_hostnames(&cfg.sni_list_path(), cfg.DEDUPLICATE_SCAN_LISTS);
+        let mut sni_view_cfg = cfg.as_ref().clone();
+        sni_view_cfg.SNI_TARGET_SOURCE = zerodpi_core::config::SniTargetSource::SniList;
         let cfg = cfg.clone();
         let path = path.to_owned();
+        let network = network.clone();
         let preparation = tokio::spawn(async move {
-            PreparedSniScan::prepare_with_progress(&cfg, &path, Some(tx)).await
+            PreparedSniScan::prepare_with_progress(&cfg, &path, network, Some(tx)).await
         });
-        match tui::run_sni_discovery_progress(terminal, &mut rx) {
-            Ok(false) => preparation.await.context("SNI discovery task panicked")??,
+        match tui::run_scan_progress(terminal, &mut rx, sni_total, &sni_view_cfg, Some(1)) {
+            Ok((_, false)) => preparation.await.context("SNI scan task panicked")??,
             outcome => {
                 preparation.abort();
                 let _ = preparation.await;
                 outcome?;
-                info!("SNI discovery aborted by user");
+                info!("stage 1 SNI scan aborted by user");
                 return Ok(Vec::new());
             }
         }
     } else {
-        PreparedSniScan::prepare(&cfg, path).await?
+        PreparedSniScan::prepare(&cfg, path, network.clone()).await?
     };
     let total_hostnames = input.total;
 
@@ -993,7 +997,10 @@ async fn scan_sni_list_with_progress(
     let scan_handle =
         tokio::spawn(async move { input.run(timeout, cfg_clone, network, Some(tx)).await });
 
-    let (arrived, aborted) = tui::run_scan_progress(terminal, &mut rx, total_hostnames, &cfg)?;
+    let stage = (cfg.SNI_TARGET_SOURCE == zerodpi_core::config::SniTargetSource::SniListIpList)
+        .then_some(2);
+    let (arrived, aborted) =
+        tui::run_scan_progress(terminal, &mut rx, total_hostnames, &cfg, stage)?;
 
     // Obtain the authoritative sorted list.
     let sorted = if scan_handle.is_finished() {
@@ -1047,7 +1054,7 @@ async fn scan_sni_list_headless(
     events: &RuntimeEventEmitter,
     scan: ScanKind,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
-    let input = PreparedSniScan::prepare(&cfg, path).await?;
+    let input = PreparedSniScan::prepare(&cfg, path, network.clone()).await?;
     let total = input.total;
     events.emit(RuntimeEvent::ScanStarted {
         scan,
@@ -1422,7 +1429,7 @@ async fn rescan_sni_once(
     let mut scan_summary: Option<(usize, Option<u8>)> = None;
     let cfg_clone = cfg.clone();
     match async {
-        PreparedSniScan::prepare(&cfg_clone, &path)
+        PreparedSniScan::prepare(&cfg_clone, &path, network.clone())
             .await?
             .run(scan_timeout, cfg_clone, network, None)
             .await

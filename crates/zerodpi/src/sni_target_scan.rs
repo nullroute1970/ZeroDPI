@@ -1,4 +1,4 @@
-//! Prepare the active source once, streaming discovery before IP probes start.
+//! Run the full hostname scan before preparing IP-list targets.
 use std::collections::HashSet;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
@@ -11,9 +11,7 @@ use tokio::sync::mpsc;
 use zerodpi_core::cloudflare::ScanFilter;
 use zerodpi_core::config::{Config, SniTargetSource};
 use zerodpi_core::net::OutboundNetwork;
-use zerodpi_core::sni_scanner::{
-    resolve_sni_list, scan_sni_ips, scan_sni_list, SniProbeEntry, SniResolveEvent,
-};
+use zerodpi_core::sni_scanner::{scan_sni_ips, scan_sni_list, SniProbeEntry};
 
 pub struct PreparedSniScan {
     path: PathBuf,
@@ -23,28 +21,34 @@ pub struct PreparedSniScan {
 }
 
 impl PreparedSniScan {
-    pub async fn prepare(cfg: &Config, path: &Path) -> Result<Self> {
-        Self::prepare_with_progress(cfg, path, None).await
+    pub async fn prepare(cfg: &Config, path: &Path, network: OutboundNetwork) -> Result<Self> {
+        Self::prepare_with_progress(cfg, path, network, None).await
     }
 
     pub async fn prepare_with_progress(
         cfg: &Config,
         path: &Path,
-        progress: Option<mpsc::UnboundedSender<SniResolveEvent>>,
+        network: OutboundNetwork,
+        progress: Option<mpsc::UnboundedSender<SniProbeEntry>>,
     ) -> Result<Self> {
         if cfg.SNI_TARGET_SOURCE == SniTargetSource::SniListIpList {
             let sni_path = cfg.sni_list_path();
-            tracing::info!(path = %sni_path.display(), "discovering SNI addresses for IP list");
-            let ips = resolve_sni_list(
+            tracing::info!(path = %sni_path.display(), "stage 1/2: scanning SNI list before IP list");
+            let entries = scan_sni_list(
                 &sni_path,
                 Duration::from_secs(cfg.SCAN_TIMEOUT_SECS),
-                cfg,
+                Arc::new(cfg.clone()),
+                network,
+                cfg.scan_filter()?,
                 progress,
             )
             .await?;
+            let mut ips: Vec<_> = entries.iter().map(|entry| entry.ip).collect();
+            ips.sort_unstable();
+            ips.dedup();
             let discovered = ips.len();
             let added = append_discovered_ips(cfg, path, ips)?;
-            tracing::info!(path = %path.display(), discovered, added, "SNI address discovery complete");
+            tracing::info!(path = %path.display(), pairs = entries.len(), discovered, added, "SNI scan complete; preparing stage 2/2 IP scan");
         }
         Self::new(cfg, path)
     }
@@ -192,6 +196,101 @@ mod tests {
     use super::*;
     use zerodpi_core::config::Config;
 
+    fn test_network() -> OutboundNetwork {
+        struct RejectSocket;
+        impl zerodpi_core::net::OutboundSocketBinder for RejectSocket {
+            fn configure(
+                &self,
+                _: &tokio::net::TcpSocket,
+                _: &zerodpi_core::net::InterfaceBinding,
+            ) -> Result<()> {
+                anyhow::bail!("reject test socket")
+            }
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        OutboundNetwork::new(
+            zerodpi_core::net::InterfaceBinding::fixed(Ipv4Addr::LOCALHOST),
+            Arc::new(RejectSocket),
+        )
+    }
+
+    #[tokio::test]
+    async fn combined_source_probes_each_hostname_before_starting_the_next_dns_lookup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ObserveProbes {
+            dns: Arc<crate::dns_test_support::TestDnsServer>,
+            calls: AtomicUsize,
+            dns_at_probe: std::sync::Mutex<Vec<usize>>,
+        }
+        impl zerodpi_core::net::OutboundSocketBinder for ObserveProbes {
+            fn configure(
+                &self,
+                _: &tokio::net::TcpSocket,
+                _: &zerodpi_core::net::InterfaceBinding,
+            ) -> Result<()> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.dns_at_probe.lock().unwrap().push(self.dns.requests());
+                anyhow::bail!("reject test socket")
+            }
+        }
+        let dns = Arc::new(
+            crate::dns_test_support::TestDnsServer::start(
+                0,
+                Some("192.0.2.8".parse().unwrap()),
+                Some(Duration::ZERO),
+            )
+            .await,
+        );
+        let (dir, mut cfg, path) = fixture("", None);
+        cfg.SNI_TARGET_SOURCE = SniTargetSource::SniListIpList;
+        cfg.CUSTOM_DNS_ENABLED = true;
+        cfg.CUSTOM_DNS_SERVERS = vec![dns.addr.to_string()];
+        cfg.SNI_MAX_CONCURRENT = 1;
+        std::fs::write(dir.path().join("sni_list.txt"), "first.test\nsecond.test\n").unwrap();
+        let binder = Arc::new(ObserveProbes {
+            dns: dns.clone(),
+            calls: AtomicUsize::new(0),
+            dns_at_probe: Default::default(),
+        });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let network = OutboundNetwork::new(
+            zerodpi_core::net::InterfaceBinding::fixed(Ipv4Addr::LOCALHOST),
+            binder.clone(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let input = PreparedSniScan::prepare_with_progress(&cfg, &path, network.clone(), Some(tx))
+            .await
+            .unwrap();
+        assert_eq!(
+            binder.calls.load(Ordering::SeqCst),
+            2,
+            "first stage must probe both SNI/IP pairs"
+        );
+        assert_eq!(*binder.dns_at_probe.lock().unwrap(), vec![1, 2]);
+        let first = rx.try_recv().unwrap();
+        let second = rx.try_recv().unwrap();
+        assert_eq!(first.sni, "first.test");
+        assert_eq!(second.sni, "second.test");
+        assert_eq!(
+            first.score, 0,
+            "failed probes must still be reported and saved"
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "192.0.2.8\n");
+        let entries = input
+            .run(Duration::from_secs(1), Arc::new(cfg), network, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            binder.calls.load(Ordering::SeqCst),
+            3,
+            "second stage must probe the unique IP again"
+        );
+        assert_eq!(dns.requests(), 2, "IP scan must not repeat DNS lookups");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sni, "fixed.example");
+    }
+
     fn candidate(
         sni: &str,
         ip: std::net::Ipv4Addr,
@@ -237,51 +336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_reports_progress_before_preparation_finishes() {
-        let server = crate::dns_test_support::TestDnsServer::start(
-            0,
-            Some("192.0.2.8".parse().unwrap()),
-            Some(Duration::from_millis(200)),
-        )
-        .await;
-        let (dir, mut cfg, path) = fixture("192.0.2.1\n", None);
-        cfg.SNI_TARGET_SOURCE = SniTargetSource::SniListIpList;
-        cfg.CUSTOM_DNS_ENABLED = true;
-        cfg.CUSTOM_DNS_SERVERS = vec![server.addr.to_string()];
-        std::fs::write(dir.path().join("sni_list.txt"), "first.test\nsecond.test\n").unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let worker = tokio::spawn(async move {
-            PreparedSniScan::prepare_with_progress(&cfg, &path, Some(tx)).await
-        });
-        let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
-            .await
-            .unwrap();
-        assert!(matches!(first, Some(SniResolveEvent::Started { total: 2 })));
-        assert!(!worker.is_finished());
-        let resolved = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap();
-        match resolved {
-            Some(SniResolveEvent::Resolved {
-                hostname,
-                ips,
-                error,
-            }) => {
-                assert!(hostname == "first.test" || hostname == "second.test");
-                assert_eq!(ips, vec!["192.0.2.8".parse::<Ipv4Addr>().unwrap()]);
-                assert!(error.is_none());
-            }
-            other => panic!("expected DNS result, got {other:?}"),
-        }
-        assert!(
-            !worker.is_finished(),
-            "progress must not wait for every hostname"
-        );
-        assert_eq!(worker.await.unwrap().unwrap().total, 2);
-    }
-
-    #[tokio::test]
-    async fn combined_source_appends_all_dns_ips_then_prepares_fixed_sni_scan() {
+    async fn combined_source_appends_scanned_ips_then_prepares_fixed_sni_scan() {
         let server = crate::dns_test_support::TestDnsServer::start_many(
             0,
             vec![
@@ -304,10 +359,12 @@ mod tests {
             "# hosts\nfirst.test\n\nsecond.test\n",
         )
         .unwrap();
-        let input = PreparedSniScan::prepare(&cfg, &path).await.unwrap();
+        let input = PreparedSniScan::prepare(&cfg, &path, test_network())
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "# existing\r\n192.0.2.1\r\n192.0.2.2\r\n198.51.100.7\r\n"
+            "# existing\r\n192.0.2.1\r\n192.0.2.2\r\n"
         );
         assert_eq!(input.total, 2);
         let (sni, ips) = input.fixed.unwrap();
@@ -321,7 +378,9 @@ mod tests {
         );
         assert_eq!(server.requests(), 2);
         let before = std::fs::read(&path).unwrap();
-        PreparedSniScan::prepare(&cfg, &path).await.unwrap();
+        PreparedSniScan::prepare(&cfg, &path, test_network())
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
@@ -339,7 +398,9 @@ mod tests {
         cfg.CUSTOM_DNS_SERVERS = vec![server.addr.to_string()];
         std::fs::write(dir.path().join("sni_list.txt"), "first.test\n").unwrap();
         std::fs::remove_file(&path).unwrap();
-        let input = PreparedSniScan::prepare(&cfg, &path).await.unwrap();
+        let input = PreparedSniScan::prepare(&cfg, &path, test_network())
+            .await
+            .unwrap();
         assert_eq!(input.total, 1);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "192.0.2.8\n");
     }
@@ -354,27 +415,15 @@ mod tests {
         cfg.CUSTOM_DNS_SERVERS = vec![server.addr.to_string()];
         std::fs::write(dir.path().join("sni_list.txt"), "missing.test\n").unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let input = PreparedSniScan::prepare_with_progress(&cfg, &path, Some(tx))
+        let input = PreparedSniScan::prepare_with_progress(&cfg, &path, test_network(), Some(tx))
             .await
             .unwrap();
         assert_eq!(input.total, 1);
         assert!(server.requests() > 0);
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            SniResolveEvent::Started { total: 1 }
-        ));
-        match rx.try_recv().unwrap() {
-            SniResolveEvent::Resolved {
-                hostname,
-                ips,
-                error,
-            } => {
-                assert_eq!(hostname, "missing.test");
-                assert!(ips.is_empty());
-                assert!(error.is_some());
-            }
-            other => panic!("expected failed DNS result, got {other:?}"),
-        }
+        assert!(
+            rx.try_recv().is_err(),
+            "failed DNS produces no probe entry, as in sni_list"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "192.0.2.1\n");
     }
 
@@ -397,7 +446,9 @@ mod tests {
     #[tokio::test]
     async fn ip_list_preparation_does_not_require_a_hostname_file() {
         let (_dir, cfg, path) = fixture("192.0.2.1\n", None);
-        let input = PreparedSniScan::prepare(&cfg, &path).await.unwrap();
+        let input = PreparedSniScan::prepare(&cfg, &path, test_network())
+            .await
+            .unwrap();
         assert_eq!(input.total, 1);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "192.0.2.1\n");
     }

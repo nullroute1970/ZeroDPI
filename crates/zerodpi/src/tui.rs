@@ -48,8 +48,6 @@ use zerodpi_core::target_pool::TargetPool;
 
 mod targets;
 use targets::{draw_targets, fit, DashboardView, TargetsState};
-mod discovery;
-pub use discovery::run_sni_discovery_progress;
 
 pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -200,6 +198,7 @@ pub fn run_scan_progress(
     rx: &mut mpsc::UnboundedReceiver<SniProbeEntry>,
     total_hostnames: usize,
     cfg: &Config,
+    stage: Option<usize>,
 ) -> anyhow::Result<(Vec<SniProbeEntry>, bool)> {
     let mut arrived: Vec<SniProbeEntry> = Vec::new();
 
@@ -213,13 +212,13 @@ pub fn run_scan_progress(
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     // Scanner finished – draw one final frame and return.
-                    draw_scan_progress(terminal, &arrived, total_hostnames, cfg)?;
+                    draw_scan_progress(terminal, &arrived, total_hostnames, cfg, stage)?;
                     return Ok((arrived, false));
                 }
             }
         }
 
-        draw_scan_progress(terminal, &arrived, total_hostnames, cfg)?;
+        draw_scan_progress(terminal, &arrived, total_hostnames, cfg, stage)?;
 
         // Poll for user input (Ctrl-C / q to abort).
         if event::poll(Duration::from_millis(100))? {
@@ -241,6 +240,7 @@ fn draw_scan_progress<B: ratatui::backend::Backend>(
     arrived: &[SniProbeEntry],
     total_hostnames: usize,
     cfg: &Config,
+    stage: Option<usize>,
 ) -> anyhow::Result<()> {
     let done = arrived.len();
     terminal.draw(|frame| {
@@ -257,18 +257,17 @@ fn draw_scan_progress<B: ratatui::backend::Backend>(
 
         // Header
         let title = match cfg.SNI_TARGET_SOURCE {
-            zerodpi_core::config::SniTargetSource::SniList => "ZeroDPI — Scanning SNIs…".to_owned(),
+            zerodpi_core::config::SniTargetSource::SniList => "Scanning SNIs…".to_owned(),
             zerodpi_core::config::SniTargetSource::IpList
             | zerodpi_core::config::SniTargetSource::SniListIpList => format!(
-                "ZeroDPI — {}Scanning {} with SNI {}",
-                if cfg.SNI_TARGET_SOURCE == zerodpi_core::config::SniTargetSource::SniListIpList {
-                    "Stage 2/2 — "
-                } else {
-                    ""
-                },
+                "Scanning {} with SNI {}",
                 cfg.IP_LIST,
                 cfg.SELECTED_SNI.as_deref().unwrap_or("")
             ),
+        };
+        let title = match stage {
+            Some(stage) => format!("ZeroDPI — Stage {stage}/2 — {title}"),
+            None => format!("ZeroDPI — {title}"),
         };
         let header = Paragraph::new(title)
             .style(
@@ -2734,12 +2733,40 @@ mod tests {
     }
 
     #[test]
+    fn combined_first_stage_uses_the_full_sni_scan_table() {
+        let cfg = crate::config_for_tests();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        draw_scan_progress(&mut terminal, &[], 10, &cfg, Some(1)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for label in [
+            "Stage 1/2",
+            "Scanning SNIs",
+            "0 probes done (~10 hostnames)",
+            "Score",
+            "TCP",
+            "TLS",
+            "TTFB",
+            "Down",
+            "Up",
+            "HTTP",
+        ] {
+            assert!(text.contains(label), "missing {label}: {text}");
+        }
+    }
+
+    #[test]
     fn combined_ip_scan_identifies_the_second_stage() {
         let mut cfg = crate::config_for_tests();
         cfg.SNI_TARGET_SOURCE = zerodpi_core::config::SniTargetSource::SniListIpList;
         cfg.SELECTED_SNI = Some("fixed.example".into());
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
-        draw_scan_progress(&mut terminal, &[], 10, &cfg).unwrap();
+        draw_scan_progress(&mut terminal, &[], 10, &cfg, Some(2)).unwrap();
         let text = terminal
             .backend()
             .buffer()

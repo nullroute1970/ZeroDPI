@@ -98,8 +98,8 @@ SNI_LIST = "sni_list.txt"
 # Source for sni_spoof and SNI-family scans (sni_scan, sni_method_scan, proxy_scan).
 # "sni_list" (default): resolve/probe hostnames from SNI_LIST.
 # "ip_list": probe IP_LIST with fixed SELECTED_SNI, without DNS. IPv4 only.
-# "sni_list+ip_list": first resolve all SNI_LIST hostnames and append new IPv4
-# addresses to IP_LIST, then behave exactly like "ip_list" (SELECTED_SNI required).
+# "sni_list+ip_list": first run the full sni_list scan (DNS/TCP/TLS/HTTP), append
+# new unique IPv4s to IP_LIST, then run the full ip_list scan with SELECTED_SNI.
 # AUTO_SELECT and load balancing work normally; IP_SCAN_SNI is not used here.
 SNI_TARGET_SOURCE = "sni_list"
 

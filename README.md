@@ -828,22 +828,28 @@ SNI_LIST = "sni_list.txt"
 IP_LIST = "ip_list.txt"
 ```
 
-The Rust CLI/TUI first resolves every hostname in `SNI_LIST` using the configured
-system/custom DNS settings. It appends new, unique IPv4 addresses to `IP_LIST`,
-creating the file if needed, and then follows the same scan, ranking, selection,
-relay, and load-balancing paths as `"ip_list"`, with the fixed `SELECTED_SNI`.
-Discovery does not require successful TCP/TLS probes or apply Cloudflare filtering;
-the normal filters apply when the updated IP list is scanned. Existing IPs and
-addresses already included by CIDR expansion are not appended again, even with
-`DEDUPLICATE_SCAN_LISTS = false`. Existing comments and line endings are preserved.
-DNS failures for individual hostnames are logged and skipped; existing IPs remain
-available. Manual, periodic, and network-recovery rescans repeat discovery before
-scanning `IP_LIST`. Both paths are relative to the config directory. This change
-does not modify the Android app.
+The Rust CLI/TUI first runs the same full scanner as `"sni_list"` over every
+hostname in `SNI_LIST`: DNS, TCP, TLS/certificate, HTTP, and download/upload
+measurements. It uses the same concurrency, timeouts, Cloudflare filtering, and
+scoring, and waits for the connection tests before completing this stage.
+The hostname list is fully scanned even though `SELECTED_SNI` is configured.
 
-The TUI shows DNS discovery as stage 1/2, including checked hostname counts,
-unique IP counts, and DNS results/errors, followed by IP probing as stage 2/2.
-Press `q` or `Esc` during discovery to cancel before starting the IP scan.
+After this scan finishes, all IPv4s in its results, including failed probes,
+are deduplicated and appended to `IP_LIST` if new. The file is created if needed.
+Existing IPs and addresses already included by CIDR expansion are not appended
+again, even with `DEDUPLICATE_SCAN_LISTS = false`; comments and line endings are
+preserved. Addresses excluded by the normal `sni_list` Cloudflare filter are
+excluded here too. DNS failures skip individual hostnames; existing IPs remain.
+
+The entire updated `IP_LIST` is then scanned again, using the fixed `SELECTED_SNI`.
+This second scan supplies the final ranking, selection, relay, and load-balancing
+targets, exactly as with `"ip_list"`. Manual, periodic, and network-recovery
+rescans repeat both stages. Both paths are relative to the config directory.
+This change does not modify the Android app.
+
+The TUI shows the full SNI probe table as stage 1/2 and the full fixed-SNI IP
+probe table as stage 2/2, with live probe results and scores in both stages.
+Press `q` or `Esc` during stage 1 to cancel before starting the IP scan.
 
 ### 📌 Fixed Candidate After a Successful Scan
 
@@ -921,14 +927,14 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | `LOAD_BALANCE_TARGET_COUNT` | `usize` | `10` | Maximum unique targets with TCP success and a positive score; must be > 0 |
 | `LOAD_BALANCE_STRATEGY` | `string` | `"round_robin"` | `random`, `round_robin`, `least_ping`, or `least_load` |
 | `LOAD_BALANCE_PING_INTERVAL_SECS` | `u64` | `60` | Delay between live TCP latency rounds for `least_ping`; must be > 0 |
-| `SELECTED_SNI` | `string` | — | With `sni_list`, skip startup scanning and resolve DNS; with `ip_list` or `sni_list+ip_list`, required fixed SNI for every probe and relay |
+| `SELECTED_SNI` | `string` | — | With `sni_list`, skip startup scanning and resolve DNS; with `ip_list` or `sni_list+ip_list`, required fixed SNI for IP-list probes and relays; the combined source first scans the original SNI hostnames |
 | `SELECTED_IP` | `string` | — | Skip IP scan; use this IP directly |
 
 ### 📂 Input Files
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `SNI_TARGET_SOURCE` | `string` | `"sni_list"` | SNI target input: `sni_list`, `ip_list`, or `sni_list+ip_list` (append discovered IPv4s, then use `ip_list`); both IP-list sources require fixed `SELECTED_SNI`; applies to SNI-family modes |
+| `SNI_TARGET_SOURCE` | `string` | `"sni_list"` | SNI target input: `sni_list`, `ip_list`, or `sni_list+ip_list` (full SNI scan, append new IPv4s, then full IP-list scan); both IP-list sources require fixed `SELECTED_SNI`; applies to SNI-family modes |
 | `SNI_LIST` | `string` | `"sni_list.txt"` | Path to decoy SNI hostname file (one per line) |
 | `IP_LIST` | `string` | `"ip_list.txt"` | Path to IP list file (plain IPs or CIDR ranges) |
 

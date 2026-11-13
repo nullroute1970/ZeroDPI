@@ -1,5 +1,7 @@
 //! Prepare the active source once, before progress UI or probe workers start.
-use std::net::Ipv4Addr;
+use std::collections::HashSet;
+use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,7 +11,7 @@ use tokio::sync::mpsc;
 use zerodpi_core::cloudflare::ScanFilter;
 use zerodpi_core::config::{Config, SniTargetSource};
 use zerodpi_core::net::OutboundNetwork;
-use zerodpi_core::sni_scanner::{scan_sni_ips, scan_sni_list, SniProbeEntry};
+use zerodpi_core::sni_scanner::{resolve_sni_list, scan_sni_ips, scan_sni_list, SniProbeEntry};
 
 pub struct PreparedSniScan {
     path: PathBuf,
@@ -19,6 +21,19 @@ pub struct PreparedSniScan {
 }
 
 impl PreparedSniScan {
+    pub async fn prepare(cfg: &Config, path: &Path) -> Result<Self> {
+        if cfg.SNI_TARGET_SOURCE == SniTargetSource::SniListIpList {
+            let sni_path = cfg.sni_list_path();
+            tracing::info!(path = %sni_path.display(), "discovering SNI addresses for IP list");
+            let ips = resolve_sni_list(&sni_path, Duration::from_secs(cfg.SCAN_TIMEOUT_SECS), cfg)
+                .await?;
+            let discovered = ips.len();
+            let added = append_discovered_ips(cfg, path, ips)?;
+            tracing::info!(path = %path.display(), discovered, added, "SNI address discovery complete");
+        }
+        Self::new(cfg, path)
+    }
+
     pub fn new(cfg: &Config, path: &Path) -> Result<Self> {
         let (total, filter, fixed) = match cfg.SNI_TARGET_SOURCE {
             SniTargetSource::SniList => {
@@ -30,7 +45,7 @@ impl PreparedSniScan {
                     None,
                 )
             }
-            SniTargetSource::IpList => {
+            SniTargetSource::IpList | SniTargetSource::SniListIpList => {
                 let (mut ips, filter) = crate::load_ip_scan_input(cfg, path)?;
                 if cfg.DEDUPLICATE_SCAN_LISTS {
                     let mut seen = std::collections::HashSet::new();
@@ -82,9 +97,59 @@ impl PreparedSniScan {
     }
 }
 
+/// Append only new addresses, preserving existing text and its newline style.
+fn append_discovered_ips(cfg: &Config, path: &Path, ips: Vec<Ipv4Addr>) -> Result<usize> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading IP list '{}'", path.display()))
+        }
+    };
+    let mut seen: HashSet<IpAddr> = if content.is_empty() {
+        HashSet::new()
+    } else {
+        zerodpi_core::ip_scanner::load_ip_list_with_options(path, cfg.IPV6_MAX_HOSTS, false)?
+            .into_iter()
+            .collect()
+    };
+    let newline = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut appended = String::new();
+    let mut added = 0;
+    for ip in ips {
+        if seen.insert(IpAddr::V4(ip)) {
+            if appended.is_empty() && !content.is_empty() && !content.ends_with('\n') {
+                appended.push_str(newline);
+            }
+            appended.push_str(&ip.to_string());
+            appended.push_str(newline);
+            added += 1;
+        }
+    }
+    if added > 0 || !path.exists() {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "opening IP list '{}' for discovered addresses",
+                    path.display()
+                )
+            })?;
+        file.write_all(appended.as_bytes())
+            .with_context(|| format!("appending discovered addresses to '{}'", path.display()))?;
+    }
+    Ok(added)
+}
+
 /// Reports keep failed probes; connection selection excludes dead IPs only in the new source.
 pub fn retain_selectable(cfg: &Config, entries: &mut Vec<SniProbeEntry>) {
-    if cfg.SNI_TARGET_SOURCE == SniTargetSource::IpList {
+    if cfg.SNI_TARGET_SOURCE != SniTargetSource::SniList {
         entries.retain(|entry| entry.tcp_latency_ms.is_some() && entry.score > 0);
     }
 }
@@ -154,6 +219,109 @@ mod tests {
         let input = PreparedSniScan::new(&cfg, &path).unwrap();
         assert_eq!(input.total, 2);
         assert_eq!(cfg.sni_scan_list(), "ip_list.txt");
+    }
+
+    #[tokio::test]
+    async fn combined_source_appends_all_dns_ips_then_prepares_fixed_sni_scan() {
+        let server = crate::dns_test_support::TestDnsServer::start_many(
+            0,
+            vec![
+                "192.0.2.1".parse().unwrap(),
+                "192.0.2.2".parse().unwrap(),
+                "198.51.100.7".parse().unwrap(),
+            ],
+            Some(Duration::ZERO),
+        )
+        .await;
+        let (dir, mut cfg, path) = fixture("# existing\r\n192.0.2.1", Some("192.0.2.0/24\n"));
+        cfg.SNI_TARGET_SOURCE = SniTargetSource::SniListIpList;
+        cfg.SNI_LIST = "names/hosts.txt".into();
+        cfg.CUSTOM_DNS_ENABLED = true;
+        cfg.CUSTOM_DNS_SERVERS = vec![server.addr.to_string()];
+        cfg.DEDUPLICATE_SCAN_LISTS = false;
+        std::fs::create_dir(dir.path().join("names")).unwrap();
+        std::fs::write(
+            dir.path().join("names/hosts.txt"),
+            "# hosts\nfirst.test\n\nsecond.test\n",
+        )
+        .unwrap();
+        let input = PreparedSniScan::prepare(&cfg, &path).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# existing\r\n192.0.2.1\r\n192.0.2.2\r\n198.51.100.7\r\n"
+        );
+        assert_eq!(input.total, 2);
+        let (sni, ips) = input.fixed.unwrap();
+        assert_eq!(sni, "fixed.example");
+        assert_eq!(
+            ips,
+            vec![
+                "192.0.2.1".parse::<Ipv4Addr>().unwrap(),
+                "192.0.2.2".parse().unwrap()
+            ]
+        );
+        assert_eq!(server.requests(), 2);
+        let before = std::fs::read(&path).unwrap();
+        PreparedSniScan::prepare(&cfg, &path).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn combined_source_creates_missing_ip_list() {
+        let server = crate::dns_test_support::TestDnsServer::start(
+            0,
+            Some("192.0.2.8".parse().unwrap()),
+            Some(Duration::ZERO),
+        )
+        .await;
+        let (dir, mut cfg, path) = fixture("", None);
+        cfg.SNI_TARGET_SOURCE = SniTargetSource::SniListIpList;
+        cfg.CUSTOM_DNS_ENABLED = true;
+        cfg.CUSTOM_DNS_SERVERS = vec![server.addr.to_string()];
+        std::fs::write(dir.path().join("sni_list.txt"), "first.test\n").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let input = PreparedSniScan::prepare(&cfg, &path).await.unwrap();
+        assert_eq!(input.total, 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "192.0.2.8\n");
+    }
+
+    #[tokio::test]
+    async fn combined_source_keeps_existing_ips_when_dns_fails() {
+        let server =
+            crate::dns_test_support::TestDnsServer::start(3, None, Some(Duration::ZERO)).await;
+        let (dir, mut cfg, path) = fixture("192.0.2.1\n", None);
+        cfg.SNI_TARGET_SOURCE = SniTargetSource::SniListIpList;
+        cfg.CUSTOM_DNS_ENABLED = true;
+        cfg.CUSTOM_DNS_SERVERS = vec![server.addr.to_string()];
+        std::fs::write(dir.path().join("sni_list.txt"), "missing.test\n").unwrap();
+        let input = PreparedSniScan::prepare(&cfg, &path).await.unwrap();
+        assert_eq!(input.total, 1);
+        assert!(server.requests() > 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "192.0.2.1\n");
+    }
+
+    #[test]
+    fn discovery_does_not_append_existing_cidr_hosts_or_duplicate_answers() {
+        let (_dir, cfg, path) = fixture("# candidates\n192.0.2.0/30\n", None);
+        let ips = vec![
+            "192.0.2.1".parse().unwrap(),
+            "192.0.2.2".parse().unwrap(),
+            "198.51.100.7".parse().unwrap(),
+            "198.51.100.7".parse().unwrap(),
+        ];
+        assert_eq!(append_discovered_ips(&cfg, &path, ips).unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# candidates\n192.0.2.0/30\n198.51.100.7\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn ip_list_preparation_does_not_require_a_hostname_file() {
+        let (_dir, cfg, path) = fixture("192.0.2.1\n", None);
+        let input = PreparedSniScan::prepare(&cfg, &path).await.unwrap();
+        assert_eq!(input.total, 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "192.0.2.1\n");
     }
 
     #[test]

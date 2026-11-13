@@ -256,7 +256,8 @@ fn draw_scan_progress(
         // Header
         let title = match cfg.SNI_TARGET_SOURCE {
             zerodpi_core::config::SniTargetSource::SniList => "ZeroDPI — Scanning SNIs…".to_owned(),
-            zerodpi_core::config::SniTargetSource::IpList => format!(
+            zerodpi_core::config::SniTargetSource::IpList
+            | zerodpi_core::config::SniTargetSource::SniListIpList => format!(
                 "ZeroDPI — Scanning {} with SNI {}",
                 cfg.IP_LIST,
                 cfg.SELECTED_SNI.as_deref().unwrap_or("")
@@ -283,7 +284,7 @@ fn draw_scan_progress(
             .gauge_style(Style::default().fg(Color::Green))
             .ratio(ratio)
             .label(
-                if cfg.SNI_TARGET_SOURCE == zerodpi_core::config::SniTargetSource::IpList {
+                if cfg.SNI_TARGET_SOURCE != zerodpi_core::config::SniTargetSource::SniList {
                     format!("{done} / {total_hostnames} IPs probed")
                 } else {
                     format!("{done} probes done (~{total_hostnames} hostnames)")

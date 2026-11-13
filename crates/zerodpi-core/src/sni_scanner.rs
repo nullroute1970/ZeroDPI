@@ -202,6 +202,51 @@ pub async fn probe_sni_candidate(
     probe_sni_ip(sni.to_owned(), ip, timeout, config, connector, network).await
 }
 
+/// Discover every IPv4 address in the hostname list without probing or filtering.
+pub async fn resolve_sni_list(
+    path: &Path,
+    timeout: Duration,
+    config: &crate::config::Config,
+) -> anyhow::Result<Vec<Ipv4Addr>> {
+    let content = crate::scan_list::read_scan_list(path, config.DEDUPLICATE_SCAN_LISTS, |entry| {
+        Some(entry.to_ascii_lowercase())
+    })?;
+    let mut hostnames = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let resolver = Arc::new(DnsResolver::from_config(config, timeout)?);
+    let limit = config.SNI_MAX_CONCURRENT.max(1);
+    let mut tasks = JoinSet::new();
+    let mut ips = Vec::new();
+    loop {
+        while tasks.len() < limit {
+            let Some(hostname) = hostnames.next() else {
+                break;
+            };
+            let hostname = hostname.to_owned();
+            let resolver = resolver.clone();
+            tasks.spawn(async move {
+                match resolver.lookup_ipv4(&hostname).await {
+                    Ok(ips) => ips,
+                    Err(error) => {
+                        warn!(%hostname, error = %error, "SNI address discovery failed");
+                        Vec::new()
+                    }
+                }
+            });
+        }
+        match tasks.join_next().await {
+            Some(Ok(found)) => ips.extend(found),
+            Some(Err(error)) => warn!(%error, "SNI address discovery task failed"),
+            None => break,
+        }
+    }
+    ips.sort_unstable();
+    ips.dedup();
+    Ok(ips)
+}
+
 pub async fn scan_sni_list(
     path: &Path,
     timeout: Duration,

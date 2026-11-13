@@ -474,6 +474,8 @@ pub enum SniTargetSource {
     #[default]
     SniList,
     IpList,
+    #[serde(rename = "sni_list+ip_list")]
+    SniListIpList,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -503,7 +505,7 @@ pub struct Config {
     #[serde(default = "default_sni_list")]
     pub SNI_LIST: String,
 
-    /// Scan hostnames from SNI_LIST, or IP_LIST using the fixed SELECTED_SNI.
+    /// Scan SNI_LIST, IP_LIST with a fixed SNI, or enrich IP_LIST from SNI_LIST first.
     #[serde(default)]
     pub SNI_TARGET_SOURCE: SniTargetSource,
 
@@ -1653,8 +1655,16 @@ impl Config {
     pub fn sni_scan_list(&self) -> &str {
         match self.SNI_TARGET_SOURCE {
             SniTargetSource::SniList => &self.SNI_LIST,
-            SniTargetSource::IpList => &self.IP_LIST,
+            SniTargetSource::IpList | SniTargetSource::SniListIpList => &self.IP_LIST,
         }
+    }
+
+    /// Resolve discovery hostnames relative to the configuration, independently of IP_LIST.
+    pub fn sni_list_path(&self) -> std::path::PathBuf {
+        self.scan_config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(&self.SNI_LIST)
     }
 
     /// Select and validate the effective DNS endpoints in configured order.
@@ -1703,21 +1713,21 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.SNI_TARGET_SOURCE == SniTargetSource::IpList
+        if self.SNI_TARGET_SOURCE != SniTargetSource::SniList
             && matches!(
                 self.MODE.as_str(),
                 "sni_spoof" | "sni_scan" | "sni_method_scan" | "proxy_scan"
             )
         {
             let sni = self.SELECTED_SNI.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("SELECTED_SNI is required when SNI_TARGET_SOURCE = 'ip_list'")
+                anyhow::anyhow!("SELECTED_SNI is required when SNI_TARGET_SOURCE uses ip_list")
             })?;
             anyhow::ensure!(
                 matches!(
                     rustls::pki_types::ServerName::try_from(sni),
                     Ok(rustls::pki_types::ServerName::DnsName(_))
                 ),
-                "SELECTED_SNI must be a valid DNS hostname when SNI_TARGET_SOURCE = 'ip_list'"
+                "SELECTED_SNI must be a valid DNS hostname when SNI_TARGET_SOURCE uses ip_list"
             );
         }
         if self.LOAD_BALANCE_TARGET_COUNT == 0 {
@@ -4976,13 +4986,29 @@ mod sni_target_source_tests {
     }
 
     #[test]
+    fn combined_source_uses_fixed_sni_and_ip_list() {
+        let cfg = parse("SNI_TARGET_SOURCE='sni_list+ip_list'\nSELECTED_SNI='fixed.example'\nIP_LIST='lists/ips.txt'").unwrap();
+        assert!(!cfg.selected_sni_uses_dns());
+        assert_eq!(cfg.sni_scan_list(), "lists/ips.txt");
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap()["SNI_TARGET_SOURCE"],
+            "sni_list+ip_list"
+        );
+    }
+
+    #[test]
     fn ip_list_source_requires_a_dns_hostname_in_sni_modes() {
-        for mode in ["sni_spoof", "sni_scan", "sni_method_scan", "proxy_scan"] {
-            for name in ["", "127.0.0.1", "::1", "bad host", "bad\\r\\nHost: evil"] {
-                let text =
-                    format!("MODE={mode:?}\nSNI_TARGET_SOURCE='ip_list'\nSELECTED_SNI={name:?}");
-                assert!(parse(&text).is_err(), "accepted {text}");
+        for source in ["ip_list", "sni_list+ip_list"] {
+            for mode in ["sni_spoof", "sni_scan", "sni_method_scan", "proxy_scan"] {
+                assert!(parse(&format!("MODE={mode:?}\nSNI_TARGET_SOURCE={source:?}")).is_err());
+                for name in ["", "127.0.0.1", "::1", "bad host", "bad\\r\\nHost: evil"] {
+                    let text = format!(
+                        "MODE={mode:?}\nSNI_TARGET_SOURCE={source:?}\nSELECTED_SNI={name:?}"
+                    );
+                    assert!(parse(&text).is_err(), "accepted {text}");
+                }
             }
+            assert!(parse(&format!("MODE='ip_scan'\nSNI_TARGET_SOURCE={source:?}")).is_ok());
         }
         assert!(parse("SNI_TARGET_SOURCE='unknown'").is_err());
         assert!(parse("MODE='ip_scan'\nSNI_TARGET_SOURCE='ip_list'").is_ok());

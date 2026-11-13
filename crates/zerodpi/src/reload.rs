@@ -179,6 +179,12 @@ impl Session {
             return Ok(None);
         }
         let list = match next.MODE.as_str() {
+            "sni_spoof"
+                if next.SNI_TARGET_SOURCE
+                    == zerodpi_core::config::SniTargetSource::SniListIpList =>
+            {
+                Some(next.SNI_LIST.as_str())
+            }
             "sni_spoof" if !next.selected_sni_uses_dns() => Some(next.sni_scan_list()),
             "ip_bypass" | "ip_bypass_plus" if next.SELECTED_IP.is_none() => {
                 Some(next.IP_LIST.as_str())
@@ -741,6 +747,16 @@ mod tests {
         fs::write(dir.path().join("ip_list.txt"), "192.0.2.1\n").unwrap();
         assert!(session.candidate(None).unwrap().is_some());
     }
+    #[test]
+    fn combined_source_allows_discovery_to_create_the_ip_file() {
+        let (dir, session, _) = session_fixture();
+        fs::write(dir.path().join("config.toml"), "LISTEN_HOST='127.0.0.1'\nLISTEN_PORT=0\nSNI_TARGET_SOURCE='sni_list+ip_list'\nSELECTED_SNI='fixed.example'\nBYPASS_METHOD='tls_frag'\n").unwrap();
+        fs::write(dir.path().join("sni_list.txt"), "first.test\n").unwrap();
+        assert!(session.candidate(None).unwrap().is_some());
+        fs::remove_file(dir.path().join("sni_list.txt")).unwrap();
+        assert!(session.candidate(None).is_err());
+    }
+
     #[test]
     fn fixed_sni_cli_override_is_applied_before_source_validation() {
         let dir = tempfile::tempdir().unwrap();

@@ -963,7 +963,7 @@ async fn scan_sni_list_with_progress(
     network: OutboundNetwork,
     terminal: &mut tui::Term,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
-    let input = PreparedSniScan::new(&cfg, path)?;
+    let input = PreparedSniScan::prepare(&cfg, path).await?;
     let total_hostnames = input.total;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();
@@ -1028,7 +1028,7 @@ async fn scan_sni_list_headless(
     events: &RuntimeEventEmitter,
     scan: ScanKind,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
-    let input = PreparedSniScan::new(&cfg, path)?;
+    let input = PreparedSniScan::prepare(&cfg, path).await?;
     let total = input.total;
     events.emit(RuntimeEvent::ScanStarted {
         scan,
@@ -1403,7 +1403,8 @@ async fn rescan_sni_once(
     let mut scan_summary: Option<(usize, Option<u8>)> = None;
     let cfg_clone = cfg.clone();
     match async {
-        PreparedSniScan::new(&cfg_clone, &path)?
+        PreparedSniScan::prepare(&cfg_clone, &path)
+            .await?
             .run(scan_timeout, cfg_clone, network, None)
             .await
     }

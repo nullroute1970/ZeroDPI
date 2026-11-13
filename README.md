@@ -255,12 +255,12 @@ Mode-specific inputs:
 
 | Mode | Reads `SNI_LIST` | Reads `IP_LIST` | Starts Proxy | Uses `BYPASS_METHOD` |
 |------|:---:|:---:|:---:|:---:|
-| `sni_spoof` | With `sni_list`, unless `SELECTED_SNI` is set | With `ip_list` | Yes | Yes |
+| `sni_spoof` | With `sni_list` (unless `SELECTED_SNI` is set), or `sni_list+ip_list` | With `ip_list` or `sni_list+ip_list` | Yes | Yes |
 | `ip_bypass` | No | Yes, unless `SELECTED_IP` is set | Yes | No |
 | `ip_bypass_plus` | No | Yes, unless `SELECTED_IP` is set | Yes | Yes, only `tls_record_frag`, `tls_record_split`, `tls_frag`, `tls_padding`, `mixed_case_sni`, `sni_boundary_frag`, `ccs_prefix`, `ip_frag`, `disorder`, or `seqovl` |
-| `sni_scan` | With `sni_list` | With `ip_list` | No | No relay; scan only |
+| `sni_scan` | With `sni_list` or `sni_list+ip_list` | With `ip_list` or `sni_list+ip_list` | No | No relay; scan only |
 | `ip_scan` | No | Yes | No | No |
-| `proxy_scan` | With `sni_list` | With `ip_list` | Temporary per-candidate tests | Yes, except standalone proxy scoring still depends on your SOCKS5 proxy |
+| `proxy_scan` | With `sni_list` or `sni_list+ip_list` | With `ip_list` or `sni_list+ip_list` | Temporary per-candidate tests | Yes, except standalone proxy scoring still depends on your SOCKS5 proxy |
 | `sni_method_scan` / `ip_method_scan` | Yes | Yes | Temporary per-method tests | Yes |
 
 `SELECTED_SNI` with the default `SNI_TARGET_SOURCE = "sni_list"`, and `SELECTED_IP` in IP-family modes, are operational shortcuts. They skip scanning and are useful after you have already identified a stable candidate. They are not a replacement for periodic scan-only testing, because CDN routing and IP reachability can change.
@@ -819,6 +819,28 @@ as configured. IP-family modes ignore `SNI_TARGET_SOURCE`. Its default value,
 This release implements the feature in Rust; Android UI/configuration support
 is deferred.
 
+To discover additional IPs from hostnames before each scan, use:
+
+```toml
+SNI_TARGET_SOURCE = "sni_list+ip_list"
+SELECTED_SNI = "example.com"
+SNI_LIST = "sni_list.txt"
+IP_LIST = "ip_list.txt"
+```
+
+The Rust CLI/TUI first resolves every hostname in `SNI_LIST` using the configured
+system/custom DNS settings. It appends new, unique IPv4 addresses to `IP_LIST`,
+creating the file if needed, and then follows the same scan, ranking, selection,
+relay, and load-balancing paths as `"ip_list"`, with the fixed `SELECTED_SNI`.
+Discovery does not require successful TCP/TLS probes or apply Cloudflare filtering;
+the normal filters apply when the updated IP list is scanned. Existing IPs and
+addresses already included by CIDR expansion are not appended again, even with
+`DEDUPLICATE_SCAN_LISTS = false`. Existing comments and line endings are preserved.
+DNS failures for individual hostnames are logged and skipped; existing IPs remain
+available. Manual, periodic, and network-recovery rescans repeat discovery before
+scanning `IP_LIST`. Both paths are relative to the config directory. This change
+does not modify the Android app.
+
 ### 📌 Fixed Candidate After a Successful Scan
 
 Use this after you have already run `sni_scan` and want deterministic startup without scanning every time.
@@ -895,14 +917,14 @@ All fields go in `config.toml` (loaded from the binary's directory, or via `--co
 | `LOAD_BALANCE_TARGET_COUNT` | `usize` | `10` | Maximum unique targets with TCP success and a positive score; must be > 0 |
 | `LOAD_BALANCE_STRATEGY` | `string` | `"round_robin"` | `random`, `round_robin`, `least_ping`, or `least_load` |
 | `LOAD_BALANCE_PING_INTERVAL_SECS` | `u64` | `60` | Delay between live TCP latency rounds for `least_ping`; must be > 0 |
-| `SELECTED_SNI` | `string` | — | With `sni_list`, skip startup scanning and resolve DNS; with `ip_list`, required fixed SNI for every probe and relay |
+| `SELECTED_SNI` | `string` | — | With `sni_list`, skip startup scanning and resolve DNS; with `ip_list` or `sni_list+ip_list`, required fixed SNI for every probe and relay |
 | `SELECTED_IP` | `string` | — | Skip IP scan; use this IP directly |
 
 ### 📂 Input Files
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `SNI_TARGET_SOURCE` | `string` | `"sni_list"` | SNI target input: `sni_list` or `ip_list` with fixed `SELECTED_SNI`; applies to SNI-family modes |
+| `SNI_TARGET_SOURCE` | `string` | `"sni_list"` | SNI target input: `sni_list`, `ip_list`, or `sni_list+ip_list` (append discovered IPv4s, then use `ip_list`); both IP-list sources require fixed `SELECTED_SNI`; applies to SNI-family modes |
 | `SNI_LIST` | `string` | `"sni_list.txt"` | Path to decoy SNI hostname file (one per line) |
 | `IP_LIST` | `string` | `"ip_list.txt"` | Path to IP list file (plain IPs or CIDR ranges) |
 

@@ -963,7 +963,26 @@ async fn scan_sni_list_with_progress(
     network: OutboundNetwork,
     terminal: &mut tui::Term,
 ) -> anyhow::Result<Vec<SniProbeEntry>> {
-    let input = PreparedSniScan::prepare(&cfg, path).await?;
+    let input = if cfg.SNI_TARGET_SOURCE == zerodpi_core::config::SniTargetSource::SniListIpList {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cfg = cfg.clone();
+        let path = path.to_owned();
+        let preparation = tokio::spawn(async move {
+            PreparedSniScan::prepare_with_progress(&cfg, &path, Some(tx)).await
+        });
+        match tui::run_sni_discovery_progress(terminal, &mut rx) {
+            Ok(false) => preparation.await.context("SNI discovery task panicked")??,
+            outcome => {
+                preparation.abort();
+                let _ = preparation.await;
+                outcome?;
+                info!("SNI discovery aborted by user");
+                return Ok(Vec::new());
+            }
+        }
+    } else {
+        PreparedSniScan::prepare(&cfg, path).await?
+    };
     let total_hostnames = input.total;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<SniProbeEntry>();

@@ -202,19 +202,40 @@ pub async fn probe_sni_candidate(
     probe_sni_ip(sni.to_owned(), ip, timeout, config, connector, network).await
 }
 
+/// Progress of the DNS-only discovery stage, including failed lookups.
+#[derive(Debug, Clone)]
+pub enum SniResolveEvent {
+    Started {
+        total: usize,
+    },
+    Resolved {
+        hostname: String,
+        ips: Vec<Ipv4Addr>,
+        error: Option<String>,
+    },
+}
+
 /// Discover every IPv4 address in the hostname list without probing or filtering.
 pub async fn resolve_sni_list(
     path: &Path,
     timeout: Duration,
     config: &crate::config::Config,
+    progress: Option<mpsc::UnboundedSender<SniResolveEvent>>,
 ) -> anyhow::Result<Vec<Ipv4Addr>> {
     let content = crate::scan_list::read_scan_list(path, config.DEDUPLICATE_SCAN_LISTS, |entry| {
         Some(entry.to_ascii_lowercase())
     })?;
-    let mut hostnames = content
+    let hostnames: Vec<_> = content
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    if let Some(tx) = &progress {
+        let _ = tx.send(SniResolveEvent::Started {
+            total: hostnames.len(),
+        });
+    }
+    let mut hostnames = hostnames.into_iter();
     let resolver = Arc::new(DnsResolver::from_config(config, timeout)?);
     let limit = config.SNI_MAX_CONCURRENT.max(1);
     let mut tasks = JoinSet::new();
@@ -227,17 +248,29 @@ pub async fn resolve_sni_list(
             let hostname = hostname.to_owned();
             let resolver = resolver.clone();
             tasks.spawn(async move {
-                match resolver.lookup_ipv4(&hostname).await {
-                    Ok(ips) => ips,
+                let (ips, error) = match resolver.lookup_ipv4(&hostname).await {
+                    Ok(ips) => (ips, None),
                     Err(error) => {
                         warn!(%hostname, error = %error, "SNI address discovery failed");
-                        Vec::new()
+                        (Vec::new(), Some(format!("{error:#}")))
                     }
+                };
+                SniResolveEvent::Resolved {
+                    hostname,
+                    ips,
+                    error,
                 }
             });
         }
         match tasks.join_next().await {
-            Some(Ok(found)) => ips.extend(found),
+            Some(Ok(event)) => {
+                if let SniResolveEvent::Resolved { ips: found, .. } = &event {
+                    ips.extend(found);
+                }
+                if let Some(tx) = &progress {
+                    let _ = tx.send(event);
+                }
+            }
             Some(Err(error)) => warn!(%error, "SNI address discovery task failed"),
             None => break,
         }

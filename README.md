@@ -841,6 +841,10 @@ available. Manual, periodic, and network-recovery rescans repeat discovery befor
 scanning `IP_LIST`. Both paths are relative to the config directory. This change
 does not modify the Android app.
 
+The TUI shows DNS discovery as stage 1/2, including checked hostname counts,
+unique IP counts, and DNS results/errors, followed by IP probing as stage 2/2.
+Press `q` or `Esc` during discovery to cancel before starting the IP scan.
+
 ### 📌 Fixed Candidate After a Successful Scan
 
 Use this after you have already run `sni_scan` and want deterministic startup without scanning every time.

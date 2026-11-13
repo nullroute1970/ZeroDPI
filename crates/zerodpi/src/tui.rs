@@ -48,6 +48,8 @@ use zerodpi_core::target_pool::TargetPool;
 
 mod targets;
 use targets::{draw_targets, fit, DashboardView, TargetsState};
+mod discovery;
+pub use discovery::run_sni_discovery_progress;
 
 pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -234,8 +236,8 @@ pub fn run_scan_progress(
     }
 }
 
-fn draw_scan_progress(
-    terminal: &mut Term,
+fn draw_scan_progress<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
     arrived: &[SniProbeEntry],
     total_hostnames: usize,
     cfg: &Config,
@@ -258,7 +260,12 @@ fn draw_scan_progress(
             zerodpi_core::config::SniTargetSource::SniList => "ZeroDPI — Scanning SNIs…".to_owned(),
             zerodpi_core::config::SniTargetSource::IpList
             | zerodpi_core::config::SniTargetSource::SniListIpList => format!(
-                "ZeroDPI — Scanning {} with SNI {}",
+                "ZeroDPI — {}Scanning {} with SNI {}",
+                if cfg.SNI_TARGET_SOURCE == zerodpi_core::config::SniTargetSource::SniListIpList {
+                    "Stage 2/2 — "
+                } else {
+                    ""
+                },
                 cfg.IP_LIST,
                 cfg.SELECTED_SNI.as_deref().unwrap_or("")
             ),
@@ -2724,6 +2731,24 @@ mod tests {
         assert_eq!(targets.rows[0].upload_bps, 100.0);
         targets.stop();
         assert_eq!(targets.rows[0].upload_bps, 0.0);
+    }
+
+    #[test]
+    fn combined_ip_scan_identifies_the_second_stage() {
+        let mut cfg = crate::config_for_tests();
+        cfg.SNI_TARGET_SOURCE = zerodpi_core::config::SniTargetSource::SniListIpList;
+        cfg.SELECTED_SNI = Some("fixed.example".into());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        draw_scan_progress(&mut terminal, &[], 10, &cfg).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Stage 2/2"), "{text}");
+        assert!(text.contains("0 / 10 IPs probed"));
     }
 
     #[test]

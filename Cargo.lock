@@ -1927,7 +1927,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zerodpi-core",
- "zerodpi-helper-protocol",
  "zerodpi-platform",
 ]
 
@@ -1953,15 +1952,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zerodpi-helper-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "zerodpi-platform"
 version = "0.1.0"
 dependencies = [
@@ -1978,21 +1968,6 @@ dependencies = [
  "windows",
  "windows-sys 0.61.2",
  "zerodpi-core",
-]
-
-[[package]]
-name = "zerodpi-root-helper"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "toml",
- "tracing",
- "tracing-subscriber",
- "zerodpi-core",
- "zerodpi-helper-protocol",
- "zerodpi-platform",
 ]
 
 [[package]]

@@ -151,14 +151,11 @@ pub fn new_flow_table() -> FlowTable {
 }
 
 /// Future returned while a flow controller makes a flow visible to the
-/// packet handler. Remote implementations complete this only after the helper
-/// acknowledges registration, preserving register-before-connect ordering.
+/// packet handler, preserving register-before-connect ordering.
 pub type FlowRegistrationFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<Arc<FlowEntry>>> + Send + 'a>>;
 
-/// Data-plane view of flow registration. Desktop builds use
-/// [`LocalFlowController`]; Android privilege separation supplies a remote
-/// implementation backed by the root-helper protocol.
+/// Data-plane view of flow registration, implemented by [`LocalFlowController`].
 pub trait FlowController: Send + Sync {
     /// Register a flow with the packet handler. `low_ttl_override` is the
     /// per-flow `low_ttl` stamp used by `LOW_TTL_DISCOVER` probe flows so
@@ -173,8 +170,7 @@ pub trait FlowController: Send + Sync {
 
     /// Whether a flow with this key is already registered (live user flow or
     /// another probe). Used by discovery to avoid clobbering an existing
-    /// flow locally and to avoid the helper's duplicate-flow-key rejection
-    /// remotely.
+    /// flow.
     fn flow_exists(&self, key: FlowKey) -> bool;
 
     /// Idempotently release a flow. Implementations must make this safe to

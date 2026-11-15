@@ -14,7 +14,6 @@
 //!      every that many seconds and switch new connections to better targets.
 
 mod data_plane;
-mod helper_client;
 mod manual_rescan;
 mod network_recovery;
 mod reload;
@@ -54,12 +53,9 @@ use zerodpi_core::methods::build_method;
 use zerodpi_core::net::{interface_binding_channel, InterfaceBindingWatch, OutboundNetwork};
 use zerodpi_core::proxy::{
     proxy_event_channel, run_ip_bypass_plus_proxy, run_ip_bypass_proxy, run_proxy, ActiveSniTarget,
-    ProxyEvent, ProxyEventReceiver, ProxyEventSender, RelayEndReason, RescanKind, CONNECT_PORT,
+    ProxyEvent, ProxyEventReceiver, ProxyEventSender, RelayEndReason, RescanKind,
 };
-use zerodpi_core::proxy_tester::{
-    failed_candidate_entry, test_candidate_full, test_candidate_with_flow_controller,
-    ProxyTestEntry,
-};
+use zerodpi_core::proxy_tester::{test_candidate_full, ProxyTestEntry};
 use zerodpi_core::sni_scanner::SniProbeEntry;
 use zerodpi_core::target_pool::{
     ip_candidates, sni_candidates, SelectionStrategy, Target, TargetPool,
@@ -67,7 +63,6 @@ use zerodpi_core::target_pool::{
 use zerodpi_platform::uplink::{platform_socket_binder, resolve_physical_binding};
 use zerodpi_platform::{ensure_packet_interception_access, DefaultInterceptor};
 
-use helper_client::{interceptor_config, RemoteHelperClient};
 use runtime_events::{
     BypassStatus, RuntimeEvent, RuntimeEventEmitter, ScanKind, TargetKind, CONTRACT_VERSION,
 };
@@ -165,28 +160,6 @@ struct Args {
     /// Override `RELAY_MAX_LIFETIME_SECS` (`0` disables relay rotation).
     #[arg(long)]
     relay_max_lifetime: Option<u64>,
-
-    /// Android privilege separation: app-private Unix socket created by the root helper.
-    #[arg(
-        long,
-        requires = "root_helper_session_file",
-        requires = "expected_data_plane_uid"
-    )]
-    root_helper_socket: Option<PathBuf>,
-    /// Android privilege separation: app-private file containing the one-time session proof.
-    #[arg(
-        long,
-        requires = "root_helper_socket",
-        requires = "expected_data_plane_uid"
-    )]
-    root_helper_session_file: Option<PathBuf>,
-    /// Android package UID expected to own this data-plane process.
-    #[arg(
-        long,
-        requires = "root_helper_socket",
-        requires = "root_helper_session_file"
-    )]
-    expected_data_plane_uid: Option<u32>,
 }
 
 impl Args {
@@ -276,11 +249,6 @@ fn main() -> Result<()> {
 
 fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     let no_tui = args.no_tui || args.json_events;
-    let helper_bootstrap = (
-        args.root_helper_socket.clone(),
-        args.root_helper_session_file.clone(),
-        args.expected_data_plane_uid,
-    );
     if args.json_events && !args.no_tui {
         warn!("--json-events implies --no-tui");
     }
@@ -298,17 +266,6 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         info!("system DNS resolver enabled");
     }
     let root_required = requires_packet_interception(&cfg);
-    let remote_helper = connect_external_helper(helper_bootstrap, root_required)?;
-    if let Some(helper) = remote_helper.as_ref() {
-        let (protocol_major, protocol_minor) = helper.protocol_version();
-        events.emit(RuntimeEvent::HelperAuthenticated {
-            pid: helper.helper_pid(),
-            uid: helper.helper_uid(),
-            protocol_major,
-            protocol_minor,
-            capabilities: helper.capabilities().to_vec(),
-        });
-    }
     events.emit(RuntimeEvent::ConfigLoaded {
         path: cfg_path.display().to_string(),
         mode: cfg.MODE.clone(),
@@ -319,7 +276,7 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
         no_tui,
         root_required,
     });
-    if root_required && remote_helper.is_none() {
+    if root_required {
         if let Err(error) = ensure_packet_interception_access() {
             events.emit(RuntimeEvent::RootRequired {
                 mode: cfg.MODE.clone(),
@@ -333,9 +290,9 @@ fn run(args: Args, events: RuntimeEventEmitter) -> Result<()> {
     let cfg = Arc::new(cfg);
 
     if !no_tui && reload::is_proxy_mode(&cfg.MODE) {
-        return reload::run(source, cfg, events, remote_helper);
+        return reload::run(source, cfg, events);
     }
-    run_config(cfg, cfg_path, no_tui, events, remote_helper, None)
+    run_config(cfg, cfg_path, no_tui, events, None)
 }
 
 fn run_config(
@@ -343,7 +300,6 @@ fn run_config(
     cfg_path: PathBuf,
     no_tui: bool,
     events: RuntimeEventEmitter,
-    remote_helper: Option<RemoteHelperClient>,
     mut session: Option<&mut reload::Session>,
 ) -> Result<()> {
     // ---- branch: ip_bypass modes ----
@@ -361,15 +317,7 @@ fn run_config(
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return ip_bypass_plus_main(
-            cfg_clone,
-            cfg_path_clone,
-            rt,
-            no_tui,
-            events,
-            remote_helper,
-            session,
-        );
+        return ip_bypass_plus_main(cfg_clone, cfg_path_clone, rt, no_tui, events, session);
     }
 
     // ---- branch: scan-only modes ----
@@ -396,7 +344,7 @@ fn run_config(
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return proxy_scan_main(cfg_clone, cfg_path_clone, rt, no_tui, events, remote_helper);
+        return proxy_scan_main(cfg_clone, cfg_path_clone, rt, no_tui, events);
     }
     if cfg.MODE == "sni_method_scan" {
         let cfg_clone = cfg.clone();
@@ -598,23 +546,6 @@ fn run_config(
             Arc::new(LocalFlowController::new(new_flow_table())),
             Arc::new(data_plane::DataPlaneController::none()),
         )
-    } else if let Some(helper) = remote_helper.as_ref() {
-        let controller = Arc::new(data_plane::DataPlaneController::remote_pending(
-            cfg.clone(),
-            helper.clone(),
-            Arc::new(helper.clone()),
-        ));
-        if let Some(session) = session.as_deref_mut() {
-            session.own_plane(controller.clone());
-        }
-        rt.block_on(controller.prepare_remote(interface_binding.current()))
-            .context("prepare root helper interceptor")?;
-        info!(
-            helper_pid = helper.helper_pid(),
-            helper_uid = helper.helper_uid(),
-            "root helper interceptor ready"
-        );
-        (Arc::new(helper.clone()), controller)
     } else {
         let flows = new_flow_table();
         let method_box = build_method(&cfg)
@@ -644,8 +575,6 @@ fn run_config(
         if let Some(value) = active_target.representative().low_ttl {
             if let Some(handle) = low_ttl_handle.as_ref() {
                 handle.store(value, Ordering::Relaxed);
-            } else if let Some(helper) = remote_helper.as_ref() {
-                rt.block_on(helper.set_low_ttl_value(value))?;
             }
         }
     }
@@ -669,15 +598,6 @@ fn run_config(
                     interface_binding: interface_binding.clone(),
                     socket_binder: socket_binder.clone(),
                     applier: LowTtlApplier::Local(handle),
-                })
-            } else if let Some(helper) = remote_helper.clone() {
-                Some(LowTtlDiscoveryState {
-                    settings: LowTtlDiscovery::from_config(&cfg),
-                    connector: zerodpi_core::low_ttl_discover::make_discovery_tls_connector(),
-                    flow_controller: flow_controller.clone(),
-                    interface_binding: interface_binding.clone(),
-                    socket_binder: socket_binder.clone(),
-                    applier: LowTtlApplier::Remote(helper),
                 })
             } else {
                 warn!("LOW_TTL_DISCOVER skipped: no interceptor method handle available");
@@ -1244,8 +1164,6 @@ fn decide_low_ttl_discovery(cfg: &Config) -> LowTtlDiscoveryDecision {
 enum LowTtlApplier {
     /// Local interceptor: the shared handle of the live `LowTtl` method.
     Local(Arc<AtomicU8>),
-    /// Remote root helper: `SetLowTtlValue` wire message.
-    Remote(RemoteHelperClient),
 }
 
 impl LowTtlApplier {
@@ -1255,7 +1173,6 @@ impl LowTtlApplier {
                 handle.store(value, Ordering::Relaxed);
                 true
             }
-            Self::Remote(helper) => helper.set_low_ttl_value(value).await.is_ok(),
         }
     }
 }
@@ -1713,53 +1630,9 @@ fn process_uid() -> u32 {
     0
 }
 
-fn connect_external_helper(
-    bootstrap: (Option<PathBuf>, Option<PathBuf>, Option<u32>),
-    root_required: bool,
-) -> Result<Option<RemoteHelperClient>> {
-    let (socket, session_file, expected_uid) = bootstrap;
-    match (socket, session_file, expected_uid) {
-        (None, None, None) => Ok(None),
-        (Some(socket), Some(session_file), Some(expected_uid)) => {
-            if !root_required {
-                anyhow::bail!("root helper bootstrap was supplied for a rootless mode");
-            }
-            verify_data_plane_uid(expected_uid)?;
-            let helper = RemoteHelperClient::connect(&socket, &session_file, expected_uid)
-                .context("authenticate root helper")?;
-            Ok(Some(helper))
-        }
-        _ => anyhow::bail!(
-            "--root-helper-socket, --root-helper-session-file, and --expected-data-plane-uid must be supplied together"
-        ),
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn verify_data_plane_uid(expected_uid: u32) -> Result<()> {
-    let mut real = 0u32;
-    let mut effective = 0u32;
-    let mut saved = 0u32;
-    let result = unsafe { libc::getresuid(&mut real, &mut effective, &mut saved) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error()).context("read data-plane UID identity");
-    }
-    if real != expected_uid || effective != expected_uid || saved != expected_uid {
-        anyhow::bail!(
-            "data-plane UID verification failed: expected {expected_uid}, got real={real} effective={effective} saved={saved}"
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn verify_data_plane_uid(_expected_uid: u32) -> Result<()> {
-    anyhow::bail!("external root helper mode is only supported on Android/Linux")
-}
-
 fn root_required_message(cfg: &Config) -> String {
     format!(
-        "MODE = \"{}\" with BYPASS_METHOD = \"{}\" requires packet interception; on Android the app must start the packaged root helper while keeping the data plane under the app UID. Rootless alternatives are MODE = \"ip_bypass\", scan-only modes, or BYPASS_METHOD = \"tls_frag\" / \"tls_padding\" / \"mixed_case_sni\" / \"sni_boundary_frag\" / \"ccs_prefix\" where supported.",
+        "MODE = \"{}\" with BYPASS_METHOD = \"{}\" requires packet interception; run ZeroDPI with Administrator privileges on Windows or root/CAP_NET_ADMIN on Linux/Termux. Rootless alternatives are MODE = \"ip_bypass\", scan-only modes, or BYPASS_METHOD = \"tls_frag\" / \"tls_padding\" / \"mixed_case_sni\" / \"sni_boundary_frag\" / \"ccs_prefix\" where supported.",
         cfg.MODE, cfg.BYPASS_METHOD
     )
 }
@@ -1786,8 +1659,6 @@ async fn run_headless_proxy(
     log_headless_proxy_start();
     let mut proxy_handle = proxy_handle;
     let event_log_handle = tokio::spawn(log_headless_proxy_events(event_rx, events.clone()));
-    let fatal = data_plane.wait_fatal();
-    tokio::pin!(fatal);
 
     tokio::select! {
         signal = shutdown_signal() => {
@@ -1806,11 +1677,6 @@ async fn run_headless_proxy(
             event_log_handle.abort();
             proxy_result?;
             stop_result
-        }
-        reason = &mut fatal => {
-            proxy_handle.abort();
-            event_log_handle.abort();
-            Err(anyhow::anyhow!(reason))
         }
     }
 }
@@ -2347,7 +2213,6 @@ fn ip_bypass_plus_main(
     rt: tokio::runtime::Runtime,
     no_tui: bool,
     events: RuntimeEventEmitter,
-    remote_helper: Option<RemoteHelperClient>,
     mut session: Option<&mut reload::Session>,
 ) -> Result<()> {
     let ip_list_path = reload::relative_path(&cfg_path, &cfg.IP_LIST);
@@ -2537,18 +2402,6 @@ fn ip_bypass_plus_main(
             Arc::new(LocalFlowController::new(new_flow_table())),
             Arc::new(data_plane::DataPlaneController::none()),
         )
-    } else if let Some(helper) = remote_helper {
-        let controller = Arc::new(data_plane::DataPlaneController::remote_pending(
-            cfg.clone(),
-            helper.clone(),
-            Arc::new(helper.clone()),
-        ));
-        if let Some(session) = session.as_deref_mut() {
-            session.own_plane(controller.clone());
-        }
-        rt.block_on(controller.prepare_remote(interface_binding.current()))
-            .context("prepare root helper interceptor")?;
-        (Arc::new(helper.clone()), controller)
     } else {
         let flows = new_flow_table();
         let method_box = build_method(&cfg)
@@ -3673,7 +3526,6 @@ fn proxy_scan_main(
     rt: tokio::runtime::Runtime,
     no_tui: bool,
     events: RuntimeEventEmitter,
-    remote_helper: Option<RemoteHelperClient>,
 ) -> Result<()> {
     // ---- resolve SNI list path ----
     let sni_scan_path = reload::relative_path(&cfg_path, cfg.sni_scan_list());
@@ -3766,7 +3618,6 @@ fn proxy_scan_main(
     let first_ip = candidates[0].ip;
     let proxy_network = physical_network(first_ip)
         .context("could not determine physical uplink for proxy tests")?;
-    let interface_ip = proxy_network.binding.ip;
 
     // ---- Phase 2: proxy test per candidate ----
     info!(
@@ -3777,7 +3628,6 @@ fn proxy_scan_main(
     let (tx2, rx2) = mpsc::unbounded_channel::<ProxyTestEntry>();
     let cfg_for_phase2 = cfg.clone();
     let candidates_for_phase2 = candidates.clone();
-    let helper_for_phase2 = remote_helper;
     let network_for_phase2 = proxy_network;
     let total_proxy_tests = candidates.len();
 
@@ -3796,41 +3646,10 @@ fn proxy_scan_main(
                 let tx_c = tx2.clone();
                 let network = network_for_phase2.clone();
 
-                let entry = if let Some(helper) = helper_for_phase2.as_ref() {
-                    let config = interceptor_config(
-                        &cfg_c,
-                        interface_ip,
-                        Some(candidate.ip),
-                        CONNECT_PORT,
-                    );
-                    let opened = async {
-                        helper.configure(config).await?;
-                        helper.open().await
-                    }
-                    .await;
-                    if let Err(error) = opened {
-                        warn!(%error, "proxy_scan: root helper failed to open for candidate");
-                        failed_candidate_entry(candidate, cfg_c.PROXY_TEST_SNI_WEIGHT)
-                    } else {
-                        let controller: Arc<dyn FlowController> = Arc::new(helper.clone());
-                        let entry = test_candidate_with_flow_controller(
-                            candidate,
-                            cfg_c.clone(),
-                            network.clone(),
-                            controller,
-                        )
-                        .await;
-                        if let Err(error) = helper.close().await {
-                            warn!(%error, "proxy_scan: root helper failed to close candidate interceptor");
-                        }
-                        entry
-                    }
-                } else {
-                    test_candidate_full(candidate, cfg_c, network, |filter| {
-                        DefaultInterceptor::open(filter)
-                    })
-                    .await
-                };
+                let entry = test_candidate_full(candidate, cfg_c, network, |filter| {
+                    DefaultInterceptor::open(filter)
+                })
+                .await;
 
                 info!("{}", entry.summary_line());
                 let _ = tx_c.send(entry.clone());
@@ -3839,11 +3658,6 @@ fn proxy_scan_main(
                 // Small gap between candidates so the previous interceptor
                 // thread has time to exit before the next one opens.
                 tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            if let Some(helper) = helper_for_phase2.as_ref() {
-                if let Err(error) = helper.shutdown().await {
-                    warn!(%error, "proxy_scan: root helper shutdown failed");
-                }
             }
             results
         })

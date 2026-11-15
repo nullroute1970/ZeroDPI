@@ -230,7 +230,6 @@ dist/windows/
 dist/linux/
 dist/linux/<target>/
 dist/termux/<arch>/
-dist/android-app/<runtime>/
 ```
 
 Copy or deploy the whole generated directory, not only the binary.
@@ -574,10 +573,8 @@ to stronger or more specific methods only when needed.
   legal; some middleboxes drop all IP fragments, in which case `ip_frag`
   connections fail and the method should be removed from the list.
   Fragment-all mode (`IP_FRAG_ONLY_FIRST_PACKET = false`) rewrites every
-  outbound data packet; prefer the default `true`. `ip_frag` is not
-  available through the Android root-helper protocol (desktop Linux/Windows
-  only). WinDivert sends both packets; on Linux/Android the decoy is
-  injected through a raw IP socket in the root helper. If the raw socket is
+  outbound data packet; prefer the default `true`. WinDivert sends both packets; on Linux/Termux the decoy is
+  injected through a raw IP socket in the interceptor process. If the raw socket is
   unavailable, ZeroDPI logs a warning and falls back to single-packet mode
   (retransmission path).
 - `disorder` requires Administrator/root (WinDivert/NFQUEUE) and is
@@ -816,8 +813,6 @@ The source also applies to `sni_scan` and the initial scan stages of
 `sni_method_scan` and `proxy_scan`; their explicit method/proxy tests still run
 as configured. IP-family modes ignore `SNI_TARGET_SOURCE`. Its default value,
 `"sni_list"`, preserves the existing hostname-list and fixed-hostname DNS paths.
-This release implements the feature in Rust; Android UI/configuration support
-is deferred.
 
 To discover additional IPs from hostnames before each scan, use:
 
@@ -845,7 +840,6 @@ The entire updated `IP_LIST` is then scanned again, using the fixed `SELECTED_SN
 This second scan supplies the final ranking, selection, relay, and load-balancing
 targets, exactly as with `"ip_list"`. Manual, periodic, and network-recovery
 rescans repeat both stages. Both paths are relative to the config directory.
-This change does not modify the Android app.
 
 The TUI shows the full SNI probe table as stage 1/2 and the full fixed-SNI IP
 probe table as stage 2/2, with live probe results and scores in both stages.
@@ -1001,8 +995,7 @@ probe and excluded from results. A hostname with mixed DNS answers retains only
 its allowed addresses. DNS-only `SELECTED_SNI` (`sni_list`) and `SELECTED_IP` bypass scanning and are
 not filtered. The SNI scanner remains IPv4-only.
 
-Build packages include `cf.txt` alongside the other runtime lists. Android seeds
-it next to each profile config when missing, preserving an existing file.
+Build packages include `cf.txt` alongside the other runtime lists.
 
 ### 📊 Scoring Parameters
 
@@ -1054,7 +1047,7 @@ With `LOW_TTL_DISCOVER = true`, ZeroDPI probes TTL candidates from `1` up to `LO
 - `low_ttl` must be in `BYPASS_METHOD`; otherwise discovery is skipped silently.
 - Discovery adds a startup delay — typically a few seconds, up to roughly `LOW_TTL_DISCOVER_MAX` × `LOW_TTL_DISCOVER_TIMEOUT_MS` in the worst case — and may extend a rescan cycle by the same worst-case bound while probing a candidate target.
 - The discovered value is session-only and shown in the logs and dashboard; copy it into `LOW_TTL_VALUE` to make it permanent.
-- On Android/Linux the discovery probes and result are applied through the root helper (`SetLowTtlValue` protocol message); no reconfiguration is needed. Probe flows carry the candidate TTL in the `RegisterFlow` message, so the helper stamps it without touching the live value.
+- Discovery probe flows carry the candidate TTL as a per-flow override, so probing does not change the live value. The selected TTL is applied to the running interceptor after discovery succeeds.
 
 #### `wrong_checksum` Parameters
 
@@ -1289,8 +1282,7 @@ method-test modes keep their existing behavior. Enabling it automatically builds
 the pool regardless of `AUTO_SELECT`, including manual rescans from the TUI.
 `SELECTED_SNI` with the default `sni_list` source, or `SELECTED_IP` in IP modes,
 takes priority, skips scanning, and keeps a single pinned target even during rescans.
-With `SNI_TARGET_SOURCE = "ip_list"`, the fixed SNI does not pin the IP pool. The Android settings editor is unchanged;
-these options are configured in TOML.
+With `SNI_TARGET_SOURCE = "ip_list"`, the fixed SNI does not pin the IP pool. Configure these options in TOML.
 
 Candidates retain the scanner's score order. Only successful TCP probes with
 positive scores qualify; duplicate `(SNI, IP)` pairs or IPs count once. Fewer
@@ -1700,17 +1692,30 @@ Runtime behavior to know:
 - Scan-only modes do not start the local proxy and do not need your VPN client to be running.
 - `proxy_scan` requires the configured SOCKS5 proxy to be running before ZeroDPI starts Phase 2.
 
-### 🤖 Headless / Android Controller Contract
+### 🤖 Headless Controller Contract
 
-Android process-wrapper runners should start ZeroDPI without the terminal UI:
+Headless process wrappers should start ZeroDPI without the terminal UI:
 
 ```sh
 zerodpi --config <path> --no-tui --auto-select --json-events
 ```
 
-`--json-events` emits newline-delimited JSON to stdout and leaves human logs on stderr. It implies `--no-tui`, so the stream remains parseable for app controllers. Event names include `startup`, `config_loaded`, `scan_started`, `scan_progress`, `scan_completed`, `next_scan_scheduled`, `rescan_started`, `rescan_finished`, `selected_target`, `listener_started`, `connection_accepted`, `bypass_finished`, `relay_bytes`, `active_target_changed`, `root_required`, `fatal_error`, and `graceful_shutdown`.
+`--json-events` emits newline-delimited JSON to stdout and leaves human logs on stderr. It implies `--no-tui`, so the stream remains parseable for controllers. Event names include `startup`, `config_loaded`, `scan_started`, `scan_progress`, `scan_completed`, `next_scan_scheduled`, `rescan_started`, `rescan_finished`, `selected_target`, `listener_started`, `connection_accepted`, `bypass_finished`, `relay_bytes`, `active_target_changed`, `root_required`, `fatal_error`, and `graceful_shutdown`.
 
 To stop a headless run, send `SIGTERM` and wait for ZeroDPI to exit. On Linux/Android NFQUEUE paths, ZeroDPI requests interceptor shutdown before returning so firewall guards can clean up. A controller may kill the process only after its own timeout. Exit code `0` means a scan completed or a headless proxy stopped cleanly; non-zero means the controller should show the error and retain stderr/stdout logs. If root is required but unavailable, the JSON stream includes `root_required` with rootless alternatives.
+
+### 🔄 Network recovery
+
+ZeroDPI recovers from network changes in place. When the default interface
+address changes (Wi-Fi to cellular, DHCP lease change, sleep/wake, adapter
+reset), the core detects it from OS notifications with a 10-second polling
+safety net, rebuilds packet interception against the new address, drops stale
+flow state, and verifies the active target. If the target no longer works and
+`AUTO_SELECT = true`, it runs one rescan (at most once per minute) and
+hot-swaps; a pinned target (`AUTO_SELECT = false` without load balancing, DNS-only `SELECTED_SNI`, or `SELECTED_IP` in IP modes)
+is never replaced automatically. Rebuild failures retry with a 1 s to 60 s
+backoff, reset by the next network event. Existing connections still break on
+a network change; only new connections recover.
 
 ### 🐧 Linux
 
@@ -1781,50 +1786,6 @@ If Windows blocks the driver or DLL, unblock the downloaded archive before extra
 Requires root, a supported firewall backend command (`iptables` by default, or `nft` with `LINUX_FIREWALL_BACKEND = "nftables"`), and a kernel with NFQUEUE support.
 
 On Android, `tls_frag`, `tls_padding`, `tls_record_split`, or `ccs_prefix` are the simplest methods to try first because they do not require NFQUEUE interception. Interceptor-based methods still need root and a compatible kernel.
-
-### 📱 Android app
-
-The Android app exposes the full core configuration: all eight operating
-modes (including `sni_method_scan` / `ip_method_scan`), all eighteen base
-bypass methods as a multi-select list (`BYPASS_METHOD`), and every
-per-method parameter group (`low_ttl`, `fake_tls`, `ip_frag`, `disorder`,
-`seqovl`, `tls_record_split`, `urg_sni_split`, `sni_boundary_frag`,
-`tls_padding`,
-`mixed_case_sni`, `ccs_prefix`) under Configure → Advanced. When a
-method-scan mode is
-selected, the Home tab shows live progress and a ranked results table
-read from `METHOD_SCAN_OUTPUT` (auto-filled to `method_scan_output.json`
-in the profile runtime directory when left blank). Socket-only methods
-(`tls_frag`, `ccs_prefix`, `tls_padding`, `mixed_case_sni`,
-`sni_boundary_frag`) run without root.
-
-With `AUTO_SELECT = false` the app mirrors the desktop selection table: the
-Home tab shows a target picker, Start runs a scan first and asks you to choose
-a ranked SNI/IP, and **Scan &amp; choose** (also on Home) re-picks at any
-time. The chosen target is stored app-side per profile and injected into an
-ephemeral run config on the next start — `config.toml` is never rewritten,
-and **Clear pin** returns to scan-and-ask behavior.
-
-ZeroDPI recovers from network changes in place. When the default interface
-address changes (Wi-Fi to cellular, DHCP lease change, sleep/wake, adapter
-reset), the core detects it from OS notifications with a 10-second polling
-safety net, rebuilds packet interception against the new address, drops stale
-flow state, and verifies the active target. If the target no longer works and
-`AUTO_SELECT = true`, it runs one rescan (at most once per minute) and
-hot-swaps; a pinned target (`AUTO_SELECT = false` without load balancing, DNS-only `SELECTED_SNI`, or `SELECTED_IP` in IP modes)
-is never replaced automatically. Rebuild failures retry with a 1 s to 60 s
-backoff, reset by the next network event. Existing connections still break on
-a network change; only new connections recover.
-
-The app supervises every run it starts. A run that ends unexpectedly is
-relaunched with a backoff (1 s doubling to 60 s) until you press Stop, and a
-run that goes silent is recovered the same way: nothing reports progress for
-two minutes during a scan (four minutes after one) means the child process is
-wedged, so the app kills it and restarts — or fails the scan with the reason
-shown on Home and in Live logs. The visible state therefore never stays on
-Starting or Scanning forever; if it keeps returning to Scanning, check the log
-line that accompanies the restart (for example `no reachable SNI candidates
-found`) before blaming the app.
 
 ---
 
@@ -1913,51 +1874,6 @@ python build.py --platform termux --termux-arch armv8 --android-api 23
 python build.py --platform termux --termux-arch x86_64 --android-ndk /path/to/android-ndk
 ```
 
-Android app APK packaging stages the native runtime and then runs the Android
-Gradle project:
-
-```sh
-python build.py --platform android
-python build.py --platform android --android-app-runtime both
-python build.py --platform android --android-app-abi debug --android-ndk /path/to/android-ndk
-python build.py --platform android --android-app-build-type release
-```
-
-The default Android app build creates the first-release public ABIs
-`arm64-v8a` and `armeabi-v7a` under `dist/android-app/rootless/`. Use
-`--android-app-abi debug` to also build `x86_64` for emulator work.
-Use debug builds for local `adb install` smoke tests unless release signing is
-configured. An unsigned release artifact such as
-`zerodpi-android-full-release-unsigned.apk` is only for manual signing and
-Android will reject it with `INSTALL_PARSE_FAILED_NO_CERTIFICATES`.
-
-Runtime variants:
-
-- `rootless`: builds `zerodpi` with packet interception disabled. Scan-only,
-  `ip_bypass`, and supported `tls_frag` workflows still run; NFQUEUE modes fail
-  with a clear unsupported-artifact/rootless-alternative error.
-- `full`: keeps the default packet-interception feature for rooted NFQUEUE
-  testing. Device support still depends on root, firewall commands, and kernel
-  NFQUEUE support.
-
-Output layout:
-
-```text
-dist/android-app/rootless/
-  assets/zerodpi/config.toml
-  assets/zerodpi/sni_list.txt
-  assets/zerodpi/ip_list.txt
-  bin/<abi>/zerodpi
-  jniLibs/<abi>/libzerodpi_exec.so
-  zerodpi-runtime-manifest.json
-  zerodpi-android-rootless-debug.apk
-```
-
-`build.py` passes the staged runtime directory to Gradle, so the APK packages
-`jniLibs/` and the default config/list assets without a manual copy into the app
-module. The app runs the ABI-matched `libzerodpi_exec.so` from
-`ApplicationInfo.nativeLibraryDir`. `bin/<abi>/zerodpi` is still provided for
-`adb` smoke tests such as `zerodpi --version` and rootless listener checks.
 </details>
 
 ---
@@ -2018,12 +1934,8 @@ Unit tests cover:
 | A fixed `SELECTED_SNI` stopped working | Clear `SELECTED_SNI`, run `sni_scan`, and select a fresh candidate. DNS and CDN edge routing can change. |
 | Linux rules remain after a forced kill | Restart ZeroDPI cleanly if possible, or inspect/remove matching `iptables`/`nft` rules manually. Normal shutdown removes temporary rules. |
 | Another device cannot connect to ZeroDPI | Use `LISTEN_HOST = "0.0.0.0"`, open the host firewall for `LISTEN_PORT`, and make sure the other device dials the ZeroDPI machine's LAN IP. |
-| Android app remote update is unavailable | In Settings -> `Remote update`, configure all three absolute `http://` or `https://` URLs. Stop ZeroDPI first; profile switching and remote updates are blocked while the runtime is active. |
-| Android app remote update fails | Check Settings -> `Remote update` for `Last attempt`, `Last success`, `Last update`, and the message below them. HTTP errors, DNS/TLS failures, unsupported redirects, empty responses, and size-limit failures leave local profile files unchanged. |
-| Android app remote update downloads but does not apply | The downloaded `config.toml`, `sni_list.txt`, or `ip_list.txt` failed validation. Fix the remote source, or disable automatic update and reset/edit the affected active-profile file locally. |
-| ZeroDPI reports `network_recovery_failed` or stays on `Network: recovering` | The data plane cannot be rebuilt on the new address. Check that interception permissions still hold (root helper alive, iptables/nftables available) and read the event's `message`. Recovery retries automatically; a dead root helper stays fatal and the supervisor restarts the run. |
+| ZeroDPI reports `network_recovery_failed` or stays on `Network: recovering` | The data plane cannot be rebuilt on the new address. Check that interception permissions still hold (Administrator/root privileges and firewall commands available) and read the event's `message`. Recovery retries automatically. |
 | `AUTO_SELECT = false` and the pinned target stopped working after a network change | Pinned targets are never replaced automatically. Run a scan and pick a target, or clear the pin. |
-| Android app stays on Scanning | Healthy scans report progress per probe and the app recovers a silent run on its own (restart for a run, an inline failure for a pick scan). Read Live logs: a repeated `no reachable SNI candidates found` means the candidates are blocked on the current network, so refresh `sni_list.txt`, raise `SCAN_TIMEOUT_SECS`, or pick a pinned target instead. |
 
 Use `RUST_LOG=debug` when collecting detailed diagnostics:
 
@@ -2046,10 +1958,6 @@ sudo journalctl -u zerodpi.service -f
 sudo journalctl -u zerodpi.service --since "10 minutes ago"
 ```
 
-For native Android app profile issues, export Diagnostics -> `Export bundle`.
-The bundle includes the active profile id/name, redacted remote URL query
-strings, auto update settings, and last remote update status.
-
 ---
 
 ## 🔐 Security & Privacy Checklist
@@ -2057,7 +1965,6 @@ strings, auto update settings, and last remote update status.
 - 🚫 Do not publish real VPN endpoints, private SNI lists, proxy credentials, or machine-specific paths.
 - 📸 Treat screenshots as publishable artifacts only after removing visible private details and embedded metadata.
 - 🔒 Keep `config.toml`, `sni_list.txt`, and `ip_list.txt` out of public commits if they contain operational infrastructure.
-- 🤫 Treat Android profile remote URLs as secrets when they include query tokens or embedded credentials. Support bundles redact query strings, but screenshots and copied settings may not.
 - 🏠 Prefer `LISTEN_HOST = "127.0.0.1"` unless another device must connect to ZeroDPI.
 - 🕵️ Review logs before sharing them. Logs can include local ports, selected candidates, timing, and failure reasons.
 - ✅ Use scan-only modes before production changes so you can validate candidates without running the relay.

@@ -224,7 +224,6 @@ where
         remote_port: CONNECT_PORT,
         queue_num: config.NFQUEUE_NUM,
         linux_firewall_backend: config.linux_firewall_backend(),
-        firewall_owner: None,
     };
 
     let interceptor = match interceptor_factory(filter) {
@@ -264,36 +263,6 @@ where
     let _ = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
 
     build_entry(candidate, probe_result, &config)
-}
-
-/// Test a candidate using an already-open interceptor controller. This is the
-/// Android privilege-separated path; the caller must configure/open the root
-/// helper before calling and close it after this future returns.
-pub async fn test_candidate_with_flow_controller(
-    candidate: &SniProbeEntry,
-    config: Arc<Config>,
-    network: OutboundNetwork,
-    flow_controller: Arc<dyn crate::flow::FlowController>,
-) -> ProxyTestEntry {
-    let timeout = Duration::from_secs(config.PROXY_TEST_TIMEOUT_SECS);
-    let active_target = Arc::new(std::sync::RwLock::new(ActiveSniTarget::new(
-        candidate.sni.clone(),
-        candidate.ip,
-        candidate.sni_score(),
-    )));
-    let probe_result = run_socks5_probe(
-        config.clone(),
-        active_target,
-        flow_controller,
-        network,
-        timeout,
-    )
-    .await;
-    build_entry(candidate, probe_result, &config)
-}
-
-pub fn failed_candidate_entry(candidate: &SniProbeEntry, sni_weight: f64) -> ProxyTestEntry {
-    failed_entry(candidate, sni_weight)
 }
 
 // ---------------------------------------------------------------------------

@@ -1426,7 +1426,7 @@ where
 /// Accept an integer, a numeric string, or an empty string for an optional
 /// `usize` field.
 ///
-/// The TOML editor in the Android app writes optional fields as `NAME = ""`,
+/// TOML editors may write optional fields as `NAME = ""`,
 /// so an empty string must decode to `None` rather than failing to parse. A
 /// bare integer keeps the desktop configuration idiomatic.
 fn empty_string_as_none_usize<'de, D>(de: D) -> Result<Option<usize>, D::Error>
@@ -3318,7 +3318,7 @@ mod tests {
 
     #[test]
     fn parses_empty_seqovl_size_as_none() {
-        // The Android config editor writes optional fields as `NAME = ""`.
+        // TOML editors may write optional fields as `NAME = ""`.
         let cfg: Config = toml::from_str(
             r#"LISTEN_HOST = "127.0.0.1"
                LISTEN_PORT = 44444

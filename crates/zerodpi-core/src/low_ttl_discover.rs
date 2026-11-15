@@ -155,8 +155,7 @@ pub async fn discover_low_ttl(
 }
 
 /// Register a probe flow, refusing to clobber a flow that already owns the
-/// 4-tuple: a live user flow locally, or any flow remotely (the root helper
-/// rejects duplicate flow keys with `HelperFatal`). `low_ttl_override` is
+/// 4-tuple. `low_ttl_override` is
 /// the candidate TTL, so the interceptor stamps it without touching the
 /// shared live handle.
 async fn register_probe_flow(

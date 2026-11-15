@@ -26,9 +26,3 @@ __pycache__/
 
 # OpenCode skills
 .opencode/
-
-# Android app
-.gradle-dist/
-android/.gradle/
-android/local.properties
-android/**/build/

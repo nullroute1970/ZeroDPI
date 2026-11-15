@@ -1,10 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/zerodpi-helper-protocol",
     "crates/zerodpi-core",
     "crates/zerodpi-platform",
-    "crates/zerodpi-root-helper",
     "crates/zerodpi",
 ]
 

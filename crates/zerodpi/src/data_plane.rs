@@ -18,26 +18,15 @@ use zerodpi_core::net::InterfaceBinding;
 use zerodpi_core::proxy::CONNECT_PORT;
 use zerodpi_platform::DefaultInterceptor;
 
-use crate::helper_client::{interceptor_config, RemoteHelperClient};
-
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A live data plane that can be rebuilt for a new interface address.
 pub trait DataPlane: Send + Sync {
     fn rebuild<'a>(&'a self, binding: InterfaceBinding) -> BoxFuture<'a, Result<()>>;
     fn stop<'a>(&'a self) -> BoxFuture<'a, Result<()>>;
-    /// Close interception while keeping the authenticated helper available.
+    /// Close interception before loading a new configuration.
     fn close_for_reload<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
         self.stop()
-    }
-    /// True when the remote root helper is gone and no rebuild can succeed.
-    fn remote_disconnected(&self) -> bool {
-        false
-    }
-    /// Resolves with a fatal reason when the plane can never recover.
-    /// Default planes wait forever.
-    fn wait_fatal(&self) -> BoxFuture<'static, String> {
-        Box::pin(std::future::pending::<String>())
     }
 }
 
@@ -51,13 +40,11 @@ pub fn interceptor_filter(cfg: &Config, binding: &InterfaceBinding) -> FilterSpe
         remote_port: CONNECT_PORT,
         queue_num: cfg.NFQUEUE_NUM,
         linux_firewall_backend: cfg.linux_firewall_backend(),
-        firewall_owner: None,
     }
 }
 
 enum Inner {
     Local(LocalPlane),
-    Remote(RemotePlane),
     None,
 }
 
@@ -74,17 +61,9 @@ struct LocalPlane {
     armed: bool,
 }
 
-struct RemotePlane {
-    cfg: Arc<Config>,
-    helper: RemoteHelperClient,
-    flow_controller: Arc<dyn FlowController>,
-    configured: bool,
-}
-
 /// Owns the live interceptor and rebuilds it for a new address.
 pub struct DataPlaneController {
     inner: Mutex<Inner>,
-    remote_helper: Option<RemoteHelperClient>,
 }
 
 impl DataPlaneController {
@@ -110,55 +89,13 @@ impl DataPlaneController {
         plane.open(binding)?;
         Ok(Self {
             inner: Mutex::new(Inner::Local(plane)),
-            remote_helper: None,
         })
-    }
-
-    /// Construct before opening so failed startup still has an owned cleanup path.
-    pub fn remote_pending(
-        cfg: Arc<Config>,
-        helper: RemoteHelperClient,
-        flow_controller: Arc<dyn FlowController>,
-    ) -> Self {
-        Self {
-            inner: Mutex::new(Inner::Remote(RemotePlane {
-                cfg,
-                helper: helper.clone(),
-                flow_controller,
-                configured: false,
-            })),
-            remote_helper: Some(helper),
-        }
-    }
-
-    pub async fn prepare_remote(&self, binding: InterfaceBinding) -> Result<()> {
-        let mut inner = self.inner.lock().await;
-        let Inner::Remote(plane) = &mut *inner else {
-            anyhow::bail!("not a remote interceptor");
-        };
-        plane
-            .helper
-            .configure(interceptor_config(
-                &plane.cfg,
-                binding.ip,
-                None,
-                CONNECT_PORT,
-            ))
-            .await
-            .context("configure root helper interceptor")?;
-        plane.configured = true;
-        plane
-            .helper
-            .open()
-            .await
-            .context("open root helper interceptor")
     }
 
     /// A plane for modes without interception (`ip_bypass`, socket-only).
     pub fn none() -> Self {
         Self {
             inner: Mutex::new(Inner::None),
-            remote_helper: None,
         }
     }
 }
@@ -169,13 +106,6 @@ impl DataPlane for DataPlaneController {
             let mut inner = self.inner.lock().await;
             match &mut *inner {
                 Inner::Local(plane) => stop_local(plane).await,
-                Inner::Remote(plane) => {
-                    if plane.configured {
-                        plane.helper.close().await?;
-                    }
-                    plane.flow_controller.reset();
-                    Ok(())
-                }
                 Inner::None => Ok(()),
             }
         })
@@ -190,29 +120,6 @@ impl DataPlane for DataPlaneController {
                     plane.open(binding)?;
                     Ok(())
                 }
-                Inner::Remote(plane) => {
-                    plane
-                        .helper
-                        .close()
-                        .await
-                        .context("close root helper interceptor")?;
-                    plane.flow_controller.reset();
-                    plane
-                        .helper
-                        .configure(interceptor_config(
-                            &plane.cfg,
-                            binding.ip,
-                            None,
-                            CONNECT_PORT,
-                        ))
-                        .await
-                        .context("reconfigure root helper interceptor")?;
-                    plane
-                        .helper
-                        .open()
-                        .await
-                        .context("reopen root helper interceptor")
-                }
                 Inner::None => Ok(()),
             }
         })
@@ -223,30 +130,9 @@ impl DataPlane for DataPlaneController {
             let mut inner = self.inner.lock().await;
             match &mut *inner {
                 Inner::Local(plane) => stop_local(plane).await,
-                Inner::Remote(plane) => {
-                    plane.helper.close().await?;
-                    plane.helper.shutdown().await
-                }
                 Inner::None => Ok(()),
             }
         })
-    }
-
-    fn remote_disconnected(&self) -> bool {
-        self.remote_helper
-            .as_ref()
-            .map(RemoteHelperClient::is_disconnected)
-            .unwrap_or(false)
-    }
-
-    fn wait_fatal(&self) -> BoxFuture<'static, String> {
-        match self.remote_helper.clone() {
-            Some(helper) => Box::pin(async move {
-                helper.wait_disconnected().await;
-                "root helper disconnected while interception was active".to_owned()
-            }),
-            None => Box::pin(std::future::pending::<String>()),
-        }
     }
 }
 
@@ -343,7 +229,6 @@ mod tests {
         assert_eq!(filter.remote_ip, None);
         assert_eq!(filter.remote_port, zerodpi_core::proxy::CONNECT_PORT);
         assert_eq!(filter.queue_num, cfg.NFQUEUE_NUM);
-        assert_eq!(filter.firewall_owner, None);
     }
 
     #[tokio::test]
@@ -355,7 +240,6 @@ mod tests {
             .unwrap();
         plane.stop().await.unwrap();
         plane.close_for_reload().await.unwrap();
-        assert!(!plane.remote_disconnected());
     }
     fn local_plane_with_missing_handles() -> LocalPlane {
         let cfg = Arc::new(crate::config_for_tests());

@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use zerodpi_core::config::Config;
 
 use crate::data_plane::DataPlane;
-use crate::helper_client::RemoteHelperClient;
 use crate::runtime_events::RuntimeEventEmitter;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -76,7 +75,7 @@ pub fn restore_pool(cfg: &Config, targets: Vec<Target>) -> Result<TargetPool> {
     )
 }
 
-fn validate_reload(cfg: &Config, helper: Option<&RemoteHelperClient>) -> Result<()> {
+fn validate_reload(cfg: &Config) -> Result<()> {
     cfg.validate()?;
     anyhow::ensure!(
         is_proxy_mode(&cfg.MODE),
@@ -89,23 +88,18 @@ fn validate_reload(cfg: &Config, helper: Option<&RemoteHelperClient>) -> Result<
         let _: IpAddr = ip.parse().context("invalid SELECTED_IP")?;
     }
     if crate::requires_packet_interception(cfg) {
-        if let Some(helper) = helper {
-            anyhow::ensure!(!helper.is_disconnected(), "root helper is disconnected");
-        } else {
-            zerodpi_platform::ensure_packet_interception_access()?;
-        }
+        zerodpi_platform::ensure_packet_interception_access()?;
         zerodpi_core::methods::build_method(cfg).context("unsupported BYPASS_METHOD")?;
     }
     Ok(())
 }
 
-/// The terminal and helper outlive individual service runtimes. Each mode owns
+/// The terminal outlives individual service runtimes. Each mode owns
 /// its own Runtime; returning from it drops and joins all its async workers
 /// (including detached scanners, connection JoinSets, and ping monitors) before
 /// `close_generation` closes the interceptor on the separate control runtime.
 pub struct Session {
     source: ConfigSource,
-    helper: Option<RemoteHelperClient>,
     terminal: Option<crate::tui::Term>,
     plane: Option<Arc<dyn DataPlane>>,
     monitor: Option<Arc<NetworkMonitor>>,
@@ -119,10 +113,9 @@ pub struct Session {
 }
 
 impl Session {
-    pub(crate) fn new(source: ConfigSource, helper: Option<RemoteHelperClient>) -> Self {
+    pub(crate) fn new(source: ConfigSource) -> Self {
         Self {
             source,
-            helper,
             terminal: None,
             plane: None,
             monitor: None,
@@ -170,7 +163,7 @@ impl Session {
 
     pub fn candidate(&self, active: Option<&Config>) -> Result<Option<Arc<Config>>> {
         let next = self.source.load()?;
-        validate_reload(&next, self.helper.as_ref())?;
+        validate_reload(&next)?;
         if active
             .map(|cfg| same_config(cfg, &next))
             .transpose()?
@@ -290,23 +283,10 @@ struct Backup {
     targets: Vec<Target>,
 }
 
-pub fn run(
-    source: ConfigSource,
-    cfg: Arc<Config>,
-    events: RuntimeEventEmitter,
-    helper: Option<RemoteHelperClient>,
-) -> Result<()> {
+pub fn run(source: ConfigSource, cfg: Arc<Config>, events: RuntimeEventEmitter) -> Result<()> {
     let path = source.path.clone();
-    let helper_for_generation = helper.clone();
-    run_with(Session::new(source, helper), cfg, |cfg, session| {
-        crate::run_config(
-            cfg,
-            path.clone(),
-            false,
-            events.clone(),
-            helper_for_generation.clone(),
-            Some(session),
-        )
+    run_with(Session::new(source), cfg, |cfg, session| {
+        crate::run_config(cfg, path.clone(), false, events.clone(), Some(session))
     })
 }
 
@@ -320,11 +300,7 @@ fn run_with(
         .build()?;
     let result = run_loop(&mut session, &control, cfg, &mut execute);
     let close_result = session.close_generation(&control);
-    let helper_result = match &session.helper {
-        Some(helper) if !helper.is_disconnected() => control.block_on(helper.shutdown()),
-        _ => Ok(()),
-    };
-    result.and(close_result).and(helper_result)
+    result.and(close_result)
 }
 
 fn run_loop(
@@ -343,7 +319,7 @@ fn run_loop(
         session.discovered_ttl = None;
         let result = execute(cfg.clone(), session);
         // execute has returned: its service Runtime has already been dropped
-        // and joined. No previous worker can touch the helper after this point.
+        // and joined. No previous worker can use the interceptor after this point.
         if session.ready {
             let mut targets = session
                 .pool
@@ -421,7 +397,7 @@ mod tests {
         ]))
         .unwrap();
         let cfg = Arc::new(source.load().unwrap());
-        (dir, Session::new(source, None), cfg)
+        (dir, Session::new(source), cfg)
     }
 
     fn spawn_proxy(
@@ -728,16 +704,16 @@ mod tests {
         for mode in ["sni_spoof", "ip_bypass", "ip_bypass_plus"] {
             cfg.MODE = mode.into();
             cfg.BYPASS_METHOD = zerodpi_core::config::BypassMethodList::from_delimited("tls_frag");
-            assert!(validate_reload(&cfg, None).is_ok(), "{mode}");
+            assert!(validate_reload(&cfg).is_ok(), "{mode}");
         }
         cfg.MODE = "sni_scan".into();
-        assert!(validate_reload(&cfg, None)
+        assert!(validate_reload(&cfg)
             .unwrap_err()
             .to_string()
             .contains("MODE"));
         cfg.MODE = "ip_bypass".into();
         cfg.LISTEN_HOST = "invalid listener".into();
-        assert!(validate_reload(&cfg, None).is_err());
+        assert!(validate_reload(&cfg).is_err());
     }
     #[test]
     fn fixed_sni_reload_preflights_ip_list_even_with_selected_sni() {

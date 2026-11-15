@@ -3014,7 +3014,7 @@ mod tests {
         ]))
         .unwrap();
         let cfg = source.load().unwrap();
-        let session = crate::reload::Session::new(source, None);
+        let session = crate::reload::Session::new(source);
         let mut state = dashboard_state(vec![record(ConnStatus::Relaying, 100.0, 200.0)]);
         state.total = 42;
         state.scroll_offset = 3;

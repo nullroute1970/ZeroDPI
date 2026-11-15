@@ -79,13 +79,6 @@ pub enum RuntimeEvent {
         pid: u32,
         uid: u32,
     },
-    HelperAuthenticated {
-        pid: u32,
-        uid: u32,
-        protocol_major: u16,
-        protocol_minor: u16,
-        capabilities: Vec<String>,
-    },
     ConfigLoaded {
         path: String,
         mode: String,

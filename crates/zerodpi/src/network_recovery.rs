@@ -65,9 +65,6 @@ pub trait RecoveryEnv: Send + Sync + 'static {
     fn verify<'a>(&'a self) -> BoxFuture<'a, bool>;
     fn rescan<'a>(&'a self) -> BoxFuture<'a, RescanOutcome>;
     fn apply_interface_binding(&self, binding: InterfaceBinding);
-    fn remote_disconnected(&self) -> bool {
-        false
-    }
     fn publish(&self, status: NetworkStatus);
 }
 
@@ -119,13 +116,6 @@ impl<E: RecoveryEnv> RecoveryCoordinator<E> {
         rx: &mut broadcast::Receiver<NetworkEvent>,
     ) {
         loop {
-            if self.env.remote_disconnected() {
-                self.current = None;
-                self.env.publish(NetworkStatus::Unavailable {
-                    message: "root helper disconnected".to_owned(),
-                });
-                return;
-            }
             let target = match self.probe_target.load(Ordering::SeqCst) {
                 0 => {
                     self.env.publish(NetworkStatus::Unavailable {
@@ -341,10 +331,6 @@ impl RecoveryEnv for MainRecoveryEnv {
         self.interface_binding_handle.set(binding);
     }
 
-    fn remote_disconnected(&self) -> bool {
-        self.data_plane.remote_disconnected()
-    }
-
     fn publish(&self, status: NetworkStatus) {
         if let Some(event) = runtime_event_for(&status) {
             self.events.emit(event);
@@ -376,7 +362,6 @@ mod tests {
         rescan_switched: AtomicBool,
         statuses: Mutex<Vec<NetworkStatus>>,
         applied: Mutex<Vec<InterfaceBinding>>,
-        disconnected: AtomicBool,
     }
 
     impl FakeEnv {
@@ -391,7 +376,6 @@ mod tests {
                 rescan_switched: AtomicBool::new(false),
                 statuses: Mutex::new(Vec::new()),
                 applied: Mutex::new(Vec::new()),
-                disconnected: AtomicBool::new(false),
             })
         }
 
@@ -436,10 +420,6 @@ mod tests {
 
         fn apply_interface_binding(&self, binding: InterfaceBinding) {
             self.applied.lock().unwrap().push(binding);
-        }
-
-        fn remote_disconnected(&self) -> bool {
-            self.disconnected.load(Ordering::SeqCst)
         }
 
         fn publish(&self, status: NetworkStatus) {
@@ -661,24 +641,6 @@ mod tests {
         assert_eq!(last_retry, 1_000, "backoff must reset after a new event");
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_disconnected_helper_stops_recovery() {
-        let env = FakeEnv::arc();
-        env.disconnected.store(true, Ordering::SeqCst);
-        let mut rx = broadcast::channel(8).1;
-        let mut coordinator = RecoveryCoordinator::new(
-            env.clone(),
-            probe_target(),
-            true,
-            Some(binding(Ipv4Addr::new(10, 0, 0, 1), 1)),
-        );
-        run_once(&mut coordinator, &mut rx).await;
-        assert!(env.rebuilds.lock().unwrap().is_empty());
-        assert!(matches!(
-            env.statuses().last(),
-            Some(NetworkStatus::Unavailable { .. })
-        ));
-    }
     #[test]
     fn maps_changing_status_to_network_changed_event() {
         let status = NetworkStatus::Changing {

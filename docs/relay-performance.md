@@ -34,7 +34,7 @@ types. Public proxy functions still accept `Option<ProxyEventSender>`.
 time and `RelayProgress { src_port, c2s_bytes, s2c_bytes }` records. Consumers must
 handle this added variant. Legacy `RelayProgress` events remain supported.
 Lifecycle events are queued separately and received before a due sample. The
-Android/headless JSON contract remains at version 1, including `final: true` on
+Headless JSON contract remains at version 1, including `final: true` on
 the existing final byte-count event.
 
 ## Method
@@ -109,7 +109,7 @@ do not establish a bandwidth increase. Most initial-RTT cases improved, but the
 128-connection case without progress regressed in this run. Peak memory changed
 only slightly because the copy and endpoint buffers dominate the test process.
 The measured values describe this local workload and do not measure VPN/DPI
-success, WAN throughput, or Android battery use.
+success, WAN throughput, or Termux battery use.
 
 ## Reproduce
 

@@ -29,9 +29,8 @@ pub struct LowTtl {
     /// DPI middlebox, low enough to expire before the destination server.
     ///
     /// Stored behind an `Arc<AtomicU8>` so `LOW_TTL_DISCOVER` can update the
-    /// live value without rebuilding the method (the root helper and the local
-    /// interceptor both share the handle through
-    /// [`BypassMethod::low_ttl_handle`]).
+    /// live value without rebuilding the method. The interceptor shares this
+    /// handle through [`BypassMethod::low_ttl_handle`].
     ttl: Arc<AtomicU8>,
     /// Whether to set the PSH flag on the spoofed packet.
     set_psh: bool,

@@ -490,7 +490,6 @@ where
             remote_port: CONNECT_PORT,
             queue_num: cfg.NFQUEUE_NUM,
             linux_firewall_backend: cfg.linux_firewall_backend(),
-            firewall_owner: None,
         };
         let interceptor = match interceptor_factory(filter) {
             Ok(i) => i,

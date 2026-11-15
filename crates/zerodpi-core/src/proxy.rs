@@ -831,8 +831,7 @@ async fn handle_intercept_connection(
         dst_port: connect_port,
     };
 
-    // A remote controller resolves this future only after the root helper has
-    // inserted the flow. The upstream connect below must never move above it.
+    // Register the flow before connecting so the interceptor sees the handshake.
     let entry = flow_controller
         .register_flow(key, target.fake_client_hello, target.low_ttl_override)
         .await

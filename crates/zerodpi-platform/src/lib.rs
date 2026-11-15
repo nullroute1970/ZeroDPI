@@ -46,8 +46,7 @@ pub use windows::WinDivertInterceptor as DefaultInterceptor;
 #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 compile_error!("zerodpi-platform: no interceptor backend for this target OS");
 
-/// Placeholder interceptor used by Android app rootless artifacts that are
-/// intentionally built without NFQUEUE support.
+/// Placeholder interceptor for artifacts built without NFQUEUE support.
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     not(feature = "packet-interception")

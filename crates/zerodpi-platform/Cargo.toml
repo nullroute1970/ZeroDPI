@@ -22,8 +22,8 @@ etherparse.workspace = true
 parking_lot.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-nfq = { version = "0.2", optional = true }
-libc = "0.2"
+nfq = { version = "0.2.6", optional = true }
+libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.48", features = ["Win32_Foundation"] }

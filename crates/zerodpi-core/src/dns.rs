@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use hickory_resolver::config::{
-    LookupIpStrategy, NameServerConfigGroup, ResolverConfig, ResolverOpts,
+    LookupIpStrategy, NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts,
 };
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::TokioResolver;
 use tracing::debug;
 
 use crate::config::Config;
@@ -29,7 +30,7 @@ pub struct DnsResolver {
 
 struct CustomNameServer {
     address: SocketAddr,
-    resolver: TokioAsyncResolver,
+    resolver: TokioResolver,
 }
 
 impl DnsResolver {
@@ -42,19 +43,28 @@ impl DnsResolver {
             .custom_dns_servers()?
             .into_iter()
             .map(|address| {
-                let name_servers =
-                    NameServerConfigGroup::from_ips_clear(&[address.ip()], address.port(), true);
-                let resolver_config = ResolverConfig::from_parts(None, Vec::new(), name_servers);
+                let mut name_server = NameServerConfig::udp_and_tcp(address.ip());
+                for connection in &mut name_server.connections {
+                    connection.port = address.port();
+                }
+                let resolver_config = ResolverConfig::from_name_servers(vec![name_server]);
                 let mut options = ResolverOpts::default();
                 options.timeout = timeout;
                 options.ip_strategy = LookupIpStrategy::Ipv4Only;
-                options.use_hosts_file = false;
-                CustomNameServer {
-                    address,
-                    resolver: TokioAsyncResolver::tokio(resolver_config, options),
-                }
+                options.use_hosts_file = ResolveHosts::Never;
+                // Keep the query format and cache bound used before the 0.26 migration.
+                options.edns0 = false;
+                options.cache_size = 32;
+                let resolver = TokioResolver::builder_with_config(
+                    resolver_config,
+                    TokioRuntimeProvider::default(),
+                )
+                .with_options(options)
+                .build()
+                .with_context(|| format!("build custom DNS resolver for {address}"))?;
+                Ok(CustomNameServer { address, resolver })
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>>>()?
             .into();
         Ok(Self {
             custom_servers,
@@ -307,12 +317,10 @@ mod tests {
     }
 
     fn dns_truncated_response(request: &[u8]) -> Vec<u8> {
-        assert!(request.len() >= 12);
-        let mut response = Vec::with_capacity(12);
-        response.extend_from_slice(&request[0..2]);
-        response.extend_from_slice(&[0x83, 0x80]);
-        response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-        response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        // Truncated replies still need the matching question section. Hickory
+        // rejects QDCOUNT=0 replies instead of trusting their transaction ID alone.
+        let mut response = dns_response(request, None);
+        response[2..4].copy_from_slice(&[0x83, 0x80]);
         response
     }
 }

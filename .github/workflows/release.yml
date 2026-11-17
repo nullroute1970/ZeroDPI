@@ -103,7 +103,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
 
       - name: Install Linux build dependencies
@@ -130,7 +130,7 @@ jobs:
       WINDIVERT_PATH: ${{ github.workspace }}\windivert
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
 
       - name: Download WinDivert
@@ -173,7 +173,7 @@ jobs:
             rust_target: aarch64-linux-android
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: ${{ matrix.rust_target }}
       - uses: Swatinem/rust-cache@v2

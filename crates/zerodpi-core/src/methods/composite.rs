@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(action, MethodAction::emit_and_wait_for_data());
 
         let mut payload: Vec<u8> = vec![0x16, 0x03, 0x03, 0x02, 0x05];
-        payload.extend(std::iter::repeat(0xAA).take(517));
+        payload.extend(std::iter::repeat_n(0xAA, 517));
         let payload: &'static [u8] = Box::leak(payload.into_boxed_slice());
         let mut packet = pkt(payload, payload.len());
         let action = m.on_first_data_packet(&handshake_state(), &mut packet);
@@ -551,7 +551,7 @@ mod tests {
         assert_eq!(m.name(), "fake_tls + disorder");
 
         let mut payload: Vec<u8> = vec![0x16, 0x03, 0x03, 0x02, 0x05];
-        payload.extend(std::iter::repeat(0xAA).take(517));
+        payload.extend(std::iter::repeat_n(0xAA, 517));
         let payload: &'static [u8] = Box::leak(payload.into_boxed_slice());
         let mut packet = pkt(payload, payload.len());
 
@@ -583,7 +583,7 @@ mod tests {
         assert_eq!(m.name(), "tls_record_frag + disorder");
 
         let mut payload: Vec<u8> = vec![0x16, 0x03, 0x03, 0x02, 0x05];
-        payload.extend(std::iter::repeat(0xAA).take(517));
+        payload.extend(std::iter::repeat_n(0xAA, 517));
         let payload: &'static [u8] = Box::leak(payload.into_boxed_slice());
         let mut packet = pkt(payload, payload.len());
 
@@ -608,7 +608,7 @@ mod tests {
         );
 
         let mut payload: Vec<u8> = vec![0x16, 0x03, 0x03, 0x02, 0x05];
-        payload.extend(std::iter::repeat(0xAA).take(517));
+        payload.extend(std::iter::repeat_n(0xAA, 517));
         let payload: &'static [u8] = Box::leak(payload.into_boxed_slice());
         let mut packet = pkt(payload, payload.len());
 

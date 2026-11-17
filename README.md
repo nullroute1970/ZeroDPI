@@ -1791,7 +1791,12 @@ On Android, `tls_frag`, `tls_padding`, `tls_record_split`, or `ccs_prefix` are t
 
 ## 🔨 Building from Source
 
-Requires **Rust 1.75+** (MSRV). The workspace targets the 2021 edition.
+Requires **Rust 1.100+** (MSRV). The workspace targets the 2021 edition.
+The project pins Rust **1.100.0** in `rust-toolchain.toml` for development and CI.
+Rustup installs the pinned toolchain automatically when you run Cargo.
+Tokio stays on the 1.53 LTS series and etherparse on the 0.20 series.
+Linux/Android builds use the published `nfq` crate, including its native
+`AsRawFd` support for readiness polling; no local NFQUEUE patch is required.
 
 ```sh
 cargo build --release
@@ -1841,7 +1846,7 @@ python build.py --platform linux --linux-target all
 Requires the MSVC toolchain. When using `build.py`, WinDivert is downloaded into the repo-local `windivert/` folder automatically.
 
 ```powershell
-cargo +stable-x86_64-pc-windows-msvc build --release
+cargo +1.100.0-x86_64-pc-windows-msvc build --release
 ```
 
 Or use the build script:
@@ -1854,7 +1859,7 @@ Useful Windows build options:
 
 ```sh
 python build.py --platform windows --windivert-version 2.2.2
-python build.py --platform windows --toolchain stable-x86_64-pc-windows-msvc
+python build.py --platform windows --toolchain 1.100.0-x86_64-pc-windows-msvc
 ```
 </details>
 

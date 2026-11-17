@@ -29,7 +29,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-libc.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time", "signal"] }
 clap.workspace = true
 ratatui.workspace = true
@@ -40,3 +39,6 @@ tokio-rustls.workspace = true
 
 zerodpi-core = { path = "../zerodpi-core" }
 zerodpi-platform = { path = "../zerodpi-platform", default-features = false }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc.workspace = true

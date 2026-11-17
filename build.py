@@ -18,7 +18,7 @@ Linux:
 Windows:
   1. Downloads/verifies the repo-local windivert/ folder and sets WINDIVERT_PATH.
   2. Runs `cargo +<toolchain> build --workspace --release` (default toolchain:
-     stable-x86_64-pc-windows-msvc). Pass --toolchain="" to use the workspace
+     1.100.0-x86_64-pc-windows-msvc). Pass --toolchain="" to use the workspace
      default toolchain instead.
   3. Copies zerodpi.exe + WinDivert.dll + WinDivert64.sys + config.toml +
      sni_list.txt + ip_list.txt + cf.txt + README.md to dist/windows/.
@@ -52,7 +52,7 @@ WINDIVERT_VERSION_FILE = ".version"
 WINDIVERT_REQUIRED_FILES = ("WinDivert.dll", "WinDivert.lib", "WinDivert64.sys")
 WINDIVERT_RELEASE_URL = "https://github.com/basil00/WinDivert/releases/download/v{version}/WinDivert-{version}-A.zip"
 # On Windows this project targets the MSVC toolchain by default.
-WINDOWS_DEFAULT_TOOLCHAIN = "stable-x86_64-pc-windows-msvc"
+WINDOWS_DEFAULT_TOOLCHAIN = "1.100.0-x86_64-pc-windows-msvc"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
 LINUX_CROSS_TARGETS = [
     "x86_64-unknown-linux-gnu",

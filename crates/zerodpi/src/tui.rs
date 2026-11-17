@@ -241,7 +241,10 @@ fn draw_scan_progress<B: ratatui::backend::Backend>(
     total_hostnames: usize,
     cfg: &Config,
     stage: Option<usize>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     let done = arrived.len();
     terminal.draw(|frame| {
         let area = frame.area();
@@ -1722,7 +1725,10 @@ fn draw_dashboard<B: ratatui::backend::Backend>(
     state: &DashboardState,
     info: &DashboardInfo,
     cfg: &Config,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     terminal.draw(|frame| {
         let area = frame.area();
         let now = Instant::now();

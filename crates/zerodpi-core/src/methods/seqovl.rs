@@ -180,7 +180,7 @@ pub fn parse_hex_pattern(input: &str) -> Result<Vec<u8>, String> {
     if digits.is_empty() {
         return Err("pattern is empty".into());
     }
-    if digits.len() % 2 != 0 {
+    if !digits.len().is_multiple_of(2) {
         return Err(format!(
             "pattern has an odd number of hex digits ({})",
             digits.len()

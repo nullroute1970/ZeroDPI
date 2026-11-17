@@ -1955,7 +1955,7 @@ impl Config {
         if self.IP_FRAG_SIZE < 8 {
             anyhow::bail!("IP_FRAG_SIZE must be >= 8");
         }
-        if self.IP_FRAG_SIZE % 8 != 0 {
+        if !self.IP_FRAG_SIZE.is_multiple_of(8) {
             anyhow::bail!(
                 "IP_FRAG_SIZE must be a multiple of 8 (fragment offsets use 8-byte units)"
             );

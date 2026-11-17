@@ -156,11 +156,11 @@ fn tcp_checksum(seg: &[u8], ihl: usize, tcp_hdr_len: usize) -> u16 {
     sum += u32::from(u16::from_be_bytes([seg[18], seg[19]]));
     sum += 6; // protocol TCP
     sum += u32::from(tcp_len);
-    let mut chunks = seg[ihl..].chunks_exact(2);
-    for word in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
+    let (words, remainder) = seg[ihl..].as_chunks::<2>();
+    for word in words {
+        sum += u32::from(u16::from_be_bytes(*word));
     }
-    if let [b] = chunks.remainder() {
+    if let [b] = remainder {
         sum += u32::from(*b) << 8;
     }
     while sum >> 16 != 0 {

@@ -5,6 +5,10 @@ members = [
     "crates/zerodpi-platform",
     "crates/zerodpi",
 ]
+exclude = ["vendor/nfq"]
+
+[patch.crates-io]
+nfq = { path = "vendor/nfq" }
 
 [workspace.package]
 version = "0.1.0"

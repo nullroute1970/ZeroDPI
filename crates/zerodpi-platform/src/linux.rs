@@ -8,7 +8,7 @@
 //! IP/TCP checksums recomputed) — this is the "modify outbound packet by
 //! replacing payload" path used by the `wrong_seq` bypass.
 
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,6 +27,8 @@ use zerodpi_core::interceptor::{
 
 const HOOK_LOCAL_IN: u8 = 1;
 const HOOK_LOCAL_OUT: u8 = 3;
+
+const NFQ_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 static RAW_INJECTION_UNAVAILABLE_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -96,7 +98,8 @@ impl PacketInterceptor for NfqInterceptor {
                         continue;
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(50));
+                        wait_for_nfq_packet(self.queue.as_raw_fd(), NFQ_SHUTDOWN_POLL_INTERVAL)
+                            .context("wait for NFQUEUE packet")?;
                         continue;
                     }
                     Err(e) if is_stale_nfq_recv_error(&e) => {
@@ -346,6 +349,40 @@ impl Drop for NfqInterceptor {
             unsafe { libc::close(fd) };
         }
     }
+}
+
+/// Wake as soon as a packet arrives, but periodically return to check shutdown.
+/// Only called after recv returns WouldBlock, so nfq's buffered batch is drained
+/// before waiting on the underlying socket.
+fn wait_for_nfq_packet(fd: RawFd, timeout: Duration) -> io::Result<()> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: poll borrows one initialized descriptor for this call only. The
+    // caller retains ownership of the open socket throughout the wait.
+    let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == ErrorKind::Interrupted {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    if descriptor.revents & libc::POLLNVAL != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+    if descriptor.revents & libc::POLLHUP != 0 {
+        return Err(io::Error::new(
+            ErrorKind::BrokenPipe,
+            "NFQUEUE socket closed",
+        ));
+    }
+    // On POLLERR, let Queue::recv report the netlink error so the existing
+    // receive-error policy (including stale-state handling) remains in charge.
+    Ok(())
 }
 
 fn is_stale_nfq_recv_error(error: &std::io::Error) -> bool {
@@ -913,6 +950,75 @@ mod tests {
     }
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn nfqueue_wait_wakes_when_data_arrives() {
+        use std::os::unix::net::UnixDatagram;
+        use std::sync::mpsc;
+
+        let (reader, writer) = UnixDatagram::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = wait_for_nfq_packet(reader.as_raw_fd(), Duration::from_secs(2));
+            let mut packet = [0u8; 4];
+            let result = result.and_then(|()| reader.recv(&mut packet));
+            done_tx.send((result, packet)).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let waited_for_data = matches!(
+            done_rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        writer.send(b"data").unwrap();
+        let completion = done_rx.recv_timeout(Duration::from_millis(500));
+        worker.join().unwrap();
+
+        assert!(waited_for_data, "an empty queue must wait for readiness");
+        let (received, packet) =
+            completion.expect("new data must wake the wait before its timeout");
+        assert_eq!(received.unwrap(), 4);
+        assert_eq!(&packet, b"data", "waiting must not consume the packet");
+    }
+
+    #[test]
+    fn nfqueue_wait_bounds_idle_shutdown_checks() {
+        use std::os::unix::net::UnixDatagram;
+        use std::time::Instant;
+
+        let (reader, _writer) = UnixDatagram::pair().unwrap();
+        let started = Instant::now();
+        wait_for_nfq_packet(reader.as_raw_fd(), NFQ_SHUTDOWN_POLL_INTERVAL).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "idle wait must not spin"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "shutdown checks must stay bounded"
+        );
+    }
+
+    #[test]
+    fn nfqueue_wait_rejects_an_invalid_descriptor() {
+        let error = wait_for_nfq_packet(i32::MAX, NFQ_SHUTDOWN_POLL_INTERVAL).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn nfqueue_wait_reports_a_closed_socket() {
+        use std::os::unix::net::UnixStream;
+
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(writer);
+        let error =
+            wait_for_nfq_packet(reader.as_raw_fd(), NFQ_SHUTDOWN_POLL_INTERVAL).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+    }
 
     #[test]
     fn nfqueue_recv_not_found_is_treated_as_stale_state() {

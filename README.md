@@ -1797,6 +1797,10 @@ Rustup installs the pinned toolchain automatically when you run Cargo.
 Tokio stays on the 1.53 LTS series and etherparse on the 0.20 series.
 Linux/Android builds use the published `nfq` crate, including its native
 `AsRawFd` support for readiness polling; no local NFQUEUE patch is required.
+The application uses `windows` 0.62 bindings. Published WinDivert crates still
+expose `windows` 0.48 handle types, isolated by a tested compatibility adapter.
+Application synchronization uses `parking_lot` 0.13; dependencies that require
+0.12 keep their own compatible version.
 
 ```sh
 cargo build --release

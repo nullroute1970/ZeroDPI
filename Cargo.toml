@@ -26,7 +26,7 @@ tokio = { version = "~1.53.3", features = ["rt-multi-thread", "net", "macros", "
 clap = { version = "4.6.8", features = ["derive"] }
 dashmap = "6.2.1"
 etherparse = "0.20.3"
-parking_lot = "0.12"
+parking_lot = "0.13.0"
 ratatui = "0.30.2"
 crossterm = "0.29"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "tls12", "std"] }

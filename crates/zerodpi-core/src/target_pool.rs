@@ -573,6 +573,72 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_leases_and_rescans_preserve_load_and_traffic() {
+        const WORKERS: usize = 4;
+        const ITERATIONS: usize = 512;
+        let pool = TargetPool::new(
+            SelectionStrategy::LeastLoad,
+            vec![target(1, 10), target(2, 20)],
+        )
+        .unwrap();
+        let ready = Arc::new(std::sync::Barrier::new(WORKERS + 1));
+
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                let pool = pool.clone();
+                let ready = ready.clone();
+                scope.spawn(move || {
+                    ready.wait();
+                    for _ in 0..ITERATIONS {
+                        let lease = pool.acquire();
+                        lease.traffic.c2s.fetch_add(3, Ordering::Relaxed);
+                        lease.traffic.s2c.fetch_add(5, Ordering::Relaxed);
+                        std::thread::yield_now();
+                    }
+                });
+            }
+            ready.wait();
+            for index in 0..ITERATIONS {
+                let targets = if index % 2 == 0 {
+                    vec![target(1, 10), target(2, 20)]
+                } else {
+                    vec![target(2, 20), target(1, 10)]
+                };
+                pool.replace(targets);
+                let snapshot = pool.snapshot();
+                assert_eq!(snapshot.targets.len(), 2);
+                assert!(
+                    snapshot
+                        .targets
+                        .iter()
+                        .map(|target| target.active_connections)
+                        .sum::<usize>()
+                        <= WORKERS
+                );
+            }
+        });
+
+        let snapshot = pool.snapshot();
+        assert_eq!(pool.active_connections(), 0);
+        assert_eq!(
+            snapshot
+                .targets
+                .iter()
+                .map(|target| target.c2s_bytes)
+                .sum::<u64>(),
+            (WORKERS * ITERATIONS * 3) as u64
+        );
+        assert_eq!(
+            snapshot
+                .targets
+                .iter()
+                .map(|target| target.s2c_bytes)
+                .sum::<u64>(),
+            (WORKERS * ITERATIONS * 5) as u64
+        );
+    }
+
+    #[test]
     fn round_robin_wraps_in_rank_order() {
         let pool = TargetPool::new(
             SelectionStrategy::RoundRobin,
